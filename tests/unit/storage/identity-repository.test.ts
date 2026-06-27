@@ -1,0 +1,304 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type Database from 'better-sqlite3';
+import { initDatabase, runMigration, closeDatabase } from '../../../src/storage/database';
+import { IdentityRepository } from '../../../src/storage/identity-repository';
+
+describe('IdentityRepository', () => {
+  let testDir: string;
+  let db: Database.Database;
+  let repo: IdentityRepository;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'lethebot-test-'));
+    const dbPath = join(testDir, 'test.db');
+    db = initDatabase({ path: dbPath });
+    runMigration(db, join(__dirname, '../../../migrations/001_initial_schema.sql'));
+    repo = new IdentityRepository(db);
+  });
+
+  afterEach(() => {
+    if (db) {
+      closeDatabase(db);
+    }
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  describe('Canonical users', () => {
+    it('should ensure canonical user exists', async () => {
+      await repo.ensureCanonicalUser('user-001');
+
+      const result = db.prepare('SELECT * FROM canonical_users WHERE id = ?').get('user-001') as any;
+      expect(result).toBeDefined();
+      expect(result.id).toBe('user-001');
+    });
+
+    it('should update last_seen_at on duplicate', async () => {
+      await repo.ensureCanonicalUser('user-001');
+      const first = db.prepare('SELECT last_seen_at FROM canonical_users WHERE id = ?').get('user-001') as any;
+
+      // Wait a bit
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      await repo.ensureCanonicalUser('user-001');
+      const second = db.prepare('SELECT last_seen_at FROM canonical_users WHERE id = ?').get('user-001') as any;
+
+      expect(second.last_seen_at).toBeGreaterThan(first.last_seen_at);
+    });
+  });
+
+  describe('Platform accounts', () => {
+    it('should upsert platform account', async () => {
+      await repo.upsertPlatformAccount({
+        platform: 'qq',
+        platformAccountId: '123456',
+        canonicalUserId: 'user-001',
+        accountType: 'private',
+        verifiedLevel: 'observed',
+        status: 'active',
+      });
+
+      const accounts = await repo.getPlatformAccounts('user-001');
+      expect(accounts).toHaveLength(1);
+      expect(accounts[0].platformAccountId).toBe('123456');
+    });
+
+    it('should find canonical user by platform account', async () => {
+      await repo.upsertPlatformAccount({
+        platform: 'qq',
+        platformAccountId: '123456',
+        canonicalUserId: 'user-alice',
+        accountType: 'private',
+        verifiedLevel: 'observed',
+        status: 'active',
+      });
+
+      const userId = await repo.findCanonicalUserId('qq', '123456');
+      expect(userId).toBe('user-alice');
+    });
+
+    it('should return null for unknown platform account', async () => {
+      const userId = await repo.findCanonicalUserId('qq', 'unknown');
+      expect(userId).toBeNull();
+    });
+
+    it('should update existing platform account', async () => {
+      await repo.upsertPlatformAccount({
+        platform: 'qq',
+        platformAccountId: '123456',
+        canonicalUserId: 'user-001',
+        accountType: 'private',
+        verifiedLevel: 'observed',
+        status: 'active',
+      });
+
+      await repo.upsertPlatformAccount({
+        platform: 'qq',
+        platformAccountId: '123456',
+        canonicalUserId: 'user-002',
+        accountType: 'private',
+        verifiedLevel: 'owner_verified',
+        status: 'active',
+      });
+
+      const userId = await repo.findCanonicalUserId('qq', '123456');
+      expect(userId).toBe('user-002');
+
+      const account = (await repo.getPlatformAccounts('user-002'))[0];
+      expect(account.verifiedLevel).toBe('owner_verified');
+    });
+
+    it('should get all platform accounts for user', async () => {
+      await repo.upsertPlatformAccount({
+        platform: 'qq',
+        platformAccountId: '111111',
+        canonicalUserId: 'user-001',
+        accountType: 'private',
+        verifiedLevel: 'observed',
+        status: 'active',
+      });
+
+      await repo.upsertPlatformAccount({
+        platform: 'qq',
+        platformAccountId: '222222',
+        canonicalUserId: 'user-001',
+        accountType: 'group_member',
+        verifiedLevel: 'observed',
+        status: 'active',
+      });
+
+      const accounts = await repo.getPlatformAccounts('user-001');
+      expect(accounts).toHaveLength(2);
+      expect(accounts.map((a) => a.platformAccountId)).toContain('111111');
+      expect(accounts.map((a) => a.platformAccountId)).toContain('222222');
+    });
+  });
+
+  describe('Display profiles', () => {
+    beforeEach(async () => {
+      await repo.ensureCanonicalUser('user-alice');
+    });
+
+    it('should upsert display profile', async () => {
+      await repo.upsertDisplayProfile({
+        canonicalUserId: 'user-alice',
+        currentDisplayName: 'Alice',
+        trust: 'platform_provided',
+      });
+
+      const profile = await repo.getDisplayProfile('user-alice');
+      expect(profile).not.toBeNull();
+      expect(profile?.currentDisplayName).toBe('Alice');
+    });
+
+    it('should support group-specific display names', async () => {
+      await repo.upsertDisplayProfile({
+        canonicalUserId: 'user-alice',
+        currentDisplayName: 'Alice Global',
+        trust: 'platform_provided',
+      });
+
+      await repo.upsertDisplayProfile({
+        canonicalUserId: 'user-alice',
+        sourceGroupId: 'group-001',
+        currentDisplayName: 'Alice in Group',
+        trust: 'platform_provided',
+      });
+
+      const globalProfile = await repo.getDisplayProfile('user-alice');
+      const groupProfile = await repo.getDisplayProfile('user-alice', 'group-001');
+
+      expect(globalProfile?.currentDisplayName).toBe('Alice Global');
+      expect(groupProfile?.currentDisplayName).toBe('Alice in Group');
+    });
+
+    it('should update existing display profile', async () => {
+      await repo.upsertDisplayProfile({
+        canonicalUserId: 'user-alice',
+        currentDisplayName: 'Alice Old',
+        trust: 'platform_provided',
+      });
+
+      // Add delay to ensure timestamps differ
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      await repo.upsertDisplayProfile({
+        canonicalUserId: 'user-alice',
+        currentDisplayName: 'Alice New',
+        trust: 'user_set',
+      });
+
+      const profile = await repo.getDisplayProfile('user-alice');
+      expect(profile?.currentDisplayName).toBe('Alice New');
+      expect(profile?.trust).toBe('user_set');
+    });
+
+    it('should return null for non-existent profile', async () => {
+      const profile = await repo.getDisplayProfile('user-nonexistent');
+      expect(profile).toBeNull();
+    });
+  });
+
+  describe('Nickname history', () => {
+    beforeEach(async () => {
+      await repo.ensureCanonicalUser('user-alice');
+    });
+
+    it('should record nickname history', async () => {
+      await repo.recordNicknameHistory('user-alice', 'Alice-v1');
+      await repo.recordNicknameHistory('user-alice', 'Alice-v2');
+
+      const history = db
+        .prepare('SELECT * FROM nickname_history WHERE canonical_user_id = ? ORDER BY observed_at ASC')
+        .all('user-alice') as any[];
+
+      expect(history).toHaveLength(2);
+      expect(history[0].display_name).toBe('Alice-v1');
+      expect(history[1].display_name).toBe('Alice-v2');
+    });
+
+    it('should record group-specific nickname history', async () => {
+      await repo.recordNicknameHistory('user-alice', 'Alice Global');
+      await repo.recordNicknameHistory('user-alice', 'Alice in Group', 'group-001');
+
+      const globalHistory = db
+        .prepare('SELECT * FROM nickname_history WHERE canonical_user_id = ? AND source_group_id = ?')
+        .all('user-alice', '') as any[];
+
+      const groupHistory = db
+        .prepare('SELECT * FROM nickname_history WHERE canonical_user_id = ? AND source_group_id = ?')
+        .all('user-alice', 'group-001') as any[];
+
+      expect(globalHistory).toHaveLength(1);
+      expect(groupHistory).toHaveLength(1);
+      expect(globalHistory[0].display_name).toBe('Alice Global');
+      expect(groupHistory[0].display_name).toBe('Alice in Group');
+    });
+  });
+
+  describe('Platform groups', () => {
+    it('should upsert platform group', async () => {
+      const id = await repo.upsertPlatformGroup('qq', '123456789', 'Test Group');
+
+      expect(id).toBe('qq:123456789');
+
+      const group = db.prepare('SELECT * FROM platform_groups WHERE id = ?').get(id) as any;
+      expect(group).toBeDefined();
+      expect(group.group_name).toBe('Test Group');
+    });
+
+    it('should update group name on duplicate', async () => {
+      await repo.upsertPlatformGroup('qq', '123456789', 'Old Name');
+      await repo.upsertPlatformGroup('qq', '123456789', 'New Name');
+
+      const group = db.prepare('SELECT * FROM platform_groups WHERE platform_group_id = ?').get('123456789') as any;
+      expect(group.group_name).toBe('New Name');
+    });
+
+    it('should preserve group name if not provided on update', async () => {
+      await repo.upsertPlatformGroup('qq', '123456789', 'Original Name');
+      await repo.upsertPlatformGroup('qq', '123456789');
+
+      const group = db.prepare('SELECT * FROM platform_groups WHERE platform_group_id = ?').get('123456789') as any;
+      expect(group.group_name).toBe('Original Name');
+    });
+  });
+
+  describe('Identity boundaries', () => {
+    it('nickname change should not create memory', async () => {
+      // 这个测试验证 identity repository 不会自动创建 memory
+      await repo.ensureCanonicalUser('user-alice');
+      await repo.upsertDisplayProfile({
+        canonicalUserId: 'user-alice',
+        currentDisplayName: 'Alice-New',
+        trust: 'platform_provided',
+      });
+
+      // 验证没有创建任何 memory 记录
+      const memories = db.prepare('SELECT * FROM memory_records WHERE canonical_user_id = ?').all('user-alice');
+      expect(memories).toHaveLength(0);
+    });
+
+    it('display profile separate from memory', async () => {
+      await repo.ensureCanonicalUser('user-alice');
+      await repo.upsertDisplayProfile({
+        canonicalUserId: 'user-alice',
+        currentDisplayName: 'Alice',
+        trust: 'platform_provided',
+      });
+
+      const profile = await repo.getDisplayProfile('user-alice');
+      expect(profile).not.toBeNull();
+
+      // display_profiles 表应该有记录
+      const displayRows = db.prepare('SELECT * FROM display_profiles').all();
+      expect(displayRows.length).toBeGreaterThan(0);
+
+      // memory_records 表应该是空的
+      const memoryRows = db.prepare('SELECT * FROM memory_records').all();
+      expect(memoryRows).toHaveLength(0);
+    });
+  });
+});
