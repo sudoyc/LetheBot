@@ -215,20 +215,22 @@ describe('E2E: Full Memory Cycle', () => {
     ];
 
     for (const msg of messages) {
+      const now = Date.now();
       db.prepare(`
         INSERT INTO chat_messages (
-          id, conversation_id, conversation_type, sender_id,
-          content_text, is_from_bot, timestamp, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          id, conversation_id, conversation_type, message_id,
+          sender_id, content_text, is_from_bot, timestamp, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         msg.id,
         conversationId,
         'private',
+        msg.id, // message_id
         msg.isBot ? 'bot' : userId,
         msg.text,
         msg.isBot ? 1 : 0,
-        Date.now(),
-        Date.now(),
+        now,
+        now,
       );
     }
 
