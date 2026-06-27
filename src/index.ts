@@ -187,6 +187,42 @@ class LetheBotApp {
   }
 
   /**
+   * 解析用户身份（canonical_user_id）
+   */
+  private async resolveIdentity(platformUserId: string): Promise<string> {
+    try {
+      // 1. 查找现有映射
+      const existingUserId = await this.identityRepo.findCanonicalUserId('qq', platformUserId);
+
+      if (existingUserId) {
+        // 更新最后见到时间
+        await this.identityRepo.ensureCanonicalUser(existingUserId);
+        return existingUserId;
+      }
+
+      // 2. 创建新用户
+      const canonicalUserId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+
+      await this.identityRepo.ensureCanonicalUser(canonicalUserId);
+
+      await this.identityRepo.upsertPlatformAccount({
+        canonicalUserId,
+        platform: 'qq',
+        platformAccountId: platformUserId,
+        accountType: 'private',
+        verifiedLevel: 'observed',
+        status: 'active',
+      });
+
+      logger.debug({ canonicalUserId, platformUserId }, 'Created new user identity');
+      return canonicalUserId;
+    } catch (error) {
+      logger.error({ error, platformUserId }, 'Failed to resolve identity');
+      throw error;
+    }
+  }
+
+  /**
    * 存储原始事件到数据库
    */
   private async storeRawEvent(event: ChatMessageReceived): Promise<void> {
@@ -289,7 +325,11 @@ class LetheBotApp {
       // 0. 存储原始事件（最优先）
       await this.storeRawEvent(event);
 
-      // 0.1 存储聊天消息
+      // 0.1 解析用户身份
+      const senderId = event.message.senderId.replace('qq-', '');
+      const canonicalUserId = await this.resolveIdentity(senderId);
+
+      // 0.2 存储聊天消息
       await this.storeChatMessage(event, false);
 
       // 1. 注意力分析
@@ -325,7 +365,6 @@ class LetheBotApp {
       }
 
       // 2. 构建上下文
-      const userId = event.message.senderId.replace('qq-', '');
       const groupId = event.message.groupId?.replace('qq-group-', '');
 
       let context;
@@ -344,7 +383,7 @@ class LetheBotApp {
               isFromBot: false,
             },
           ],
-          targetUserId: userId,
+          targetUserId: canonicalUserId,
           groupId,
         });
 
@@ -360,7 +399,7 @@ class LetheBotApp {
             name: error.name,
           } : error,
           step: 'context_building',
-          userId,
+          canonicalUserId,
           groupId,
           conversationId: event.conversationId,
         }, 'Context building failed');
@@ -380,7 +419,7 @@ class LetheBotApp {
           contextPack: context,
           systemPrompt,
           actor: {
-            canonicalUserId: userId,
+            canonicalUserId,
             actorClass: 'user',
           },
           invocationContext: event.message.conversationType === 'private' ? 'private_chat' : 'group_chat',
@@ -400,7 +439,7 @@ class LetheBotApp {
             name: error.name,
           } : error,
           step: 'pi_inference',
-          userId,
+          canonicalUserId,
           conversationId: event.conversationId,
         }, 'Pi inference failed');
         throw error;
@@ -428,7 +467,7 @@ class LetheBotApp {
           try {
             await this.memoryExtractor.extractFromTurn({
               conversationId: event.conversationId ?? event.message.conversationId,
-              userId,
+              userId: canonicalUserId,
               userMessage: event.message.content.text || '',
               botResponse: responseText,
             });
