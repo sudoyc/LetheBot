@@ -10,6 +10,15 @@ Use this checklist when moving from design to implementation.
 - [ ] `.env` is ignored.
 - [ ] GitHub repository exists.
 
+## Loop Engineering Readiness
+
+- [ ] `loop-engineering-prep.md` explains execution model and gates.
+- [ ] `docs/prompts/loop-goal-lethebot-mainline.md` is current.
+- [ ] `loop-state.md` is updated before/after long loop runs.
+- [ ] Contracts are explicit enough for agent implementation.
+- [ ] Test strategy exists before large implementation loops.
+- [ ] Fast path / risk path / background path are reflected in code tasks.
+
 ## MVP Readiness
 
 - [ ] Internal event model is defined.
