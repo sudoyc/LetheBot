@@ -20,6 +20,7 @@ import { PiAdapter } from './pi/pi-adapter.js';
 import { ToolRegistry } from './tools/registry.js';
 import { PolicyGate } from './policy/gate.js';
 import { buildSystemPrompt } from './context/persona.js';
+import { MemoryExtractionWorker } from './workers/memory-extraction.js';
 import type { ChatMessageReceived } from './types/events.js';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -53,6 +54,7 @@ class LetheBotApp {
   private toolRegistry: ToolRegistry;
   private policyGate: PolicyGate;
   private pi: PiAdapter;
+  private memoryExtractor: MemoryExtractionWorker;
   private server: ReturnType<typeof createServer> | null = null;
 
   constructor() {
@@ -72,6 +74,7 @@ class LetheBotApp {
     // 初始化核心模块
     this.attention = new AttentionEngine();
     this.contextBuilder = new ContextBuilder(this.memoryRepo, this.identityRepo, this.db);
+    this.memoryExtractor = new MemoryExtractionWorker(this.db);
 
     // 初始化 Pi Agent
     const provider = process.env.PI_PROVIDER || 'openai';
@@ -420,6 +423,19 @@ class LetheBotApp {
 
           // 4.1 存储 Bot 回复
           await this.storeBotResponse(event.conversationId ?? event.message.conversationId, responseText);
+
+          // 4.2 提取记忆
+          try {
+            await this.memoryExtractor.extractFromTurn({
+              conversationId: event.conversationId ?? event.message.conversationId,
+              userId,
+              userMessage: event.message.content.text || '',
+              botResponse: responseText,
+            });
+          } catch (error) {
+            // 记忆提取失败不应阻塞流程
+            logger.warn({ error }, 'Memory extraction failed, continuing');
+          }
         } catch (error) {
           logger.error({
             error: error instanceof Error ? {
