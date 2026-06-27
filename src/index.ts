@@ -21,6 +21,7 @@ import { ToolRegistry } from './tools/registry.js';
 import { PolicyGate } from './policy/gate.js';
 import { buildSystemPrompt } from './context/persona.js';
 import { MemoryExtractionWorker } from './workers/memory-extraction.js';
+import { WorkerScheduler } from './workers/scheduler.js';
 import type { ChatMessageReceived } from './types/events.js';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -55,6 +56,7 @@ class LetheBotApp {
   private policyGate: PolicyGate;
   private pi: PiAdapter;
   private memoryExtractor: MemoryExtractionWorker;
+  private workerScheduler: WorkerScheduler;
   private server: ReturnType<typeof createServer> | null = null;
 
   constructor() {
@@ -75,6 +77,7 @@ class LetheBotApp {
     this.attention = new AttentionEngine();
     this.contextBuilder = new ContextBuilder(this.memoryRepo, this.identityRepo, this.db);
     this.memoryExtractor = new MemoryExtractionWorker(this.db);
+    this.workerScheduler = new WorkerScheduler();
 
     // 初始化 Pi Agent
     const provider = process.env.PI_PROVIDER || 'openai';
@@ -177,6 +180,9 @@ class LetheBotApp {
    */
   async stop(): Promise<void> {
     logger.info('Stopping LetheBot...');
+
+    // 停止 Worker Scheduler
+    this.workerScheduler.stop();
 
     if (this.server) {
       this.server.close();
