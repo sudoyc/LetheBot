@@ -16,12 +16,13 @@
 
 ## 总体进度
 
-**完成的 Phases**: 2/12
+**完成的 Phases**: 3/12
 
 | Phase | 名称 | 状态 | 开始时间 | 完成时间 | 提交数 | 测试 |
 |-------|------|------|---------|---------|--------|------|
 | N.0 | Post-MVP Foundation | ✅ | 2026-06-28 | 2026-06-28 | 1 | ✅ 291 passing |
 | N.1 | Data Persistence Layer | ✅ | 2026-06-28 | 2026-06-28 | 1 | ✅ 296 passing |
+| N.2 | Context & History | ✅ | 2026-06-28 | 2026-06-28 | 1 | ✅ 300 passing |
 | N.1 | Data Persistence Layer | ⏳ | - | - | 0 | - |
 | N.2 | Context & History | ⏳ | - | - | 0 | - |
 | N.3 | Persona System | ⏳ | - | - | 0 | - |

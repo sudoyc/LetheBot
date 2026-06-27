@@ -70,7 +70,7 @@ class LetheBotApp {
 
     // 初始化核心模块
     this.attention = new AttentionEngine();
-    this.contextBuilder = new ContextBuilder(this.memoryRepo, this.identityRepo);
+    this.contextBuilder = new ContextBuilder(this.memoryRepo, this.identityRepo, this.db);
 
     // 初始化 Pi Agent
     const provider = process.env.PI_PROVIDER || 'openai';

@@ -8,6 +8,7 @@ import { ulid } from 'ulidx';
 import type { ContextPack, RecentMessage } from '../types/context';
 import type { MemoryRepository } from '../storage/memory-repository';
 import type { IdentityRepository } from '../storage/identity-repository';
+import type Database from 'better-sqlite3';
 
 export interface BuildContextInput {
   turnId: string;
@@ -16,12 +17,14 @@ export interface BuildContextInput {
   recentMessages: RecentMessage[];
   targetUserId?: string;
   groupId?: string;
+  db?: Database.Database; // 添加数据库连接
 }
 
 export class ContextBuilder {
   constructor(
     private memoryRepo: MemoryRepository,
-    private identityRepo: IdentityRepository // Will be used in future phases for participant context
+    private identityRepo: IdentityRepository,
+    private db?: Database.Database // 添加数据库连接
   ) {}
 
   /**
@@ -31,8 +34,57 @@ export class ContextBuilder {
     return this.identityRepo;
   }
 
+  /**
+   * 从数据库加载最近的聊天消息
+   */
+  private async loadRecentMessages(
+    conversationId: string,
+    limit: number = 20
+  ): Promise<RecentMessage[]> {
+    if (!this.db) {
+      return [];
+    }
+
+    const rows = this.db.prepare(`
+      SELECT
+        id, sender_id, text, timestamp
+      FROM chat_messages
+      WHERE conversation_id = ?
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `).all(conversationId, limit) as Array<{
+      id: string;
+      sender_id: string;
+      text: string;
+      timestamp: number;
+    }>;
+
+    // 反转顺序，使最旧的消息在前
+    return rows.reverse().map((row) => ({
+      messageId: row.id,
+      senderId: row.sender_id === 'bot-self' ? 'bot-self' : `qq-${row.sender_id}`,
+      senderDisplayName: row.sender_id === 'bot-self' ? 'LetheBot' : `qq-${row.sender_id}`,
+      text: row.text,
+      timestamp: new Date(row.timestamp),
+      isFromBot: row.sender_id === 'bot-self',
+    }));
+  }
+
   async buildContext(input: BuildContextInput): Promise<ContextPack> {
-    const { turnId, conversationId, conversationType, recentMessages, targetUserId, groupId } = input;
+    const { turnId, conversationId, conversationType, targetUserId, groupId } = input;
+
+    // 从数据库加载历史消息（如果有数据库连接）
+    let recentMessages: RecentMessage[];
+    if (this.db) {
+      recentMessages = await this.loadRecentMessages(conversationId, 20);
+      // 如果数据库中没有历史，回退到传入的消息
+      if (recentMessages.length === 0) {
+        recentMessages = input.recentMessages;
+      }
+    } else {
+      // 无数据库连接时使用传入的消息
+      recentMessages = input.recentMessages;
+    }
 
     // 检索记忆（带可见性过滤）
     const retrievedFacts = await this.retrieveMemory(targetUserId, conversationType, groupId);
@@ -77,18 +129,26 @@ export class ContextBuilder {
     conversationType?: 'private' | 'group',
     groupId?: string
   ) {
-    if (!userId) {
-      return [];
-    }
+    const allMemories: Array<Awaited<ReturnType<typeof this.memoryRepo.retrieve>>[number]> = [];
 
     // 检索用户记忆
-    const memories = await this.memoryRepo.retrieve({
-      canonicalUserId: userId,
+    if (userId) {
+      const userMemories = await this.memoryRepo.retrieve({
+        canonicalUserId: userId,
+        state: 'active',
+      });
+      allMemories.push(...userMemories);
+    }
+
+    // 检索全局公开记忆
+    const globalMemories = await this.memoryRepo.retrieve({
+      scope: 'global',
       state: 'active',
     });
+    allMemories.push(...globalMemories);
 
     // 应用可见性过滤
-    const filtered = memories.filter((mem) => {
+    const filtered = allMemories.filter((mem) => {
       // private_only 只在私聊可见
       if (mem.visibility === 'private_only') {
         return conversationType === 'private';
