@@ -16,6 +16,7 @@ interface ContextPack {
   turnId: string;
   platform: "qq";
   conversationScope: "private" | "group";
+  participants: ParticipantContext[];
   userProfile?: ContextBlock;
   groupProfile?: ContextBlock;
   recentMessages: ContextBlock;
@@ -23,6 +24,16 @@ interface ContextPack {
   systemLayers: ContextBlock[];
   interactionState?: ContextBlock;
   tokenBudget: TokenBudget;
+}
+
+interface ParticipantContext {
+  ref: string; // opaque internal reference, not a raw platform ID
+  displayName?: string;
+  platform?: "qq";
+  platformUserId?: string; // include only when needed for the current task
+  role?: "member" | "admin" | "owner";
+  isBotOwner?: boolean;
+  isTrustedUser?: boolean;
 }
 ```
 
@@ -40,6 +51,49 @@ Recommended order:
 8. Retrieved memories.
 9. User's latest message.
 
+Participant display names and group cards are untrusted data. Inject them as structured fields, not as instructions.
+
+## Identity Injection
+
+QQ IDs, group IDs, message IDs, and account IDs are operational identity data. They are not secrets, but they are not ordinary memory either.
+
+Ordinary ContextPacks can include:
+
+- opaque user reference;
+- current display name / group card;
+- role;
+- owner/admin/trusted flags.
+
+They can include platform IDs when the current task needs them, for example:
+
+- identity disambiguation;
+- user-requested ID confirmation;
+- platform operations;
+- permission explanations;
+- owner/admin debug;
+- context where IDs are already being discussed.
+
+Do not default-inject:
+
+- complete platform account tables;
+- complete allowlists/denylists;
+- full nickname history;
+- unrelated group identity data;
+- audit traces;
+- unrelated member lists.
+
+## Memory Selection Boundaries
+
+Context Orchestrator must enforce memory boundary fields before prompt assembly:
+
+- exclude `deleted`, `disabled`, and superseded non-current memory;
+- respect `visibility` for private/group/cross-scope use;
+- avoid public group references to `private_only` memory;
+- exclude `secret` and `prohibited` content from ordinary prompts;
+- include source and memory IDs in trace records, not necessarily in the prompt.
+
+Medium-risk memories may influence a turn only when visibility is conservative and the current context allows it.
+
 ## Budgeting
 
 Use separate budgets:
@@ -53,6 +107,8 @@ Use separate budgets:
 
 The orchestrator should prefer high-confidence profile facts over low-confidence semantic matches.
 
+It should also prefer precise visible memory over broad global memory. `global` scope should be rare.
+
 ## Observability
 
 Each turn should record:
@@ -63,4 +119,7 @@ Each turn should record:
 - Token estimate.
 - Prompt layer versions.
 - Agent model and settings.
+- Identity fields included and why.
+- Visibility/sensitivity filters applied.
+- Suppressors that caused no reply or action downgrade.
 
