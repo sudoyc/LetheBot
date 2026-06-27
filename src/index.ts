@@ -19,6 +19,7 @@ import { ContextBuilder } from './context/builder.js';
 import { PiAdapter } from './pi/pi-adapter.js';
 import { ToolRegistry } from './tools/registry.js';
 import { PolicyGate } from './policy/gate.js';
+import { buildSystemPrompt } from './context/persona.js';
 import type { ChatMessageReceived } from './types/events.js';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -366,9 +367,15 @@ class LetheBotApp {
       // 3. 调用推理核心（PiAdapter）
       let piResult;
       try {
+        // 动态生成 system prompt
+        const systemPrompt = buildSystemPrompt({
+          conversationType: event.message.conversationType,
+          hasMemorySystem: true,
+        });
+
         piResult = await this.pi.runTurn({
           contextPack: context,
-          systemPrompt: 'You are LetheBot, a helpful assistant.',
+          systemPrompt,
           actor: {
             canonicalUserId: userId,
             actorClass: 'user',
