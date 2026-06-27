@@ -5,3 +5,4 @@
  */
 
 export * from './adapter';
+export * from './onebot-adapter';

@@ -1,0 +1,31 @@
+services:
+  lethebot:
+    build: .
+    container_name: lethebot
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      LOG_LEVEL: info
+      LETHEBOT_DB_PATH: /app/data/lethebot.db
+      # OneBot connection (NapCat)
+      ONEBOT_HTTP_URL: http://host.docker.internal:3000
+      ONEBOT_WS_URL: ws://host.docker.internal:3000
+      ONEBOT_TOKEN: Ln5Gfgdq1t6v2O9zsY7jHNz_1GW1_LeXA-0kV6VjjZw
+      # Bot configuration
+      BOT_QQ_ID: ${BOT_QQ_ID}
+      # Pi API (when ready)
+      # PI_API_KEY: ${PI_API_KEY}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    ports:
+      - "127.0.0.1:6700:6700"  # OneBot event endpoint
+      - "127.0.0.1:8081:8080"  # Health check
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    networks:
+      - lethebot-network
+
+networks:
+  lethebot-network:
+    driver: bridge
