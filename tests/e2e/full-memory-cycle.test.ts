@@ -219,7 +219,7 @@ describe('E2E: Full Memory Cycle', () => {
       db.prepare(`
         INSERT INTO chat_messages (
           id, conversation_id, conversation_type, message_id,
-          sender_id, content_text, is_from_bot, timestamp, created_at
+          sender_id, text_content, is_from_bot, timestamp, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         msg.id,
