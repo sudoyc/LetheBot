@@ -217,14 +217,14 @@ describe('E2E: Full Memory Cycle', () => {
     for (const msg of messages) {
       db.prepare(`
         INSERT INTO chat_messages (
-          id, conversation_id, sender_id, sender_display_name,
+          id, conversation_id, conversation_type, sender_id,
           content_text, is_from_bot, timestamp, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         msg.id,
         conversationId,
+        'private',
         msg.isBot ? 'bot' : userId,
-        msg.isBot ? 'LetheBot' : 'Diana',
         msg.text,
         msg.isBot ? 1 : 0,
         Date.now(),
