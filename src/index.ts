@@ -4,17 +4,22 @@
  * 集成所有模块，启动 HTTP 服务器接收 NapCat 事件
  */
 
+import Database from 'better-sqlite3';
 import { createServer } from 'node:http';
-import { loadConfig } from './config';
-import { getLogger } from './logger';
-import { initDatabase, runMigration } from './storage/database';
-import { MemoryRepository } from './storage/memory-repository';
-import { IdentityRepository } from './storage/identity-repository';
-import { OneBotAdapter } from './gateway/onebot-adapter';
-import { AttentionEngine } from './attention/engine';
-import { ContextBuilder } from './context/builder';
-import { MockPi } from './pi/mock-pi';
-import type { ChatMessageReceived } from './types/events';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { loadConfig } from './config/index.js';
+import { getLogger } from './logger/index.js';
+import { initDatabase, runMigration } from './storage/database.js';
+import { MemoryRepository } from './storage/memory-repository.js';
+import { IdentityRepository } from './storage/identity-repository.js';
+import { OneBotAdapter } from './gateway/onebot-adapter.js';
+import { AttentionEngine } from './attention/engine.js';
+import { ContextBuilder } from './context/builder.js';
+import { PiAdapter } from './pi/pi-adapter.js';
+import { ToolRegistry } from './tools/registry.js';
+import { PolicyGate } from './policy/gate.js';
+import type { ChatMessageReceived } from './types/events.js';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -28,17 +33,26 @@ const logger = getLogger();
 export const VERSION = '0.1.0';
 
 /**
+ * 测试导出函数
+ */
+export function hello(): string {
+  return `LetheBot v${VERSION}`;
+}
+
+/**
  * 主应用类
  */
 class LetheBotApp {
-  private db: any;
+  private db: Database.Database;
   private memoryRepo: MemoryRepository;
   private identityRepo: IdentityRepository;
   private adapter: OneBotAdapter;
   private attention: AttentionEngine;
   private contextBuilder: ContextBuilder;
-  private pi: MockPi;
-  private server: any;
+  private toolRegistry: ToolRegistry;
+  private policyGate: PolicyGate;
+  private pi: PiAdapter;
+  private server: ReturnType<typeof createServer> | null = null;
 
   constructor() {
     // 初始化数据库
@@ -50,10 +64,41 @@ class LetheBotApp {
     this.memoryRepo = new MemoryRepository(this.db);
     this.identityRepo = new IdentityRepository(this.db);
 
+    // 初始化工具注册表和策略门
+    this.toolRegistry = new ToolRegistry();
+    this.policyGate = new PolicyGate(this.toolRegistry);
+
     // 初始化核心模块
     this.attention = new AttentionEngine();
     this.contextBuilder = new ContextBuilder(this.memoryRepo, this.identityRepo);
-    this.pi = new MockPi();
+
+    // 初始化 Pi Agent
+    const provider = process.env.PI_PROVIDER || 'openai';
+    const model = process.env.PI_MODEL || 'deepseek-v4-flash';
+    const baseUrl = process.env.PI_BASE_URL || 'https://api.deepseek.com/v1';
+
+    // 读取 API Key
+    let apiKey = process.env.PI_API_KEY || '';
+    if (!apiKey) {
+      try {
+        const keyPath = join(homedir(), 'deepseek');
+        apiKey = readFileSync(keyPath, 'utf-8').trim();
+        logger.info({ keyPath }, 'Loaded API key from file');
+      } catch {
+        logger.warn('No API key found, Pi Agent may not work');
+      }
+    }
+
+    this.pi = new PiAdapter({
+      toolRegistry: this.toolRegistry,
+      policyGate: this.policyGate,
+      provider,
+      model,
+      apiKey,
+      baseUrl,
+    });
+
+    logger.info({ provider, model, baseUrl }, 'Pi Agent initialized');
 
     // 初始化网关适配器
     const onebotHttpUrl = process.env.ONEBOT_HTTP_URL || 'http://localhost:3000';
@@ -138,6 +183,95 @@ class LetheBotApp {
   }
 
   /**
+   * 存储原始事件到数据库
+   */
+  private async storeRawEvent(event: ChatMessageReceived): Promise<void> {
+    const eventId = `evt-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+
+    await this.db.prepare(`
+      INSERT INTO raw_events (
+        id, type, timestamp, source, platform,
+        conversation_id, payload, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      eventId,
+      event.type,
+      new Date(event.timestamp).getTime(),
+      'gateway',
+      'qq',
+      event.conversationId,
+      JSON.stringify(event),
+      Date.now(),
+    );
+
+    logger.debug({ eventId }, 'Raw event stored');
+  }
+
+  /**
+   * 存储聊天消息到数据库
+   */
+  private async storeChatMessage(event: ChatMessageReceived, isFromBot: boolean = false): Promise<void> {
+    const messageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+    const userId = event.message.senderId.replace('qq-', '');
+
+    await this.db.prepare(`
+      INSERT INTO chat_messages (
+        id, raw_event_id, message_id, conversation_id,
+        conversation_type, group_id, sender_id, sender_role,
+        text, has_media, has_quote, mentions_bot,
+        reply_to_message_id, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      messageId,
+      `evt-${Date.now()}`, // 暂时用同样的 ID 格式
+      event.message.messageId,
+      event.conversationId,
+      event.message.conversationType,
+      event.message.groupId || null,
+      userId,
+      event.message.senderRole || null,
+      event.message.content.text || '',
+      event.message.content.media ? 1 : 0,
+      event.message.content.quote ? 1 : 0,
+      event.message.mentionsBot ? 1 : 0,
+      event.message.replyToMessageId || null,
+      new Date(event.timestamp).getTime(),
+    );
+
+    logger.debug({ messageId, isFromBot }, 'Chat message stored');
+  }
+
+  /**
+   * 存储 Bot 回复到数据库
+   */
+  private async storeBotResponse(conversationId: string, text: string): Promise<void> {
+    const messageId = `msg-bot-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+
+    // 创建一个简化的 Bot 消息记录
+    await this.db.prepare(`
+      INSERT INTO chat_messages (
+        id, raw_event_id, message_id, conversation_id,
+        conversation_type, sender_id, text,
+        has_media, has_quote, mentions_bot, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      messageId,
+      `evt-bot-${Date.now()}`,
+      messageId, // Bot 消息使用内部 ID
+      conversationId,
+      'private', // 暂时默认，后续会改进
+      'bot-self',
+      text,
+      0,
+      0,
+      0,
+      Date.now(),
+    );
+
+    logger.debug({ messageId }, 'Bot response stored');
+  }
+
+  /**
    * 处理内部事件
    */
   private async handleEvent(event: ChatMessageReceived): Promise<void> {
@@ -148,16 +282,37 @@ class LetheBotApp {
         senderId: event.message.senderId,
       }, 'Processing event');
 
-      // 1. 注意力分析
-      const signals = this.attention.analyze({
-        conversationType: event.message.conversationType,
-        mentionsBot: event.message.mentionsBot,
-        text: event.message.content.text ?? '',
-        senderId: event.message.senderId,
-        replyToBot: false,
-      });
+      // 0. 存储原始事件（最优先）
+      await this.storeRawEvent(event);
 
-      logger.debug({ signals }, 'Attention analysis');
+      // 0.1 存储聊天消息
+      await this.storeChatMessage(event, false);
+
+      // 1. 注意力分析
+      let signals;
+      try {
+        signals = this.attention.analyze({
+          conversationType: event.message.conversationType,
+          mentionsBot: event.message.mentionsBot,
+          text: event.message.content.text ?? '',
+          senderId: event.message.senderId,
+          replyToBot: false,
+        });
+
+        logger.debug({ signals }, 'Attention analysis');
+      } catch (error) {
+        logger.error({
+          error: error instanceof Error ? {
+            message: error.message,
+            stack: error.stack,
+            name: error.name,
+          } : error,
+          step: 'attention_analysis',
+          eventType: event.type,
+          conversationId: event.conversationId,
+        }, 'Attention analysis failed');
+        throw error;
+      }
 
       // 如果不需要响应，直接返回
       if (signals.classification === 'silent') {
@@ -169,55 +324,128 @@ class LetheBotApp {
       const userId = event.message.senderId.replace('qq-', '');
       const groupId = event.message.groupId?.replace('qq-group-', '');
 
-      const context = await this.contextBuilder.buildContext({
-        turnId: `turn-${Date.now()}`,
-        conversationId: event.conversationId ?? event.message.conversationId,
-        conversationType: event.message.conversationType,
-        recentMessages: [
-          {
-            messageId: event.message.messageId,
-            senderId: event.message.senderId,
-            text: event.message.content.text ?? '',
-            timestamp: event.timestamp,
-            senderDisplayName: event.message.senderId,
-            isFromBot: false,
+      let context;
+      try {
+        context = await this.contextBuilder.buildContext({
+          turnId: `turn-${Date.now()}`,
+          conversationId: event.conversationId ?? event.message.conversationId,
+          conversationType: event.message.conversationType,
+          recentMessages: [
+            {
+              messageId: event.message.messageId,
+              senderId: event.message.senderId,
+              text: event.message.content.text ?? '',
+              timestamp: event.timestamp,
+              senderDisplayName: event.message.senderId,
+              isFromBot: false,
+            },
+          ],
+          targetUserId: userId,
+          groupId,
+        });
+
+        logger.debug({
+          memoryCount: context.memory.retrievedFacts.length,
+          tokenBudget: context.tokenBudget,
+        }, 'Context built');
+      } catch (error) {
+        logger.error({
+          error: error instanceof Error ? {
+            message: error.message,
+            stack: error.stack,
+            name: error.name,
+          } : error,
+          step: 'context_building',
+          userId,
+          groupId,
+          conversationId: event.conversationId,
+        }, 'Context building failed');
+        throw error;
+      }
+
+      // 3. 调用推理核心（PiAdapter）
+      let piResult;
+      try {
+        piResult = await this.pi.runTurn({
+          contextPack: context,
+          systemPrompt: 'You are LetheBot, a helpful assistant.',
+          actor: {
+            canonicalUserId: userId,
+            actorClass: 'user',
           },
-        ],
-        targetUserId: userId,
-        groupId,
-      });
+          invocationContext: event.message.conversationType === 'private' ? 'private_chat' : 'group_chat',
+          turnId: `turn-${Date.now()}`,
+        });
 
-      logger.debug({
-        memoryCount: context.memory.retrievedFacts.length,
-        tokenBudget: context.tokenBudget,
-      }, 'Context built');
-
-      // 3. 调用推理核心（MockPi）
-      const piResult = await this.pi.run({
-        contextPack: context,
-      });
-
-      logger.debug({
-        responseLength: piResult.responseText?.length ?? 0,
-        actionDecision: piResult.actionDecision,
-      }, 'Pi response');
+        logger.debug({
+          responseLength: piResult.responseText?.length ?? 0,
+          toolCallCount: piResult.toolCallIds.length,
+          status: piResult.status,
+        }, 'Pi response');
+      } catch (error) {
+        logger.error({
+          error: error instanceof Error ? {
+            message: error.message,
+            stack: error.stack,
+            name: error.name,
+          } : error,
+          step: 'pi_inference',
+          userId,
+          conversationId: event.conversationId,
+        }, 'Pi inference failed');
+        throw error;
+      }
 
       // 4. 发送响应
       const responseText = piResult.responseText ?? '';
       if (responseText.trim().length > 0) {
-        if (event.message.conversationType === 'private') {
-          await this.adapter.sendPrivateMessage(event.message.senderId, responseText);
-        } else if (event.message.conversationType === 'group' && event.message.groupId) {
-          await this.adapter.sendGroupMessage(event.message.groupId, responseText);
-        }
+        try {
+          if (event.message.conversationType === 'private') {
+            await this.adapter.sendPrivateMessage(event.message.senderId, responseText);
+          } else if (event.message.conversationType === 'group' && event.message.groupId) {
+            await this.adapter.sendGroupMessage(event.message.groupId, responseText);
+          }
 
-        logger.info({
-          conversationId: event.conversationId,
-          responseLength: responseText.length,
-        }, 'Response sent');
+          logger.info({
+            conversationId: event.conversationId,
+            responseLength: responseText.length,
+          }, 'Response sent');
+
+          // 4.1 存储 Bot 回复
+          await this.storeBotResponse(event.conversationId ?? event.message.conversationId, responseText);
+        } catch (error) {
+          logger.error({
+            error: error instanceof Error ? {
+              message: error.message,
+              stack: error.stack,
+              name: error.name,
+            } : error,
+            step: 'send_message',
+            conversationType: event.message.conversationType,
+            conversationId: event.conversationId,
+            senderId: event.message.senderId,
+            groupId: event.message.groupId,
+            responseLength: responseText.length,
+          }, 'Failed to send message');
+          throw error;
+        }
       }
     } catch (error) {
-      logger.error({ error, event }, 'Failed to handle event');
+      logger.error({
+        error: error instanceof Error ? {
+          message: error.message,
+          stack: error.stack,
+          name: error.name,
+        } : error,
+        event: {
+          type: event.type,
+          conversationId: event.conversationId,
+          senderId: event.message.senderId,
+          conversationType: event.message.conversationType,
+          messageId: event.message.messageId,
+          timestamp: event.timestamp,
+        },
+      }, 'Failed to handle event');
     }
   }
 }
