@@ -20,15 +20,15 @@ export interface BuildContextInput {
 
 export class ContextBuilder {
   constructor(
-    private memoryRepo: MemoryRepository,
-    private identityRepo: IdentityRepository // Will be used in future phases for participant context
+    private _memoryRepo: MemoryRepository,
+    private _identityRepo: IdentityRepository // Will be used in future phases for participant context
   ) {}
 
   /**
    * 获取身份仓库（预留给未来使用）
    */
   getIdentityRepo(): IdentityRepository {
-    return this.identityRepo;
+    return this._identityRepo;
   }
 
   async buildContext(input: BuildContextInput): Promise<ContextPack> {
@@ -82,7 +82,7 @@ export class ContextBuilder {
     }
 
     // 检索用户记忆
-    const memories = await this.memoryRepo.retrieve({
+    const memories = await this._memoryRepo.retrieve({
       canonicalUserId: userId,
       state: 'active',
     });

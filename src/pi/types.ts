@@ -25,7 +25,7 @@ export interface AgentTurnOutput {
 }
 
 export interface ReasoningCore {
-  run(input: AgentTurnInput): Promise<AgentTurnOutput>;
+  run(_input: AgentTurnInput): Promise<AgentTurnOutput>;
   isMock(): boolean;
   getModelInfo(): { model: string; provider: string };
 }

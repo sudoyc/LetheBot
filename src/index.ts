@@ -31,14 +31,14 @@ export const VERSION = '0.1.0';
  * 主应用类
  */
 class LetheBotApp {
-  private db: any;
+  private db: ReturnType<typeof initDatabase>;
   private memoryRepo: MemoryRepository;
   private identityRepo: IdentityRepository;
   private adapter: OneBotAdapter;
   private attention: AttentionEngine;
   private contextBuilder: ContextBuilder;
   private pi: MockPi;
-  private server: any;
+  private server: ReturnType<typeof createServer> | null = null;
 
   constructor() {
     // 初始化数据库

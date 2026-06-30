@@ -21,13 +21,13 @@ export interface CommandResult {
 }
 
 export class GovernanceCLI {
-  constructor(private readonly memoryRepo: MemoryRepository) {}
+  constructor(private readonly _memoryRepo: MemoryRepository) {}
 
   /**
    * 列出记忆记录
    */
   async listMemory(options: ListMemoryOptions): Promise<MemoryRecord[]> {
-    const filters: Parameters<typeof this.memoryRepo.retrieve>[0] = {};
+    const filters: Parameters<typeof this._memoryRepo.retrieve>[0] = {};
 
     if (options.userId) {
       filters.canonicalUserId = options.userId;
@@ -43,7 +43,7 @@ export class GovernanceCLI {
       filters.state = 'active';
     }
 
-    return this.memoryRepo.retrieve(filters);
+    return this._memoryRepo.retrieve(filters);
   }
 
   /**
@@ -51,7 +51,7 @@ export class GovernanceCLI {
    */
   async deleteMemory(memoryId: string): Promise<CommandResult> {
     try {
-      const existing = await this.memoryRepo.findById(memoryId);
+      const existing = await this._memoryRepo.findById(memoryId);
 
       if (!existing) {
         return {
@@ -60,7 +60,7 @@ export class GovernanceCLI {
         };
       }
 
-      await this.memoryRepo.updateState(memoryId, 'deleted');
+      await this._memoryRepo.updateState(memoryId, 'deleted');
 
       return {
         success: true,
@@ -79,7 +79,7 @@ export class GovernanceCLI {
    */
   async disableMemory(memoryId: string): Promise<CommandResult> {
     try {
-      const existing = await this.memoryRepo.findById(memoryId);
+      const existing = await this._memoryRepo.findById(memoryId);
 
       if (!existing) {
         return {
@@ -88,7 +88,7 @@ export class GovernanceCLI {
         };
       }
 
-      await this.memoryRepo.updateState(memoryId, 'disabled');
+      await this._memoryRepo.updateState(memoryId, 'disabled');
 
       return {
         success: true,
@@ -107,7 +107,7 @@ export class GovernanceCLI {
    */
   async enableMemory(memoryId: string): Promise<CommandResult> {
     try {
-      const existing = await this.memoryRepo.findById(memoryId);
+      const existing = await this._memoryRepo.findById(memoryId);
 
       if (!existing || existing.state !== 'disabled') {
         return {
@@ -116,7 +116,7 @@ export class GovernanceCLI {
         };
       }
 
-      await this.memoryRepo.updateState(memoryId, 'active');
+      await this._memoryRepo.updateState(memoryId, 'active');
 
       return {
         success: true,

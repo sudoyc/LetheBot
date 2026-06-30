@@ -39,12 +39,12 @@ export interface GatewayAdapter {
   /**
    * 发送消息
    */
-  sendMessage(target: MessageTarget, content: MessageContent): Promise<string>;
+  sendMessage(_target: MessageTarget, _content: MessageContent): Promise<string>;
 
   /**
    * 发送表情回应
    */
-  sendReaction?(messageId: string, emoji: string): Promise<void>;
+  sendReaction?(_messageId: string, _emoji: string): Promise<void>;
 
   /**
    * 获取网关能力
@@ -54,15 +54,15 @@ export interface GatewayAdapter {
   /**
    * 监听消息事件
    */
-  on(event: 'message', handler: (msg: ChatMessageReceived) => void): void;
+  on(_event: 'message', _handler: (msg: ChatMessageReceived) => void): void;
 
   /**
    * 监听错误事件
    */
-  on(event: 'error', handler: (error: Error) => void): void;
+  on(_event: 'error', _handler: (error: Error) => void): void;
 
   /**
    * 移除事件监听
    */
-  off(event: 'message' | 'error', handler: (...args: unknown[]) => void): void;
+  off(_event: 'message' | 'error', _handler: (...args: unknown[]) => void): void;
 }

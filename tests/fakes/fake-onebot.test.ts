@@ -265,7 +265,6 @@ describe('FakeOneBot', () => {
       gateway.reset();
 
       gateway.simulatePrivateMessage({ text: 'test3' });
-      const last = gateway.getLastSentMessage();
       // After reset, counters start from 1 again
       expect(gateway.getSentMessages()).toHaveLength(0); // No messages sent, only simulated
     });

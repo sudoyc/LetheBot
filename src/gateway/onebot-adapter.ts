@@ -154,14 +154,14 @@ export class OneBotAdapter extends EventEmitter {
   /**
    * 注册事件处理器
    */
-  onEvent(handler: (event: ChatMessageReceived) => void): void {
-    this.on('event', handler);
+  onEvent(_handler: (event: ChatMessageReceived) => void): void {
+    this.on('event', _handler);
   }
 
   /**
    * 调用 OneBot API
    */
-  private async callApi(action: string, params: Record<string, unknown>): Promise<any> {
+  private async callApi(action: string, params: Record<string, unknown>): Promise<unknown> {
     const url = `${this.config.httpUrl}/${action}`;
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -181,7 +181,7 @@ export class OneBotAdapter extends EventEmitter {
       throw new Error(`OneBot API failed: ${response.status} ${response.statusText}`);
     }
 
-    const result: any = await response.json();
+    const result = await response.json() as { status?: string; retcode?: number; message?: string; data?: unknown };
     if (result.status !== 'ok' && result.retcode !== 0) {
       throw new Error(`OneBot API error: ${result.message ?? 'Unknown error'}`);
     }

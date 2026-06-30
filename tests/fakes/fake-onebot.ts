@@ -104,7 +104,7 @@ export class FakeOneBot implements GatewayAdapter {
     return messageId;
   }
 
-  async sendReaction(messageId: string, emoji: string): Promise<void> {
+  async sendReaction(_messageId: string, _emoji: string): Promise<void> {
     // Store reactions if needed for assertions
     // For now, just a no-op
   }
@@ -113,12 +113,12 @@ export class FakeOneBot implements GatewayAdapter {
     return this.capabilities;
   }
 
-  on(event: 'message' | 'error', handler: (...args: unknown[]) => void): void {
-    this.emitter.on(event, handler);
+  on(_event: 'message' | 'error', _handler: (...args: unknown[]) => void): void {
+    this.emitter.on(_event, _handler);
   }
 
-  off(event: 'message' | 'error', handler: (...args: unknown[]) => void): void {
-    this.emitter.off(event, handler);
+  off(_event: 'message' | 'error', _handler: (...args: unknown[]) => void): void {
+    this.emitter.off(_event, _handler);
   }
 
   /**

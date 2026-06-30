@@ -20,7 +20,7 @@ export interface PolicyCheckResult {
 }
 
 export class PolicyGate {
-  constructor(private toolRegistry: ToolRegistry) {}
+  constructor(private _toolRegistry: ToolRegistry) {}
 
   /**
    * 检查工具调用是否允许（L0 策略）
@@ -29,7 +29,7 @@ export class PolicyGate {
     const { toolName, actor, context } = request;
 
     // 检查工具是否存在
-    const tool = this.toolRegistry.get(toolName);
+    const tool = this._toolRegistry.get(toolName);
     if (!tool) {
       return {
         allowed: false,
@@ -38,7 +38,7 @@ export class PolicyGate {
     }
 
     // L0 策略：检查权限（不受 evaluatorPolicy 影响）
-    const hasPermission = this.toolRegistry.checkPermission(toolName, actor, context);
+    const hasPermission = this._toolRegistry.checkPermission(toolName, actor, context);
     if (!hasPermission) {
       return {
         allowed: false,
@@ -47,7 +47,7 @@ export class PolicyGate {
     }
 
     // 检查是否需要 evaluator
-    const requiresEvaluator = this.toolRegistry.requiresEvaluator(toolName);
+    const requiresEvaluator = this._toolRegistry.requiresEvaluator(toolName);
 
     return {
       allowed: true,
