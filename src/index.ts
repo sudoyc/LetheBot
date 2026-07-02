@@ -124,7 +124,9 @@ class LetheBotApp {
 
     // 初始化网关适配器
     this.adapter = new OneBotAdapter({
+      transport: this.config.onebotTransport,
       httpUrl: this.config.onebotHttpUrl,
+      wsUrl: this.config.onebotWsUrl,
       token: this.config.onebotToken,
       botId: this.config.onebotBotQqId,
     });
@@ -141,7 +143,7 @@ class LetheBotApp {
   async start(): Promise<void> {
     await this.adapter.start();
 
-    // 启动 HTTP 服务器接收 NapCat POST 事件
+    // 启动 HTTP 服务器接收健康检查和 OneBot reverse HTTP 事件
     const port = this.config.lethebotPort;
 
     this.server = createServer(async (req, res) => {
@@ -157,12 +159,6 @@ class LetheBotApp {
 
       // OneBot 事件 endpoint
       if (requestPath === this.config.lethebotEventPath && req.method === 'POST') {
-        if (!this.adapter.validateHttpEventAuth(req.headers)) {
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Unauthorized' }));
-          return;
-        }
-
         let body = '';
         req.on('data', (chunk) => {
           body += chunk.toString();
@@ -170,6 +166,12 @@ class LetheBotApp {
 
         req.on('end', () => {
           try {
+            if (!this.adapter.validateHttpEventAuth(req.headers, body)) {
+              res.writeHead(401, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'Unauthorized' }));
+              return;
+            }
+
             const event = JSON.parse(body);
             logger.debug({ event }, 'Received OneBot event');
             this.adapter.handleHttpEvent(event);

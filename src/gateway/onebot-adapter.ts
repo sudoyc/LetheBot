@@ -1,11 +1,12 @@
 /**
- * OneBot 11 Adapter (HTTP mode)
+ * OneBot 11 Adapter (HTTP / WebSocket modes)
  *
- * 连接到 NapCat 的 HTTP API + reverse HTTP event endpoint 适配器。
+ * 连接到 SnowLuma / OneBot runtime，并统一转换 OneBot event。
  */
 
 import { EventEmitter } from 'node:events';
 import type { IncomingHttpHeaders } from 'node:http';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { MessageContent, MessageTarget } from './adapter';
 import type {
   ChatMessageReceived,
@@ -18,13 +19,40 @@ interface OneBotApiResponse {
   status?: unknown;
   retcode?: unknown;
   message?: unknown;
+  wording?: unknown;
   data?: unknown;
+  echo?: unknown;
 }
+
+export type OneBotTransport = 'http' | 'ws';
+
+export interface OneBotWebSocketEvent {
+  data?: unknown;
+  error?: unknown;
+  message?: unknown;
+  reason?: unknown;
+}
+
+export interface OneBotWebSocketLike {
+  readonly readyState: number;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  addEventListener(
+    event: 'open' | 'message' | 'error' | 'close',
+    handler: (event: OneBotWebSocketEvent) => void,
+  ): void;
+}
+
+export type OneBotWebSocketFactory = (url: string) => OneBotWebSocketLike;
 
 export interface OneBotConfig {
   httpUrl: string;
+  wsUrl?: string;
+  transport?: OneBotTransport;
   token?: string;
   botId?: string;
+  webSocketFactory?: OneBotWebSocketFactory;
+  wsReconnectIntervalMs?: number;
 }
 
 export interface OneBotSegment {
@@ -33,7 +61,7 @@ export interface OneBotSegment {
 }
 
 export interface OneBotMessage {
-  post_type: 'message' | 'notice' | 'request' | 'meta_event';
+  post_type: 'message' | 'message_sent' | 'notice' | 'request' | 'meta_event';
   message_type?: 'private' | 'group';
   message_id?: number | string;
   user_id?: number | string;
@@ -51,8 +79,11 @@ export interface OneBotMessage {
 
 export interface OneBotReadiness {
   ready: boolean;
-  mode: 'http';
+  mode: OneBotTransport;
   httpUrl: string;
+  wsUrl?: string;
+  wsConnected?: boolean;
+  pendingWsRequests?: number;
   hasToken: boolean;
   botIdConfigured: boolean;
   lastError?: string;
@@ -69,15 +100,35 @@ interface ParsedMessageContent {
   replyToMessageId?: string;
 }
 
+interface PendingWsRequest {
+  resolve: (value: OneBotApiResponse) => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+}
+
 export class OneBotAdapter extends EventEmitter {
   private readonly config: OneBotConfig;
+  private readonly transport: OneBotTransport;
+  private readonly webSocketFactory: OneBotWebSocketFactory;
+  private readonly wsReconnectIntervalMs: number;
   private ready = false;
   private lastError: string | undefined;
+  private socket: OneBotWebSocketLike | null = null;
+  private wsConnected = false;
+  private manuallyClosed = false;
+  private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly pendingWsRequests = new Map<string, PendingWsRequest>();
 
   constructor(config: OneBotConfig) {
     super();
+    this.transport = config.transport ?? 'http';
+    this.wsReconnectIntervalMs = Math.max(100, config.wsReconnectIntervalMs ?? 5000);
+    this.webSocketFactory = config.webSocketFactory ?? ((url) => {
+      return new WebSocket(url) as unknown as OneBotWebSocketLike;
+    });
     this.config = {
       ...config,
+      wsUrl: this.normalizeOptional(config.wsUrl) ?? 'ws://localhost:3001/',
       token: this.normalizeOptional(config.token),
       botId: this.normalizeOptional(config.botId),
     };
@@ -86,11 +137,18 @@ export class OneBotAdapter extends EventEmitter {
   async start(): Promise<void> {
     this.ready = true;
     this.lastError = undefined;
-    console.log('OneBot adapter started (HTTP mode)');
+    this.manuallyClosed = false;
+    if (this.transport === 'ws') {
+      this.openWebSocket();
+    }
+    console.log(`OneBot adapter started (${this.transport.toUpperCase()} mode)`);
   }
 
   async stop(): Promise<void> {
     this.ready = false;
+    this.manuallyClosed = true;
+    this.clearReconnectTimer();
+    this.closeWebSocket();
     console.log('OneBot adapter stopped');
   }
 
@@ -107,10 +165,16 @@ export class OneBotAdapter extends EventEmitter {
   }
 
   getReadiness(): OneBotReadiness {
+    const ready = this.transport === 'ws'
+      ? this.ready && this.wsConnected
+      : this.ready;
     return {
-      ready: this.ready,
-      mode: 'http',
+      ready,
+      mode: this.transport,
       httpUrl: this.config.httpUrl,
+      wsUrl: this.config.wsUrl,
+      wsConnected: this.transport === 'ws' ? this.wsConnected : undefined,
+      pendingWsRequests: this.transport === 'ws' ? this.pendingWsRequests.size : undefined,
       hasToken: Boolean(this.config.token),
       botIdConfigured: Boolean(this.config.botId),
       lastError: this.lastError,
@@ -120,26 +184,28 @@ export class OneBotAdapter extends EventEmitter {
   /**
    * 校验 reverse HTTP event 的访问令牌。
    *
-   * 若未配置 ONEBOT_TOKEN，则允许本地/dev 流量；配置后要求
-   * Authorization: Bearer <token>，和出站 OneBot API 调用使用同一 token。
+   * 若未配置 ONEBOT_TOKEN，则允许本地/dev 流量；配置后接受：
+   * - Authorization: Bearer <token>（NapCat / generic OneBot）
+   * - X-Signature: sha1=<hmac-sha1(rawBody, token)>（SnowLuma reverse HTTP）
    */
-  validateHttpEventAuth(headers: AuthHeaders): boolean {
+  validateHttpEventAuth(headers: AuthHeaders, rawBody = ''): boolean {
     const expectedToken = this.config.token;
     if (!expectedToken) {
       return true;
     }
 
     const authorization = this.getHeader(headers, 'authorization')?.trim();
-    if (!authorization) {
-      return false;
+    const [scheme, ...rest] = authorization?.split(/\s+/) ?? [];
+    if (scheme?.toLowerCase() === 'bearer' && rest.join(' ') === expectedToken) {
+      return true;
     }
 
-    const [scheme, ...rest] = authorization.split(/\s+/);
-    return scheme?.toLowerCase() === 'bearer' && rest.join(' ') === expectedToken;
+    const signature = this.getHeader(headers, 'x-signature')?.trim();
+    return signature ? this.validateSnowLumaSignature(signature, rawBody, expectedToken) : false;
   }
 
   /**
-   * 处理来自 NapCat 的 HTTP POST 事件。
+   * 处理来自 OneBot runtime 的事件。
    */
   handleHttpEvent(body: OneBotMessage): boolean {
     try {
@@ -453,6 +519,14 @@ export class OneBotAdapter extends EventEmitter {
    * 调用 OneBot API。
    */
   private async callApi(action: string, params: Record<string, unknown>): Promise<unknown> {
+    if (this.transport === 'ws') {
+      return this.callWsApi(action, params);
+    }
+
+    return this.callHttpApi(action, params);
+  }
+
+  private async callHttpApi(action: string, params: Record<string, unknown>): Promise<unknown> {
     const url = this.buildActionUrl(action);
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -474,10 +548,7 @@ export class OneBotAdapter extends EventEmitter {
       }
 
       const result = (await response.json()) as OneBotApiResponse;
-      if (result.status !== 'ok' && result.retcode !== 0) {
-        const message = typeof result.message === 'string' ? result.message : 'Unknown error';
-        throw new Error(`OneBot API error: ${message}`);
-      }
+      this.assertApiOk(result);
 
       this.lastError = undefined;
       return result.data;
@@ -487,11 +558,236 @@ export class OneBotAdapter extends EventEmitter {
     }
   }
 
+  private async callWsApi(action: string, params: Record<string, unknown>): Promise<unknown> {
+    const socket = this.socket;
+    if (!socket || !this.wsConnected) {
+      throw new Error('OneBot WebSocket is not connected');
+    }
+
+    const echo = this.generateEcho(action);
+    const responsePromise = new Promise<OneBotApiResponse>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingWsRequests.delete(echo);
+        reject(new Error(`OneBot WebSocket API timeout: ${action}`));
+      }, 30000);
+      this.pendingWsRequests.set(echo, { resolve, reject, timeout });
+    });
+
+    try {
+      socket.send(JSON.stringify({ action, params, echo }));
+    } catch (error) {
+      this.rejectPendingWsRequest(echo, error);
+      throw error;
+    }
+
+    try {
+      const result = await responsePromise;
+      this.assertApiOk(result);
+      this.lastError = undefined;
+      return result.data;
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : 'Unknown OneBot WebSocket API error';
+      throw error;
+    }
+  }
+
+  private assertApiOk(result: OneBotApiResponse): void {
+    if (result.status !== 'ok' && result.retcode !== 0) {
+      const message = this.extractApiErrorMessage(result);
+      throw new Error(`OneBot API error: ${message}`);
+    }
+  }
+
+  private extractApiErrorMessage(result: OneBotApiResponse): string {
+    if (typeof result.message === 'string') {
+      return result.message;
+    }
+    if (typeof result.wording === 'string') {
+      return result.wording;
+    }
+    return 'Unknown error';
+  }
+
   private buildActionUrl(action: string): string {
     const baseUrl = this.config.httpUrl.endsWith('/')
       ? this.config.httpUrl
       : `${this.config.httpUrl}/`;
     return new URL(action, baseUrl).toString();
+  }
+
+  private openWebSocket(): void {
+    if (this.transport !== 'ws' || !this.ready || this.socket) {
+      return;
+    }
+
+    try {
+      const socket = this.webSocketFactory(this.buildWebSocketUrl());
+      this.socket = socket;
+      this.wsConnected = false;
+
+      socket.addEventListener('open', () => {
+        this.wsConnected = true;
+        this.lastError = undefined;
+      });
+      socket.addEventListener('message', (event) => this.handleWebSocketMessage(event));
+      socket.addEventListener('error', (event) => this.handleWebSocketError(event));
+      socket.addEventListener('close', (event) => this.handleWebSocketClose(event));
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : 'Failed to open OneBot WebSocket';
+      this.emitError(error);
+      this.scheduleReconnect();
+    }
+  }
+
+  private closeWebSocket(): void {
+    this.wsConnected = false;
+    const socket = this.socket;
+    this.socket = null;
+    if (socket) {
+      try {
+        socket.close(1000, 'LetheBot shutdown');
+      } catch (error) {
+        this.lastError = error instanceof Error ? error.message : 'Failed to close OneBot WebSocket';
+      }
+    }
+    this.rejectAllPendingWsRequests(new Error('OneBot WebSocket closed'));
+  }
+
+  private buildWebSocketUrl(): string {
+    const url = new URL(this.config.wsUrl ?? 'ws://localhost:3001/');
+    if (this.config.token) {
+      url.searchParams.set('access_token', this.config.token);
+    }
+    return url.toString();
+  }
+
+  private handleWebSocketMessage(event: OneBotWebSocketEvent): void {
+    const text = this.websocketPayloadToString(event.data);
+    if (!text) {
+      return;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : 'Invalid OneBot WebSocket JSON';
+      this.emitError(error);
+      return;
+    }
+
+    if (!this.isRecord(parsed)) {
+      return;
+    }
+
+    if (parsed.echo !== undefined && this.resolvePendingWsResponse(parsed)) {
+      return;
+    }
+
+    if (typeof parsed.post_type === 'string') {
+      this.handleHttpEvent(parsed as unknown as OneBotMessage);
+    }
+  }
+
+  private resolvePendingWsResponse(packet: Record<string, unknown>): boolean {
+    const echo = String(packet.echo);
+    const pending = this.pendingWsRequests.get(echo);
+    if (!pending) {
+      return false;
+    }
+
+    clearTimeout(pending.timeout);
+    this.pendingWsRequests.delete(echo);
+    pending.resolve(packet as OneBotApiResponse);
+    return true;
+  }
+
+  private handleWebSocketError(event: OneBotWebSocketEvent): void {
+    const error = event.error instanceof Error
+      ? event.error
+      : new Error('OneBot WebSocket error');
+    this.lastError = error.message;
+    this.emitError(error);
+  }
+
+  private handleWebSocketClose(event: OneBotWebSocketEvent): void {
+    this.wsConnected = false;
+    this.socket = null;
+    this.rejectAllPendingWsRequests(new Error('OneBot WebSocket closed'));
+    const reason = typeof event.reason === 'string' && event.reason
+      ? event.reason
+      : 'OneBot WebSocket closed';
+    this.lastError = reason;
+
+    if (!this.manuallyClosed && this.ready) {
+      this.scheduleReconnect();
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.transport !== 'ws' || this.manuallyClosed || this.reconnectTimer) {
+      return;
+    }
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      this.openWebSocket();
+    }, this.wsReconnectIntervalMs);
+    this.reconnectTimer.unref?.();
+  }
+
+  private clearReconnectTimer(): void {
+    if (!this.reconnectTimer) {
+      return;
+    }
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+  }
+
+  private rejectPendingWsRequest(echo: string, error: unknown): void {
+    const pending = this.pendingWsRequests.get(echo);
+    if (!pending) {
+      return;
+    }
+
+    clearTimeout(pending.timeout);
+    this.pendingWsRequests.delete(echo);
+    pending.reject(error instanceof Error ? error : new Error('OneBot WebSocket request failed'));
+  }
+
+  private rejectAllPendingWsRequests(error: Error): void {
+    for (const [echo, pending] of this.pendingWsRequests.entries()) {
+      clearTimeout(pending.timeout);
+      pending.reject(error);
+      this.pendingWsRequests.delete(echo);
+    }
+  }
+
+  private websocketPayloadToString(payload: unknown): string {
+    if (typeof payload === 'string') {
+      return payload;
+    }
+    if (Buffer.isBuffer(payload)) {
+      return payload.toString('utf8');
+    }
+    if (payload instanceof ArrayBuffer) {
+      return Buffer.from(payload).toString('utf8');
+    }
+    if (ArrayBuffer.isView(payload)) {
+      return Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength).toString('utf8');
+    }
+    return '';
+  }
+
+  private generateEcho(action: string): string {
+    return `lethebot-${action}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  }
+
+  private emitError(error: unknown): void {
+    if (this.listenerCount('error') === 0) {
+      return;
+    }
+    this.emit('error', error instanceof Error ? error : new Error(String(error)));
   }
 
   private extractSentMessageId(data: unknown): string {
@@ -516,6 +812,14 @@ export class OneBotAdapter extends EventEmitter {
     }
 
     return value;
+  }
+
+  private validateSnowLumaSignature(signature: string, rawBody: string, token: string): boolean {
+    const expected = `sha1=${createHmac('sha1', token).update(rawBody).digest('hex')}`;
+    const actualBuffer = Buffer.from(signature);
+    const expectedBuffer = Buffer.from(expected);
+    return actualBuffer.length === expectedBuffer.length
+      && timingSafeEqual(actualBuffer, expectedBuffer);
   }
 
   private normalizeMessageId(value: number | string): string {

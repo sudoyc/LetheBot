@@ -1,5 +1,11 @@
 import { describe, test, expect, beforeEach, afterEach } from 'vitest';
-import { loadConfig, loadNapCatConfig, resetConfig, ConfigValidationError } from '../../../src/config/index.js';
+import {
+  loadConfig,
+  loadNapCatConfig,
+  loadOneBotRuntimeConfig,
+  resetConfig,
+  ConfigValidationError,
+} from '../../../src/config/index.js';
 
 describe('NapCat Config Loader', () => {
   const originalEnv = process.env;
@@ -16,14 +22,18 @@ describe('NapCat Config Loader', () => {
 
   describe('loadNapCatConfig', () => {
     test('loads NapCat config with defaults', () => {
+      delete process.env.ONEBOT_TRANSPORT;
       delete process.env.ONEBOT_HTTP_URL;
+      delete process.env.ONEBOT_WS_URL;
       delete process.env.ONEBOT_TOKEN;
       delete process.env.LETHEBOT_PORT;
       delete process.env.LETHEBOT_HOST;
 
       const config = loadNapCatConfig();
 
+      expect(config.transport).toBe('ws');
       expect(config.httpUrl).toBe('http://localhost:3000');
+      expect(config.wsUrl).toBe('ws://localhost:3001/');
       expect(config.token).toBeUndefined();
       expect(config.botQqId).toBeUndefined();
       expect(config.serverPort).toBe(6700);
@@ -33,7 +43,9 @@ describe('NapCat Config Loader', () => {
     });
 
     test('loads NapCat config from env vars', () => {
+      process.env.ONEBOT_TRANSPORT = 'http';
       process.env.ONEBOT_HTTP_URL = 'http://napcat.example.com:3000';
+      process.env.ONEBOT_WS_URL = 'ws://snowluma.example.com:3001/';
       process.env.ONEBOT_TOKEN = 'secret-token-123';
       process.env.LETHEBOT_BOT_QQ_ID = '3889000770';
       process.env.LETHEBOT_PORT = '8080';
@@ -43,7 +55,9 @@ describe('NapCat Config Loader', () => {
 
       const config = loadNapCatConfig();
 
+      expect(config.transport).toBe('http');
       expect(config.httpUrl).toBe('http://napcat.example.com:3000');
+      expect(config.wsUrl).toBe('ws://snowluma.example.com:3001/');
       expect(config.token).toBe('secret-token-123');
       expect(config.botQqId).toBe('3889000770');
       expect(config.serverPort).toBe(8080);
@@ -54,6 +68,12 @@ describe('NapCat Config Loader', () => {
 
     test('validates httpUrl is a valid URL', () => {
       process.env.ONEBOT_HTTP_URL = 'not-a-valid-url';
+
+      expect(() => loadNapCatConfig()).toThrow(ConfigValidationError);
+    });
+
+    test('validates transport is http or ws', () => {
+      process.env.ONEBOT_TRANSPORT = 'tcp';
 
       expect(() => loadNapCatConfig()).toThrow(ConfigValidationError);
     });
@@ -87,10 +107,12 @@ describe('NapCat Config Loader', () => {
 
       const mainConfig = loadConfig();
       const napCatConfig = loadNapCatConfig();
+      const oneBotConfig = loadOneBotRuntimeConfig();
 
       expect(mainConfig.logLevel).toBe('debug');
       expect(mainConfig.dbPath).toBe('/custom/db.sqlite');
       expect(napCatConfig.httpUrl).toBe('http://localhost:3000');
+      expect(oneBotConfig.transport).toBe('ws');
     });
 
     test('ConfigValidationError contains detailed issues', () => {

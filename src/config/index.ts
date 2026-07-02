@@ -19,8 +19,10 @@ const ConfigSchema = z.object({
   auditLogRetentionDays: z.number().int().min(0).default(0),
   disabledDeletedMemoryRetentionDays: z.number().int().min(0).default(0),
 
-  // NapCat OneBot configuration
+  // OneBot runtime configuration (SnowLuma / NapCat compatible)
+  onebotTransport: z.enum(['http', 'ws']).default('ws'),
   onebotHttpUrl: z.string().url().default('http://localhost:3000'),
+  onebotWsUrl: z.string().url().default('ws://localhost:3001/'),
   onebotToken: z.string().optional(),
   onebotBotQqId: z.string().optional(),
   lethebotPort: z.number().int().min(1).max(65535).default(6700),
@@ -31,11 +33,15 @@ const ConfigSchema = z.object({
 
 export type Config = z.infer<typeof ConfigSchema>;
 
+export type OneBotTransport = Config['onebotTransport'];
+
 /**
- * NapCat-specific configuration
+ * OneBot runtime configuration.
  */
-export interface NapCatConfig {
+export interface OneBotRuntimeConfig {
+  transport: OneBotTransport;
   httpUrl: string;
+  wsUrl: string;
   token?: string;
   botQqId?: string;
   serverPort: number;
@@ -43,6 +49,11 @@ export interface NapCatConfig {
   healthCheckPath: string;
   eventPath: string;
 }
+
+/**
+ * Backward-compatible alias for older NapCat-named deployment helpers.
+ */
+export type NapCatConfig = OneBotRuntimeConfig;
 
 /**
  * Configuration validation error
@@ -85,8 +96,10 @@ export function loadConfig(): Config {
       ? parseInt(process.env.LETHEBOT_DISABLED_DELETED_MEMORY_RETENTION_DAYS, 10)
       : undefined,
 
-    // NapCat configuration
+    // OneBot runtime configuration
+    onebotTransport: process.env.ONEBOT_TRANSPORT,
     onebotHttpUrl: process.env.ONEBOT_HTTP_URL,
+    onebotWsUrl: process.env.ONEBOT_WS_URL,
     onebotToken: process.env.ONEBOT_TOKEN,
     onebotBotQqId: process.env.LETHEBOT_BOT_QQ_ID,
     lethebotPort: process.env.LETHEBOT_PORT
@@ -111,12 +124,14 @@ export function loadConfig(): Config {
 }
 
 /**
- * Load NapCat-specific configuration
+ * Load OneBot runtime configuration.
  */
-export function loadNapCatConfig(): NapCatConfig {
+export function loadOneBotRuntimeConfig(): OneBotRuntimeConfig {
   const config = loadConfig();
   return {
+    transport: config.onebotTransport,
     httpUrl: config.onebotHttpUrl,
+    wsUrl: config.onebotWsUrl,
     token: config.onebotToken,
     botQqId: config.onebotBotQqId,
     serverPort: config.lethebotPort,
@@ -124,4 +139,13 @@ export function loadNapCatConfig(): NapCatConfig {
     healthCheckPath: config.lethebotHealthPath,
     eventPath: config.lethebotEventPath,
   };
+}
+
+/**
+ * Load NapCat-compatible OneBot configuration.
+ *
+ * @deprecated Prefer loadOneBotRuntimeConfig().
+ */
+export function loadNapCatConfig(): NapCatConfig {
+  return loadOneBotRuntimeConfig();
 }

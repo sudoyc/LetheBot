@@ -41,6 +41,7 @@ describe('E2E Conversation Flow', () => {
     process.env.LETHEBOT_TEST = 'true';
     process.env.LETHEBOT_PORT = testPort.toString();
     process.env.LETHEBOT_DB_PATH = join(testDir, 'lethebot-e2e.db');
+    process.env.ONEBOT_TRANSPORT = 'http';
     process.env.ONEBOT_HTTP_URL = 'http://localhost:3000';
     process.env.ONEBOT_TOKEN = 'test-onebot-token';
     process.env.LETHEBOT_BOT_QQ_ID = '3889000770';
