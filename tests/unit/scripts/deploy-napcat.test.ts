@@ -138,6 +138,8 @@ describe('NapCat Deployment Scripts', () => {
 
       expect(existsSync(outputPath)).toBe(true);
       const content = readFileSync(outputPath, 'utf-8');
+      expect(content).toContain('ONEBOT_TRANSPORT=');
+      expect(content).toContain('ONEBOT_WS_URL=');
       expect(content).toContain('ONEBOT_HTTP_URL=');
       expect(content).toContain('LETHEBOT_PORT=');
       expect(content).toContain('ONEBOT_TOKEN=');
@@ -208,6 +210,8 @@ describe('NapCat Deployment Scripts', () => {
       const content = readFileSync(composePath, 'utf-8');
       expect(content).toContain('services:');
       expect(content).toContain('lethebot:');
+      expect(content).toContain('ONEBOT_TRANSPORT=');
+      expect(content).toContain('ONEBOT_WS_URL=');
       expect(content).toContain('ONEBOT_HTTP_URL=');
       expect(content).toContain('LETHEBOT_BOT_QQ_ID=');
     });
@@ -228,6 +232,8 @@ describe('NapCat Deployment Scripts', () => {
       expect(content).toContain('[Unit]');
       expect(content).toContain('[Service]');
       expect(content).toContain('[Install]');
+      expect(content).toContain('ONEBOT_TRANSPORT=');
+      expect(content).toContain('ONEBOT_WS_URL=');
       expect(content).toContain('ONEBOT_HTTP_URL=');
       expect(content).toContain('LETHEBOT_BOT_QQ_ID=');
     });
@@ -247,6 +253,8 @@ describe('NapCat Deployment Scripts', () => {
       const content = readFileSync(ecosystemPath, 'utf-8');
       expect(content).toContain('module.exports');
       expect(content).toContain('apps:');
+      expect(content).toContain('ONEBOT_TRANSPORT');
+      expect(content).toContain('ONEBOT_WS_URL');
       expect(content).toContain('ONEBOT_HTTP_URL');
       expect(content).toContain('LETHEBOT_BOT_QQ_ID');
     });
@@ -267,6 +275,7 @@ describe('NapCat Deployment Scripts', () => {
     });
 
     test('verifies NapCat connection when requested', async () => {
+      process.env.ONEBOT_TRANSPORT = 'http';
       global.fetch = vi.fn().mockResolvedValue({
         ok: true,
         json: async () => ({ status: 'ok', data: { user_id: 12345 } }),
@@ -284,6 +293,7 @@ describe('NapCat Deployment Scripts', () => {
     });
 
     test('fails when NapCat verification fails', async () => {
+      process.env.ONEBOT_TRANSPORT = 'http';
       global.fetch = vi.fn().mockRejectedValue(new Error('Connection refused')) as any;
 
       const result = await deployLetheBot({
@@ -292,7 +302,7 @@ describe('NapCat Deployment Scripts', () => {
       });
 
       expect(result.success).toBe(false);
-      expect(result.message).toContain('NapCat connection verification failed');
+      expect(result.message).toContain('OneBot runtime connection verification failed');
       expect(result.error).toBeInstanceOf(NapCatConnectionError);
     });
 
@@ -342,6 +352,7 @@ describe('NapCat Deployment Scripts', () => {
     });
 
     test('provides helpful error messages', async () => {
+      process.env.ONEBOT_TRANSPORT = 'http';
       global.fetch = vi.fn().mockRejectedValue(new Error('ECONNREFUSED')) as any;
 
       const result = await deployLetheBot({

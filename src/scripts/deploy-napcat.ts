@@ -1,7 +1,7 @@
 /**
- * NapCat Deployment Script
+ * OneBot Runtime Deployment Script
  *
- * Automates deployment of LetheBot with NapCat integration
+ * Automates deployment of LetheBot with SnowLuma / OneBot integration.
  * Supports Docker, systemd, and PM2 deployment modes
  */
 
@@ -21,9 +21,23 @@ interface StatusResponse {
   status?: unknown;
   retcode?: unknown;
   message?: unknown;
+  echo?: unknown;
   data?: {
     nickname?: unknown;
   };
+}
+
+interface VerifyWebSocketEvent {
+  data?: unknown;
+}
+
+interface VerifyWebSocketLike {
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  addEventListener(
+    event: 'open' | 'message' | 'error' | 'close',
+    handler: (event: VerifyWebSocketEvent) => void,
+  ): void;
 }
 
 /**
@@ -49,6 +63,7 @@ export interface DeploymentOptions {
 export interface DeploymentDetails {
   configPath: string;
   serverUrl: string;
+  oneBotUrl: string;
   napCatUrl: string;
   healthCheckPassed?: boolean;
 }
@@ -103,7 +118,7 @@ export class PortConflictError extends Error {
 }
 
 /**
- * Verify NapCat connection
+ * Verify OneBot HTTP connection.
  */
 export async function verifyNapCatConnection(
   httpUrl: string,
@@ -132,7 +147,7 @@ export async function verifyNapCatConnection(
     clearTimeout(timeoutId);
 
     if (!response.ok) {
-      console.error(`NapCat API returned ${response.status}: ${response.statusText}`);
+      console.error(`OneBot HTTP API returned ${response.status}: ${response.statusText}`);
       return false;
     }
 
@@ -140,23 +155,130 @@ export async function verifyNapCatConnection(
 
     if (result.status === 'ok' || result.retcode === 0) {
       const nickname = typeof result.data?.nickname === 'string' ? result.data.nickname : 'Unknown';
-      console.log(`✓ NapCat connection verified: ${nickname}`);
+      console.log(`✓ OneBot HTTP connection verified: ${nickname}`);
       return true;
     }
 
     const message = typeof result.message === 'string' ? result.message : 'Unknown error';
-    console.error(`NapCat API error: ${message}`);
+    console.error(`OneBot HTTP API error: ${message}`);
     return false;
   } catch (error) {
     if (error instanceof Error) {
       if (error.name === 'AbortError') {
-        console.error('NapCat connection timeout (5s)');
+        console.error('OneBot HTTP connection timeout (5s)');
       } else {
-        console.error(`NapCat connection failed: ${error.message}`);
+        console.error(`OneBot HTTP connection failed: ${error.message}`);
       }
     }
     return false;
   }
+}
+
+export async function verifyOneBotConnection(config: NapCatConfig): Promise<boolean> {
+  if (config.transport === 'ws') {
+    return verifyOneBotWebSocketConnection(config.wsUrl, config.token);
+  }
+  return verifyNapCatConnection(config.httpUrl, config.token);
+}
+
+export function verifyOneBotWebSocketConnection(
+  wsUrl: string,
+  token?: string,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const echo = `verify-onebot-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const timeout = setTimeout(() => {
+      console.error('OneBot WebSocket connection timeout (5s)');
+      cleanup(false);
+    }, 5000);
+
+    let settled = false;
+    let socket: VerifyWebSocketLike | null = null;
+
+    const cleanup = (result: boolean): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      try {
+        socket?.close(1000, 'verify complete');
+      } catch {
+        // Ignore close errors during verification cleanup.
+      }
+      resolve(result);
+    };
+
+    try {
+      socket = new WebSocket(buildWebSocketUrl(wsUrl, token)) as unknown as VerifyWebSocketLike;
+    } catch (error) {
+      clearTimeout(timeout);
+      console.error(`OneBot WebSocket connection failed: ${error instanceof Error ? error.message : String(error)}`);
+      resolve(false);
+      return;
+    }
+
+    socket.addEventListener('open', () => {
+      socket?.send(JSON.stringify({ action: 'get_login_info', params: {}, echo }));
+    });
+    socket.addEventListener('message', (event) => {
+      const text = websocketPayloadToString(event.data);
+      if (!text) {
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(text) as StatusResponse;
+        if (parsed.echo !== echo) {
+          return;
+        }
+        if (parsed.status === 'ok' || parsed.retcode === 0) {
+          const nickname = typeof parsed.data?.nickname === 'string' ? parsed.data.nickname : 'Unknown';
+          console.log(`✓ OneBot WebSocket connection verified: ${nickname}`);
+          cleanup(true);
+          return;
+        }
+
+        const message = typeof parsed.message === 'string' ? parsed.message : 'Unknown error';
+        console.error(`OneBot WebSocket API error: ${message}`);
+        cleanup(false);
+      } catch (error) {
+        console.error(`OneBot WebSocket parse error: ${error instanceof Error ? error.message : String(error)}`);
+        cleanup(false);
+      }
+    });
+    socket.addEventListener('error', () => {
+      console.error('OneBot WebSocket connection failed');
+      cleanup(false);
+    });
+    socket.addEventListener('close', () => {
+      cleanup(false);
+    });
+  });
+}
+
+function buildWebSocketUrl(wsUrl: string, token?: string): string {
+  const url = new URL(wsUrl);
+  if (token) {
+    url.searchParams.set('access_token', token);
+  }
+  return url.toString();
+}
+
+function websocketPayloadToString(payload: unknown): string {
+  if (typeof payload === 'string') {
+    return payload;
+  }
+  if (Buffer.isBuffer(payload)) {
+    return payload.toString('utf8');
+  }
+  if (payload instanceof ArrayBuffer) {
+    return Buffer.from(payload).toString('utf8');
+  }
+  if (ArrayBuffer.isView(payload)) {
+    return Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength).toString('utf8');
+  }
+  return '';
 }
 
 /**
@@ -180,7 +302,9 @@ export async function generateNapCatConfig(outputPath: string): Promise<void> {
   writeFileSync(outputPath, template, 'utf-8');
   console.log(`✓ Configuration template written to ${outputPath}`);
   console.log('  Please edit the file and set required values:');
-  console.log('  - ONEBOT_HTTP_URL: NapCat HTTP API URL');
+  console.log('  - ONEBOT_TRANSPORT: ws or http (default: ws)');
+  console.log('  - ONEBOT_WS_URL: SnowLuma OneBot WebSocket URL');
+  console.log('  - ONEBOT_HTTP_URL: OneBot HTTP API URL');
   console.log('  - ONEBOT_TOKEN: Optional authentication token');
   console.log('  - LETHEBOT_BOT_QQ_ID: Bot QQ id used for exact @ mention detection');
   console.log('  - LETHEBOT_PORT: HTTP server port (default: 6700)');
@@ -263,7 +387,9 @@ services:
     environment:
       - NODE_ENV=production
       - LOG_LEVEL=${process.env.LOG_LEVEL || 'info'}
+      - ONEBOT_TRANSPORT=${config.transport}
       - ONEBOT_HTTP_URL=${config.httpUrl}
+      - ONEBOT_WS_URL=${config.wsUrl}
       - ONEBOT_TOKEN=${config.token || ''}
       - LETHEBOT_BOT_QQ_ID=${config.botQqId || ''}
       - LETHEBOT_PORT=${config.serverPort}
@@ -296,7 +422,9 @@ User=${process.env.USER || 'lethebot'}
 WorkingDirectory=${workDir}
 Environment="NODE_ENV=production"
 Environment="LOG_LEVEL=${process.env.LOG_LEVEL || 'info'}"
+Environment="ONEBOT_TRANSPORT=${config.transport}"
 Environment="ONEBOT_HTTP_URL=${config.httpUrl}"
+Environment="ONEBOT_WS_URL=${config.wsUrl}"
 Environment="ONEBOT_TOKEN=${config.token || ''}"
 Environment="LETHEBOT_BOT_QQ_ID=${config.botQqId || ''}"
 Environment="LETHEBOT_PORT=${config.serverPort}"
@@ -329,7 +457,9 @@ function generatePM2Ecosystem(config: NapCatConfig, workDir: string): string {
     env: {
       NODE_ENV: 'production',
       LOG_LEVEL: '${process.env.LOG_LEVEL || 'info'}',
+      ONEBOT_TRANSPORT: '${config.transport}',
       ONEBOT_HTTP_URL: '${config.httpUrl}',
+      ONEBOT_WS_URL: '${config.wsUrl}',
       ONEBOT_TOKEN: '${config.token || ''}',
       LETHEBOT_BOT_QQ_ID: '${config.botQqId || ''}',
       LETHEBOT_PORT: '${config.serverPort}',
@@ -371,6 +501,7 @@ export async function deployLetheBot(
         details: {
           configPath: outputPath,
           serverUrl: 'http://localhost:6700',
+          oneBotUrl: 'ws://localhost:3001/',
           napCatUrl: 'http://localhost:3000',
         },
       };
@@ -399,28 +530,26 @@ export async function deployLetheBot(
 
     console.log('✓ Configuration loaded');
 
-    // Verify NapCat connection if requested
+    // Verify OneBot runtime connection if requested
     if (verifyNapCat) {
-      console.log('Verifying NapCat connection...');
-      const isConnected = await verifyNapCatConnection(
-        config.httpUrl,
-        config.token,
-      );
+      console.log('Verifying OneBot runtime connection...');
+      const isConnected = await verifyOneBotConnection(config);
 
       if (!isConnected) {
+        const oneBotUrl = config.transport === 'ws' ? config.wsUrl : config.httpUrl;
         const error = new NapCatConnectionError(
-          'Failed to connect to NapCat',
-          config.httpUrl,
+          'Failed to connect to OneBot runtime',
+          oneBotUrl,
         );
-        console.error('\n❌ NapCat connection failed');
+        console.error('\n❌ OneBot runtime connection failed');
         console.error('  Please check:');
-        console.error(`  - Is NapCat running at ${config.httpUrl}?`);
-        console.error('  - Is ONEBOT_HTTP_URL correct?');
+        console.error(`  - Is SnowLuma / OneBot running at ${oneBotUrl}?`);
+        console.error('  - Is ONEBOT_TRANSPORT / ONEBOT_WS_URL / ONEBOT_HTTP_URL correct?');
         console.error('  - Is the network reachable?');
-        console.error(`  - Test with: curl -X POST ${config.httpUrl}/get_login_info`);
+        console.error(`  - HTTP smoke: curl -X POST ${config.httpUrl}/get_login_info`);
         return {
           success: false,
-          message: 'NapCat connection verification failed',
+          message: 'OneBot runtime connection verification failed',
           error,
         };
       }
@@ -486,6 +615,7 @@ export async function deployLetheBot(
       details: {
         configPath,
         serverUrl,
+        oneBotUrl: config.transport === 'ws' ? config.wsUrl : config.httpUrl,
         napCatUrl: config.httpUrl,
         healthCheckPassed,
       },
@@ -507,11 +637,11 @@ async function main() {
   const modeArg = args.find((arg) => arg.startsWith('--mode='));
   const mode = (modeArg?.split('=')[1] ?? 'configure') as DeploymentMode;
 
-  const verifyArg = args.includes('--verify-napcat');
+  const verifyArg = args.includes('--verify-napcat') || args.includes('--verify-onebot');
   const noHealthCheck = args.includes('--no-health-check');
 
   console.log('╔════════════════════════════════════════╗');
-  console.log('║   LetheBot NapCat Deployment Tool     ║');
+  console.log('║  LetheBot OneBot Deployment Tool      ║');
   console.log('╚════════════════════════════════════════╝\n');
 
   const result = await deployLetheBot({
@@ -527,7 +657,7 @@ async function main() {
       console.log('\nDetails:');
       console.log(`  Config: ${result.details.configPath}`);
       console.log(`  Server: ${result.details.serverUrl}`);
-      console.log(`  NapCat: ${result.details.napCatUrl}`);
+      console.log(`  OneBot: ${result.details.oneBotUrl}`);
       if (result.details.healthCheckPassed !== undefined) {
         console.log(`  Health: ${result.details.healthCheckPassed ? '✓' : '✗'}`);
       }

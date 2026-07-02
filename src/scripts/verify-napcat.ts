@@ -1,41 +1,43 @@
 /**
- * NapCat Connection Verification Utility
+ * OneBot Runtime Connection Verification Utility
  *
- * Standalone tool to verify NapCat HTTP API connectivity
+ * Standalone tool to verify SnowLuma / OneBot connectivity
  */
 
 import { loadNapCatConfig } from '../config/index.js';
-import { verifyNapCatConnection } from './deploy-napcat.js';
+import { verifyOneBotConnection } from './deploy-napcat.js';
 
 async function main() {
   console.log('╔════════════════════════════════════════╗');
-  console.log('║   NapCat Connection Verification      ║');
+  console.log('║   OneBot Connection Verification      ║');
   console.log('╚════════════════════════════════════════╝\n');
 
   try {
     console.log('Loading configuration...');
     const config = loadNapCatConfig();
     console.log(`✓ Configuration loaded`);
-    console.log(`  NapCat URL: ${config.httpUrl}`);
+    console.log(`  Transport: ${config.transport}`);
+    console.log(`  HTTP URL: ${config.httpUrl}`);
+    console.log(`  WS URL: ${config.wsUrl}`);
     console.log(`  Token: ${config.token ? '***' + config.token.slice(-4) : '(none)'}`);
 
     console.log('\nVerifying connection...');
-    const isConnected = await verifyNapCatConnection(config.httpUrl, config.token);
+    const isConnected = await verifyOneBotConnection(config);
 
     console.log('\n' + '═'.repeat(42));
     if (isConnected) {
-      console.log('✓ NapCat connection successful');
+      console.log('✓ OneBot runtime connection successful');
       console.log('\nYou can now deploy LetheBot with:');
       console.log('  pnpm run deploy:docker');
       console.log('  pnpm run deploy:systemd');
       console.log('  pnpm run deploy:pm2');
       process.exit(0);
     } else {
-      console.log('✗ NapCat connection failed');
+      console.log('✗ OneBot runtime connection failed');
       console.log('\nTroubleshooting:');
-      console.log('  1. Check if NapCat is running');
-      console.log(`  2. Verify ONEBOT_HTTP_URL in .env: ${config.httpUrl}`);
-      console.log('  3. Test manually:');
+      console.log('  1. Check if SnowLuma / OneBot runtime is running');
+      console.log('  2. Verify ONEBOT_TRANSPORT / ONEBOT_WS_URL / ONEBOT_HTTP_URL in .env');
+      console.log('  3. HTTP test manually:');
       console.log(`     curl -X POST ${config.httpUrl}/get_login_info`);
       console.log('  4. Check network connectivity');
       console.log('  5. Verify authentication token if configured');

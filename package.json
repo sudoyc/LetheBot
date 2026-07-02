@@ -21,6 +21,7 @@
     "deploy:docker": "tsx src/scripts/deploy-napcat.ts --mode=docker",
     "deploy:systemd": "tsx src/scripts/deploy-napcat.ts --mode=systemd",
     "deploy:pm2": "tsx src/scripts/deploy-napcat.ts --mode=pm2",
+    "verify:onebot": "tsx src/scripts/verify-napcat.ts",
     "verify:napcat": "tsx src/scripts/verify-napcat.ts",
     "ops:backup": "tsx src/scripts/ops-maintenance.ts backup",
     "ops:restore": "tsx src/scripts/ops-maintenance.ts restore",
