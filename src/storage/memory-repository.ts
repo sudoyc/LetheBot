@@ -8,7 +8,7 @@ import type Database from 'better-sqlite3';
 import type { AuditEntry } from '../types/audit';
 import type { MemoryRecord, MemorySource } from '../types/memory';
 import type { ActorClass, InvocationContext } from '../types/tool';
-import { scanMemoryForSecrets, type SecretScanFinding } from '../memory/secret-scan';
+import { scanMemoryForSecrets, type SecretScanFinding } from '../memory/secret-scan.js';
 import { ulid } from 'ulidx';
 
 export interface MemorySourceInput {
