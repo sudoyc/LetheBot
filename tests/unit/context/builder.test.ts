@@ -135,6 +135,13 @@ describe('ContextBuilder', () => {
 
       // Private memory should be filtered out
       expect(context.memory.retrievedFacts.every((m) => !m.content.includes('secret123'))).toBe(true);
+      expect(context.trace?.rejectedMemories).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            reason: 'private_only_in_group_context',
+          }),
+        ])
+      );
     });
 
     it('should include same_user_any_context memory in both private and group', async () => {
@@ -205,6 +212,7 @@ describe('ContextBuilder', () => {
       });
 
       expect(context.memory.retrievedFacts).toHaveLength(0);
+      expect(context.trace?.selectedMemoryIds).toHaveLength(0);
     });
 
     it('should calculate token budget', async () => {
@@ -228,6 +236,58 @@ describe('ContextBuilder', () => {
       expect(context.tokenBudget.used).toBeGreaterThan(0);
       expect(context.tokenBudget.breakdown.recentMessages).toBeGreaterThan(0);
       expect(context.tokenBudget.breakdown.system).toBeGreaterThan(0);
+    });
+
+    it('should retrieve group and conversation summaries with trace and identity fields', async () => {
+      const groupSummaryId = await memoryRepo.create({
+        scope: 'group',
+        groupId: 'group-1',
+        visibility: 'same_group_only',
+        sensitivity: 'normal',
+        authority: 'tool_derived',
+        kind: 'summary',
+        title: 'Group summary',
+        content: 'The group is discussing the release plan',
+        state: 'active',
+        confidence: 0.9,
+        importance: 0.8,
+        sourceContext: 'background_worker:summary',
+      });
+
+      const conversationSummaryId = await memoryRepo.create({
+        scope: 'conversation',
+        conversationId: 'conv-group-1',
+        visibility: 'same_group_only',
+        sensitivity: 'normal',
+        authority: 'tool_derived',
+        kind: 'summary',
+        title: 'Conversation summary',
+        content: 'This conversation covered deployment blockers',
+        state: 'active',
+        confidence: 0.85,
+        importance: 0.7,
+        sourceContext: 'background_worker:summary',
+      });
+
+      const context = await builder.buildContext({
+        turnId: 'turn-008',
+        conversationId: 'conv-group-1',
+        conversationType: 'group',
+        recentMessages: [],
+        targetUserId: 'user-alice',
+        groupId: 'group-1',
+      });
+
+      expect(context.memory.selectedMemoryIds).toContain(groupSummaryId);
+      expect(context.memory.selectedMemoryIds).toContain(conversationSummaryId);
+      expect(context.memory.groupProfile?.memoryId).toBe(groupSummaryId);
+      expect(context.trace?.candidateMemoryIds).toEqual(
+        expect.arrayContaining([groupSummaryId, conversationSummaryId])
+      );
+      expect(context.trace?.selectedMemoryIds).toEqual(context.memory.selectedMemoryIds);
+      expect(context.injectedIdentityFields).toEqual(
+        expect.arrayContaining(['conversation_id', 'conversation_type', 'group_id', 'target_user_ref'])
+      );
     });
   });
 });

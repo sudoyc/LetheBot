@@ -25,7 +25,7 @@ describe('Tool', () => {
           input: {},
           output: {},
         },
-        handler: 'echo-handler',
+        handler: async () => ({ ok: true }),
       };
 
       expect(entry.name).toBe('echo');
@@ -59,7 +59,7 @@ describe('Tool', () => {
           sandboxPolicy: { filesystem: 'none', network: 'none', execution: 'in_process' },
           outputSensitivity: 'normal',
           piSchema: { input: {}, output: {} },
-          handler: 'test',
+          handler: async () => ({ ok: true }),
         };
 
         expect(entry.capabilities).toContain(cap);
@@ -81,7 +81,7 @@ describe('Tool', () => {
           sandboxPolicy: { filesystem: 'none', network: 'none', execution: 'in_process' },
           outputSensitivity: 'normal',
           piSchema: { input: {}, output: {} },
-          handler: 'test',
+          handler: async () => ({ ok: true }),
         };
 
         expect(entry.evaluatorPolicy).toBe(policy);

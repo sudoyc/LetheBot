@@ -5,3 +5,4 @@
  */
 
 export * from './background';
+export * from './memory-extraction';

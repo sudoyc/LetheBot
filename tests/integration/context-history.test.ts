@@ -209,6 +209,58 @@ describe('Context History Loading', () => {
     expect(context.recentMessages[0].isFromBot).toBe(false);
     expect(context.recentMessages[1].text).toBe('Hi there!');
     expect(context.recentMessages[1].isFromBot).toBe(true);
+    expect(context.recentMessages[1].senderId).toBe('bot-self');
+  });
+
+  it('should not double-prefix already normalized QQ sender IDs', async () => {
+    const conversationId = 'qq-private-prefixed';
+    const now = Date.now();
+
+    db.prepare(`
+      INSERT INTO raw_events (
+        id, type, timestamp, source, platform,
+        conversation_id, payload, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'evt-prefixed',
+      'chat.message.received',
+      now,
+      'gateway',
+      'qq',
+      conversationId,
+      JSON.stringify({ text: 'Hello' }),
+      now,
+    );
+
+    db.prepare(`
+      INSERT INTO chat_messages (
+        id, raw_event_id, message_id, conversation_id,
+        conversation_type, sender_id, text,
+        has_media, has_quote, mentions_bot, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'msg-prefixed',
+      'evt-prefixed',
+      'platform-prefixed',
+      conversationId,
+      'private',
+      'qq-123456',
+      'Hello',
+      0,
+      0,
+      0,
+      now,
+    );
+
+    const context = await contextBuilder.buildContext({
+      turnId: 'turn-prefixed',
+      conversationId,
+      conversationType: 'private',
+      recentMessages: [],
+      targetUserId: 'qq-123456',
+    });
+
+    expect(context.recentMessages[0].senderId).toBe('qq-123456');
   });
 
   it('should fall back to input messages when database is empty', async () => {

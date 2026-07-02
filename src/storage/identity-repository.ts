@@ -78,6 +78,34 @@ export class IdentityRepository {
   }
 
   /**
+   * 获取或创建 canonical user，并确保平台账号映射存在。
+   */
+  async getOrCreateCanonicalUser(
+    platform: PlatformAccountMapping['platform'],
+    platformAccountId: string,
+    accountType: PlatformAccountMapping['accountType'] = 'private'
+  ): Promise<string> {
+    const existing = await this.findCanonicalUserId(platform, platformAccountId);
+
+    if (existing) {
+      await this.ensureCanonicalUser(existing);
+      return existing;
+    }
+
+    const canonicalUserId = `user-${ulid()}`;
+    await this.upsertPlatformAccount({
+      platform,
+      platformAccountId,
+      canonicalUserId,
+      accountType,
+      verifiedLevel: 'observed',
+      status: 'active',
+    });
+
+    return canonicalUserId;
+  }
+
+  /**
    * 获取用户的所有平台账号
    */
   async getPlatformAccounts(canonicalUserId: string): Promise<PlatformAccountMapping[]> {

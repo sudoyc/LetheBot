@@ -69,6 +69,26 @@ export interface SandboxPolicy {
 }
 
 /**
+ * 工具处理器输入
+ */
+export interface ToolHandlerRequest {
+  toolCallId: string;
+  turnId: string;
+  toolName: string;
+  input: unknown;
+  actor: {
+    canonicalUserId?: string;
+    actorClass: ActorClass;
+  };
+  context: InvocationContext;
+}
+
+/**
+ * 工具处理器
+ */
+export type ToolHandler = (request: ToolHandlerRequest) => Promise<unknown>;
+
+/**
  * 工具注册表条目
  */
 export interface ToolRegistryEntry {
@@ -100,8 +120,8 @@ export interface ToolRegistryEntry {
     output: object; // JSON schema
   };
 
-  // 处理器
-  handler: string; // 模块路径或函数引用
+  // 已解析处理器函数；模块/插件加载必须在注册前完成
+  handler: ToolHandler;
 }
 
 /**

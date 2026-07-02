@@ -4,11 +4,15 @@
  * Verifies that Phase A (Repository Foundation) meets its acceptance criteria.
  */
 
-import { describe, test, expect } from 'vitest';
-import { loadConfig } from '../../src/config/index.js';
+import { describe, test, expect, beforeEach } from 'vitest';
+import { loadConfig, resetConfig } from '../../src/config/index.js';
 import { hello, VERSION } from '../../src/index.js';
 
 describe('Phase A Acceptance', () => {
+  beforeEach(() => {
+    resetConfig();
+  });
+
   test('TypeScript compiles without errors', () => {
     // If this test runs, TypeScript compilation succeeded
     expect(true).toBe(true);

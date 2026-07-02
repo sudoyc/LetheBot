@@ -27,7 +27,7 @@ describe('ToolRegistry', () => {
           input: { type: 'object', properties: { text: { type: 'string' } } },
           output: { type: 'object', properties: { echo: { type: 'string' } } },
         },
-        handler: 'echo',
+        handler: async () => ({ ok: true }),
       });
 
       const tool = registry.get('echo');
@@ -47,7 +47,7 @@ describe('ToolRegistry', () => {
         sandboxPolicy: { networkAccess: false, filesystemAccess: false, maxExecutionTimeMs: 1000 },
         outputSensitivity: 'normal',
         piSchema: { input: {}, output: {} },
-        handler: 'test',
+        handler: async () => ({ ok: true }),
       });
 
       expect(() =>
@@ -62,9 +62,27 @@ describe('ToolRegistry', () => {
           sandboxPolicy: { networkAccess: false, filesystemAccess: false, maxExecutionTimeMs: 1000 },
           outputSensitivity: 'normal',
           piSchema: { input: {}, output: {} },
-          handler: 'test',
+          handler: async () => ({ ok: true }),
         })
       ).toThrow(/already registered/i);
+    });
+
+    it('should reject unresolved string handlers', () => {
+      const invalidEntry = {
+        name: 'unresolved',
+        version: '1.0.0',
+        description: 'Unresolved handler',
+        capabilities: [],
+        permissions: { allowedActors: [], allowedContexts: [] },
+        evaluatorPolicy: 'bypass',
+        auditLevel: 'summary',
+        sandboxPolicy: { filesystem: 'none', network: 'none', execution: 'none' },
+        outputSensitivity: 'normal',
+        piSchema: { input: {}, output: {} },
+        handler: 'module/path',
+      };
+
+      expect(() => registry.register(invalidEntry as never)).toThrow(/resolved function handler/i);
     });
   });
 
@@ -85,7 +103,7 @@ describe('ToolRegistry', () => {
         sandboxPolicy: { networkAccess: true, filesystemAccess: false, maxExecutionTimeMs: 5000 },
         outputSensitivity: 'normal',
         piSchema: { input: {}, output: {} },
-        handler: 'search',
+        handler: async () => ({ ok: true }),
       });
 
       const tool = registry.get('search');
@@ -109,7 +127,7 @@ describe('ToolRegistry', () => {
         sandboxPolicy: { networkAccess: false, filesystemAccess: false, maxExecutionTimeMs: 1000 },
         outputSensitivity: 'normal',
         piSchema: { input: {}, output: {} },
-        handler: 'tool1',
+        handler: async () => ({ ok: true }),
       });
 
       freshRegistry.register({
@@ -123,7 +141,7 @@ describe('ToolRegistry', () => {
         sandboxPolicy: { networkAccess: false, filesystemAccess: false, maxExecutionTimeMs: 1000 },
         outputSensitivity: 'normal',
         piSchema: { input: {}, output: {} },
-        handler: 'tool2',
+        handler: async () => ({ ok: true }),
       });
 
       const tools = freshRegistry.list();
@@ -151,7 +169,7 @@ describe('ToolRegistry', () => {
         sandboxPolicy: { networkAccess: false, filesystemAccess: false, maxExecutionTimeMs: 1000 },
         outputSensitivity: 'sensitive',
         piSchema: { input: {}, output: {} },
-        handler: 'restricted',
+        handler: async () => ({ ok: true }),
       });
     });
 

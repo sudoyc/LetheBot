@@ -4,7 +4,12 @@
  * 工具注册表，管理工具元数据和权限
  */
 
-import type { ToolRegistryEntry, InvocationContext, ActorClass } from '../types/tool';
+import type {
+  ToolRegistryEntry,
+  InvocationContext,
+  ActorClass,
+  ToolHandler,
+} from '../types/tool';
 
 export interface ActorContext {
   actorClass: ActorClass;
@@ -22,6 +27,10 @@ export class ToolRegistry {
       throw new Error(`Tool "${entry.name}" is already registered`);
     }
 
+    if (typeof entry.handler !== 'function') {
+      throw new Error(`Tool "${entry.name}" must be registered with a resolved function handler`);
+    }
+
     this.tools.set(entry.name, entry);
   }
 
@@ -37,6 +46,21 @@ export class ToolRegistry {
    */
   list(): ToolRegistryEntry[] {
     return Array.from(this.tools.values());
+  }
+
+  /**
+   * 获取所有工具（别名）
+   */
+  getAll(): ToolRegistryEntry[] {
+    return this.list();
+  }
+
+  /**
+   * 获取工具处理器
+   */
+  getHandler(name: string): ToolHandler | undefined {
+    const tool = this.tools.get(name);
+    return tool?.handler;
   }
 
   /**

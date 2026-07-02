@@ -20,12 +20,27 @@ export interface RecentMessage {
  * 记忆块
  */
 export interface MemoryBlock {
+  id?: string; // compatibility alias for memoryId used by older tests/callers
   memoryId: string;
   scope: string;
+  kind?: 'preference' | 'fact' | 'constraint' | 'summary' | 'reflection' | 'procedure';
   title: string;
   content: string;
   confidence: number;
   sourceContext?: string;
+}
+
+/**
+ * Context retrieval trace
+ */
+export interface ContextTrace {
+  candidateMemoryIds: string[];
+  selectedMemoryIds: string[];
+  rejectedMemories: Array<{
+    memoryId: string;
+    reason: string;
+  }>;
+  filtersApplied: string[];
 }
 
 /**
@@ -78,6 +93,9 @@ export interface ContextPack {
 
   // 注入的身份字段（用于审计）
   injectedIdentityFields: string[]; // 例如 ['current_display_name', 'sender_role']
+
+  // 检索/注入可解释性 trace（不一定进入 prompt）
+  trace?: ContextTrace;
 
   // Token 预算跟踪
   tokenBudget: {

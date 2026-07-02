@@ -30,3 +30,6 @@ export * from './audit';
 
 // Attention Signals
 export * from './attention';
+
+// Evaluator (Risk Assessment)
+export * from './evaluator';

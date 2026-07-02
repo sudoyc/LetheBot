@@ -39,6 +39,33 @@ export interface AuditEntry {
 }
 
 /**
+ * 审计日志查询选项
+ */
+export interface AuditQueryOptions {
+  category?: AuditEntry['category'];
+  level?: AuditEntry['level'];
+  eventType?: string;
+  userId?: string;
+  startTime?: Date;
+  endTime?: Date;
+  riskLevel?: AuditEntry['riskLevel'];
+  limit?: number;
+}
+
+/**
+ * 审计日志统计结果
+ */
+export interface AuditStatsResult {
+  totalEvents: number;
+  eventsByCategory: Record<string, number>;
+  eventsByRiskLevel: Record<string, number>;
+  recentActivity: Array<{
+    date: string;
+    count: number;
+  }>;
+}
+
+/**
  * 错误封装
  */
 export interface ErrorEnvelope {

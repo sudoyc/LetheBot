@@ -16,7 +16,16 @@
     "test:run": "vitest run",
     "test:ui": "vitest --ui",
     "smoke": "tsx scripts/smoke-test.ts",
-    "cli": "tsx src/cli/main.ts"
+    "cli": "tsx src/cli/main.ts",
+    "deploy:configure": "tsx src/scripts/deploy-napcat.ts --mode=configure",
+    "deploy:docker": "tsx src/scripts/deploy-napcat.ts --mode=docker",
+    "deploy:systemd": "tsx src/scripts/deploy-napcat.ts --mode=systemd",
+    "deploy:pm2": "tsx src/scripts/deploy-napcat.ts --mode=pm2",
+    "verify:napcat": "tsx src/scripts/verify-napcat.ts",
+    "ops:backup": "tsx src/scripts/ops-maintenance.ts backup",
+    "ops:restore": "tsx src/scripts/ops-maintenance.ts restore",
+    "ops:retention": "tsx src/scripts/ops-maintenance.ts retention",
+    "ops:metrics": "tsx src/scripts/ops-maintenance.ts metrics"
   },
   "keywords": [
     "chatbot",
@@ -33,9 +42,12 @@
   },
   "packageManager": "pnpm@9.0.0",
   "dependencies": {
+    "@earendil-works/pi-agent-core": "^0.80.2",
+    "@earendil-works/pi-ai": "^0.80.2",
     "better-sqlite3": "^12.11.1",
     "commander": "^15.0.0",
     "dotenv": "^16.4.5",
+    "minimatch": "^10.2.5",
     "pino": "^9.5.0",
     "pino-pretty": "^13.0.0",
     "ulid": "^2.3.0",

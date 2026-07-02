@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type Database from 'better-sqlite3';
 import { initDatabase, runMigration, closeDatabase } from '../../../src/storage/database';
-import { MemoryRepository } from '../../../src/storage/memory-repository';
+import { MemoryPolicyError, MemoryRepository } from '../../../src/storage/memory-repository';
 
 describe('MemoryRepository', () => {
   let testDir: string;
@@ -51,6 +51,77 @@ describe('MemoryRepository', () => {
 
       expect(id).toBeDefined();
       expect(id.length).toBeGreaterThan(0);
+    });
+
+    it('should create source, revision, audit, and FTS rows in the governed write path', async () => {
+      const id = await repo.create({
+        scope: 'user',
+        canonicalUserId: 'user-alice',
+        visibility: 'private_only',
+        sensitivity: 'normal',
+        authority: 'user_stated',
+        kind: 'preference',
+        title: 'Favorite editor',
+        content: 'User likes NeovimUniqueTerm',
+        state: 'active',
+        confidence: 0.9,
+        importance: 0.7,
+        sourceContext: 'private_chat',
+        sources: [
+          {
+            sourceType: 'chat_message',
+            sourceId: 'msg-source-1',
+            sourceTimestamp: 1234,
+            extractedBy: 'worker',
+          },
+        ],
+      });
+
+      const sources = db
+        .prepare('SELECT * FROM memory_sources WHERE memory_id = ?')
+        .all(id) as any[];
+      const revisions = db
+        .prepare('SELECT * FROM memory_revisions WHERE memory_id = ?')
+        .all(id) as any[];
+      const auditRows = db
+        .prepare("SELECT * FROM audit_log WHERE category = 'memory' AND event_id = ?")
+        .all(id) as any[];
+      const searchResults = await repo.search('NeovimUniqueTerm', {
+        canonicalUserId: 'user-alice',
+      });
+
+      expect(sources).toHaveLength(1);
+      expect(sources[0].source_type).toBe('chat_message');
+      expect(sources[0].source_id).toBe('msg-source-1');
+      expect(revisions).toHaveLength(1);
+      expect(revisions[0].change_type).toBe('create');
+      expect(auditRows).toHaveLength(1);
+      expect(auditRows[0].event_type).toBe('memory.create');
+      expect(searchResults.map((memory) => memory.id)).toContain(id);
+    });
+
+    it('should reject deterministic secret/prohibited memory content without writing rows', async () => {
+      await expect(
+        repo.create({
+          scope: 'user',
+          canonicalUserId: 'user-alice',
+          visibility: 'private_only',
+          sensitivity: 'normal',
+          authority: 'user_stated',
+          kind: 'fact',
+          title: 'Temporary credential',
+          content: 'password = hunter2',
+          state: 'active',
+          confidence: 0.9,
+          importance: 0.7,
+          sourceContext: 'private_chat',
+        })
+      ).rejects.toBeInstanceOf(MemoryPolicyError);
+
+      const rows = db
+        .prepare("SELECT * FROM memory_records WHERE title = 'Temporary credential'")
+        .all();
+      expect(rows).toHaveLength(0);
     });
 
     it('should find memory by ID', async () => {
@@ -229,6 +300,35 @@ describe('MemoryRepository', () => {
       const results = await repo.retrieve({ canonicalUserId: 'user-alice' });
       expect(results.every((r) => r.id !== memoryId)).toBe(true);
     });
+
+    it('superseded memories excluded from retrieval and search', async () => {
+      await repo.updateState(memoryId, 'superseded');
+
+      const retrieved = await repo.retrieve({ canonicalUserId: 'user-alice' });
+      const searched = await repo.search('Content', { canonicalUserId: 'user-alice' });
+
+      expect(retrieved.every((r) => r.id !== memoryId)).toBe(true);
+      expect(searched.every((r) => r.id !== memoryId)).toBe(true);
+    });
+
+    it('state changes should create revision and audit rows', async () => {
+      await repo.disable(memoryId, { reason: 'test disable' });
+      await repo.delete(memoryId, { reason: 'test delete' });
+
+      const revisions = db
+        .prepare('SELECT change_type FROM memory_revisions WHERE memory_id = ? ORDER BY revision_number ASC')
+        .all(memoryId) as Array<{ change_type: string }>;
+      const auditRows = db
+        .prepare("SELECT event_type FROM audit_log WHERE category = 'memory' AND event_id = ? ORDER BY timestamp ASC")
+        .all(memoryId) as Array<{ event_type: string }>;
+
+      expect(revisions.map((row) => row.change_type)).toEqual(['create', 'disable', 'delete']);
+      expect(auditRows.map((row) => row.event_type)).toEqual([
+        'memory.create',
+        'memory.disable',
+        'memory.delete',
+      ]);
+    });
   });
 
   describe('full-text search', () => {
@@ -288,6 +388,83 @@ describe('MemoryRepository', () => {
       const results = await repo.search('User');
 
       expect(results.every((r) => r.state === 'active')).toBe(true);
+    });
+
+    it('should enforce sensitivity, visibility, and state filters in search', async () => {
+      const disabledId = await repo.create({
+        scope: 'user',
+        canonicalUserId: 'user-alice',
+        visibility: 'same_user_any_context',
+        sensitivity: 'normal',
+        authority: 'user_stated',
+        kind: 'fact',
+        title: 'Disabled searchable',
+        content: 'SearchGovernanceTerm disabled',
+        state: 'disabled',
+        confidence: 0.8,
+        importance: 0.5,
+        sourceContext: 'private_chat',
+      });
+
+      await repo.create({
+        scope: 'user',
+        canonicalUserId: 'user-alice',
+        visibility: 'private_only',
+        sensitivity: 'normal',
+        authority: 'user_stated',
+        kind: 'fact',
+        title: 'Private searchable',
+        content: 'SearchGovernanceTerm private only',
+        state: 'active',
+        confidence: 0.8,
+        importance: 0.5,
+        sourceContext: 'private_chat',
+      });
+
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO memory_records (
+          id, scope, canonical_user_id, visibility, sensitivity, authority, kind,
+          title, content, state, confidence, importance, source_context,
+          evaluator_decision_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        'legacy-secret',
+        'user',
+        'user-alice',
+        'same_user_any_context',
+        'secret',
+        'user_stated',
+        'fact',
+        'Legacy secret',
+        'SearchGovernanceTerm hidden',
+        'active',
+        0.9,
+        0.7,
+        'private_chat',
+        'legacy',
+        now,
+        now
+      );
+      const legacyRow = db
+        .prepare('SELECT rowid FROM memory_records WHERE id = ?')
+        .get('legacy-secret') as { rowid: number };
+      db.prepare('INSERT INTO memory_fts(rowid, title, content) VALUES (?, ?, ?)')
+        .run(legacyRow.rowid, 'Legacy secret', 'SearchGovernanceTerm hidden');
+
+      const groupResults = await repo.search('SearchGovernanceTerm', {
+        canonicalUserId: 'user-alice',
+        contextType: 'group',
+      });
+      const disabledResults = await repo.search('SearchGovernanceTerm', {
+        canonicalUserId: 'user-alice',
+        state: 'disabled',
+      });
+
+      expect(groupResults.every((memory) => memory.visibility !== 'private_only')).toBe(true);
+      expect(groupResults.every((memory) => memory.sensitivity !== 'secret')).toBe(true);
+      expect(groupResults.every((memory) => memory.state === 'active')).toBe(true);
+      expect(disabledResults.map((memory) => memory.id)).toContain(disabledId);
     });
   });
 });

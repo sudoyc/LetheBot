@@ -214,23 +214,42 @@ describe('E2E: Full Memory Cycle', () => {
       { id: 'msg-3', text: '今天天气怎么样', isBot: false },
     ];
 
-    for (const msg of messages) {
-      const now = Date.now();
+    // First, create raw events for each message
+    const baseTime = Date.now();
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      const msgTime = baseTime + i * 1000; // Each message 1 second apart
+      const rawEventId = `raw-${msg.id}`;
+
+      db.prepare(`
+        INSERT INTO raw_events (
+          id, type, timestamp, source, platform, conversation_id, payload, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        rawEventId,
+        'chat.message.received',
+        msgTime,
+        'gateway',
+        'qq',
+        conversationId,
+        JSON.stringify({ text: msg.text }),
+        msgTime,
+      );
+
       db.prepare(`
         INSERT INTO chat_messages (
-          id, conversation_id, conversation_type, message_id,
-          sender_id, text_content, is_from_bot, timestamp, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          id, raw_event_id, conversation_id, conversation_type, message_id,
+          sender_id, text, timestamp
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         msg.id,
+        rawEventId,
         conversationId,
         'private',
-        msg.id, // message_id
+        msg.id,
         msg.isBot ? 'bot' : userId,
         msg.text,
-        msg.isBot ? 1 : 0,
-        now,
-        now,
+        msgTime,
       );
     }
 

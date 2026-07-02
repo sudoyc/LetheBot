@@ -24,7 +24,7 @@ describe('PolicyGate', () => {
       sandboxPolicy: { networkAccess: false, filesystemAccess: false, maxExecutionTimeMs: 1000 },
       outputSensitivity: 'normal',
       piSchema: { input: {}, output: {} },
-      handler: 'test',
+      handler: async () => ({ ok: true }),
     });
   });
 
@@ -66,7 +66,7 @@ describe('PolicyGate', () => {
         sandboxPolicy: { networkAccess: false, filesystemAccess: false, maxExecutionTimeMs: 1000 },
         outputSensitivity: 'sensitive',
         piSchema: { input: {}, output: {} },
-        handler: 'admin',
+        handler: async () => ({ ok: true }),
       });
 
       const result = gate.checkToolCall({
@@ -108,7 +108,7 @@ describe('PolicyGate', () => {
         sandboxPolicy: { networkAccess: false, filesystemAccess: false, maxExecutionTimeMs: 1000 },
         outputSensitivity: 'normal',
         piSchema: { input: {}, output: {} },
-        handler: 'bypass',
+        handler: async () => ({ ok: true }),
       });
 
       const result = gate.checkToolCall({
