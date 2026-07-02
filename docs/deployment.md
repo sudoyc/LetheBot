@@ -1,18 +1,18 @@
 # Deployment Guide
 
-本文档描述如何将 LetheBot 从开发环境部署到受控的 QQ / NapCat 试运行环境。
+本文档描述如何将 LetheBot 从开发环境部署到受控的 QQ / SnowLuma / OneBot 试运行环境。
 
 ## 前置要求
 
 - Node.js 22+
 - pnpm 9+
 - SQLite 3.35+
-- （可选）NapCat 实例（用于真实 QQ 连接）
+- （可选）SnowLuma 或其它 OneBot v11 兼容运行时（用于真实 QQ 连接）
 - （可选）Pi/API provider 凭据（用于真实推理能力）
 
 ## 快速开始（开发模式）
 
-开发模式使用本地数据库、Mock Pi runtime 和 FakeOneBot / HTTP fake tests，无需真实 API 密钥或 NapCat 实例。
+开发模式使用本地数据库、Mock Pi runtime 和 FakeOneBot / HTTP fake tests，无需真实 API 密钥或真实 OneBot 运行时。
 
 ```bash
 pnpm install
@@ -45,7 +45,9 @@ PI_MODEL=deepseek-v4-flash
 PI_BASE_URL=https://api.deepseek.com/v1
 PI_API_KEY=your_api_key_here
 
-# NapCat OneBot HTTP API + reverse HTTP event auth
+# SnowLuma / OneBot transport
+ONEBOT_TRANSPORT=ws
+ONEBOT_WS_URL=ws://localhost:3001/
 ONEBOT_HTTP_URL=http://localhost:3000
 ONEBOT_TOKEN=your_onebot_access_token
 
@@ -59,14 +61,15 @@ LETHEBOT_HEALTH_PATH=/healthz
 LETHEBOT_EVENT_PATH=/onebot/event
 ```
 
-### NapCat 配置要点
+### SnowLuma / OneBot 配置要点
 
-1. NapCat HTTP API 地址应写入 `ONEBOT_HTTP_URL`。
-2. NapCat reverse HTTP 上报地址应配置为：
+1. 推荐第一版使用 `ONEBOT_TRANSPORT=ws`，SnowLuma WebSocket server 地址写入 `ONEBOT_WS_URL`。
+2. 如需 reverse HTTP 兼容模式，设置 `ONEBOT_TRANSPORT=http`，OneBot HTTP API 地址写入 `ONEBOT_HTTP_URL`，并把 SnowLuma `httpClients[].url` 配为：
    `http://<lethebot-host>:<LETHEBOT_PORT><LETHEBOT_EVENT_PATH>`。
 3. 如果设置 `ONEBOT_TOKEN`：
-   - LetheBot 出站调用 NapCat API 会发送 `Authorization: Bearer <ONEBOT_TOKEN>`。
-   - LetheBot 入站 event endpoint 也要求同样的 Bearer token。
+   - LetheBot 出站 HTTP API 会发送 `Authorization: Bearer <ONEBOT_TOKEN>`。
+   - LetheBot 出站 WS 会在 URL query 中设置 `access_token=<ONEBOT_TOKEN>`。
+   - LetheBot 入站 reverse HTTP 同时接受 Bearer token 和 SnowLuma `X-Signature: sha1=<hmac>`。
 4. `LETHEBOT_BOT_QQ_ID` 必须是机器人自己的 QQ 号；群聊中只有 `[CQ:at,qq=<bot-id>]` 会触发 `mentionsBot=true`。
 
 ## 数据库迁移
@@ -97,6 +100,16 @@ curl http://localhost:6700/healthz
 - `checks.adapter.ready`
 - adapter token/bot-id 是否已配置（不回显 token 值）
 
+## 本地双容器验收
+
+如需在本机同时启动 LetheBot 和 SnowLuma 容器，使用：
+
+```bash
+docker compose -f docker-compose.local-acceptance.yml up -d --build
+```
+
+详细步骤见 [`docs/local-container-acceptance.md`](./local-container-acceptance.md)。
+
 ## 部署脚本
 
 当前脚本只生成部署资产，不自动启动服务；默认输出到显式 `outputDir` 或当前目录。测试应使用 `test-output/`，不要污染 repo root。
@@ -106,10 +119,11 @@ pnpm deploy:configure
 pnpm deploy:docker
 pnpm deploy:systemd
 pnpm deploy:pm2
+pnpm verify:onebot
 pnpm verify:napcat
 ```
 
-`pnpm verify:napcat` 会对 `ONEBOT_HTTP_URL/get_login_info` 发送 POST；如果配置 token，会带 Bearer header。
+`pnpm verify:onebot` 会按 `ONEBOT_TRANSPORT` 检查当前 OneBot 运行时；`pnpm verify:napcat` 是兼容别名。
 
 ## 治理命令
 
@@ -126,18 +140,18 @@ pnpm cli redact-display-profile <canonical-user-id>
 
 ## Fake-to-real parity checklist（R8）
 
-默认 deterministic tests 必须继续使用 FakeOneBot / 本地 HTTP fake，不依赖真实 NapCat。真实 NapCat 只用于显式配置后的受控 smoke / soak。
+默认 deterministic tests 必须继续使用 FakeOneBot / 本地 HTTP fake，不依赖真实 SnowLuma。真实 OneBot 运行时只用于显式配置后的受控 smoke / soak。
 
 上线前逐项核对：
 
 - [ ] FakeOneBot private message path 覆盖 raw event、chat message、Pi turn、reply sink。
 - [ ] FakeOneBot group path 覆盖普通群聊静默、目标 @bot 触发、非目标 @ 不触发。
-- [ ] OneBot HTTP event endpoint 在未配置 token 时允许 dev flow，在配置 `ONEBOT_TOKEN` 后拒绝无 Bearer token 请求。
-- [ ] NapCat 出站 API 调用带同一个 Bearer token。
+- [ ] OneBot HTTP event endpoint 在未配置 token 时允许 dev flow，在配置 `ONEBOT_TOKEN` 后拒绝无效 Bearer / SnowLuma 签名请求。
+- [ ] OneBot HTTP/WS 出站 API 调用使用同一个 token。
 - [ ] CQ `at` 只在匹配 `LETHEBOT_BOT_QQ_ID` 时设置 `mentionsBot=true`。
 - [ ] 私聊/群聊 message id、sender role、group card、quote、media 被结构化保存，不把 CQ 控制码当成普通文本注入。
 - [ ] `/healthz` 同时检查 DB 和 adapter readiness。
-- [ ] 默认 `pnpm test:run` 不连接真实 NapCat；真实连接用 `pnpm verify:napcat` 或显式 soak 脚本。
+- [ ] 默认 `pnpm test:run` 不连接真实 SnowLuma；真实连接用 `pnpm verify:onebot` 或显式 soak 脚本。
 
 ## 监控和日志
 
@@ -180,13 +194,13 @@ sqlite3 ./data/lethebot.db ".backup ./backups/lethebot-$(date +%Y%m%d).db"
 - `PI_PROVIDER` 不是 `mock`
 - `PI_API_KEY` 已设置，或 `~/deepseek` 文件存在（当前入口仍支持该本地 fallback）
 
-### NapCat 连接失败
+### SnowLuma / OneBot 连接失败
 
 ```bash
-# 无 token
+# HTTP 无 token
 curl -X POST http://localhost:3000/get_login_info
 
-# 有 token
+# HTTP 有 token
 curl -X POST http://localhost:3000/get_login_info \
   -H "Authorization: Bearer $ONEBOT_TOKEN" \
   -H "Content-Type: application/json" \
@@ -195,8 +209,10 @@ curl -X POST http://localhost:3000/get_login_info \
 
 同时检查：
 
-- `ONEBOT_HTTP_URL` 是否为 HTTP API 地址，不是 WebSocket 地址。
-- NapCat reverse HTTP event URL 是否指向 LetheBot 的 `LETHEBOT_EVENT_PATH`。
+- `ONEBOT_TRANSPORT` 是否为 `ws` 或 `http`。
+- `ONEBOT_WS_URL` 是否为 SnowLuma WebSocket server 地址。
+- `ONEBOT_HTTP_URL` 是否为 HTTP API 地址。
+- SnowLuma reverse HTTP event URL 是否指向 LetheBot 的 `LETHEBOT_EVENT_PATH`。
 - `LETHEBOT_BOT_QQ_ID` 是否为机器人自己的 QQ 号。
 - LetheBot `/healthz` 中 `checks.database.ok` 和 `checks.adapter.ready` 是否为 true。
 

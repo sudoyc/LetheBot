@@ -6,7 +6,7 @@ The first deployment target is one local machine or small VPS running one Node p
 
 Recommended MVP processes:
 
-- `gateway`: NapCat / OneBot HTTP event receiving and message routing.
+- `gateway`: SnowLuma / OneBot WS or HTTP event receiving and message routing.
 - `api`: internal HTTP server and governance CLI entrypoints.
 - `worker`: summarization, extraction, retention, backup, and maintenance jobs.
 - `pi-runtime`: embedded in API at first; split later only if needed.
@@ -22,6 +22,8 @@ Use environment variables for secrets and deployment-specific values:
 - `LETHEBOT_CHAT_MESSAGE_RETENTION_DAYS`
 - `LETHEBOT_AUDIT_LOG_RETENTION_DAYS`
 - `LETHEBOT_DISABLED_DELETED_MEMORY_RETENTION_DAYS`
+- `ONEBOT_TRANSPORT`
+- `ONEBOT_WS_URL`
 - `ONEBOT_HTTP_URL`
 - `ONEBOT_TOKEN`
 - `LETHEBOT_BOT_QQ_ID`
@@ -58,10 +60,10 @@ Known failure modes:
 | Symptom | Likely cause | Operator action |
 |---|---|---|
 | `/healthz` returns 503 / `database.ok=false` | DB missing, locked, corrupt, or wrong `LETHEBOT_DB_PATH` | Check path, file permissions, `PRAGMA integrity_check`, restore from backup if corrupt. |
-| `/healthz` returns `adapter.ready=false` | app not fully started or adapter stopped | Check process logs and restart service. |
-| OneBot event POST returns 401 | `ONEBOT_TOKEN` mismatch or NapCat reverse HTTP did not send Bearer token | Align token in NapCat and `.env`; retry with `Authorization: Bearer $ONEBOT_TOKEN`. |
+| `/healthz` returns `adapter.ready=false` | app not fully started, adapter stopped, or WS transport disconnected | Check process logs, SnowLuma status, `ONEBOT_TRANSPORT`, and restart service if needed. |
+| OneBot event POST returns 401 | `ONEBOT_TOKEN` mismatch or SnowLuma reverse HTTP signature/Bearer mismatch | Align token in SnowLuma and `.env`; retry with Bearer or verify SnowLuma `X-Signature`. |
 | Group @bot does not trigger | missing/wrong `LETHEBOT_BOT_QQ_ID` | Set bot QQ id to the actual bot account and restart. |
-| `pnpm verify:napcat` fails | NapCat HTTP API down, wrong URL/token, network issue | Check `ONEBOT_HTTP_URL`, token, and NapCat container/process. |
+| `pnpm verify:onebot` fails | SnowLuma / OneBot down, wrong transport/URL/token, network issue | Check `ONEBOT_TRANSPORT`, `ONEBOT_WS_URL`, `ONEBOT_HTTP_URL`, token, and SnowLuma process. |
 | FK/check failures after maintenance | manual DB edits or unsafe deletion | Stop service, restore from latest verified backup, rerun tests on a copy. |
 
 ## Backup and Restore

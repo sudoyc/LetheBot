@@ -4,14 +4,14 @@ Common issues and practical solutions for LetheBot.
 
 ## OneBot Connection Problems
 
-### Check NapCat Status
+### Check SnowLuma / OneBot Status
 
 ```bash
-# Check if NapCat is running
-ps aux | grep -i napcat
+# Check if SnowLuma is running
+ps aux | grep -i snowluma
 
-# Check NapCat logs
-tail -f /path/to/napcat/logs/latest.log
+# Check SnowLuma logs
+tail -f /path/to/snowluma/logs/latest.log
 
 # Test OneBot HTTP API endpoint
 curl -X POST http://localhost:3000/get_login_info
@@ -31,14 +31,14 @@ Expected response:
 
 ### Port Configuration
 
-Check that the port in your `.env` matches NapCat's configuration:
+Check that the transport and port in your `.env` match SnowLuma's configuration:
 
 ```bash
 # In LetheBot .env
-grep ONEBOT_PORT .env
-# Should match NapCat's HTTP listening port
+grep -E 'ONEBOT_TRANSPORT|ONEBOT_WS_URL|ONEBOT_HTTP_URL' .env
+# ONEBOT_TRANSPORT=ws uses ONEBOT_WS_URL; ONEBOT_TRANSPORT=http uses ONEBOT_HTTP_URL.
 
-# Test connection
+# Test HTTP port when using HTTP API
 nc -zv localhost 3000
 ```
 
@@ -47,7 +47,7 @@ If port is in use:
 # Find what's using the port
 lsof -i :3000
 
-# Change port in both NapCat config and LetheBot .env
+# Change port in both SnowLuma config and LetheBot .env
 ```
 
 ### Test with curl
