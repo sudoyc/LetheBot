@@ -92,6 +92,7 @@ describe('FakeOneBot', () => {
         gateway.on('message', (msg) => {
           expect(msg.message.conversationType).toBe('group');
           expect(msg.message.conversationId).toBe('group:test-group');
+          expect(msg.message.groupId).toBe('test-group');
           expect(msg.message.content.text).toBe('大家好');
           resolve();
         });
@@ -113,6 +114,22 @@ describe('FakeOneBot', () => {
 
         gateway.simulateGroupMessage({
           text: '@bot 你好',
+        });
+      });
+    });
+
+    it('should auto-detect exact CQ mention for configured bot id', () => {
+      gateway = new FakeOneBot({ botId: '3889000770' });
+
+      return new Promise<void>((resolve) => {
+        gateway.on('message', (msg) => {
+          expect(msg.message.mentions).toEqual(['qq-3889000770']);
+          expect(msg.message.mentionsBot).toBe(true);
+          resolve();
+        });
+
+        gateway.simulateGroupMessage({
+          text: '[CQ:at,qq=3889000770] 你好',
         });
       });
     });
@@ -143,6 +160,30 @@ describe('FakeOneBot', () => {
           text: 'test',
           senderRole: 'admin',
           senderCard: 'Admin Bob',
+        });
+      });
+    });
+
+    it('should include quote and media attachments', () => {
+      return new Promise<void>((resolve) => {
+        gateway.on('message', (msg) => {
+          expect(msg.message.content.quote?.messageId).toBe('quoted-msg-1');
+          expect(msg.message.replyToMessageId).toBe('quoted-msg-1');
+          expect(msg.message.content.media).toEqual([
+            { type: 'image', url: 'https://example.test/a.png' },
+          ]);
+          resolve();
+        });
+
+        gateway.simulateGroupMessage({
+          text: '看图',
+          quote: {
+            messageId: 'quoted-msg-1',
+            text: '上一条',
+          },
+          media: [
+            { type: 'image', url: 'https://example.test/a.png' },
+          ],
         });
       });
     });
@@ -265,7 +306,6 @@ describe('FakeOneBot', () => {
       gateway.reset();
 
       gateway.simulatePrivateMessage({ text: 'test3' });
-      const last = gateway.getLastSentMessage();
       // After reset, counters start from 1 again
       expect(gateway.getSentMessages()).toHaveLength(0); // No messages sent, only simulated
     });

@@ -77,6 +77,8 @@ export interface ChatMessageReceived extends InternalEvent {
     groupId?: string; // 如果是群聊
     senderId: string; // 平台用户 ID
     senderRole?: 'member' | 'admin' | 'owner';
+    senderDisplayName?: string;
+    senderCard?: string;
 
     content: {
       text?: string;

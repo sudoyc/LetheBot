@@ -7,7 +7,7 @@
 import { EventEmitter } from 'node:events';
 import { ulid } from 'ulidx';
 import type { GatewayAdapter, MessageTarget, MessageContent } from '../../src/gateway/adapter';
-import type { ChatMessageReceived, GatewayCapabilities } from '../../src/types/events';
+import type { ChatMessageReceived, GatewayCapabilities, MediaAttachment } from '../../src/types/events';
 
 export interface SimulatePrivateMessageOptions {
   senderId?: string;
@@ -18,6 +18,7 @@ export interface SimulatePrivateMessageOptions {
     messageId: string;
     text: string;
   };
+  media?: MediaAttachment[];
 }
 
 export interface SimulateGroupMessageOptions {
@@ -34,6 +35,7 @@ export interface SimulateGroupMessageOptions {
     messageId: string;
     text: string;
   };
+  media?: MediaAttachment[];
 }
 
 export interface SentMessage {
@@ -104,7 +106,7 @@ export class FakeOneBot implements GatewayAdapter {
     return messageId;
   }
 
-  async sendReaction(messageId: string, emoji: string): Promise<void> {
+  async sendReaction(_messageId: string, _emoji: string): Promise<void> {
     // Store reactions if needed for assertions
     // For now, just a no-op
   }
@@ -142,8 +144,17 @@ export class FakeOneBot implements GatewayAdapter {
         senderId,
         content: {
           text: options.text,
+          media: options.media ?? [],
+          quote: options.quote
+            ? {
+                messageId: options.quote.messageId,
+                senderId: 'unknown',
+                text: options.quote.text,
+              }
+            : undefined,
         },
         mentionsBot: false,
+        replyToMessageId: options.quote?.messageId,
       },
       gatewayCapabilities: this.capabilities,
     };
@@ -160,8 +171,12 @@ export class FakeOneBot implements GatewayAdapter {
     const messageId = options.messageId ?? this.generateMessageId();
     const timestamp = options.timestamp ?? new Date();
 
-    // Auto-detect @bot if not specified
-    const mentionsBot = options.mentionsBot ?? options.text.includes('@bot');
+    const mentions = this.extractMentions(options.text);
+
+    // Auto-detect @bot / exact CQ mention if not specified
+    const autoMentionsBot = options.text.includes('@bot')
+      || mentions.includes(this.normalizeUserId(this.botId));
+    const mentionsBot = options.mentionsBot ?? autoMentionsBot;
 
     const event: ChatMessageReceived = {
       id: ulid(),
@@ -173,14 +188,25 @@ export class FakeOneBot implements GatewayAdapter {
         messageId,
         conversationId: `group:${groupId}`,
         conversationType: 'group',
+        groupId,
         senderId,
         senderRole: options.senderRole,
+        senderDisplayName: options.senderCard,
         senderCard: options.senderCard,
         content: {
           text: options.text,
+          media: options.media ?? [],
+          quote: options.quote
+            ? {
+                messageId: options.quote.messageId,
+                senderId: 'unknown',
+                text: options.quote.text,
+              }
+            : undefined,
         },
+        mentions,
         mentionsBot,
-        replyToMessageId: options.replyToMessageId,
+        replyToMessageId: options.replyToMessageId ?? options.quote?.messageId,
       },
       gatewayCapabilities: this.capabilities,
     };
@@ -287,5 +313,23 @@ export class FakeOneBot implements GatewayAdapter {
   private generateUserId(): string {
     this.userCounter++;
     return `fake-user-${this.userCounter.toString().padStart(3, '0')}`;
+  }
+
+  private extractMentions(text: string): string[] {
+    const mentions: string[] = [];
+    const cqAtPattern = /\[CQ:at,qq=([^\],]+)[^\]]*\]/g;
+    let match = cqAtPattern.exec(text);
+    while (match) {
+      const qq = match[1];
+      if (qq) {
+        mentions.push(this.normalizeUserId(qq));
+      }
+      match = cqAtPattern.exec(text);
+    }
+    return mentions;
+  }
+
+  private normalizeUserId(userId: string): string {
+    return userId.startsWith('qq-') ? userId : `qq-${userId}`;
   }
 }
