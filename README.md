@@ -46,6 +46,14 @@ See [Deployment Guide](docs/deployment.md) for detailed instructions on:
 - Security configuration
 - Monitoring and backup
 
+## Troubleshooting
+
+See [docs/troubleshooting.md](docs/troubleshooting.md) for common issues:
+- OneBot connection problems
+- Pi API configuration (DeepSeek, OpenAI)
+- Database and migration issues
+- Test failures and debugging
+
 ## Project Structure
 
 ```
@@ -69,27 +77,45 @@ LetheBot/
 └── docs/               # Architecture and design docs
 ```
 
+## Documentation
+
+- [Architecture](docs/architecture.md) - System design and module overview
+- [Deployment Guide](docs/deployment.md) - Production setup with DeepSeek/NapCat
+- [Troubleshooting](docs/troubleshooting.md) - Common issues and solutions
+
+### Examples
+- [Tool Registration](docs/examples/tool-registration-example.md)
+- [Memory Visibility](docs/examples/memory-visibility-scenarios.md)
+- [OneBot Message Flow](docs/examples/onebot-message-flow.md)
+
 ## Current Status
 
-MVP implementation completed (Phases A-L). Test coverage: 247 tests passing.
+The current evidence-based recovery status is tracked in [docs/loop-state-recovery.md](docs/loop-state-recovery.md). Do not rely on older completion-count claims without rerunning the gates.
 
-**Implemented:**
-- ✅ Core TypeScript contracts
-- ✅ SQLite storage with migrations
-- ✅ Memory visibility filtering
-- ✅ Attention engine with trigger scoring
-- ✅ Mock Pi adapter (testing without real API key)
-- ✅ Context builder with memory retrieval
-- ✅ Tool registry with permission checks
-- ✅ Policy gate with L0 enforcement
-- ✅ Background worker queue
-- ✅ Governance CLI (list/delete/disable memory)
+Latest verified local gates from the recovery log:
 
-**Pending:**
-- ⏳ Real Pi SDK adapter (see [deployment.md](docs/deployment.md))
-- ⏳ Real OneBot adapter for NapCat (see [deployment.md](docs/deployment.md))
-- ⏳ Smoke test script
-- ⏳ Health check endpoint
+- `pnpm typecheck`: pass
+- `pnpm lint`: pass with 0 errors and documented warnings
+- `pnpm test:run`: pass in the default deterministic suite
+
+Implemented capabilities include:
+
+- Core TypeScript contracts and SQLite storage with migrations
+- Governed memory repository with source/revision/audit links
+- Context builder with retrieval filters and trace fields
+- Pi adapter integration with mockable tests
+- Tool registry, policy gate, sandbox/path validation, and audit coverage
+- Background memory extraction and summary worker paths
+- Governance CLI for memory list/state changes, context explanation, and display profile redaction
+- OneBot/NapCat HTTP adapter path with auth, CQ mention parsing, health checks, and fake/local tests
+- SQLite operations helpers for backup/restore, retention, and metrics
+
+Still requires controlled live validation before production claims:
+
+- Real NapCat soak test
+- Full social action executor/router beyond the adapter-level reply path
+- Scheduled/durable operations automation
+- Optional governance UI beyond the CLI
 
 ## Documentation
 

@@ -4,13 +4,67 @@ This file is the mutable checkpoint for long-running `/goal` or `/loop` developm
 
 Do not treat chat history as the only source of state. Update this file at phase boundaries, after gate failures, and before stopping due to context pressure.
 
+## Current Evidence-Based Status
+
+This file contains historical loop notes and may include stale completion counts. For the current recovery audit and verified gates, use [loop-state-recovery.md](loop-state-recovery.md).
+
+As of the latest recovery audit, R0-R9 are complete by current command evidence, with final gates recorded in `docs/loop-state-recovery.md`.
+
 ## Current Phase
 
-- Phase: Phase M (Deployment & Documentation)
-- Status: Phase M completed ✅ (MVP COMPLETE!)
+- Phase: Phase P0 (Pi Agent Integration - Real LLM)
+- Status: Phase P0 completed ✅
 - Started at: 2026-06-27
 - Completed at: 2026-06-27
 - Last updated: 2026-06-27
+
+## Phase P0: Pi Agent Integration - Completed ✅
+
+Goal: Replace MockPi with real Pi Agent SDK integration
+
+✅ Completed:
+- Installed Pi Agent dependencies (@earendil-works/pi-agent-core, @earendil-works/pi-ai)
+- Implemented PiAdapter wrapper around Pi Agent Core
+- Multi-provider support (OpenAI, Anthropic, Google, DeepSeek, etc.)
+- ContextPack → Pi AgentMessage conversion
+- Tool registration with PolicyGate integration
+- beforeToolCall/afterToolCall hooks for L0 policy enforcement
+- Main entry point integration (src/index.ts)
+- DeepSeek API configuration support
+- Configuration file updates (.env.example)
+- Test script for DeepSeek connectivity (test-deepseek.js)
+- 20 Pi adapter unit tests passing
+
+Key design decisions:
+- ReasoningCore interface implemented via PiAdapter
+- Tool hooks call PolicyGate for L0 permission checks
+- Independent Evaluator boundary preserved
+- Historical bot messages skipped in MVP (only user messages converted)
+- Provider abstraction: provider + model + baseUrl parameters
+- API key fallback: PI_API_KEY env var → ~/deepseek file
+
+Files created/modified:
+- src/pi/pi-adapter.ts (modified: removed Anthropic hardcode, added provider param)
+- src/pi/tool-adapter.ts (created: LetheBot tool → Pi tool conversion)
+- src/pi/types.ts (created: type definitions)
+- src/index.ts (modified: replaced MockPi with PiAdapter)
+- .env.example (modified: added Pi configuration section)
+- test-deepseek.js (created: connectivity test script)
+- tests/unit/pi/pi-adapter.test.ts (created: 20 tests)
+
+Test results:
+- ✅ TypeScript compilation passes
+- ✅ 267 tests pass (25 test files)
+- ✅ Including 20 Pi adapter tests
+- ⚠️  Some lint warnings for unused variables (non-blocking)
+
+Configuration:
+- Default provider: openai (for DeepSeek compatibility)
+- Default model: deepseek-v4-flash
+- Default baseUrl: https://api.deepseek.com
+- API key read from ~/deepseek or PI_API_KEY env var
+
+Ready for production testing via QQ bot!
 
 ## Phase A Completion Summary
 

@@ -24,6 +24,13 @@ This directory contains the initial design deliverables for LetheBot.
 18. [Operations](operations.md)
 19. [Delivery Checklist](delivery-checklist.md)
 
+
+## Recovery and Long-Term Development
+
+- [Long-Term Development Direction Review](long-term-development-direction-review.md) — 整理长期开发方向，并诊断当前路线/执行健康度。
+- [Long-Term Development Constraints](long-term-development-constraints.md) — 后续修复和长期完善必须遵守的 evidence、架构、记忆、隐私、测试和 Git 约束。
+- [Repair and Long-Term Development `/goal` Prompt](prompts/repair-and-long-term-development-goal.md) — 新的 recovery-first 长期开发 prompt，替代旧的 optimistic post-MVP prompt。
+
 ## Loop Engineering Materials
 
 - [Loop Engineering Preparation](loop-engineering-prep.md) - Strategy for long-running `/goal` implementation
