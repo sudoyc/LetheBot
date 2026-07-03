@@ -83,6 +83,8 @@ SnowLuma 才会为该账号启动 OneBot HTTP / WS adapter；登录前 `3000` / 
 VNC_PASSWD=vncpasswd
 SNOWLUMA_WEBUI_BOOTSTRAP_PASSWORD=lethebot-local
 ONEBOT_TOKEN=lethebot-local-token
+PI_PROVIDER=mock
+PI_MODEL=mock
 ```
 
 Framework 栈数据落在：
@@ -91,6 +93,17 @@ Framework 栈数据落在：
 - `./data/snowluma-framework-qq-config`
 - `./data/snowluma-framework-qq-data`
 - `./data/lethebot-snowluma-framework.db`
+
+使用真实 Pi / DeepSeek 验收时，不要把 API key 写入仓库。可从本地临时文件注入：
+
+```bash
+PI_PROVIDER=openai \
+PI_MODEL=deepseek-v4-flash \
+PI_BASE_URL="$(cat /tmp/pi_base_url)" \
+PI_API_KEY="$(cat /tmp/pi_api_key)" \
+LETHEBOT_BOT_QQ_ID=<bot-qq-id> \
+docker compose -f docker-compose.snowluma-framework.yml up -d --build --force-recreate lethebot
+```
 
 如需强制重置 OneBot token 配置：
 
