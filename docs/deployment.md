@@ -42,7 +42,7 @@ LETHEBOT_DISABLED_DELETED_MEMORY_RETENTION_DAYS=365
 # Pi runtime（src/index.ts 使用这些变量）
 PI_PROVIDER=openai
 PI_MODEL=deepseek-v4-flash
-PI_BASE_URL=https://api.deepseek.com/v1
+PI_BASE_URL=https://api.deepseek.com
 PI_API_KEY=your_api_key_here
 
 # SnowLuma / OneBot transport
@@ -52,7 +52,7 @@ ONEBOT_HTTP_URL=http://localhost:3000
 ONEBOT_TOKEN=your_onebot_access_token
 
 # Bot QQ id：用于群聊 CQ @ 精确匹配，避免把 @其他人 当成 @bot
-LETHEBOT_BOT_QQ_ID=3889000770
+LETHEBOT_BOT_QQ_ID=<bot-qq-id>
 
 # LetheBot HTTP server
 LETHEBOT_PORT=6700

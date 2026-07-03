@@ -698,11 +698,11 @@ interface AttentionSignals {
 
 ## 11. Implementation Guidance
 
-For detailed phase-by-phase tasks with exact file paths, code snippets, tests, and acceptance criteria, see:
+For current implementation sequencing, tests, and acceptance criteria, see:
 
-- **`docs/detailed-phase-tasks.md`** - Phase 2 (Pi Runtime) and Phase 3 (Memory v0) fully expanded
-- **`docs/test-strategy.md`** - P0 regression tests and phase acceptance criteria
-- **`docs/fake-gateway-design.md`** - Test harness interface and test scenarios
-- **`docs/sqlite-schema.md`** - Complete database schema with indexes
+- **`docs/next-full-implementation-plan.md`** - current full-function roadmap and phase order
+- **`docs/test-strategy.md`** - deterministic regression tests and acceptance criteria
+- **`docs/fake-gateway-design.md`** - test harness interface and test scenarios
+- **`docs/sqlite-schema.md`** - complete database schema with indexes
 
-These documents provide the concrete implementation details for the interfaces defined in this contracts document.
+Historical phase-by-phase task lists were moved to `docs/archive/plans/` and should not be treated as current completion evidence.

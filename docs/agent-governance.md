@@ -2,7 +2,7 @@
 
 LetheBot uses agent judgement for ambiguous social, memory, and tool decisions, but the agent does not directly own high-risk execution.
 
-This document summarizes the confirmed governance model from `answer-review-discussion-log.md`.
+This document summarizes the confirmed governance model from the archived discussion log at `archive/discussions/answer-review-discussion-log.md`.
 
 ## Evaluator Boundary
 

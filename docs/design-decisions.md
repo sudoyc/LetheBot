@@ -1,6 +1,6 @@
 # Design Decisions
 
-This is the concise decision index for the D1-D8 answer-review discussion. The full reasoning remains in `answer-review-discussion-log.md`; implementation-facing guidance is split into the formal design documents linked below.
+This is the concise decision index for the D1-D8 answer-review discussion. The full reasoning is archived in `archive/discussions/answer-review-discussion-log.md`; implementation-facing guidance is split into the formal design documents linked below.
 
 ## D1. Evaluator Boundary
 
@@ -64,7 +64,7 @@ Primary docs:
 
 - `memory-system.md`
 - `agent-governance.md`
-- `mvp-roadmap.md`
+- `next-full-implementation-plan.md`
 
 ## D5. Social Action Model
 
@@ -82,7 +82,7 @@ Primary docs:
 - `social-action-model.md`
 - `architecture.md`
 - `pi-integration.md`
-- `mvp-roadmap.md`
+- `next-full-implementation-plan.md`
 
 ## D6. Tool Registry Metadata
 
@@ -124,7 +124,7 @@ Primary docs:
 
 Decision:
 
-- Keep `answer-review-discussion-log.md` as the full discussion/audit trail.
+- Keep `archive/discussions/answer-review-discussion-log.md` as the historical discussion/audit trail.
 - Split confirmed decisions into formal design docs.
 - Maintain this file as the compact decision index for future sessions.
 
@@ -146,4 +146,4 @@ Primary docs:
 - `pi-integration.md`
 - `data-model.md`
 - `security-privacy.md`
-- `mvp-roadmap.md`
+- `next-full-implementation-plan.md`

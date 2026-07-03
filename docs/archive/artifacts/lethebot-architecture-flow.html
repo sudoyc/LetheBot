@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LetheBot Architecture Flow</title>
+  <style>
+    :root {
+      --bg: #020617;
+      --panel: #0f172a;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --grid: #1e293b;
+      --cyan: #22d3ee;
+      --emerald: #34d399;
+      --violet: #a78bfa;
+      --amber: #fbbf24;
+      --rose: #fb7185;
+      --orange: #fb923c;
+      --indigo: #818cf8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at 20% 0%, rgba(34, 211, 238, 0.08), transparent 28%),
+                  radial-gradient(circle at 90% 10%, rgba(167, 139, 250, 0.09), transparent 26%),
+                  var(--bg);
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+    .wrap { max-width: 1680px; margin: 0 auto; padding: 28px; }
+    .header { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
+    .pulse { width: 12px; height: 12px; border-radius: 50%; background: var(--emerald); box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.6); animation: pulse 2s infinite; }
+    @keyframes pulse { 70% { box-shadow: 0 0 0 12px rgba(52, 211, 153, 0); } 100% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0); } }
+    h1 { margin: 0; font-size: 22px; letter-spacing: -0.02em; }
+    .subtitle { color: var(--muted); font-size: 13px; margin: 6px 0 0 26px; }
+    .canvas { border: 1px solid #1f2937; border-radius: 16px; overflow: hidden; background: #020617; box-shadow: 0 24px 80px rgba(0,0,0,.35); }
+    svg { width: 100%; height: auto; display: block; }
+    .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-top: 16px; }
+    .card { background: rgba(15, 23, 42, 0.78); border: 1px solid #1f2937; border-radius: 14px; padding: 14px 16px; }
+    .card h3 { margin: 0 0 10px; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+    .dot.cyan { background: var(--cyan); } .dot.violet { background: var(--violet); } .dot.rose { background: var(--rose); }
+    .card ul { margin: 0; padding: 0; list-style: none; color: #cbd5e1; font-size: 12px; line-height: 1.7; }
+    .footer { margin-top: 14px; color: #64748b; font-size: 11px; }
+    @media (max-width: 900px) { .cards { grid-template-columns: 1fr; } .wrap { padding: 16px; } }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="header"><div class="pulse"></div><div><h1>LetheBot Architecture Flow</h1><div class="subtitle">Gateway → Ingestion → Identity/Memory/Context → Pi → Evaluator/Policy → Executor → QQ, with audit and rollback</div></div></div>
+
+  <div class="canvas">
+  <svg viewBox="0 0 1600 1120" role="img" aria-label="LetheBot architecture flow diagram">
+    <defs>
+      <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/></pattern>
+      <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#64748b"/></marker>
+      <marker id="arrowCyan" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#22d3ee"/></marker>
+      <marker id="arrowRose" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#fb7185"/></marker>
+      <style>
+        .bg { fill: #020617; }
+        .boundary { fill: rgba(15,23,42,.18); stroke: #334155; stroke-width: 1.2; stroke-dasharray: 7 5; }
+        .label { fill: #e5e7eb; font-size: 14px; font-weight: 700; }
+        .sub { fill: #94a3b8; font-size: 10px; }
+        .tiny { fill: #94a3b8; font-size: 9px; }
+        .edge { fill: none; stroke: #64748b; stroke-width: 1.6; marker-end: url(#arrow); }
+        .edge2 { fill: none; stroke: #22d3ee; stroke-width: 1.8; marker-end: url(#arrowCyan); }
+        .policyEdge { fill: none; stroke: #fb7185; stroke-width: 1.7; stroke-dasharray: 5 4; marker-end: url(#arrowRose); }
+        .boxBg { fill: #0f172a; }
+        .platform { fill: rgba(30,41,59,.58); stroke: #94a3b8; }
+        .gateway { fill: rgba(8,51,68,.45); stroke: #22d3ee; }
+        .event { fill: rgba(124,45,18,.42); stroke: #fb923c; }
+        .memory { fill: rgba(76,29,149,.45); stroke: #a78bfa; }
+        .reason { fill: rgba(6,78,59,.44); stroke: #34d399; }
+        .policy { fill: rgba(136,19,55,.45); stroke: #fb7185; }
+        .tool { fill: rgba(120,53,15,.38); stroke: #fbbf24; }
+        .store { fill: rgba(49,46,129,.45); stroke: #818cf8; }
+      </style>
+    </defs>
+    <rect class="bg" width="1600" height="1120"/>
+    <rect width="1600" height="1120" fill="url(#grid)" opacity="0.75"/>
+
+    <!-- Boundaries -->
+    <rect class="boundary" x="30" y="60" width="220" height="330" rx="14"/>
+    <text class="tiny" x="46" y="84">Platform / Gateway</text>
+    <rect class="boundary" x="285" y="60" width="280" height="330" rx="14"/>
+    <text class="tiny" x="301" y="84">Ingestion / Identity / Attention</text>
+    <rect class="boundary" x="600" y="60" width="330" height="330" rx="14"/>
+    <text class="tiny" x="616" y="84">Memory + Governance</text>
+    <rect class="boundary" x="970" y="60" width="300" height="330" rx="14"/>
+    <text class="tiny" x="986" y="84">Context + Pi</text>
+    <rect class="boundary" x="1300" y="60" width="270" height="330" rx="14"/>
+    <text class="tiny" x="1316" y="84">Policy + Execution</text>
+    <rect class="boundary" x="600" y="445" width="670" height="290" rx="14"/>
+    <text class="tiny" x="616" y="469">Tool Layer</text>
+    <rect class="boundary" x="30" y="445" width="535" height="290" rx="14"/>
+    <text class="tiny" x="46" y="469">Background Memory Work</text>
+    <rect class="boundary" x="1300" y="445" width="270" height="290" rx="14"/>
+    <text class="tiny" x="1316" y="469">Delivery</text>
+    <rect class="boundary" x="30" y="790" width="1540" height="250" rx="14"/>
+    <text class="tiny" x="46" y="814">Complex-case controls: downgrade, redaction, revision, audit, fallback</text>
+
+    <!-- Components -->
+    <g transform="translate(60,115)"><rect class="boxBg" width="160" height="64" rx="8"/><rect class="platform" width="160" height="64" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">QQ 用户/群聊</text><text class="sub" x="18" y="47">private + group</text></g>
+    <g transform="translate(60,245)"><rect class="boxBg" width="160" height="70" rx="8"/><rect class="gateway" width="160" height="70" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">NapCat / OneBot</text><text class="sub" x="18" y="48">protocol runtime</text></g>
+
+    <g transform="translate(320,105)"><rect class="boxBg" width="210" height="70" rx="8"/><rect class="event" width="210" height="70" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Ingestion / Event Bus</text><text class="sub" x="18" y="48">normalize + persist raw first</text></g>
+    <g transform="translate(320,205)"><rect class="boxBg" width="210" height="70" rx="8"/><rect class="store" width="210" height="70" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Identity Registry</text><text class="sub" x="18" y="48">canonical_user_id / QQ IDs</text></g>
+    <g transform="translate(320,305)"><rect class="boxBg" width="210" height="70" rx="8"/><rect class="event" width="210" height="70" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Attention Engine</text><text class="sub" x="18" y="48">trigger score + suppressors</text></g>
+
+    <g transform="translate(630,105)"><rect class="boxBg" width="250" height="70" rx="8"/><rect class="store" width="250" height="70" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Raw Event Store</text><text class="sub" x="18" y="48">audit foundation / replay</text></g>
+    <g transform="translate(630,205)"><rect class="boxBg" width="250" height="78" rx="8"/><rect class="memory" width="250" height="78" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Thick Memory Layer</text><text class="sub" x="18" y="48">records / sources / revisions</text><text class="sub" x="18" y="63">visibility + sensitivity</text></g>
+    <g transform="translate(630,315)"><rect class="boxBg" width="250" height="58" rx="8"/><rect class="memory" width="250" height="58" rx="8" stroke-width="1.5"/><text class="label" x="18" y="25">Governance UI/CLI</text><text class="sub" x="18" y="43">why / delete / rollback</text></g>
+
+    <g transform="translate(1000,125)"><rect class="boxBg" width="230" height="82" rx="8"/><rect class="reason" width="230" height="82" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Context Orchestrator</text><text class="sub" x="18" y="48">retrieval + token budget</text><text class="sub" x="18" y="64">minimal identity injection</text></g>
+    <g transform="translate(1000,245)"><rect class="boxBg" width="230" height="78" rx="8"/><rect class="reason" width="230" height="78" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Pi Agent Runtime</text><text class="sub" x="18" y="48">reasoning + proposals</text><text class="sub" x="18" y="63">not direct executor</text></g>
+
+    <g transform="translate(1325,115)"><rect class="boxBg" width="220" height="92" rx="8"/><rect class="policy" width="220" height="92" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Evaluator / Policy</text><text class="sub" x="18" y="48">LLM if required</text><text class="sub" x="18" y="64">deterministic L0 gate</text><text class="sub" x="18" y="80">required | bypass</text></g>
+    <g transform="translate(1325,255)"><rect class="boxBg" width="220" height="88" rx="8"/><rect class="policy" width="220" height="88" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Action Executor</text><text class="sub" x="18" y="48">cooldown + fallback</text><text class="sub" x="18" y="64">audit + rollback handle</text></g>
+
+    <g transform="translate(65,500)"><rect class="boxBg" width="210" height="72" rx="8"/><rect class="event" width="210" height="72" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Background Workers</text><text class="sub" x="18" y="48">summary / extraction / decay</text></g>
+    <g transform="translate(325,500)"><rect class="boxBg" width="200" height="72" rx="8"/><rect class="memory" width="200" height="72" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Memory Candidates</text><text class="sub" x="18" y="48">proposals / digest</text></g>
+    <g transform="translate(325,625)"><rect class="boxBg" width="200" height="72" rx="8"/><rect class="policy" width="200" height="72" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Memory Policy</text><text class="sub" x="18" y="48">auto-active or proposal</text></g>
+
+    <g transform="translate(640,505)"><rect class="boxBg" width="210" height="78" rx="8"/><rect class="tool" width="210" height="78" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Tool Orchestrator</text><text class="sub" x="18" y="48">tool call lifecycle</text></g>
+    <g transform="translate(900,505)"><rect class="boxBg" width="230" height="88" rx="8"/><rect class="tool" width="230" height="88" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Tool Registry</text><text class="sub" x="18" y="48">capabilities + permissions</text><text class="sub" x="18" y="64">audit + sandbox policy</text></g>
+    <g transform="translate(900,625)"><rect class="boxBg" width="230" height="78" rx="8"/><rect class="tool" width="230" height="78" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Sandbox / Tools</text><text class="sub" x="18" y="48">filesystem / network / shell</text></g>
+
+    <g transform="translate(1325,505)"><rect class="boxBg" width="220" height="78" rx="8"/><rect class="gateway" width="220" height="78" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Response Router</text><text class="sub" x="18" y="48">group / DM / digest</text><text class="sub" x="18" y="63">reaction / folded forward</text></g>
+    <g transform="translate(1325,625)"><rect class="boxBg" width="220" height="72" rx="8"/><rect class="store" width="220" height="72" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Audit Log</text><text class="sub" x="18" y="48">decision / actor / redaction</text></g>
+
+    <!-- Complex Controls -->
+    <g transform="translate(70,845)"><rect class="boxBg" width="220" height="78" rx="8"/><rect class="policy" width="220" height="78" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Hard Policy</text><text class="sub" x="18" y="48">secret/prohibited excluded</text><text class="sub" x="18" y="63">deleted memory not retrieved</text></g>
+    <g transform="translate(330,845)"><rect class="boxBg" width="220" height="78" rx="8"/><rect class="reason" width="220" height="78" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Action Downgrade</text><text class="sub" x="18" y="48">full → short → react → silent</text><text class="sub" x="18" y="63">DM → digest / silent</text></g>
+    <g transform="translate(590,845)"><rect class="boxBg" width="220" height="78" rx="8"/><rect class="memory" width="220" height="78" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Memory Governance</text><text class="sub" x="18" y="48">proposal / active / supersede</text><text class="sub" x="18" y="63">revision + rollback</text></g>
+    <g transform="translate(850,845)"><rect class="boxBg" width="220" height="78" rx="8"/><rect class="tool" width="220" height="78" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Tool Safety</text><text class="sub" x="18" y="48">permissions + sandbox</text><text class="sub" x="18" y="63">secret scanner</text></g>
+    <g transform="translate(1110,845)"><rect class="boxBg" width="220" height="78" rx="8"/><rect class="store" width="220" height="78" rx="8" stroke-width="1.5"/><text class="label" x="18" y="28">Identity Boundaries</text><text class="sub" x="18" y="48">QQ ID operational data</text><text class="sub" x="18" y="63">nickname is untrusted data</text></g>
+
+    <!-- Edges -->
+    <path class="edge2" d="M140 180 L140 245"/>
+    <path class="edge2" d="M220 280 C260 280 275 140 320 140"/>
+    <path class="edge" d="M530 140 L630 140"/>
+    <path class="edge" d="M530 140 C570 145 580 240 630 240"/>
+    <path class="edge" d="M530 140 C580 150 270 330 320 340"/>
+    <path class="edge" d="M530 240 C715 240 835 166 1000 166"/>
+    <path class="edge" d="M530 340 C725 340 825 166 1000 166"/>
+    <path class="edge" d="M880 244 C930 244 950 166 1000 166"/>
+    <path class="edge2" d="M1230 166 C1280 166 1290 160 1325 160"/>
+    <path class="edge2" d="M1115 207 L1115 245"/>
+    <path class="policyEdge" d="M1230 284 C1285 284 1290 300 1325 300"/>
+    <path class="policyEdge" d="M1545 160 L1545 255"/>
+    <path class="edge2" d="M1545 300 C1575 350 1575 545 1545 545"/>
+    <path class="edge2" d="M1325 545 C1240 545 1230 340 1325 315"/>
+    <path class="edge2" d="M1325 545 C1240 545 1160 545 1130 545"/>
+    <path class="edge" d="M640 545 C590 545 570 530 525 535"/>
+    <path class="edge" d="M275 536 L325 536"/>
+    <path class="policyEdge" d="M425 572 L425 625"/>
+    <path class="edge" d="M425 625 C515 575 575 260 630 245"/>
+    <path class="edge" d="M755 175 L755 205"/>
+    <path class="edge" d="M755 283 L755 315"/>
+    <path class="edge" d="M850 545 L900 545"/>
+    <path class="policyEdge" d="M1130 545 C1200 545 1260 180 1325 172"/>
+    <path class="edge" d="M1015 593 L1015 625"/>
+    <path class="edge" d="M1015 625 C1025 760 760 760 755 283"/>
+    <path class="edge" d="M1325 661 C1235 661 1130 665 1130 665"/>
+    <path class="edge" d="M1545 545 C1590 520 1590 280 220 280" opacity="0.25"/>
+
+    <!-- Legend -->
+    <g transform="translate(70,975)">
+      <rect width="1380" height="44" rx="8" fill="rgba(15,23,42,.75)" stroke="#334155"/>
+      <circle cx="26" cy="22" r="5" fill="#22d3ee"/><text class="tiny" x="40" y="25">Gateway/Delivery</text>
+      <circle cx="176" cy="22" r="5" fill="#fb923c"/><text class="tiny" x="190" y="25">Events/Attention/Workers</text>
+      <circle cx="386" cy="22" r="5" fill="#a78bfa"/><text class="tiny" x="400" y="25">Memory/Governance</text>
+      <circle cx="566" cy="22" r="5" fill="#34d399"/><text class="tiny" x="580" y="25">Reasoning/Context/Pi</text>
+      <circle cx="776" cy="22" r="5" fill="#fb7185"/><text class="tiny" x="790" y="25">Policy/Evaluator/Executor</text>
+      <circle cx="1016" cy="22" r="5" fill="#fbbf24"/><text class="tiny" x="1030" y="25">Tools/Sandbox</text>
+      <circle cx="1176" cy="22" r="5" fill="#818cf8"/><text class="tiny" x="1190" y="25">Storage/Identity/Audit</text>
+    </g>
+  </svg>
+  </div>
+
+  <div class="cards">
+    <div class="card"><h3><span class="dot cyan"></span>How it works</h3><ul><li>• Gateway only adapts QQ/NapCat protocol.</li><li>• Ingestion writes raw events before reasoning.</li><li>• ContextPack includes visible memory and minimal identity data.</li><li>• Pi proposes; policy/executor decides and acts.</li></ul></div>
+    <div class="card"><h3><span class="dot rose"></span>Complex-case controls</h3><ul><li>• No mandatory group reply trigger.</li><li>• Suppressors downgrade risky or noisy actions.</li><li>• L0 policy excludes secrets and deleted memory.</li><li>• Tools require permissions, sandbox, audit, redaction.</li></ul></div>
+    <div class="card"><h3><span class="dot violet"></span>Recovery and governance</h3><ul><li>• Memory source links, revisions, supersede, rollback.</li><li>• Proposals/admin digest for high risk cases.</li><li>• Users can request deletion, opt-out, unlink.</li><li>• Owner/admin can inspect redacted traces and /why.</li></ul></div>
+  </div>
+  <div class="footer">Generated from LetheBot D1-D8 design docs. Open this file directly in a browser; no JavaScript required.</div>
+</div>
+</body>
+</html>
