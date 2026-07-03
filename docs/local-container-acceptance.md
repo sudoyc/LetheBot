@@ -2,6 +2,11 @@
 
 本文档用于本地启动 LetheBot + SnowLuma 双容器，验证容器构建、运行配置、健康检查，以及 SnowLuma OneBot WS 配置是否与 LetheBot 对齐。
 
+本仓库保留两套本地验收栈：
+
+- `docker-compose.local-acceptance.yml`：从 `../SnowLuma` 源码构建 SnowLuma，适合协议对接和开发调试。
+- `docker-compose.snowluma-framework.yml`：使用 SnowLuma Docker Framework 镜像，内置 Linux QQ、Xvfb、VNC/noVNC，适合扫码登录和真实 QQ 收发验收。
+
 ## 适用范围
 
 这个 compose 目标是本地验收，不是生产部署模板：
@@ -9,10 +14,11 @@
 - LetheBot 使用 `PI_PROVIDER=mock`，不会调用真实模型。
 - LetheBot 通过 `ONEBOT_TRANSPORT=ws` 连接 `ws://snowluma:3001/`。
 - SnowLuma 的 WebUI 暴露在 `http://localhost:5099`。
+- Framework 栈的 QQ 扫码桌面暴露在 `http://localhost:6081/`。
 - SnowLuma OneBot HTTP / WS 端口分别暴露在 `3000` / `3001`。
 - Compose 会把 SnowLuma 配置写到 `./data/snowluma-config`，把 LetheBot SQLite 写到 `./data/lethebot-local-acceptance.db`。
 
-注意：SnowLuma 的 OneBot adapter 是账号会话级的；没有可用 QQ / SnowLuma session 时，SnowLuma WebUI 可以启动，但 `3001` 不一定已经监听，LetheBot `/healthz` 可能显示 `adapter.ready=false`。完整 QQ 收发验收仍需要 SnowLuma 里有真实可用的账号会话。
+注意：SnowLuma 的 OneBot adapter 是账号会话级的；没有可用 QQ / SnowLuma session 时，SnowLuma WebUI 可以启动，但 `3001` 不一定已经监听，LetheBot `/healthz` 可能显示 `adapter.ready=false`。完整 QQ 收发验收请使用 Framework 栈并在 noVNC 里扫码登录 QQ。
 
 ## 前置条件
 
@@ -23,6 +29,8 @@
 Compose 文件通过 `../SnowLuma` 作为 SnowLuma build context；如果路径不同，需要编辑 `docker-compose.local-acceptance.yml` 中 `snowluma.build.context` 和 `dockerfile`。
 
 ## 启动
+
+### 源码构建栈（协议开发）
 
 首次构建并启动：
 
@@ -49,6 +57,56 @@ docker compose -f docker-compose.local-acceptance.yml down
 ```
 
 停止并删除镜像外的持久数据前，手动删除 `./data/snowluma-*` 和 `./data/lethebot-local-acceptance.db`。
+
+### Docker Framework 栈（扫码 / 真实 QQ 验收）
+
+启动完整验收栈：
+
+```bash
+docker compose -f docker-compose.snowluma-framework.yml up -d --build
+```
+
+访问：
+
+- QQ 扫码桌面：`http://localhost:6081/`
+- SnowLuma WebUI：`http://localhost:5099/`
+- LetheBot health：`http://localhost:6700/healthz`
+
+如果 noVNC 要求密码，使用 `VNC_PASSWD`。首次进入 SnowLuma WebUI 时，用
+`SNOWLUMA_WEBUI_BOOTSTRAP_PASSWORD` 登录并同意协议。QQ 扫码登录完成后，
+SnowLuma 才会为该账号启动 OneBot HTTP / WS adapter；登录前 `3000` / `3001`
+未监听、LetheBot health 显示 degraded 属于正常状态。
+
+默认值：
+
+```bash
+VNC_PASSWD=vncpasswd
+SNOWLUMA_WEBUI_BOOTSTRAP_PASSWORD=lethebot-local
+ONEBOT_TOKEN=lethebot-local-token
+```
+
+Framework 栈数据落在：
+
+- `./data/snowluma-framework-data`
+- `./data/snowluma-framework-qq-config`
+- `./data/snowluma-framework-qq-data`
+- `./data/lethebot-snowluma-framework.db`
+
+如需强制重置 OneBot token 配置：
+
+```bash
+SNOWLUMA_FRAMEWORK_OVERWRITE_ONEBOT_CONFIG=1 \
+ONEBOT_TOKEN=lethebot-local-token \
+docker compose -f docker-compose.snowluma-framework.yml up -d snowluma lethebot
+```
+
+如需强制重置 SnowLuma WebUI 访问令牌：
+
+```bash
+SNOWLUMA_FRAMEWORK_OVERWRITE_WEBUI_CONFIG=1 \
+SNOWLUMA_WEBUI_BOOTSTRAP_PASSWORD=lethebot-local \
+docker compose -f docker-compose.snowluma-framework.yml up -d snowluma
+```
 
 ## 默认本地配置
 

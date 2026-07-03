@@ -1,0 +1,79 @@
+name: lethebot-snowluma-framework
+
+services:
+  snowluma:
+    image: ${SNOWLUMA_FRAMEWORK_IMAGE:-motricseven7/snowluma:latest}
+    restart: unless-stopped
+    shm_size: 1gb
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      VNC_PASSWD: "${VNC_PASSWD:-vncpasswd}"
+      SNOWLUMA_UID: "${SNOWLUMA_UID:-1000}"
+      SNOWLUMA_GID: "${SNOWLUMA_GID:-1000}"
+      SNOWLUMA_WEBUI_BOOTSTRAP_PASSWORD: "${SNOWLUMA_WEBUI_BOOTSTRAP_PASSWORD:-lethebot-local}"
+      SNOWLUMA_WEBUI_PORT: "5099"
+      SNOWLUMA_LOG_LEVEL: "${SNOWLUMA_LOG_LEVEL:-info}"
+      SNOWLUMA_SCREEN: "${SNOWLUMA_SCREEN:-1920x1080x24}"
+      SNOWLUMA_HOOK_AUTOLOAD: "${SNOWLUMA_HOOK_AUTOLOAD:-1}"
+      SNOWLUMA_EXTRA_QQ_HOMES: "${SNOWLUMA_EXTRA_QQ_HOMES:-}"
+      SNOWLUMA_QQ_FLAGS: "${SNOWLUMA_QQ_FLAGS:---disable-gpu --disable-software-rasterizer --disable-gpu-compositing}"
+      SNOWLUMA_FRAMEWORK_OVERWRITE_ONEBOT_CONFIG: "${SNOWLUMA_FRAMEWORK_OVERWRITE_ONEBOT_CONFIG:-0}"
+      SNOWLUMA_FRAMEWORK_OVERWRITE_WEBUI_CONFIG: "${SNOWLUMA_FRAMEWORK_OVERWRITE_WEBUI_CONFIG:-0}"
+      ONEBOT_TOKEN: "${ONEBOT_TOKEN:-lethebot-local-token}"
+      TZ: "${TZ:-Asia/Tokyo}"
+    command: ["bash", "/usr/local/bin/snowluma-framework-entrypoint.sh"]
+    volumes:
+      - ./data/snowluma-framework-data:/app/snowluma-data
+      - ./data/snowluma-framework-qq-config:/app/.config
+      - ./data/snowluma-framework-qq-data:/app/.local/share
+      - ./docker/snowluma-framework/entrypoint.sh:/usr/local/bin/snowluma-framework-entrypoint.sh:ro
+    ports:
+      - "5900:5900"
+      - "6081:6081"
+      - "5099:5099"
+      - "3000:3000"
+      - "3001:3001"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:5099/').then(() => process.exit(0)).catch(() => process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  lethebot:
+    image: lethebot/lethebot-local-acceptance:latest
+    build:
+      context: .
+      dockerfile: docker/local-acceptance/lethebot.Dockerfile
+    depends_on:
+      snowluma:
+        condition: service_healthy
+    environment:
+      NODE_ENV: "production"
+      LOG_LEVEL: "info"
+      LETHEBOT_TEST: "false"
+      LETHEBOT_DB_PATH: "/app/data/lethebot-snowluma-framework.db"
+      PI_PROVIDER: "mock"
+      PI_MODEL: "mock"
+      ONEBOT_TRANSPORT: "ws"
+      ONEBOT_WS_URL: "ws://snowluma:3001/"
+      ONEBOT_HTTP_URL: "http://snowluma:3000"
+      ONEBOT_TOKEN: "${ONEBOT_TOKEN:-lethebot-local-token}"
+      LETHEBOT_BOT_QQ_ID: "${LETHEBOT_BOT_QQ_ID:-}"
+      LETHEBOT_PORT: "6700"
+      LETHEBOT_HOST: "0.0.0.0"
+      LETHEBOT_HEALTH_PATH: "/healthz"
+      LETHEBOT_EVENT_PATH: "/onebot/event"
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "6700:6700"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:6700/healthz').then(() => process.exit(0)).catch(() => process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
