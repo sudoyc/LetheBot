@@ -44,6 +44,11 @@ Typical fields:
 The current display name/group card is conversation participant context.
 
 Nickname/group-card history is bounded display metadata. It is useful for identity continuity, debug, and audit, but it is not ordinary semantic memory and should not be injected into normal prompts by default.
+Secret-like values and QQ/platform-ID-like values observed inside platform
+provided nicknames/group cards are redacted by the gateway before emitting
+`senderDisplayName` / `senderCard` into normalized raw events, and the same
+redacted text is written to `display_profiles` / `nickname_history`; raw event
+retention remains the audit source and is governed separately.
 
 ### 3. User Memory
 
@@ -130,6 +135,8 @@ participant_display:
 ```
 
 Display names are untrusted user-provided text. Treat them as data, not instructions.
+Persisted display-profile/history rows store redacted display text when the
+platform value contains credential-shaped or platform-ID-shaped substrings.
 
 Nickname history should be bounded:
 

@@ -38,6 +38,7 @@ LETHEBOT_RAW_EVENT_RETENTION_DAYS=90
 LETHEBOT_CHAT_MESSAGE_RETENTION_DAYS=90
 LETHEBOT_AUDIT_LOG_RETENTION_DAYS=90
 LETHEBOT_DISABLED_DELETED_MEMORY_RETENTION_DAYS=365
+LETHEBOT_EVENT_PROCESSING_FAILURE_RETENTION_DAYS=90
 
 # Pi runtime（src/index.ts 使用这些变量）
 PI_PROVIDER=openai
@@ -58,6 +59,8 @@ LETHEBOT_BOT_QQ_ID=<bot-qq-id>
 LETHEBOT_PORT=6700
 LETHEBOT_HOST=0.0.0.0
 LETHEBOT_HEALTH_PATH=/healthz
+LETHEBOT_READINESS_PATH=/readyz
+LETHEBOT_METRICS_PATH=/metrics
 LETHEBOT_EVENT_PATH=/onebot/event
 ```
 
@@ -156,6 +159,10 @@ pnpm cli redact-display-profile <canonical-user-id>
 ## 监控和日志
 
 日志输出到 stdout（JSON/pino 格式），可通过 Loki、journald、PM2 logs 等收集。
+运行日志在写出前会经过结构化 redaction hook：secret-like 文本、
+QQ/platform-ID-like 文本、平台 ID 数字字段、Error message/stack 都会被
+脱敏。legacy/free-text 中经由非字母数字分隔符嵌入的
+`legacy_qq-...` / `legacy_123456789` 形态也按 platform ID 脱敏。
 
 关注字段：
 
@@ -215,6 +222,13 @@ curl -X POST http://localhost:3000/get_login_info \
 - SnowLuma reverse HTTP event URL 是否指向 LetheBot 的 `LETHEBOT_EVENT_PATH`。
 - `LETHEBOT_BOT_QQ_ID` 是否为机器人自己的 QQ 号。
 - LetheBot `/healthz` 中 `checks.database.ok` 和 `checks.adapter.ready` 是否为 true。
+
+`pnpm verify:onebot` 和 deployment verification 输出会在显示前脱敏
+secret-like 文本、token presence、QQ/platform-ID-like 文本，以及经由非字母数字
+分隔符嵌入 legacy/free-text URL 或 OneBot API message 的
+`legacy_qq-...` / `legacy_123456789` 形态。相邻的 `sk-...-qq-...` 片段会保留
+secret 与 platform 两类 redaction marker，但不会显示原始值。真实 token、QQ 号和群号
+仍不要复制到 issue、日志摘录或验收记录中。
 
 ### 数据库锁定错误
 

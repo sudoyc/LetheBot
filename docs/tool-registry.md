@@ -155,6 +155,18 @@ P0 tools should record at least `summary`. `none` is reserved for future extreme
 
 `redacted_full` records structured input/output with field-level redaction.
 
+Repository-backed `tool_calls` rows use the same defensive posture: before
+persistence, structured tool input/output payload keys and values plus
+error diagnostics are scanned for secret-like and QQ/platform-ID-like text.
+ID-shaped numeric values are redacted when they sit under ID fields such as
+`userId`, `senderIds`, `targetUserId`, `recipientGroupIds`, `group_id`, or
+`platformMessageId`. The row's `secrets_redacted` flag is set when this final
+guard changes stored data. Adjacent secret/platform fragments such as
+`sk-...-qq-...` use a marker-preserving platform-before-secret-after-platform
+ordering so both marker classes remain visible without storing raw values.
+Assignment-shaped fragments such as `api_key=sk-...-qq-...` follow the same
+marker-preserving rule for structured keys, values, and error diagnostics.
+
 `full` is only for owner/admin debug or local experiment mode, should have short retention, must not enter ordinary prompt/retrieval, and still passes secret scanning.
 
 `credential_access` must never use `full` for secret values.
@@ -205,3 +217,13 @@ Initial output sensitivity values:
 - `secret_possible`
 
 `secret_possible` outputs must be scanned before audit, memory proposal, or prompt injection.
+For `network_request`, this includes response bodies, response headers,
+response `statusText`, and thrown network error messages before the handler
+returns them to Pi/tool-call callers. Adjacent secret/platform fragments such as
+`sk-...-qq-...` must preserve both redaction marker classes without exposing the
+raw combined value.
+For file-operation tools, this includes read-file content, output paths,
+directory entry names/paths, audit summaries, validation reasons, and filesystem
+error messages before the handler result can feed audit or prompt paths.
+Adjacent secret/platform fragments in file contents or filenames must preserve
+both marker classes without exposing raw values.

@@ -13,6 +13,7 @@ This is a conceptual model for the first implementation. Exact schemas can chang
 - `identity_links`
 - `display_profiles`
 - `nickname_history`
+- `privacy_preferences`
 - `identity_tombstones`
 
 These tables separate QQ identifiers from LetheBot internal user IDs.
@@ -21,10 +22,19 @@ Raw QQ IDs, group IDs, and account IDs are operational identity data. They are n
 
 `canonical_user_id` is the owner key for user memory. Platform account IDs are mapping keys for routing, permissions, identity disambiguation, and audit.
 
+`privacy_preferences` stores durable user opt-outs such as `proactive_dm`
+and `memory_association`. These preferences are governance state, not prompt
+memory. They are enforced by action execution and memory proposal paths and
+are inspectable through owner/admin CLI. Preference `reason` text is persisted
+only after deterministic secret/platform-ID redaction; raw operator notes with
+credentials or QQ-like identifiers must not be stored as ordinary reason or
+audit-detail content.
+
 ### Events
 
 - `raw_events`
 - `chat_messages`
+- `event_processing_failures`
 - `agent_runs`
 - `agent_events`
 - `evaluator_decisions`
@@ -34,6 +44,9 @@ Raw QQ IDs, group IDs, and account IDs are operational identity data. They are n
 - `audit_log`
 
 Raw events are the audit foundation. Derived tables can be rebuilt from them when possible.
+`event_processing_failures` stores durable, redacted failure observability for
+async event handling using internal IDs and hashes only; it must not store raw
+platform IDs, message text, display names, or raw error strings.
 
 ### Memory
 
@@ -49,38 +62,38 @@ Raw events are the audit foundation. Derived tables can be rebuilt from them whe
 ```sql
 CREATE TABLE memory_records (
   id TEXT PRIMARY KEY,
-  
+
   -- Ownership
   scope TEXT NOT NULL CHECK(scope IN ('global', 'user', 'group', 'conversation', 'tool', 'system')),
   canonical_user_id TEXT,
   group_id TEXT,
   conversation_id TEXT,
   subject_user_id TEXT,
-  
+
   -- Boundaries
   visibility TEXT NOT NULL CHECK(visibility IN ('private_only', 'same_user_any_context', 'same_group_only', 'owner_admin_only', 'public')),
   sensitivity TEXT NOT NULL CHECK(sensitivity IN ('normal', 'personal', 'sensitive', 'secret', 'prohibited')),
   authority TEXT NOT NULL CHECK(authority IN ('user_stated', 'inferred', 'tool_derived', 'system')),
-  
+
   -- Content
   kind TEXT NOT NULL CHECK(kind IN ('preference', 'fact', 'constraint', 'summary', 'reflection', 'procedure')),
   title TEXT NOT NULL,
   content TEXT NOT NULL,
-  
+
   -- Lifecycle
-  state TEXT NOT NULL CHECK(state IN ('proposed', 'active', 'superseded', 'disabled', 'deleted')),
+  state TEXT NOT NULL CHECK(state IN ('proposed', 'active', 'rejected', 'superseded', 'disabled', 'deleted')),
   confidence REAL NOT NULL DEFAULT 0.5 CHECK(confidence >= 0 AND confidence <= 1),
   importance REAL NOT NULL DEFAULT 0.5 CHECK(importance >= 0 AND importance <= 1),
-  
+
   -- Provenance
   source_context TEXT,
   evaluator_decision_id TEXT,
-  
+
   -- Timestamps
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   expires_at INTEGER,
-  
+
   -- Indexes for retrieval
   FOREIGN KEY (canonical_user_id) REFERENCES canonical_users(id),
   FOREIGN KEY (group_id) REFERENCES platform_groups(id)
@@ -209,4 +222,3 @@ Display metadata such as nickname/group-card history can use:
 - `deleted`
 
 Display tombstones may be retained to prevent deleted data from being rebuilt, but tombstones do not enter prompt or retrieval.
-

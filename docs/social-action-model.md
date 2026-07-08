@@ -61,6 +61,30 @@ interface ActionPlan {
 
 `suppressors[]` records why an action was downgraded or skipped. This is necessary for tuning and `/why` explanations.
 
+Cooldown suppressors are local control evidence. Repository persistence preserves
+valid internal keys such as `cooldown:group:qq-group-12345:reply_short` and the
+matching `constraints.cooldownKey` so cooldown debugging and exact owner/admin
+lookup keep working. Ordinary narrative suppressor text and action reasons are
+still storage-redacted for secret-like and QQ/platform-ID-like substrings before
+being written to `action_decisions`. Adjacent secret/platform fragments such as
+`sk-...-qq-...` use marker-preserving storage redaction, so both secret and
+platform marker classes remain visible without persisting raw values.
+Assignment-shaped fragments such as `api_key=sk-...-qq-...` follow the same
+marker-preserving rule for action reasons, ordinary suppressors, and structured
+action payload keys/values before persistence or owner/admin inspection.
+
+Action execution failures are diagnostics, not ordinary conversation content.
+When reply or `dm_user` delivery fails, the executor must redact secret-like and
+QQ/platform-ID-like substrings from the returned error and from persisted
+`action_executions.error_message`, including platform identifiers embedded after
+non-alphanumeric separators in adapter-provided legacy/free-text errors. The
+same marker-preserving boundary applies when the adjacent platform fragment is
+inside an assignment-shaped secret such as `api_key=sk-...-qq-...`; the
+assignment marker and platform marker both remain visible while raw values are
+omitted. The
+same marker-preserving adjacent secret/platform redaction applies to persisted
+execution downgrade reasons, diagnostic codes/messages, and audit entries.
+
 ## Trigger Score and Suppressors
 
 Group chat uses weighted triggers plus suppressors:

@@ -52,6 +52,20 @@ Recommended order:
 9. User's latest message.
 
 Participant display names and group cards are untrusted data. Inject them as structured fields, not as instructions.
+The Pi prompt adapter currently renders participant display names, participant
+group cards, and recent-message display names as quoted data fields such as
+`display_name="..."`, `group_card="..."`, and
+`sender_display_name="..."`, with newline/control-context delimiters neutralized
+and secret-like / platform-ID-like substrings redacted before prompt injection.
+Assignment-shaped adjacent display metadata such as `api_key=sk-...-qq-...`
+preserves both `[REDACTED:api_key_assignment]` and `[REDACTED:platform_id]`
+markers in the rendered prompt labels without exposing raw values.
+Participant platform role is rendered as bounded structured metadata such as
+`role=admin`; the actual user message text remains message content, while
+display names and group cards are labels only.
+`ContextBuilder` can now carry already-resolved group participant context into
+the `ContextPack`; it does not query full member lists or platform account
+tables by default.
 
 ## Identity Injection
 
@@ -92,6 +106,16 @@ Context Orchestrator must enforce memory boundary fields before prompt assembly:
 - exclude `secret` and `prohibited` content from ordinary prompts;
 - include source and memory IDs in trace records, not necessarily in the prompt.
 
+- store only redacted narrative trace metadata: rejected reasons, applied filter
+  strings, injected identity-field labels, memory titles, and memory source
+  context are final-guard redacted before `context_traces` insertion; exact
+  local lookup IDs remain raw in SQLite for owner/admin debugging and are
+  display-redacted by `/why`/CLI output. Adjacent secret/platform fragments such
+  as `sk-...-qq-...`, including assignment-shaped metadata such as
+  `api_key=sk-...-qq-...`, use marker-preserving storage redaction, so both
+  secret and platform marker classes remain visible without persisting raw
+  values.
+
 Medium-risk memories may influence a turn only when visibility is conservative and the current context allows it.
 
 ## Budgeting
@@ -104,6 +128,33 @@ Use separate budgets:
 - Recent messages: adaptive.
 - Retrieved memory: adaptive.
 - Tool results: bounded per tool.
+
+Current `ContextBuilder` token-budget evidence estimates the prompt-rendered
+recent-message shape (`sender_display_name=...`, optional `message_text`),
+selected-memory context preamble shape (profile/relevant-fact headings, memory
+titles, and memory content), and the actual structured identity fields injected
+for the turn (`conversation_id`, `conversation_type`, optional `group_id`,
+optional `target_user_ref`, and optional `participant_context`). For group
+participant context, budgeting follows the current Pi prompt adapter's
+participant line shape (`display_name=...`, optional `group_card=...`, optional
+`role=...`, plus owner/admin/trusted flags) rather than leaving these as
+placeholder constants. `tokenBudget.promptLayers` now records per-layer
+renderer/estimate evidence:
+
+- `recent_messages@pi-prompt-recent-message-v2`
+- `memory_context@pi-prompt-memory-context-v2`
+- `identity_fields@context-builder-identity-fields-v2`
+- `participant_context@pi-prompt-participant-context-v2`
+- `system_prompt_estimate@bounded-system-estimate-v1`
+
+The layer token counts sum to `tokenBudget.used`; `identity_fields` and
+`participant_context` sum to the identity breakdown. `/why` prints this prompt
+layer summary for rebuilt traces, and durable `context_traces.token_budget`
+keeps the layer evidence with final-guard redaction for layer names and
+versions, including marker-preserving adjacent secret/platform and
+assignment-shaped adjacent redaction. The system layer remains a bounded
+estimate, but it is now explicitly versioned instead of being an undocumented
+constant.
 
 The orchestrator should prefer high-confidence profile facts over low-confidence semantic matches.
 
@@ -122,4 +173,3 @@ Each turn should record:
 - Identity fields included and why.
 - Visibility/sensitivity filters applied.
 - Suppressors that caused no reply or action downgrade.
-
