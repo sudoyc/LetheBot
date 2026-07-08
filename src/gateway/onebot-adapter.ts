@@ -7,6 +7,7 @@
 import { EventEmitter } from 'node:events';
 import type { IncomingHttpHeaders } from 'node:http';
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { redactSecretsInText } from '../memory/secret-scan';
 import type { MessageContent, MessageTarget } from './adapter';
 import type {
   ChatMessageReceived,
@@ -63,6 +64,7 @@ export interface OneBotSegment {
 export interface OneBotMessage {
   post_type: 'message' | 'message_sent' | 'notice' | 'request' | 'meta_event';
   message_type?: 'private' | 'group';
+  sub_type?: unknown;
   message_id?: number | string;
   user_id?: number | string;
   group_id?: number | string;
@@ -207,9 +209,13 @@ export class OneBotAdapter extends EventEmitter {
   /**
    * 处理来自 OneBot runtime 的事件。
    */
-  handleHttpEvent(body: OneBotMessage): boolean {
+  handleHttpEvent(body: unknown): boolean {
     try {
-      const internalEvent = this.convertToInternalEvent(body);
+      if (!this.isRecord(body)) {
+        return false;
+      }
+
+      const internalEvent = this.convertToInternalEvent(body as unknown as OneBotMessage);
       if (!internalEvent) {
         return false;
       }
@@ -218,12 +224,10 @@ export class OneBotAdapter extends EventEmitter {
       this.emit('message', internalEvent);
       return true;
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown OneBot event error';
-      this.lastError = message;
-      console.error('Failed to handle OneBot event:', error);
-      if (this.listenerCount('error') > 0) {
-        this.emit('error', error instanceof Error ? error : new Error(message));
-      }
+      const redactedMessage = this.toRedactedDiagnosticMessage(error, 'Unknown OneBot event error');
+      this.lastError = redactedMessage;
+      console.error('Failed to handle OneBot event:', this.formatRedactedConsoleDiagnostic(error, 'Unknown OneBot event error'));
+      this.emitError(error);
       return false;
     }
   }
@@ -240,11 +244,19 @@ export class OneBotAdapter extends EventEmitter {
       return null;
     }
 
-    const platformMessageId = this.normalizeMessageId(msg.message_id ?? Date.now());
-    const senderPlatformId = msg.user_id ?? msg.sender?.user_id ?? 'unknown';
+    if (!this.isSupportedMessageSubtype(msg.message_type, msg.sub_type)) {
+      return null;
+    }
+
+    const platformMessageId = this.normalizeMessageId(
+      this.normalizeTopLevelId(msg.message_id) ?? this.createLocalMessageId()
+    );
+    const senderPlatformId = this.normalizeTopLevelId(msg.user_id)
+      ?? this.normalizeTopLevelId(msg.sender?.user_id)
+      ?? 'unknown';
     const senderId = this.normalizeUserId(senderPlatformId);
     const parsed = this.parseMessageContent(msg.message, msg.raw_message);
-    const timestamp = msg.time ? new Date(msg.time * 1000) : new Date();
+    const timestamp = this.normalizeTimestamp(msg.time);
 
     if (msg.message_type === 'private') {
       const conversationId = `private:${senderId}`;
@@ -260,7 +272,7 @@ export class OneBotAdapter extends EventEmitter {
           conversationId,
           conversationType: 'private',
           senderId,
-          senderDisplayName: this.normalizeOptional(msg.sender?.nickname),
+          senderDisplayName: this.normalizeDisplayMetadata(msg.sender?.nickname),
           content: {
             text: parsed.text,
             media: parsed.media,
@@ -274,9 +286,9 @@ export class OneBotAdapter extends EventEmitter {
       };
     }
 
-    const groupId = this.normalizeGroupId(msg.group_id ?? 'unknown');
-    const senderCard = this.normalizeOptional(msg.sender?.card);
-    const senderDisplayName = senderCard ?? this.normalizeOptional(msg.sender?.nickname);
+    const groupId = this.normalizeGroupId(this.normalizeTopLevelId(msg.group_id) ?? 'unknown');
+    const senderCard = this.normalizeDisplayMetadata(msg.sender?.card);
+    const senderDisplayName = senderCard ?? this.normalizeDisplayMetadata(msg.sender?.nickname);
     return {
       id: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
       type: 'chat.message.received',
@@ -314,21 +326,33 @@ export class OneBotAdapter extends EventEmitter {
       return this.parseSegmentArray(message);
     }
 
-    const raw = typeof message === 'string' ? message : rawMessage ?? '';
-    return this.parseCqString(raw);
+    if (typeof message === 'string') {
+      return this.parseCqString(message);
+    }
+
+    if (typeof rawMessage === 'string') {
+      return this.parseCqString(rawMessage);
+    }
+
+    return this.emptyParsedContent();
   }
 
   private parseSegmentArray(segments: OneBotSegment[]): ParsedMessageContent {
     const parsed = this.emptyParsedContent();
     const textParts: string[] = [];
 
-    for (const segment of segments) {
-      if (segment.type === 'text') {
-        textParts.push(this.decodeCqValue(this.stringifySegmentData(segment.data, 'text')));
+    for (const segment of segments as unknown[]) {
+      if (!this.isOneBotSegment(segment)) {
         continue;
       }
 
-      this.applyStructuredSegment(segment.type, segment.data ?? {}, parsed);
+      const data = this.segmentDataRecord(segment.data);
+      if (segment.type === 'text') {
+        textParts.push(this.decodeCqValue(this.stringifySegmentString(data, 'text')));
+        continue;
+      }
+
+      this.applyStructuredSegment(segment.type, data, parsed);
     }
 
     return {
@@ -369,13 +393,25 @@ export class OneBotAdapter extends EventEmitter {
     };
   }
 
+  private isOneBotSegment(segment: unknown): segment is OneBotSegment {
+    return this.isRecord(segment) && typeof segment.type === 'string';
+  }
+
+  private segmentDataRecord(data: unknown): Record<string, unknown> {
+    return this.isRecord(data) ? data : {};
+  }
+
+  private isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+  }
+
   private applyStructuredSegment(
     type: string,
     data: Record<string, unknown>,
     parsed: ParsedMessageContent,
   ): void {
     if (type === 'at') {
-      const qq = this.stringifySegmentData(data, 'qq');
+      const qq = this.stringifySegmentId(data, 'qq', { allowAll: true });
       if (qq) {
         parsed.mentions.push(this.normalizeUserId(qq));
       }
@@ -383,7 +419,7 @@ export class OneBotAdapter extends EventEmitter {
     }
 
     if (type === 'reply') {
-      const id = this.stringifySegmentData(data, 'id');
+      const id = this.stringifySegmentId(data, 'id', { allowInternalBotMessageId: true });
       if (id) {
         const messageId = this.normalizeMessageId(id);
         parsed.replyToMessageId = messageId;
@@ -399,7 +435,7 @@ export class OneBotAdapter extends EventEmitter {
     if (mediaType) {
       parsed.media.push({
         type: mediaType,
-        url: this.normalizeOptional(this.stringifySegmentData(data, 'url')),
+        url: this.normalizeMediaUrl(this.stringifySegmentString(data, 'url')),
       });
     }
   }
@@ -433,15 +469,41 @@ export class OneBotAdapter extends EventEmitter {
       .replace(/&amp;/g, '&');
   }
 
-  private stringifySegmentData(data: Record<string, unknown> | undefined, key: string): string {
+  private stringifySegmentId(
+    data: Record<string, unknown> | undefined,
+    key: string,
+    options: { allowAll?: boolean; allowInternalBotMessageId?: boolean } = {},
+  ): string {
     const value = data?.[key];
-    if (typeof value === 'string') {
-      return value;
-    }
-    if (typeof value === 'number' || typeof value === 'boolean') {
+    if (this.isPositiveIntegerId(value)) {
       return String(value);
     }
+
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (!trimmed) {
+        return '';
+      }
+
+      if (/^\d+$/.test(trimmed) || /^qq-\d+$/.test(trimmed)) {
+        return trimmed;
+      }
+
+      if (options.allowInternalBotMessageId && /^qq-bot-\d+$/.test(trimmed)) {
+        return trimmed;
+      }
+
+      if (options.allowAll && (trimmed === 'all' || trimmed === 'qq-all')) {
+        return trimmed;
+      }
+    }
+
     return '';
+  }
+
+  private stringifySegmentString(data: Record<string, unknown> | undefined, key: string): string {
+    const value = data?.[key];
+    return typeof value === 'string' ? value : '';
   }
 
   private mapMediaType(type: string): MediaAttachment['type'] | null {
@@ -553,8 +615,10 @@ export class OneBotAdapter extends EventEmitter {
       this.lastError = undefined;
       return result.data;
     } catch (error) {
-      this.lastError = error instanceof Error ? error.message : 'Unknown OneBot API error';
-      throw error;
+      const message = error instanceof Error ? error.message : 'Unknown OneBot API error';
+      const redactedMessage = this.redactDiagnosticText(message);
+      this.lastError = redactedMessage;
+      throw new Error(redactedMessage);
     }
   }
 
@@ -576,8 +640,17 @@ export class OneBotAdapter extends EventEmitter {
     try {
       socket.send(JSON.stringify({ action, params, echo }));
     } catch (error) {
-      this.rejectPendingWsRequest(echo, error);
-      throw error;
+      const pending = this.pendingWsRequests.get(echo);
+      if (pending) {
+        clearTimeout(pending.timeout);
+        this.pendingWsRequests.delete(echo);
+      }
+      const message = error instanceof Error
+        ? error.message
+        : `OneBot WebSocket API send failed: ${action}`;
+      const redactedMessage = this.redactDiagnosticText(message);
+      this.lastError = redactedMessage;
+      throw new Error(redactedMessage);
     }
 
     try {
@@ -586,12 +659,18 @@ export class OneBotAdapter extends EventEmitter {
       this.lastError = undefined;
       return result.data;
     } catch (error) {
-      this.lastError = error instanceof Error ? error.message : 'Unknown OneBot WebSocket API error';
-      throw error;
+      const message = error instanceof Error ? error.message : 'Unknown OneBot WebSocket API error';
+      const redactedMessage = this.redactDiagnosticText(message);
+      this.lastError = redactedMessage;
+      throw new Error(redactedMessage);
     }
   }
 
-  private assertApiOk(result: OneBotApiResponse): void {
+  private assertApiOk(result: unknown): asserts result is OneBotApiResponse {
+    if (!this.isRecord(result)) {
+      throw new Error('OneBot API error: Unknown error');
+    }
+
     if (result.status !== 'ok' && result.retcode !== 0) {
       const message = this.extractApiErrorMessage(result);
       throw new Error(`OneBot API error: ${message}`);
@@ -600,10 +679,10 @@ export class OneBotAdapter extends EventEmitter {
 
   private extractApiErrorMessage(result: OneBotApiResponse): string {
     if (typeof result.message === 'string') {
-      return result.message;
+      return this.redactDiagnosticText(result.message);
     }
     if (typeof result.wording === 'string') {
-      return result.wording;
+      return this.redactDiagnosticText(result.wording);
     }
     return 'Unknown error';
   }
@@ -633,7 +712,7 @@ export class OneBotAdapter extends EventEmitter {
       socket.addEventListener('error', (event) => this.handleWebSocketError(event));
       socket.addEventListener('close', (event) => this.handleWebSocketClose(event));
     } catch (error) {
-      this.lastError = error instanceof Error ? error.message : 'Failed to open OneBot WebSocket';
+      this.lastError = this.toRedactedDiagnosticMessage(error, 'Failed to open OneBot WebSocket');
       this.emitError(error);
       this.scheduleReconnect();
     }
@@ -647,7 +726,7 @@ export class OneBotAdapter extends EventEmitter {
       try {
         socket.close(1000, 'LetheBot shutdown');
       } catch (error) {
-        this.lastError = error instanceof Error ? error.message : 'Failed to close OneBot WebSocket';
+        this.lastError = this.toRedactedDiagnosticMessage(error, 'Failed to close OneBot WebSocket');
       }
     }
     this.rejectAllPendingWsRequests(new Error('OneBot WebSocket closed'));
@@ -671,7 +750,7 @@ export class OneBotAdapter extends EventEmitter {
     try {
       parsed = JSON.parse(text);
     } catch (error) {
-      this.lastError = error instanceof Error ? error.message : 'Invalid OneBot WebSocket JSON';
+      this.lastError = this.toRedactedDiagnosticMessage(error, 'Invalid OneBot WebSocket JSON');
       this.emitError(error);
       return;
     }
@@ -680,12 +759,13 @@ export class OneBotAdapter extends EventEmitter {
       return;
     }
 
-    if (parsed.echo !== undefined && this.resolvePendingWsResponse(parsed)) {
+    if (typeof parsed.post_type === 'string') {
+      this.handleHttpEvent(parsed as unknown as OneBotMessage);
       return;
     }
 
-    if (typeof parsed.post_type === 'string') {
-      this.handleHttpEvent(parsed as unknown as OneBotMessage);
+    if (parsed.echo !== undefined && this.resolvePendingWsResponse(parsed)) {
+      return;
     }
   }
 
@@ -706,7 +786,7 @@ export class OneBotAdapter extends EventEmitter {
     const error = event.error instanceof Error
       ? event.error
       : new Error('OneBot WebSocket error');
-    this.lastError = error.message;
+    this.lastError = this.redactDiagnosticText(error.message);
     this.emitError(error);
   }
 
@@ -717,7 +797,7 @@ export class OneBotAdapter extends EventEmitter {
     const reason = typeof event.reason === 'string' && event.reason
       ? event.reason
       : 'OneBot WebSocket closed';
-    this.lastError = reason;
+    this.lastError = this.redactDiagnosticText(reason);
 
     if (!this.manuallyClosed && this.ready) {
       this.scheduleReconnect();
@@ -742,17 +822,6 @@ export class OneBotAdapter extends EventEmitter {
     }
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
-  }
-
-  private rejectPendingWsRequest(echo: string, error: unknown): void {
-    const pending = this.pendingWsRequests.get(echo);
-    if (!pending) {
-      return;
-    }
-
-    clearTimeout(pending.timeout);
-    this.pendingWsRequests.delete(echo);
-    pending.reject(error instanceof Error ? error : new Error('OneBot WebSocket request failed'));
   }
 
   private rejectAllPendingWsRequests(error: Error): void {
@@ -787,18 +856,37 @@ export class OneBotAdapter extends EventEmitter {
     if (this.listenerCount('error') === 0) {
       return;
     }
-    this.emit('error', error instanceof Error ? error : new Error(String(error)));
+    const message = error instanceof Error ? error.message : String(error);
+    this.emit('error', new Error(this.redactDiagnosticText(message)));
+  }
+
+  private toRedactedDiagnosticMessage(error: unknown, fallback: string): string {
+    const message = error instanceof Error ? error.message : fallback;
+    return this.redactDiagnosticText(message);
+  }
+
+  private formatRedactedConsoleDiagnostic(error: unknown, fallback: string): string {
+    const message = this.toRedactedDiagnosticMessage(error, fallback);
+    if (!(error instanceof Error)) {
+      return message;
+    }
+
+    return JSON.stringify({
+      name: this.redactDiagnosticText(error.name || 'Error'),
+      message,
+      ...(error.stack ? { stack: '[REDACTED:stack]' } : {}),
+    });
   }
 
   private extractSentMessageId(data: unknown): string {
     if (this.isRecord(data)) {
-      const messageId = data.message_id;
-      if (typeof messageId === 'string' || typeof messageId === 'number') {
-        return this.normalizeMessageId(messageId);
+      const messageId = this.normalizeOutboundMessageId(data.message_id);
+      if (messageId) {
+        return messageId;
       }
     }
 
-    return `qq-sent-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    return this.createSentMessageId();
   }
 
   private getHeader(headers: AuthHeaders, name: string): string | undefined {
@@ -837,6 +925,66 @@ export class OneBotAdapter extends EventEmitter {
     return text.startsWith('qq-group-') ? text : `qq-group-${text}`;
   }
 
+  private normalizeTopLevelId(value: unknown): number | string | undefined {
+    if (this.isPositiveIntegerId(value)) {
+      return value;
+    }
+
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (!trimmed) {
+        return undefined;
+      }
+
+      if (/^\d+$/.test(trimmed) || /^qq-\d+$/.test(trimmed) || /^qq-group-\d+$/.test(trimmed)) {
+        return trimmed;
+      }
+    }
+
+    return undefined;
+  }
+
+  private normalizeOutboundMessageId(value: unknown): string | undefined {
+    if (this.isPositiveIntegerId(value)) {
+      return this.normalizeMessageId(value);
+    }
+
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (/^\d+$/.test(trimmed) || /^qq-\d+$/.test(trimmed)) {
+        return this.normalizeMessageId(trimmed);
+      }
+    }
+
+    return undefined;
+  }
+
+  private isPositiveIntegerId(value: unknown): value is number {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+  }
+
+  private createLocalMessageId(): string {
+    return `local-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  }
+
+  private createSentMessageId(): string {
+    return `qq-sent-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  }
+
+  private normalizeTimestamp(value: unknown): Date {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      return new Date();
+    }
+
+    const milliseconds = value * 1000;
+    if (!Number.isFinite(milliseconds)) {
+      return new Date();
+    }
+
+    const timestamp = new Date(milliseconds);
+    return Number.isFinite(timestamp.getTime()) ? timestamp : new Date();
+  }
+
   private stripUserPrefix(value: string): string {
     return value.startsWith('qq-') ? value.slice('qq-'.length) : value;
   }
@@ -857,22 +1005,86 @@ export class OneBotAdapter extends EventEmitter {
   private toOneBotNumericId(value: string, prefix: string, label: string): number {
     const stripped = value.startsWith(prefix) ? value.slice(prefix.length) : value;
     if (!/^\d+$/.test(stripped)) {
-      throw new Error(`Invalid OneBot ${label}: expected ${prefix}<numeric-id>`);
+      throw new Error(`Invalid OneBot ${label}: expected ${prefix}<positive-safe-integer-id>`);
     }
 
-    return Number(stripped);
+    const numeric = Number(stripped);
+    if (!Number.isSafeInteger(numeric) || numeric <= 0) {
+      throw new Error(`Invalid OneBot ${label}: expected ${prefix}<positive-safe-integer-id>`);
+    }
+
+    return numeric;
   }
 
-  private normalizeSenderRole(role: string | undefined): 'member' | 'admin' | 'owner' | undefined {
+  private normalizeSenderRole(role: unknown): 'member' | 'admin' | 'owner' | undefined {
     if (role === 'member' || role === 'admin' || role === 'owner') {
       return role;
     }
     return undefined;
   }
 
-  private normalizeOptional(value: string | undefined): string | undefined {
-    const trimmed = value?.trim();
+  private isSupportedMessageSubtype(
+    messageType: 'private' | 'group',
+    subtype: unknown,
+  ): boolean {
+    if (subtype === undefined || subtype === null) {
+      return true;
+    }
+
+    if (typeof subtype !== 'string') {
+      return false;
+    }
+
+    const normalized = subtype.trim();
+    if (!normalized) {
+      return false;
+    }
+
+    if (messageType === 'private') {
+      return ['friend', 'group', 'group_self', 'other'].includes(normalized);
+    }
+
+    return ['normal', 'anonymous', 'notice'].includes(normalized);
+  }
+
+  private normalizeOptional(value: unknown): string | undefined {
+    if (typeof value !== 'string') {
+      return undefined;
+    }
+
+    const trimmed = value.trim();
     return trimmed ? trimmed : undefined;
+  }
+
+  private normalizeDisplayMetadata(value: unknown): string | undefined {
+    const normalized = this.normalizeOptional(value);
+    return normalized ? this.redactDiagnosticText(normalized) : undefined;
+  }
+
+  private normalizeMediaUrl(value: unknown): string | undefined {
+    const normalized = this.normalizeOptional(value);
+    if (!normalized) {
+      return undefined;
+    }
+
+    return this.redactDiagnosticText(normalized) === normalized ? normalized : undefined;
+  }
+
+  private redactDiagnosticText(value: string): string {
+    const platformRedacted = this.redactPlatformIdentifiers(value);
+    const secretRedacted = redactSecretsInText(platformRedacted).text;
+    const redacted = this.redactPlatformIdentifiers(secretRedacted);
+    const platformMarkerLost =
+      platformRedacted.includes('[REDACTED:platform_id]')
+      && !redacted.includes('[REDACTED:platform_id]');
+
+    return platformMarkerLost ? `${redacted} [REDACTED:platform_id]` : redacted;
+  }
+
+  private redactPlatformIdentifiers(value: string): string {
+    return value
+      .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
+      .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
   }
 
   private buildCapabilities(): GatewayCapabilities {
@@ -884,7 +1096,4 @@ export class OneBotAdapter extends EventEmitter {
     };
   }
 
-  private isRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === 'object' && value !== null;
-  }
 }

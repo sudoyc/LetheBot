@@ -20,9 +20,7 @@ describe('NapCat Deployment Integration', () => {
 
     // Cleanup server
     if (server) {
-      await new Promise<void>((resolve) => {
-        server!.close(() => resolve());
-      });
+      await closeTestServer(server);
       server = null;
     }
 
@@ -32,6 +30,18 @@ describe('NapCat Deployment Integration', () => {
       adapter = null;
     }
   });
+
+  function closeTestServer(serverToClose: Server): Promise<void> {
+    return new Promise((resolve) => {
+      serverToClose.close(() => resolve());
+    });
+  }
+
+  function listenTestServer(serverToListen: Server, port: number, host: string): Promise<void> {
+    return new Promise((resolve) => {
+      serverToListen.listen(port, host, () => resolve());
+    });
+  }
 
   test('HTTP server starts and responds to health check', async () => {
     process.env.ONEBOT_HTTP_URL = 'http://localhost:3000';
@@ -57,9 +67,7 @@ describe('NapCat Deployment Integration', () => {
       res.end('Not Found');
     });
 
-    await new Promise<void>((resolve) => {
-      server!.listen(config.serverPort, config.serverHost, () => resolve());
-    });
+    await listenTestServer(server, config.serverPort, config.serverHost);
 
     // Test health check
     const response = await fetch(`http://localhost:${config.serverPort}/healthz`);
@@ -75,15 +83,16 @@ describe('NapCat Deployment Integration', () => {
     process.env.LETHEBOT_PORT = '6702';
 
     const config = loadNapCatConfig();
-    adapter = new OneBotAdapter({
+    const eventAdapter = new OneBotAdapter({
       httpUrl: config.httpUrl,
       token: config.token,
     });
+    adapter = eventAdapter;
 
-    await adapter.start();
+    await eventAdapter.start();
 
     let receivedEvent: ChatMessageReceived | null = null;
-    adapter.onEvent((event) => {
+    eventAdapter.onEvent((event) => {
       receivedEvent = event;
     });
 
@@ -98,7 +107,7 @@ describe('NapCat Deployment Integration', () => {
         req.on('end', () => {
           try {
             const event = JSON.parse(body);
-            adapter!.handleHttpEvent(event);
+            eventAdapter.handleHttpEvent(event);
 
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'ok' }));
@@ -114,9 +123,7 @@ describe('NapCat Deployment Integration', () => {
       res.end('Not Found');
     });
 
-    await new Promise<void>((resolve) => {
-      server!.listen(config.serverPort, config.serverHost, () => resolve());
-    });
+    await listenTestServer(server, config.serverPort, config.serverHost);
 
     // Send OneBot event
     const onebotEvent = {
@@ -154,15 +161,16 @@ describe('NapCat Deployment Integration', () => {
     process.env.LETHEBOT_PORT = '6703';
 
     const config = loadNapCatConfig();
-    adapter = new OneBotAdapter({
+    const eventAdapter = new OneBotAdapter({
       httpUrl: config.httpUrl,
       token: config.token,
     });
+    adapter = eventAdapter;
 
-    await adapter.start();
+    await eventAdapter.start();
 
     let receivedEvent: ChatMessageReceived | null = null;
-    adapter.onEvent((event) => {
+    eventAdapter.onEvent((event) => {
       receivedEvent = event;
     });
 
@@ -177,7 +185,7 @@ describe('NapCat Deployment Integration', () => {
         req.on('end', () => {
           try {
             const event = JSON.parse(body);
-            adapter!.handleHttpEvent(event);
+            eventAdapter.handleHttpEvent(event);
 
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'ok' }));
@@ -193,9 +201,7 @@ describe('NapCat Deployment Integration', () => {
       res.end('Not Found');
     });
 
-    await new Promise<void>((resolve) => {
-      server!.listen(config.serverPort, config.serverHost, () => resolve());
-    });
+    await listenTestServer(server, config.serverPort, config.serverHost);
 
     // Send group message event
     const groupEvent = {
@@ -241,9 +247,7 @@ describe('NapCat Deployment Integration', () => {
       res.end('Not Found');
     });
 
-    await new Promise<void>((resolve) => {
-      server!.listen(config.serverPort, config.serverHost, () => resolve());
-    });
+    await listenTestServer(server, config.serverPort, config.serverHost);
 
     const response = await fetch(`http://localhost:${config.serverPort}/unknown`);
     expect(response.status).toBe(404);
@@ -280,9 +284,7 @@ describe('NapCat Deployment Integration', () => {
       res.end();
     });
 
-    await new Promise<void>((resolve) => {
-      server!.listen(config.serverPort, config.serverHost, () => resolve());
-    });
+    await listenTestServer(server, config.serverPort, config.serverHost);
 
     const response = await fetch(`http://127.0.0.1:${config.serverPort}/healthz`);
     expect(response.status).toBe(200);
@@ -292,11 +294,12 @@ describe('NapCat Deployment Integration', () => {
     process.env.LETHEBOT_PORT = '6706';
 
     const config = loadNapCatConfig();
-    adapter = new OneBotAdapter({
+    const eventAdapter = new OneBotAdapter({
       httpUrl: config.httpUrl,
     });
+    adapter = eventAdapter;
 
-    await adapter.start();
+    await eventAdapter.start();
 
     server = createServer((req, res) => {
       if (req.url === '/onebot/event' && req.method === 'POST') {
@@ -308,7 +311,7 @@ describe('NapCat Deployment Integration', () => {
         req.on('end', () => {
           try {
             const event = JSON.parse(body);
-            adapter!.handleHttpEvent(event);
+            eventAdapter.handleHttpEvent(event);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'ok' }));
           } catch {
@@ -323,9 +326,7 @@ describe('NapCat Deployment Integration', () => {
       res.end();
     });
 
-    await new Promise<void>((resolve) => {
-      server!.listen(config.serverPort, config.serverHost, () => resolve());
-    });
+    await listenTestServer(server, config.serverPort, config.serverHost);
 
     const response = await fetch(`http://localhost:${config.serverPort}/onebot/event`, {
       method: 'POST',

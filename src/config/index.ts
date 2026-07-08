@@ -18,6 +18,7 @@ const ConfigSchema = z.object({
   chatMessageRetentionDays: z.number().int().min(0).default(0),
   auditLogRetentionDays: z.number().int().min(0).default(0),
   disabledDeletedMemoryRetentionDays: z.number().int().min(0).default(0),
+  eventProcessingFailureRetentionDays: z.number().int().min(0).default(0),
 
   // OneBot runtime configuration (SnowLuma / NapCat compatible)
   onebotTransport: z.enum(['http', 'ws']).default('ws'),
@@ -28,6 +29,8 @@ const ConfigSchema = z.object({
   lethebotPort: z.number().int().min(1).max(65535).default(6700),
   lethebotHost: z.string().default('0.0.0.0'),
   lethebotHealthPath: z.string().default('/healthz'),
+  lethebotReadinessPath: z.string().default('/readyz'),
+  lethebotMetricsPath: z.string().default('/metrics'),
   lethebotEventPath: z.string().default('/onebot/event'),
 });
 
@@ -47,6 +50,8 @@ export interface OneBotRuntimeConfig {
   serverPort: number;
   serverHost: string;
   healthCheckPath: string;
+  readinessPath: string;
+  metricsPath: string;
   eventPath: string;
 }
 
@@ -95,6 +100,9 @@ export function loadConfig(): Config {
     disabledDeletedMemoryRetentionDays: process.env.LETHEBOT_DISABLED_DELETED_MEMORY_RETENTION_DAYS
       ? parseInt(process.env.LETHEBOT_DISABLED_DELETED_MEMORY_RETENTION_DAYS, 10)
       : undefined,
+    eventProcessingFailureRetentionDays: process.env.LETHEBOT_EVENT_PROCESSING_FAILURE_RETENTION_DAYS
+      ? parseInt(process.env.LETHEBOT_EVENT_PROCESSING_FAILURE_RETENTION_DAYS, 10)
+      : undefined,
 
     // OneBot runtime configuration
     onebotTransport: process.env.ONEBOT_TRANSPORT,
@@ -107,6 +115,8 @@ export function loadConfig(): Config {
       : undefined,
     lethebotHost: process.env.LETHEBOT_HOST,
     lethebotHealthPath: process.env.LETHEBOT_HEALTH_PATH,
+    lethebotReadinessPath: process.env.LETHEBOT_READINESS_PATH,
+    lethebotMetricsPath: process.env.LETHEBOT_METRICS_PATH,
     lethebotEventPath: process.env.LETHEBOT_EVENT_PATH,
   };
 
@@ -115,8 +125,6 @@ export function loadConfig(): Config {
     return cachedConfig;
   } catch (error) {
     if (error instanceof z.ZodError) {
-      console.error('Configuration validation failed:');
-      console.error(error.issues);
       throw new ConfigValidationError('Invalid configuration', error.issues);
     }
     throw error;
@@ -137,6 +145,8 @@ export function loadOneBotRuntimeConfig(): OneBotRuntimeConfig {
     serverPort: config.lethebotPort,
     serverHost: config.lethebotHost,
     healthCheckPath: config.lethebotHealthPath,
+    readinessPath: config.lethebotReadinessPath,
+    metricsPath: config.lethebotMetricsPath,
     eventPath: config.lethebotEventPath,
   };
 }

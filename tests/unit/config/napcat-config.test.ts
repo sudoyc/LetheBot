@@ -39,6 +39,8 @@ describe('NapCat Config Loader', () => {
       expect(config.serverPort).toBe(6700);
       expect(config.serverHost).toBe('0.0.0.0');
       expect(config.healthCheckPath).toBe('/healthz');
+      expect(config.readinessPath).toBe('/readyz');
+      expect(config.metricsPath).toBe('/metrics');
       expect(config.eventPath).toBe('/onebot/event');
     });
 
@@ -51,6 +53,8 @@ describe('NapCat Config Loader', () => {
       process.env.LETHEBOT_PORT = '8080';
       process.env.LETHEBOT_HOST = '127.0.0.1';
       process.env.LETHEBOT_HEALTH_PATH = '/health';
+      process.env.LETHEBOT_READINESS_PATH = '/ready';
+      process.env.LETHEBOT_METRICS_PATH = '/ops/metrics';
       process.env.LETHEBOT_EVENT_PATH = '/events';
 
       const config = loadNapCatConfig();
@@ -63,6 +67,8 @@ describe('NapCat Config Loader', () => {
       expect(config.serverPort).toBe(8080);
       expect(config.serverHost).toBe('127.0.0.1');
       expect(config.healthCheckPath).toBe('/health');
+      expect(config.readinessPath).toBe('/ready');
+      expect(config.metricsPath).toBe('/ops/metrics');
       expect(config.eventPath).toBe('/events');
     });
 

@@ -13,9 +13,31 @@ import {
   type NapCatConfig,
 } from '../config/index.js';
 import { fileURLToPath } from 'node:url';
+import { redactSecretsInText } from '../memory/secret-scan.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+
+function redactForDisplay(value: string): string {
+  const platformRedacted = redactPlatformIdentifiers(value);
+  const secretRedacted = redactSecretsInText(platformRedacted).text;
+  const redacted = redactPlatformIdentifiers(secretRedacted);
+  const platformMarkerLost =
+    platformRedacted.includes('[REDACTED:platform_id]')
+    && !redacted.includes('[REDACTED:platform_id]');
+
+  return platformMarkerLost ? `${redacted} [REDACTED:platform_id]` : redacted;
+}
+
+function redactPlatformIdentifiers(value: string): string {
+  return value
+    .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
+    .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
+}
+
+function display(value: unknown): string {
+  return redactForDisplay(value instanceof Error ? value.message : String(value));
+}
 
 interface StatusResponse {
   status?: unknown;
@@ -147,7 +169,7 @@ export async function verifyNapCatConnection(
     clearTimeout(timeoutId);
 
     if (!response.ok) {
-      console.error(`OneBot HTTP API returned ${response.status}: ${response.statusText}`);
+      console.error(`OneBot HTTP API returned ${response.status}: ${redactForDisplay(response.statusText)}`);
       return false;
     }
 
@@ -155,19 +177,19 @@ export async function verifyNapCatConnection(
 
     if (result.status === 'ok' || result.retcode === 0) {
       const nickname = typeof result.data?.nickname === 'string' ? result.data.nickname : 'Unknown';
-      console.log(`✓ OneBot HTTP connection verified: ${nickname}`);
+      console.log(`✓ OneBot HTTP connection verified: ${redactForDisplay(nickname)}`);
       return true;
     }
 
     const message = typeof result.message === 'string' ? result.message : 'Unknown error';
-    console.error(`OneBot HTTP API error: ${message}`);
+    console.error(`OneBot HTTP API error: ${redactForDisplay(message)}`);
     return false;
   } catch (error) {
     if (error instanceof Error) {
       if (error.name === 'AbortError') {
         console.error('OneBot HTTP connection timeout (5s)');
       } else {
-        console.error(`OneBot HTTP connection failed: ${error.message}`);
+        console.error(`OneBot HTTP connection failed: ${redactForDisplay(error.message)}`);
       }
     }
     return false;
@@ -213,7 +235,7 @@ export function verifyOneBotWebSocketConnection(
       socket = new WebSocket(buildWebSocketUrl(wsUrl, token)) as unknown as VerifyWebSocketLike;
     } catch (error) {
       clearTimeout(timeout);
-      console.error(`OneBot WebSocket connection failed: ${error instanceof Error ? error.message : String(error)}`);
+      console.error(`OneBot WebSocket connection failed: ${display(error)}`);
       resolve(false);
       return;
     }
@@ -234,16 +256,16 @@ export function verifyOneBotWebSocketConnection(
         }
         if (parsed.status === 'ok' || parsed.retcode === 0) {
           const nickname = typeof parsed.data?.nickname === 'string' ? parsed.data.nickname : 'Unknown';
-          console.log(`✓ OneBot WebSocket connection verified: ${nickname}`);
+          console.log(`✓ OneBot WebSocket connection verified: ${redactForDisplay(nickname)}`);
           cleanup(true);
           return;
         }
 
         const message = typeof parsed.message === 'string' ? parsed.message : 'Unknown error';
-        console.error(`OneBot WebSocket API error: ${message}`);
+        console.error(`OneBot WebSocket API error: ${redactForDisplay(message)}`);
         cleanup(false);
       } catch (error) {
-        console.error(`OneBot WebSocket parse error: ${error instanceof Error ? error.message : String(error)}`);
+        console.error(`OneBot WebSocket parse error: ${display(error)}`);
         cleanup(false);
       }
     });
@@ -288,7 +310,7 @@ export async function generateNapCatConfig(outputPath: string): Promise<void> {
   const examplePath = join(__dirname, '../../.env.example');
 
   if (!existsSync(examplePath)) {
-    throw new Error(`.env.example not found at ${examplePath}`);
+    throw new Error(`.env.example not found at ${redactForDisplay(examplePath)}`);
   }
 
   const template = readFileSync(examplePath, 'utf-8');
@@ -300,7 +322,7 @@ export async function generateNapCatConfig(outputPath: string): Promise<void> {
   }
 
   writeFileSync(outputPath, template, 'utf-8');
-  console.log(`✓ Configuration template written to ${outputPath}`);
+  console.log(`✓ Configuration template written to ${redactForDisplay(outputPath)}`);
   console.log('  Please edit the file and set required values:');
   console.log('  - ONEBOT_TRANSPORT: ws or http (default: ws)');
   console.log('  - ONEBOT_WS_URL: SnowLuma OneBot WebSocket URL');
@@ -395,6 +417,8 @@ services:
       - LETHEBOT_PORT=${config.serverPort}
       - LETHEBOT_HOST=${config.serverHost}
       - LETHEBOT_HEALTH_PATH=${config.healthCheckPath}
+      - LETHEBOT_READINESS_PATH=${config.readinessPath}
+      - LETHEBOT_METRICS_PATH=${config.metricsPath}
       - LETHEBOT_EVENT_PATH=${config.eventPath}
       - LETHEBOT_DB_PATH=/app/data/lethebot.db
     command: sh -c "npm install -g pnpm && pnpm install && pnpm build && pnpm start"
@@ -430,6 +454,8 @@ Environment="LETHEBOT_BOT_QQ_ID=${config.botQqId || ''}"
 Environment="LETHEBOT_PORT=${config.serverPort}"
 Environment="LETHEBOT_HOST=${config.serverHost}"
 Environment="LETHEBOT_HEALTH_PATH=${config.healthCheckPath}"
+Environment="LETHEBOT_READINESS_PATH=${config.readinessPath}"
+Environment="LETHEBOT_METRICS_PATH=${config.metricsPath}"
 Environment="LETHEBOT_EVENT_PATH=${config.eventPath}"
 Environment="LETHEBOT_DB_PATH=${workDir}/data/lethebot.db"
 ExecStart=${process.execPath} ${workDir}/dist/index.js
@@ -465,6 +491,8 @@ function generatePM2Ecosystem(config: NapCatConfig, workDir: string): string {
       LETHEBOT_PORT: '${config.serverPort}',
       LETHEBOT_HOST: '${config.serverHost}',
       LETHEBOT_HEALTH_PATH: '${config.healthCheckPath}',
+      LETHEBOT_READINESS_PATH: '${config.readinessPath}',
+      LETHEBOT_METRICS_PATH: '${config.metricsPath}',
       LETHEBOT_EVENT_PATH: '${config.eventPath}',
       LETHEBOT_DB_PATH: '${workDir}/data/lethebot.db'
     },
@@ -516,7 +544,7 @@ export async function deployLetheBot(
       if (error instanceof ConfigValidationError) {
         console.error('\n❌ Configuration validation failed:');
         for (const issue of error.issues) {
-          console.error(`  - ${issue.path.join('.')}: ${issue.message}`);
+          console.error(`  - ${redactForDisplay(issue.path.join('.'))}: ${redactForDisplay(issue.message)}`);
         }
         console.error('\nPlease fix the configuration and try again.');
         return {
@@ -543,10 +571,10 @@ export async function deployLetheBot(
         );
         console.error('\n❌ OneBot runtime connection failed');
         console.error('  Please check:');
-        console.error(`  - Is SnowLuma / OneBot running at ${oneBotUrl}?`);
+        console.error(`  - Is SnowLuma / OneBot running at ${redactForDisplay(oneBotUrl)}?`);
         console.error('  - Is ONEBOT_TRANSPORT / ONEBOT_WS_URL / ONEBOT_HTTP_URL correct?');
         console.error('  - Is the network reachable?');
-        console.error(`  - HTTP smoke: curl -X POST ${config.httpUrl}/get_login_info`);
+        console.error(`  - HTTP smoke: curl -X POST ${redactForDisplay(config.httpUrl)}/get_login_info`);
         return {
           success: false,
           message: 'OneBot runtime connection verification failed',
@@ -568,7 +596,7 @@ export async function deployLetheBot(
       const dockerCompose = generateDockerCompose(config);
       const composePath = join(outputDir, 'docker-compose.yml');
       writeFileSync(composePath, dockerCompose, 'utf-8');
-      console.log(`✓ docker-compose.yml written to ${composePath}`);
+      console.log(`✓ docker-compose.yml written to ${redactForDisplay(composePath)}`);
       console.log('\nTo start the service, run:');
       console.log('  docker-compose up -d');
     } else if (mode === 'systemd') {
@@ -576,9 +604,9 @@ export async function deployLetheBot(
       const serviceContent = generateSystemdService(config, workDir);
       const servicePath = join(outputDir, 'lethebot.service');
       writeFileSync(servicePath, serviceContent, 'utf-8');
-      console.log(`✓ lethebot.service written to ${servicePath}`);
+      console.log(`✓ lethebot.service written to ${redactForDisplay(servicePath)}`);
       console.log('\nTo install and start the service, run:');
-      console.log(`  sudo cp ${servicePath} /etc/systemd/system/`);
+      console.log(`  sudo cp ${redactForDisplay(servicePath)} /etc/systemd/system/`);
       console.log('  sudo systemctl daemon-reload');
       console.log('  sudo systemctl enable lethebot');
       console.log('  sudo systemctl start lethebot');
@@ -590,9 +618,9 @@ export async function deployLetheBot(
       const ecosystemContent = generatePM2Ecosystem(config, workDir);
       const ecosystemPath = join(outputDir, 'ecosystem.config.js');
       writeFileSync(ecosystemPath, ecosystemContent, 'utf-8');
-      console.log(`✓ ecosystem.config.js written to ${ecosystemPath}`);
+      console.log(`✓ ecosystem.config.js written to ${redactForDisplay(ecosystemPath)}`);
       console.log('\nTo start the service, run:');
-      console.log(`  pm2 start ${ecosystemPath}`);
+      console.log(`  pm2 start ${redactForDisplay(ecosystemPath)}`);
       console.log('\nTo manage the service:');
       console.log('  pm2 status');
       console.log('  pm2 logs lethebot');
@@ -652,20 +680,20 @@ async function main() {
 
   console.log('\n' + '═'.repeat(42));
   if (result.success) {
-    console.log(`✓ ${result.message}`);
+    console.log(`✓ ${redactForDisplay(result.message)}`);
     if (result.details) {
       console.log('\nDetails:');
-      console.log(`  Config: ${result.details.configPath}`);
-      console.log(`  Server: ${result.details.serverUrl}`);
-      console.log(`  OneBot: ${result.details.oneBotUrl}`);
+      console.log(`  Config: ${redactForDisplay(result.details.configPath)}`);
+      console.log(`  Server: ${redactForDisplay(result.details.serverUrl)}`);
+      console.log(`  OneBot: ${redactForDisplay(result.details.oneBotUrl)}`);
       if (result.details.healthCheckPassed !== undefined) {
         console.log(`  Health: ${result.details.healthCheckPassed ? '✓' : '✗'}`);
       }
     }
   } else {
-    console.log(`✗ ${result.message}`);
+    console.log(`✗ ${redactForDisplay(result.message)}`);
     if (result.error) {
-      console.error(`\nError: ${result.error.message}`);
+      console.error(`\nError: ${redactForDisplay(result.error.message)}`);
     }
     process.exit(1);
   }
@@ -674,7 +702,7 @@ async function main() {
 // Run CLI if executed directly
 if (import.meta.url === `file://${process.argv[1]}`) {
   main().catch((error) => {
-    console.error('Fatal error:', error);
+    console.error('Fatal error:', display(error));
     process.exit(1);
   });
 }

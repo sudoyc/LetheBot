@@ -22,6 +22,9 @@ describe('Config Loader', () => {
     delete process.env.LETHEBOT_CHAT_MESSAGE_RETENTION_DAYS;
     delete process.env.LETHEBOT_AUDIT_LOG_RETENTION_DAYS;
     delete process.env.LETHEBOT_DISABLED_DELETED_MEMORY_RETENTION_DAYS;
+    delete process.env.LETHEBOT_EVENT_PROCESSING_FAILURE_RETENTION_DAYS;
+    delete process.env.LETHEBOT_READINESS_PATH;
+    delete process.env.LETHEBOT_METRICS_PATH;
 
     const config = loadConfig();
 
@@ -32,6 +35,9 @@ describe('Config Loader', () => {
     expect(config.chatMessageRetentionDays).toBe(0);
     expect(config.auditLogRetentionDays).toBe(0);
     expect(config.disabledDeletedMemoryRetentionDays).toBe(0);
+    expect(config.eventProcessingFailureRetentionDays).toBe(0);
+    expect(config.lethebotReadinessPath).toBe('/readyz');
+    expect(config.lethebotMetricsPath).toBe('/metrics');
   });
 
   test('loads config from env vars', () => {
@@ -42,6 +48,9 @@ describe('Config Loader', () => {
     process.env.LETHEBOT_CHAT_MESSAGE_RETENTION_DAYS = '60';
     process.env.LETHEBOT_AUDIT_LOG_RETENTION_DAYS = '90';
     process.env.LETHEBOT_DISABLED_DELETED_MEMORY_RETENTION_DAYS = '365';
+    process.env.LETHEBOT_EVENT_PROCESSING_FAILURE_RETENTION_DAYS = '120';
+    process.env.LETHEBOT_READINESS_PATH = '/ops/ready';
+    process.env.LETHEBOT_METRICS_PATH = '/ops/metrics';
 
     const config = loadConfig();
 
@@ -52,6 +61,9 @@ describe('Config Loader', () => {
     expect(config.chatMessageRetentionDays).toBe(60);
     expect(config.auditLogRetentionDays).toBe(90);
     expect(config.disabledDeletedMemoryRetentionDays).toBe(365);
+    expect(config.eventProcessingFailureRetentionDays).toBe(120);
+    expect(config.lethebotReadinessPath).toBe('/ops/ready');
+    expect(config.lethebotMetricsPath).toBe('/ops/metrics');
   });
 
   test('validates logLevel enum', () => {

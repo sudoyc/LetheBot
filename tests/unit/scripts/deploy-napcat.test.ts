@@ -1,6 +1,8 @@
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   verifyNapCatConnection,
+  verifyOneBotConnection,
+  verifyOneBotWebSocketConnection,
   generateNapCatConfig,
   deployLetheBot,
   NapCatConnectionError,
@@ -11,6 +13,7 @@ import { join } from 'node:path';
 
 describe('NapCat Deployment Scripts', () => {
   const originalEnv = process.env;
+  const originalWebSocket = globalThis.WebSocket;
   const testOutputDir = join(process.cwd(), 'test-output');
 
   beforeEach(() => {
@@ -24,6 +27,8 @@ describe('NapCat Deployment Scripts', () => {
 
   afterEach(() => {
     process.env = originalEnv;
+    globalThis.WebSocket = originalWebSocket;
+    FakeVerifyWebSocket.reset();
     resetConfig();
     // Cleanup test files
     try {
@@ -105,6 +110,171 @@ describe('NapCat Deployment Scripts', () => {
       expect(result).toBe(false);
     });
 
+    test('redacts secret-like and platform identifiers from HTTP API error output', async () => {
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const rawSecret = 'sk-deploy-http-error-secret-should-not-print';
+      const rawPlatformId = 'qq-1234567890';
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          status: 'failed',
+          message: `Authentication failed api_key=${rawSecret} target=${rawPlatformId}`,
+        }),
+      }) as any;
+
+      try {
+        const result = await verifyNapCatConnection('http://localhost:3000');
+        const output = errorSpy.mock.calls.flat().join('\n');
+
+        expect(result).toBe(false);
+        expect(output).toContain('[REDACTED:api_key_assignment]');
+        expect(output).toContain('[REDACTED:platform_id]');
+        expect(output).not.toContain(rawSecret);
+        expect(output).not.toContain(rawPlatformId);
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    test('redacts embedded platform identifiers from HTTP API error output', async () => {
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const embeddedPrefixedPlatformId = 'legacy_qq-1234567890';
+      const embeddedNumericPlatformId = 'legacy_987654321';
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          status: 'failed',
+          message: `Authentication failed target=${embeddedPrefixedPlatformId} peer=${embeddedNumericPlatformId}`,
+        }),
+      }) as any;
+
+      try {
+        const result = await verifyNapCatConnection('http://localhost:3000');
+        const output = errorSpy.mock.calls.flat().join('\n');
+
+        expect(result).toBe(false);
+        expect(output).toContain('[REDACTED:platform_id]');
+        expect(output).not.toContain(embeddedPrefixedPlatformId);
+        expect(output).not.toContain(embeddedNumericPlatformId);
+        expect(output).not.toContain('legacy_qq-');
+        expect(output).not.toContain('1234567890');
+        expect(output).not.toContain('987654321');
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    test('redacts adjacent secret/platform identifiers from HTTP API error output', async () => {
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const adjacentSecretPlatformId = 'sk-deploy-adjacent-http-error-secret-qq-1234567890';
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          status: 'failed',
+          message: `Authentication failed ${adjacentSecretPlatformId}`,
+        }),
+      }) as any;
+
+      try {
+        const result = await verifyNapCatConnection('http://localhost:3000');
+        const output = errorSpy.mock.calls.flat().join('\n');
+
+        expect(result).toBe(false);
+        expect(output).toContain('[REDACTED:openai_like_api_key]');
+        expect(output).toContain('[REDACTED:platform_id]');
+        expect(output).not.toContain(adjacentSecretPlatformId);
+        expect(output).not.toContain('qq-1234567890');
+        expect(output).not.toContain('1234567890');
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    test('preserves assignment-shaped adjacent markers in HTTP API error output', async () => {
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const rawAssignment = 'api_key=sk-deploy-assignment-http-error-secret-qq-1234567890';
+      const rawSecret = 'sk-deploy-assignment-http-error-secret-qq-1234567890';
+      const rawPlatformId = 'qq-1234567890';
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          status: 'failed',
+          message: `Authentication failed ${rawAssignment}`,
+        }),
+      }) as any;
+
+      try {
+        const result = await verifyNapCatConnection('http://localhost:3000');
+        const output = errorSpy.mock.calls.flat().join('\n');
+
+        expect(result).toBe(false);
+        expect(output).toContain('[REDACTED:api_key_assignment]');
+        expect(output).toContain('[REDACTED:platform_id]');
+        expect(output).not.toContain(rawAssignment);
+        expect(output).not.toContain(rawSecret);
+        expect(output).not.toContain(rawPlatformId);
+        expect(output).not.toContain('1234567890');
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    test('redacts secret-like and platform identifiers from successful HTTP nickname output', async () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      const rawSecret = 'sk-deploy-http-nickname-secret-should-not-print';
+      const rawPlatformId = 'qq-1234567890';
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          status: 'ok',
+          data: {
+            nickname: `TestBot api_key=${rawSecret} owner=${rawPlatformId}`,
+          },
+        }),
+      }) as any;
+
+      try {
+        const result = await verifyNapCatConnection('http://localhost:3000');
+        const output = logSpy.mock.calls.flat().join('\n');
+
+        expect(result).toBe(true);
+        expect(output).toContain('[REDACTED:api_key_assignment]');
+        expect(output).toContain('[REDACTED:platform_id]');
+        expect(output).not.toContain(rawSecret);
+        expect(output).not.toContain(rawPlatformId);
+      } finally {
+        logSpy.mockRestore();
+      }
+    });
+
+    test('redacts adjacent secret/platform identifiers from successful HTTP nickname output', async () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      const adjacentSecretPlatformId = 'sk-deploy-adjacent-http-nickname-secret-qq-1234567890';
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          status: 'ok',
+          data: {
+            nickname: `TestBot ${adjacentSecretPlatformId}`,
+          },
+        }),
+      }) as any;
+
+      try {
+        const result = await verifyNapCatConnection('http://localhost:3000');
+        const output = logSpy.mock.calls.flat().join('\n');
+
+        expect(result).toBe(true);
+        expect(output).toContain('[REDACTED:openai_like_api_key]');
+        expect(output).toContain('[REDACTED:platform_id]');
+        expect(output).not.toContain(adjacentSecretPlatformId);
+        expect(output).not.toContain('qq-1234567890');
+        expect(output).not.toContain('1234567890');
+      } finally {
+        logSpy.mockRestore();
+      }
+    });
+
     test('returns false on network error', async () => {
       global.fetch = vi.fn().mockRejectedValue(new Error('Network error')) as any;
 
@@ -127,6 +297,97 @@ describe('NapCat Deployment Scripts', () => {
       const result = await verifyNapCatConnection('http://localhost:3000');
 
       expect(result).toBe(true);
+    });
+  });
+
+  describe('verifyOneBotWebSocketConnection', () => {
+    test('sends get_login_info over WebSocket with token query and resolves matching echo', async () => {
+      globalThis.WebSocket = FakeVerifyWebSocket as unknown as typeof globalThis.WebSocket;
+
+      const resultPromise = verifyOneBotWebSocketConnection(
+        'ws://localhost:3001/',
+        'test-token-123',
+      );
+      const socket = FakeVerifyWebSocket.last();
+
+      expect(new URL(socket.url).searchParams.get('access_token')).toBe('test-token-123');
+
+      socket.emit('open');
+      const request = parseSentRequest(socket);
+
+      expect(request.action).toBe('get_login_info');
+      expect(request.params).toEqual({});
+      expect(typeof request.echo).toBe('string');
+
+      socket.emitJsonMessage({
+        status: 'ok',
+        echo: request.echo,
+        data: { nickname: 'TestBot' },
+      });
+
+      await expect(resultPromise).resolves.toBe(true);
+      expect(socket.closeCalls).toContainEqual({
+        code: 1000,
+        reason: 'verify complete',
+      });
+    });
+
+    test('ignores unrelated WebSocket echo and returns false for matching API error without logging token', async () => {
+      globalThis.WebSocket = FakeVerifyWebSocket as unknown as typeof globalThis.WebSocket;
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+      try {
+        const resultPromise = verifyOneBotWebSocketConnection(
+          'ws://localhost:3001/',
+          'secret-token-should-not-log',
+        );
+        const socket = FakeVerifyWebSocket.last();
+
+        socket.emit('open');
+        const request = parseSentRequest(socket);
+
+        socket.emitJsonMessage({
+          status: 'ok',
+          echo: 'unrelated-echo',
+          data: { nickname: 'IgnoredBot' },
+        });
+        socket.emitJsonMessage({
+          status: 'failed',
+          echo: request.echo,
+          message: 'Authentication failed',
+        });
+
+        await expect(resultPromise).resolves.toBe(false);
+        expect(errorSpy).toHaveBeenCalledWith('OneBot WebSocket API error: Authentication failed');
+        expect(errorSpy.mock.calls.flat().join('\n')).not.toContain('secret-token-should-not-log');
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    test('verifyOneBotConnection uses WebSocket verification for ws transport', async () => {
+      globalThis.WebSocket = FakeVerifyWebSocket as unknown as typeof globalThis.WebSocket;
+
+      const resultPromise = verifyOneBotConnection({
+        transport: 'ws',
+        httpUrl: 'http://localhost:3000',
+        wsUrl: 'ws://localhost:3001/',
+        token: 'ws-route-token',
+        serverPort: 6700,
+        serverHost: '0.0.0.0',
+        healthCheckPath: '/healthz',
+        readinessPath: '/readyz',
+        metricsPath: '/metrics',
+        eventPath: '/onebot/event',
+      });
+      const socket = FakeVerifyWebSocket.last();
+
+      socket.emit('open');
+      const request = parseSentRequest(socket);
+      socket.emitJsonMessage({ retcode: 0, echo: request.echo, data: {} });
+
+      await expect(resultPromise).resolves.toBe(true);
+      expect(new URL(socket.url).searchParams.get('access_token')).toBe('ws-route-token');
     });
   });
 
@@ -365,3 +626,73 @@ describe('NapCat Deployment Scripts', () => {
     });
   });
 });
+
+type FakeVerifyWebSocketEventName = 'open' | 'message' | 'error' | 'close';
+type FakeVerifyWebSocketHandler = (event: { data?: unknown }) => void;
+
+class FakeVerifyWebSocket {
+  static instances: FakeVerifyWebSocket[] = [];
+
+  readonly url: string;
+  readonly sent: string[] = [];
+  readonly closeCalls: Array<{ code?: number; reason?: string }> = [];
+  private readonly handlers: Partial<Record<FakeVerifyWebSocketEventName, FakeVerifyWebSocketHandler[]>> = {};
+
+  constructor(url: string | URL) {
+    this.url = String(url);
+    FakeVerifyWebSocket.instances.push(this);
+  }
+
+  static reset(): void {
+    FakeVerifyWebSocket.instances = [];
+  }
+
+  static last(): FakeVerifyWebSocket {
+    const socket = FakeVerifyWebSocket.instances.at(-1);
+    if (!socket) {
+      throw new Error('Expected a FakeVerifyWebSocket instance');
+    }
+    return socket;
+  }
+
+  send(data: string): void {
+    this.sent.push(data);
+  }
+
+  close(code?: number, reason?: string): void {
+    this.closeCalls.push({ code, reason });
+  }
+
+  addEventListener(
+    event: FakeVerifyWebSocketEventName,
+    handler: FakeVerifyWebSocketHandler,
+  ): void {
+    const handlers = this.handlers[event] ?? [];
+    handlers.push(handler);
+    this.handlers[event] = handlers;
+  }
+
+  emit(event: FakeVerifyWebSocketEventName, payload: { data?: unknown } = {}): void {
+    for (const handler of this.handlers[event] ?? []) {
+      handler(payload);
+    }
+  }
+
+  emitJsonMessage(payload: unknown): void {
+    this.emit('message', { data: JSON.stringify(payload) });
+  }
+}
+
+function parseSentRequest(socket: FakeVerifyWebSocket): {
+  action?: string;
+  params?: unknown;
+  echo?: unknown;
+} {
+  const sent = socket.sent[0];
+  expect(sent).toBeDefined();
+  return JSON.parse(sent ?? '{}') as {
+    action?: string;
+    params?: unknown;
+    echo?: unknown;
+  };
+}
