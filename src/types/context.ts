@@ -44,6 +44,29 @@ export interface ContextTrace {
 }
 
 /**
+ * Prompt/token budget layer evidence.
+ *
+ * `name` and `version` identify the renderer/estimate contract used for a
+ * token-budget component. They are audit metadata, not prompt instructions.
+ */
+export interface TokenBudgetPromptLayer {
+  name: string;
+  version: string;
+  tokens: number;
+}
+
+/**
+ * Structured identity data prepared by ContextBuilder for prompt rendering.
+ *
+ * Values are operational context data and must be rendered as bounded prompt
+ * data, not instructions.
+ */
+export interface InjectedIdentityDataField {
+  name: string;
+  value: string;
+}
+
+/**
  * 参与者上下文
  */
 export interface ParticipantContext {
@@ -93,6 +116,7 @@ export interface ContextPack {
 
   // 注入的身份字段（用于审计）
   injectedIdentityFields: string[]; // 例如 ['current_display_name', 'sender_role']
+  injectedIdentityData?: InjectedIdentityDataField[];
 
   // 检索/注入可解释性 trace（不一定进入 prompt）
   trace?: ContextTrace;
@@ -107,5 +131,6 @@ export interface ContextPack {
       identity: number;
       system: number;
     };
+    promptLayers?: TokenBudgetPromptLayer[];
   };
 }

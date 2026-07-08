@@ -76,6 +76,27 @@ CREATE TABLE IF NOT EXISTS nickname_history (
 
 CREATE INDEX IF NOT EXISTS idx_nickname_history_user ON nickname_history(canonical_user_id);
 
+CREATE TABLE IF NOT EXISTS privacy_preferences (
+  canonical_user_id TEXT NOT NULL,
+  preference_type TEXT NOT NULL CHECK(preference_type IN ('proactive_dm', 'memory_association')),
+
+  state TEXT NOT NULL CHECK(state IN ('opted_in', 'opted_out')),
+  reason TEXT,
+
+  updated_by_user_id TEXT,
+  updated_by_actor_class TEXT NOT NULL,
+  updated_by_context TEXT NOT NULL,
+
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+
+  PRIMARY KEY (canonical_user_id, preference_type),
+  FOREIGN KEY (canonical_user_id) REFERENCES canonical_users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_privacy_preferences_state
+  ON privacy_preferences(preference_type, state);
+
 -- ============================================================
 -- Event Store
 -- ============================================================
@@ -128,6 +149,38 @@ CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation ON chat_messages(conve
 CREATE INDEX IF NOT EXISTS idx_chat_messages_sender ON chat_messages(sender_id);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_timestamp ON chat_messages(timestamp DESC);
 
+CREATE TABLE IF NOT EXISTS event_processing_failures (
+  id TEXT PRIMARY KEY,
+
+  raw_event_id TEXT,
+  turn_id TEXT,
+
+  occurred_at INTEGER NOT NULL,
+  stage TEXT NOT NULL,
+  conversation_type TEXT CHECK(conversation_type IN ('private', 'group')),
+
+  error_name TEXT NOT NULL,
+  error_message_hash TEXT NOT NULL,
+
+  message_id_hash TEXT,
+  sender_id_hash TEXT,
+  conversation_id_hash TEXT,
+
+  details TEXT NOT NULL,
+
+  FOREIGN KEY (raw_event_id) REFERENCES raw_events(id) ON DELETE SET NULL,
+  FOREIGN KEY (turn_id) REFERENCES agent_turns(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_processing_failures_occurred
+  ON event_processing_failures(occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_event_processing_failures_stage
+  ON event_processing_failures(stage);
+CREATE INDEX IF NOT EXISTS idx_event_processing_failures_raw_event
+  ON event_processing_failures(raw_event_id) WHERE raw_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_event_processing_failures_turn
+  ON event_processing_failures(turn_id) WHERE turn_id IS NOT NULL;
+
 -- ============================================================
 -- Memory System
 -- ============================================================
@@ -153,7 +206,7 @@ CREATE TABLE IF NOT EXISTS memory_records (
   content TEXT NOT NULL,
 
   -- Lifecycle
-  state TEXT NOT NULL CHECK(state IN ('proposed', 'active', 'superseded', 'disabled', 'deleted')),
+  state TEXT NOT NULL CHECK(state IN ('proposed', 'active', 'rejected', 'superseded', 'disabled', 'deleted')),
   confidence REAL NOT NULL DEFAULT 0.5 CHECK(confidence >= 0 AND confidence <= 1),
   importance REAL NOT NULL DEFAULT 0.5 CHECK(importance >= 0 AND importance <= 1),
 
@@ -202,7 +255,7 @@ CREATE TABLE IF NOT EXISTS memory_revisions (
   memory_id TEXT NOT NULL,
   revision_number INTEGER NOT NULL,
 
-  change_type TEXT NOT NULL CHECK(change_type IN ('create', 'update', 'supersede', 'disable', 'delete', 'restore')),
+  change_type TEXT NOT NULL CHECK(change_type IN ('create', 'update', 'approve', 'reject', 'supersede', 'disable', 'delete', 'restore')),
 
   previous_state TEXT,
   new_state TEXT,
@@ -250,6 +303,31 @@ CREATE TABLE IF NOT EXISTS agent_turns (
 CREATE INDEX IF NOT EXISTS idx_agent_turns_conversation ON agent_turns(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_agent_turns_status ON agent_turns(status);
 CREATE INDEX IF NOT EXISTS idx_agent_turns_started ON agent_turns(started_at DESC);
+
+CREATE TABLE IF NOT EXISTS context_traces (
+  id TEXT PRIMARY KEY,
+  turn_id TEXT NOT NULL,
+
+  conversation_id TEXT NOT NULL,
+  conversation_type TEXT NOT NULL CHECK(conversation_type IN ('private', 'group')),
+  group_id TEXT,
+
+  candidate_memory_ids TEXT NOT NULL,
+  selected_memory_ids TEXT NOT NULL,
+  rejected_memories TEXT NOT NULL,
+  filters_applied TEXT NOT NULL,
+  injected_identity_fields TEXT NOT NULL,
+  recent_message_ids TEXT NOT NULL,
+  token_budget TEXT NOT NULL,
+  memories TEXT NOT NULL,
+
+  created_at INTEGER NOT NULL,
+
+  FOREIGN KEY (turn_id) REFERENCES agent_turns(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_traces_turn ON context_traces(turn_id);
+CREATE INDEX IF NOT EXISTS idx_context_traces_conversation ON context_traces(conversation_id);
 
 CREATE TABLE IF NOT EXISTS action_decisions (
   id TEXT PRIMARY KEY,
@@ -369,11 +447,18 @@ CREATE TABLE IF NOT EXISTS jobs (
   type TEXT NOT NULL,
 
   payload TEXT NOT NULL,
+  idempotency_key TEXT,
 
   status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed')),
   attempts INTEGER NOT NULL DEFAULT 0,
   max_attempts INTEGER NOT NULL DEFAULT 3,
 
+  lease_owner TEXT,
+  lease_expires_at INTEGER,
+  heartbeat_at INTEGER,
+
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
   scheduled_at INTEGER NOT NULL,
   started_at INTEGER,
   completed_at INTEGER,
@@ -384,3 +469,36 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_scheduled ON jobs(scheduled_at) WHERE status = 'pending';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency_key ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS job_attempts (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  attempt_number INTEGER NOT NULL,
+
+  worker_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed')),
+
+  started_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  heartbeat_at INTEGER,
+
+  error TEXT,
+  result TEXT,
+
+  FOREIGN KEY (job_id) REFERENCES jobs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_attempts_job ON job_attempts(job_id, attempt_number);
+CREATE INDEX IF NOT EXISTS idx_job_attempts_worker ON job_attempts(worker_id);
+
+CREATE TABLE IF NOT EXISTS worker_heartbeats (
+  worker_id TEXT PRIMARY KEY,
+  worker_type TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('idle', 'running', 'stopping', 'error')),
+  current_job_id TEXT,
+  heartbeat_at INTEGER NOT NULL,
+  details TEXT,
+
+  FOREIGN KEY (current_job_id) REFERENCES jobs(id)
+);

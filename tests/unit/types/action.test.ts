@@ -119,6 +119,32 @@ describe('Action Decision & Execution', () => {
       expect(plan.reason).toBe('Quick acknowledgment');
     });
 
+    it('should allow proactive DM metadata on constraints', () => {
+      const plan: ActionPlan = {
+        type: 'dm_user',
+        priority: 1,
+        target: {
+          conversationId: 'private:user-001',
+          conversationType: 'private',
+          userId: 'user-001',
+        },
+        payload: {
+          text: 'Reminder',
+        },
+        constraints: {
+          proactive: true,
+          proactiveTrigger: 'reminder',
+          evaluatorRequired: true,
+          cooldownKey: 'dm:user-001:reminder',
+          cooldownSeconds: 3600,
+        },
+        reason: 'Scheduled reminder',
+      };
+
+      expect(plan.constraints.proactive).toBe(true);
+      expect(plan.constraints.proactiveTrigger).toBe('reminder');
+    });
+
     it('should support all action types', () => {
       const types: ActionType[] = [
         'silent_store',

@@ -28,7 +28,7 @@ export interface MemoryRecord {
   content: string;
 
   // 生命周期
-  state: 'proposed' | 'active' | 'superseded' | 'disabled' | 'deleted';
+  state: 'proposed' | 'active' | 'rejected' | 'superseded' | 'disabled' | 'deleted';
   confidence: number; // 0.0 - 1.0
   importance: number; // 0.0 - 1.0
 
@@ -66,7 +66,7 @@ export interface MemoryRevision {
   newState: Partial<MemoryRecord>;
 
   reason: string;
-  changeType: 'create' | 'update' | 'supersede' | 'disable' | 'delete' | 'restore';
+  changeType: 'create' | 'update' | 'approve' | 'reject' | 'supersede' | 'disable' | 'delete' | 'restore';
 
   actor: string; // canonical_user_id 或 'system'
   evaluatorDecisionId?: string;

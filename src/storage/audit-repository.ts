@@ -6,6 +6,7 @@
 
 import type Database from 'better-sqlite3';
 import type { AuditEntry, AuditQueryOptions, AuditStatsResult } from '../types/audit';
+import { redactSecretsInText } from '../memory/secret-scan.js';
 import { ulid } from 'ulidx';
 
 /**
@@ -23,6 +24,9 @@ export class AuditRepository {
    */
   async create(entry: Omit<AuditEntry, 'id'>): Promise<string> {
     const id = ulid();
+    const summary = this.redactAuditText(entry.summary);
+    const details = entry.details ? this.redactStructuredValue(entry.details) : undefined;
+    const redacted = entry.redacted || summary.redacted || Boolean(details?.redacted);
 
     this.db
       .prepare(
@@ -42,9 +46,9 @@ export class AuditRepository {
         entry.actor.canonicalUserId ?? null,
         entry.actor.actorClass,
         entry.actor.context,
-        entry.summary,
-        entry.details ? JSON.stringify(entry.details) : null,
-        entry.redacted ? 1 : 0,
+        summary.text,
+        details ? JSON.stringify(details.value) : null,
+        redacted ? 1 : 0,
         entry.riskLevel ?? null,
         entry.evaluatorDecisionId ?? null
       );
@@ -215,5 +219,84 @@ export class AuditRepository {
       riskLevel: (row.risk_level as AuditEntry['riskLevel']) ?? undefined,
       evaluatorDecisionId: (row.evaluator_decision_id as string | null) ?? undefined,
     };
+  }
+
+  private redactAuditText(text: string): { text: string; redacted: boolean } {
+    const initialPlatformRedacted = this.redactPlatformIdentifiers(text);
+    const secretRedacted = redactSecretsInText(initialPlatformRedacted);
+    const platformRedacted = this.redactPlatformIdentifiers(secretRedacted.text);
+    const platformMarkerLost =
+      initialPlatformRedacted.includes('[REDACTED:platform_id]')
+      && !platformRedacted.includes('[REDACTED:platform_id]');
+    const redactedText = platformMarkerLost ? `${platformRedacted} [REDACTED:platform_id]` : platformRedacted;
+
+    return {
+      text: redactedText,
+      redacted:
+        initialPlatformRedacted !== text ||
+        secretRedacted.findings.length > 0 ||
+        platformRedacted !== secretRedacted.text ||
+        platformMarkerLost,
+    };
+  }
+
+  private redactPlatformIdentifiers(text: string): string {
+    return text
+      .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
+      .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
+  }
+
+  private redactStructuredValue(value: unknown, path: string[] = []): { value: unknown; redacted: boolean } {
+    if (typeof value === 'string') {
+      const redacted = this.redactAuditText(value);
+      return { value: redacted.text, redacted: redacted.redacted };
+    }
+
+    if (typeof value === 'number') {
+      return this.shouldRedactNumericPlatformId(path, value)
+        ? { value: '[REDACTED:platform_id]', redacted: true }
+        : { value, redacted: false };
+    }
+
+    if (Array.isArray(value)) {
+      let redacted = false;
+      const items = value.map((item) => {
+        const result = this.redactStructuredValue(item, path);
+        redacted = redacted || result.redacted;
+        return result.value;
+      });
+      return { value: items, redacted };
+    }
+
+    if (value && typeof value === 'object') {
+      let redacted = false;
+      const result: Record<string, unknown> = {};
+      for (const [key, child] of Object.entries(value)) {
+        const redactedKey = this.redactAuditText(key);
+        const redactedChild = this.redactStructuredValue(child, [...path, key]);
+        redacted = redacted || redactedKey.redacted || redactedChild.redacted;
+        result[redactedKey.text] = redactedChild.value;
+      }
+      return { value: result, redacted };
+    }
+
+    return { value, redacted: false };
+  }
+
+  private shouldRedactNumericPlatformId(path: string[], value: number): boolean {
+    return Number.isInteger(value)
+      && this.isPlatformIdField(path)
+      && /^\d{8,12}$/.test(String(Math.abs(value)));
+  }
+
+  private isPlatformIdField(path: string[]): boolean {
+    const key = path.at(-1);
+    if (!key) {
+      return false;
+    }
+
+    return /(^|_)(?:target|subject|recipient|actor|owner)?[_-]?(user|sender|group|message|conversation|platform|qq)[_-]?ids?$/i.test(key)
+      || /^(?:target|subject|recipient|actor|owner)?(?:User|Sender|Group|Message|Conversation|Platform|Qq)Ids?$/i.test(key)
+      || /^(userId|senderId|groupId|messageId|conversationId|platformUserId|platformMessageId)$/i.test(key);
   }
 }

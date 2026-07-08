@@ -70,9 +70,12 @@ export interface ActionPlan {
   constraints: {
     evaluatorRequired?: boolean;
     cooldownKey?: string;
+    cooldownSeconds?: number;
     maxResponseTokens?: number;
     redactionLevel?: 'none' | 'light' | 'strict';
     capabilities?: string[]; // 所需网关能力
+    proactive?: boolean;
+    proactiveTrigger?: 'user_requested' | 'tool_result' | 'memory_review' | 'safety_or_privacy' | 'reminder';
   };
 
   reason: string;

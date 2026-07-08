@@ -34,7 +34,7 @@ export interface AuditEntry {
   redacted: boolean;
 
   // 风险标志
-  riskLevel?: 'low' | 'medium' | 'high';
+  riskLevel?: 'low' | 'medium' | 'high' | 'prohibited';
   evaluatorDecisionId?: string;
 }
 

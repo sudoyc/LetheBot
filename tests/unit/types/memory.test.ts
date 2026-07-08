@@ -117,6 +117,7 @@ describe('Memory Records', () => {
       const states: Array<MemoryRecord['state']> = [
         'proposed',
         'active',
+        'rejected',
         'superseded',
         'disabled',
         'deleted',
@@ -246,6 +247,8 @@ describe('Memory Records', () => {
       const types: Array<MemoryRevision['changeType']> = [
         'create',
         'update',
+        'approve',
+        'reject',
         'supersede',
         'disable',
         'delete',

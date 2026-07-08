@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -60,6 +60,89 @@ describe('Database', () => {
       db = initDatabase({ path: dbPath, readonly: true });
       expect(db).toBeDefined();
     });
+
+    it('should redact verbose SQL console output', () => {
+      const dbPath = join(testDir, 'test.db');
+      const rawSecret = 'sk-database-verbose-secret-should-not-leak';
+      const rawPlatformId = 'qq-1234567890';
+      const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+      try {
+        db = initDatabase({ path: dbPath, verbose: true });
+        db.exec(`
+          CREATE TABLE verbose_redaction_probe (value TEXT);
+          INSERT INTO verbose_redaction_probe (value)
+          VALUES ('api_key=${rawSecret} target=${rawPlatformId}');
+        `);
+
+        const output = consoleLog.mock.calls
+          .map((call) => call.map((value) => String(value)).join(' '))
+          .join('\n');
+
+        expect(output).toContain('[REDACTED:api_key_assignment]');
+        expect(output).toContain('[REDACTED:platform_id]');
+        expect(output).not.toContain(rawSecret);
+        expect(output).not.toContain(rawPlatformId);
+      } finally {
+        consoleLog.mockRestore();
+      }
+    });
+
+    it('should preserve both markers for adjacent secret/platform verbose SQL output', () => {
+      const dbPath = join(testDir, 'test.db');
+      const rawAdjacent = 'sk-database-verbose-adjacent-secret-qq-1234567890';
+      const rawPlatformId = 'qq-1234567890';
+      const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+      try {
+        db = initDatabase({ path: dbPath, verbose: true });
+        db.exec(`
+          CREATE TABLE verbose_adjacent_redaction_probe (value TEXT);
+          INSERT INTO verbose_adjacent_redaction_probe (value)
+          VALUES ('target=${rawAdjacent}');
+        `);
+
+        const output = consoleLog.mock.calls
+          .map((call) => call.map((value) => String(value)).join(' '))
+          .join('\n');
+
+        expect(output).toContain('[REDACTED:openai_like_api_key]');
+        expect(output).toContain('[REDACTED:platform_id]');
+        expect(output).not.toContain(rawAdjacent);
+        expect(output).not.toContain(rawPlatformId);
+        expect(output).not.toContain('1234567890');
+      } finally {
+        consoleLog.mockRestore();
+      }
+    });
+
+    it('should preserve both markers for assignment-shaped adjacent verbose SQL output', () => {
+      const dbPath = join(testDir, 'test.db');
+      const rawAdjacent = 'api_key=sk-database-verbose-assignment-secret-qq-1234567890';
+      const rawPlatformId = 'qq-1234567890';
+      const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+      try {
+        db = initDatabase({ path: dbPath, verbose: true });
+        db.exec(`
+          CREATE TABLE verbose_assignment_adjacent_redaction_probe (value TEXT);
+          INSERT INTO verbose_assignment_adjacent_redaction_probe (value)
+          VALUES ('target=${rawAdjacent}');
+        `);
+
+        const output = consoleLog.mock.calls
+          .map((call) => call.map((value) => String(value)).join(' '))
+          .join('\n');
+
+        expect(output).toContain('[REDACTED:api_key_assignment]');
+        expect(output).toContain('[REDACTED:platform_id]');
+        expect(output).not.toContain(rawAdjacent);
+        expect(output).not.toContain(rawPlatformId);
+        expect(output).not.toContain('1234567890');
+      } finally {
+        consoleLog.mockRestore();
+      }
+    });
   });
 
   describe('Schema version tracking', () => {
@@ -119,9 +202,15 @@ describe('Database', () => {
 
       expect(tableNames).toContain('canonical_users');
       expect(tableNames).toContain('platform_accounts');
+      expect(tableNames).toContain('privacy_preferences');
       expect(tableNames).toContain('memory_records');
       expect(tableNames).toContain('agent_turns');
+      expect(tableNames).toContain('context_traces');
       expect(tableNames).toContain('audit_log');
+      expect(tableNames).toContain('event_processing_failures');
+      expect(tableNames).toContain('jobs');
+      expect(tableNames).toContain('job_attempts');
+      expect(tableNames).toContain('worker_heartbeats');
     });
 
     it('migration should be idempotent', () => {
@@ -253,6 +342,21 @@ describe('Database', () => {
       expect(indexNames).toContain('idx_raw_events_type');
       expect(indexNames).toContain('idx_raw_events_timestamp');
       expect(indexNames).toContain('idx_raw_events_conversation');
+    });
+
+    it('should create indexes for event_processing_failures', () => {
+      const indexes = db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='event_processing_failures' AND name NOT LIKE 'sqlite_%'"
+        )
+        .all() as Array<{ name: string }>;
+
+      const indexNames = indexes.map((i) => i.name);
+
+      expect(indexNames).toContain('idx_event_processing_failures_occurred');
+      expect(indexNames).toContain('idx_event_processing_failures_stage');
+      expect(indexNames).toContain('idx_event_processing_failures_raw_event');
+      expect(indexNames).toContain('idx_event_processing_failures_turn');
     });
   });
 

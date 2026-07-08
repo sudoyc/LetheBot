@@ -329,6 +329,164 @@ describe('MemoryRepository', () => {
         'memory.delete',
       ]);
     });
+
+    it('redacts secret-like revision reasons before durable storage', async () => {
+      const secret = 'sk-memoryrevisionabcdefghijklmnopqrstuvwxyz';
+      const platformId = 'qq-723456789';
+
+      await repo.disable(memoryId, { reason: `operator pasted ${secret} for ${platformId}` });
+
+      const revision = db
+        .prepare(
+          `SELECT reason
+           FROM memory_revisions
+           WHERE memory_id = ? AND change_type = 'disable'`
+        )
+        .get(memoryId) as { reason: string };
+
+      expect(revision.reason).toContain('[REDACTED:openai_like_api_key]');
+      expect(revision.reason).toContain('[REDACTED:platform_id]');
+      expect(revision.reason).not.toContain(secret);
+      expect(revision.reason).not.toContain(platformId);
+    });
+
+    it('preserves platform markers for adjacent secret/platform revision and audit text', async () => {
+      const adjacentSecretPlatform = 'sk-memoryrepo-adjacent-secret-qq-12345678901';
+
+      await repo.disable(memoryId, {
+        reason: `operator pasted ${adjacentSecretPlatform}`,
+        auditSummary: `disable summary ${adjacentSecretPlatform}`,
+        auditDetails: {
+          reason: `disable detail ${adjacentSecretPlatform}`,
+          nested: {
+            value: adjacentSecretPlatform,
+          },
+        },
+      });
+
+      const revision = db
+        .prepare(
+          `SELECT reason
+           FROM memory_revisions
+           WHERE memory_id = ? AND change_type = 'disable'`
+        )
+        .get(memoryId) as { reason: string };
+      const audit = db
+        .prepare(
+          `SELECT summary, details
+           FROM audit_log
+           WHERE category = 'memory' AND event_id = ? AND event_type = 'memory.disable'`
+        )
+        .get(memoryId) as { summary: string; details: string };
+      const serialized = `${revision.reason}\n${audit.summary}\n${audit.details}`;
+
+      expect(serialized).toContain('[REDACTED:openai_like_api_key]');
+      expect(serialized).toContain('[REDACTED:platform_id]');
+      expect(serialized).not.toContain(adjacentSecretPlatform);
+      expect(serialized).not.toContain('qq-12345678901');
+      expect(serialized).not.toContain('12345678901');
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+    });
+
+    it('preserves platform markers for assignment-shaped adjacent revision and audit text', async () => {
+      const adjacentSecretPlatform = 'api_key=sk-memoryrepo-adjacent-secret-qq-12345678901';
+
+      await repo.disable(memoryId, {
+        reason: `operator pasted ${adjacentSecretPlatform}`,
+        auditSummary: `disable summary ${adjacentSecretPlatform}`,
+        auditDetails: {
+          reason: `disable detail ${adjacentSecretPlatform}`,
+          nested: {
+            value: adjacentSecretPlatform,
+          },
+          [adjacentSecretPlatform]: 'dynamic key',
+        },
+      });
+
+      const revision = db
+        .prepare(
+          `SELECT reason
+           FROM memory_revisions
+           WHERE memory_id = ? AND change_type = 'disable'`
+        )
+        .get(memoryId) as { reason: string };
+      const audit = db
+        .prepare(
+          `SELECT summary, details
+           FROM audit_log
+           WHERE category = 'memory' AND event_id = ? AND event_type = 'memory.disable'`
+        )
+        .get(memoryId) as { summary: string; details: string };
+      const serialized = `${revision.reason}\n${audit.summary}\n${audit.details}`;
+
+      expect(serialized).toContain('[REDACTED:api_key_assignment]');
+      expect(serialized).toContain('[REDACTED:platform_id]');
+      expect(serialized).not.toContain(adjacentSecretPlatform);
+      expect(serialized).not.toContain('sk-memoryrepo-adjacent-secret');
+      expect(serialized).not.toContain('qq-12345678901');
+      expect(serialized).not.toContain('12345678901');
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+    });
+
+    it('should approve proposed memory with explicit approve revision', async () => {
+      const proposedId = await repo.create({
+        scope: 'user',
+        canonicalUserId: 'user-alice',
+        visibility: 'private_only',
+        sensitivity: 'normal',
+        authority: 'inferred',
+        kind: 'preference',
+        title: 'Proposal',
+        content: 'Proposed content',
+        state: 'proposed',
+        confidence: 0.7,
+        importance: 0.6,
+      });
+
+      await repo.approve(proposedId, { reason: 'admin approve proposal' });
+
+      const record = await repo.findById(proposedId);
+      const active = await repo.retrieve({ canonicalUserId: 'user-alice' });
+      const revisions = db
+        .prepare('SELECT change_type, reason FROM memory_revisions WHERE memory_id = ? ORDER BY revision_number ASC')
+        .all(proposedId) as Array<{ change_type: string; reason: string }>;
+
+      expect(record?.state).toBe('active');
+      expect(active.map((memory) => memory.id)).toContain(proposedId);
+      expect(revisions.map((row) => row.change_type)).toEqual(['create', 'approve']);
+      expect(revisions[1].reason).toBe('admin approve proposal');
+    });
+
+    it('should reject proposed memory and exclude it from retrieval', async () => {
+      const proposedId = await repo.create({
+        scope: 'user',
+        canonicalUserId: 'user-alice',
+        visibility: 'private_only',
+        sensitivity: 'normal',
+        authority: 'inferred',
+        kind: 'fact',
+        title: 'Rejectable proposal',
+        content: 'Unverified content',
+        state: 'proposed',
+        confidence: 0.4,
+        importance: 0.3,
+      });
+
+      await repo.reject(proposedId, { reason: 'admin reject proposal' });
+
+      const record = await repo.findById(proposedId);
+      const active = await repo.retrieve({ canonicalUserId: 'user-alice' });
+      const rejected = await repo.retrieve({ canonicalUserId: 'user-alice', state: 'rejected' });
+      const revisions = db
+        .prepare('SELECT change_type, reason FROM memory_revisions WHERE memory_id = ? ORDER BY revision_number ASC')
+        .all(proposedId) as Array<{ change_type: string; reason: string }>;
+
+      expect(record?.state).toBe('rejected');
+      expect(active.map((memory) => memory.id)).not.toContain(proposedId);
+      expect(rejected.map((memory) => memory.id)).toContain(proposedId);
+      expect(revisions.map((row) => row.change_type)).toEqual(['create', 'reject']);
+      expect(revisions[1].reason).toBe('admin reject proposal');
+    });
   });
 
   describe('full-text search', () => {

@@ -8,7 +8,11 @@ import type Database from 'better-sqlite3';
 import type { AuditEntry } from '../types/audit';
 import type { MemoryRecord, MemorySource } from '../types/memory';
 import type { ActorClass, InvocationContext } from '../types/tool';
-import { scanMemoryForSecrets, type SecretScanFinding } from '../memory/secret-scan.js';
+import {
+  redactSecretsInText,
+  scanMemoryForSecrets,
+  type SecretScanFinding,
+} from '../memory/secret-scan.js';
 import { ulid } from 'ulidx';
 
 export interface MemorySourceInput {
@@ -53,6 +57,7 @@ export interface MemoryStateChangeOptions {
   actor?: MemoryActorInput;
   reason?: string;
   auditSummary?: string;
+  auditDetails?: Record<string, unknown>;
   evaluatorDecisionId?: string;
 }
 
@@ -88,6 +93,8 @@ type MemoryRecordSnapshot = Omit<MemoryRecord, 'createdAt' | 'updatedAt' | 'expi
 type MemoryRevisionChangeType =
   | 'create'
   | 'update'
+  | 'approve'
+  | 'reject'
   | 'supersede'
   | 'disable'
   | 'delete'
@@ -286,10 +293,11 @@ export class MemoryRepository {
         return;
       }
 
+      const changeType = this.changeTypeForTransition(previousRecord.state, state);
       const evaluatorDecisionId = options?.evaluatorDecisionId
         ?? previousRecord.evaluatorDecisionId
         ?? this.defaultPolicyDecisionId(id, state);
-      const actor = this.resolveActor(options?.actor, previousRecord, this.changeTypeForState(state));
+      const actor = this.resolveActor(options?.actor, previousRecord, changeType);
 
       this.db
         .prepare(
@@ -300,7 +308,6 @@ export class MemoryRepository {
         .run(state, now, evaluatorDecisionId, id);
 
       const updatedRow = this.getRequiredMemoryRow(id);
-      const changeType = this.changeTypeForState(state);
       const nextRevision = this.nextRevisionNumber(id);
 
       this.insertRevision({
@@ -333,6 +340,7 @@ export class MemoryRepository {
           newState: state,
           revisionNumber: nextRevision,
           policyDecision: evaluatorDecisionId,
+          ...(options?.auditDetails ?? {}),
         },
         redacted: true,
         riskLevel: 'low',
@@ -355,6 +363,35 @@ export class MemoryRepository {
    */
   async disable(id: string, options?: MemoryStateChangeOptions): Promise<void> {
     await this.updateState(id, 'disabled', options);
+  }
+
+  /**
+   * 批准 proposed memory，变为 active。
+   */
+  async approve(id: string, options?: MemoryStateChangeOptions): Promise<void> {
+    await this.updateState(id, 'active', options);
+  }
+
+  /**
+   * 拒绝 proposed memory。Rejected records remain auditable but are excluded
+   * from ordinary retrieval because retrieval defaults to active-only.
+   */
+  async reject(id: string, options?: MemoryStateChangeOptions): Promise<void> {
+    await this.updateState(id, 'rejected', options);
+  }
+
+  /**
+   * 标记旧记忆已被新证据/新记录取代。
+   */
+  async supersede(id: string, options?: MemoryStateChangeOptions): Promise<void> {
+    await this.updateState(id, 'superseded', options);
+  }
+
+  /**
+   * 恢复被禁用或拒绝的记忆。
+   */
+  async restore(id: string, options?: MemoryStateChangeOptions): Promise<void> {
+    await this.updateState(id, 'active', options);
   }
 
   /**
@@ -509,7 +546,7 @@ export class MemoryRepository {
         input.changeType,
         input.previousState ? JSON.stringify(input.previousState) : null,
         JSON.stringify(input.newState),
-        input.reason,
+        this.redactAuditText(input.reason),
         input.actor,
         input.evaluatorDecisionId ?? null,
         input.createdAt
@@ -517,6 +554,9 @@ export class MemoryRepository {
   }
 
   private insertAudit(entry: Omit<AuditEntry, 'id'>): void {
+    const summary = this.redactAuditText(entry.summary);
+    const details = entry.details ? this.redactAuditStructuredValue(entry.details) : null;
+
     this.db
       .prepare(
         `INSERT INTO audit_log (
@@ -535,12 +575,48 @@ export class MemoryRepository {
         entry.actor.canonicalUserId ?? null,
         entry.actor.actorClass,
         entry.actor.context,
-        entry.summary,
-        entry.details ? JSON.stringify(entry.details) : null,
+        summary,
+        details ? JSON.stringify(details) : null,
         entry.redacted ? 1 : 0,
         entry.riskLevel ?? null,
         entry.evaluatorDecisionId ?? null
       );
+  }
+
+  private redactAuditText(text: string): string {
+    const platformRedacted = this.redactPlatformIdentifiers(text);
+    const secretRedacted = redactSecretsInText(platformRedacted).text;
+    const redacted = this.redactPlatformIdentifiers(secretRedacted);
+    const platformMarkerLost =
+      platformRedacted.includes('[REDACTED:platform_id]') && !redacted.includes('[REDACTED:platform_id]');
+
+    return platformMarkerLost ? `${redacted} [REDACTED:platform_id]` : redacted;
+  }
+
+  private redactPlatformIdentifiers(text: string): string {
+    return text
+      .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
+      .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
+  }
+
+  private redactAuditStructuredValue(value: unknown): unknown {
+    if (typeof value === 'string') {
+      return this.redactAuditText(value);
+    }
+
+    if (Array.isArray(value)) {
+      return value.map((item) => this.redactAuditStructuredValue(item));
+    }
+
+    if (value && typeof value === 'object') {
+      const result: Record<string, unknown> = {};
+      for (const [key, child] of Object.entries(value)) {
+        result[this.redactAuditText(key)] = this.redactAuditStructuredValue(child);
+      }
+      return result;
+    }
+
+    return value;
   }
 
   private upsertFtsRow(rowid: number, title: string, content: string): void {
@@ -584,7 +660,7 @@ export class MemoryRepository {
   private resolveActor(
     actor: MemoryActorInput | undefined,
     input: Pick<MemoryRecordInput, 'canonicalUserId' | 'authority' | 'sourceContext'>,
-    changeType: 'create' | 'update' | 'supersede' | 'disable' | 'delete' | 'restore'
+    changeType: MemoryRevisionChangeType
   ): Required<Pick<MemoryActorInput, 'actorClass' | 'context'>> & Pick<MemoryActorInput, 'canonicalUserId'> {
     const context = actor?.context ?? this.inferInvocationContext(input.sourceContext, changeType);
     const actorClass = actor?.actorClass ?? this.inferActorClass(input.authority, context, changeType);
@@ -598,7 +674,7 @@ export class MemoryRepository {
 
   private inferInvocationContext(
     sourceContext: string | undefined,
-    changeType: 'create' | 'update' | 'supersede' | 'disable' | 'delete' | 'restore'
+    changeType: MemoryRevisionChangeType
   ): InvocationContext {
     if (sourceContext?.startsWith('group_chat')) {
       return 'group_chat';
@@ -612,7 +688,13 @@ export class MemoryRepository {
     if (sourceContext?.startsWith('background_worker')) {
       return 'background_worker';
     }
-    if (changeType === 'disable' || changeType === 'delete' || changeType === 'restore') {
+    if (
+      changeType === 'approve' ||
+      changeType === 'reject' ||
+      changeType === 'disable' ||
+      changeType === 'delete' ||
+      changeType === 'restore'
+    ) {
       return 'admin_cli';
     }
     return 'internal';
@@ -621,9 +703,15 @@ export class MemoryRepository {
   private inferActorClass(
     authority: MemoryRecord['authority'] | undefined,
     context: InvocationContext,
-    changeType: 'create' | 'update' | 'supersede' | 'disable' | 'delete' | 'restore'
+    changeType: MemoryRevisionChangeType
   ): ActorClass {
-    if (changeType === 'disable' || changeType === 'delete' || changeType === 'restore') {
+    if (
+      changeType === 'approve' ||
+      changeType === 'reject' ||
+      changeType === 'disable' ||
+      changeType === 'delete' ||
+      changeType === 'restore'
+    ) {
       return 'admin';
     }
     if (authority === 'user_stated') {
@@ -676,9 +764,16 @@ export class MemoryRepository {
     return 'low';
   }
 
-  private changeTypeForState(
+  private changeTypeForTransition(
+    previousState: MemoryRecord['state'],
     state: MemoryRecord['state']
   ): Exclude<MemoryRevisionChangeType, 'create'> {
+    if (state === 'active' && previousState === 'proposed') {
+      return 'approve';
+    }
+    if (state === 'rejected') {
+      return 'reject';
+    }
     if (state === 'superseded') {
       return 'supersede';
     }

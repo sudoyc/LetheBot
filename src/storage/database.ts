@@ -6,6 +6,7 @@
 
 import Database from 'better-sqlite3';
 import { readFileSync } from 'node:fs';
+import { redactSecretsInText } from '../memory/secret-scan';
 
 export interface DatabaseConfig {
   path: string;
@@ -19,7 +20,7 @@ export interface DatabaseConfig {
 export function initDatabase(config: DatabaseConfig): Database.Database {
   const db = new Database(config.path, {
     readonly: config.readonly ?? false,
-    verbose: config.verbose ? console.log : undefined,
+    verbose: config.verbose ? logVerboseSql : undefined,
   });
 
   // 启用外键约束
@@ -31,6 +32,30 @@ export function initDatabase(config: DatabaseConfig): Database.Database {
   }
 
   return db;
+}
+
+function logVerboseSql(message?: unknown, ...additionalArgs: unknown[]): void {
+  const parts = [message, ...additionalArgs]
+    .filter((part) => part !== undefined)
+    .map((part) => redactSqlForDisplay(String(part)));
+  console.log(parts.join(' '));
+}
+
+function redactSqlForDisplay(sql: string): string {
+  const platformRedacted = redactPlatformIdentifiers(sql);
+  const secretRedacted = redactSecretsInText(platformRedacted).text;
+  const redacted = redactPlatformIdentifiers(secretRedacted);
+  const platformMarkerLost =
+    platformRedacted.includes('[REDACTED:platform_id]')
+    && !redacted.includes('[REDACTED:platform_id]');
+
+  return platformMarkerLost ? `${redacted} [REDACTED:platform_id]` : redacted;
+}
+
+function redactPlatformIdentifiers(sql: string): string {
+  return sql
+    .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
+    .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
 }
 
 /**
