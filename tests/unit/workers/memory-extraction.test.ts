@@ -10,6 +10,7 @@ import {
   type ExtractionPattern,
 } from '../../../src/workers/memory-extraction';
 import { MemoryRepository } from '../../../src/storage/memory-repository';
+import { PrivacyPreferenceRepository } from '../../../src/storage/privacy-preference-repository';
 
 describe('MemoryExtractionWorker', () => {
   let testDir: string;
@@ -389,8 +390,7 @@ describe('MemoryExtractionWorker', () => {
       // 错误被收集而不是抛出
       expect(result.matched).toBe(false);
       expect(result.count).toBe(0);
-      expect(result.errors).toBeDefined();
-      expect(result.errors!.length).toBeGreaterThan(0);
+      expect(result.errors?.length ?? 0).toBeGreaterThan(0);
     });
 
     it('should include error code and context', async () => {
@@ -505,6 +505,44 @@ describe('MemoryExtractionWorker', () => {
       expect(memory.source_context).toBe('group_chat');
       expect(memory.visibility).toBe('same_group_only');
       expect(activeMemories).toHaveLength(0);
+    });
+
+    it('should enforce memory-association opt-out through the default proposal service', async () => {
+      const privacyRepo = new PrivacyPreferenceRepository(db);
+      db.prepare('INSERT INTO canonical_users (id, created_at, last_seen_at) VALUES (?, ?, ?)')
+        .run('user-optout', Date.now(), Date.now());
+      privacyRepo.setOptOut({
+        canonicalUserId: 'user-optout',
+        preferenceType: 'memory_association',
+        reason: 'User requested no memory association',
+        actor: {
+          actorClass: 'admin',
+          context: 'admin_cli',
+        },
+      });
+
+      const result = await worker.extractFromTurn({
+        conversationId: 'conv-optout',
+        userId: 'user-optout',
+        userMessage: '我喜欢不会被记住',
+        botResponse: '收到',
+        messageId: 'msg-optout',
+      });
+
+      const memoryRows = db
+        .prepare('SELECT * FROM memory_records WHERE canonical_user_id = ?')
+        .all('user-optout');
+      const rejectionAudit = db
+        .prepare("SELECT * FROM audit_log WHERE event_type = 'memory.candidate_rejected'")
+        .get() as { summary: string; details: string };
+
+      expect(result.matched).toBe(false);
+      expect(result.count).toBe(0);
+      expect(result.memoryIds).toHaveLength(0);
+      expect(result.errors?.[0]?.message).toBe('Memory candidate rejected by memory-association opt-out');
+      expect(memoryRows).toHaveLength(0);
+      expect(rejectionAudit.summary).toBe('Memory candidate rejected by memory-association opt-out');
+      expect(rejectionAudit.details).not.toContain('不会被记住');
     });
   });
 });

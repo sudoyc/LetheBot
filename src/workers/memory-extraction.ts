@@ -5,8 +5,12 @@
  */
 
 import type Database from 'better-sqlite3';
-import { MemoryRepository, type MemoryRecordInput } from '../storage/memory-repository.js';
+import { AuditRepository } from '../storage/audit-repository.js';
+import { MemoryRepository } from '../storage/memory-repository.js';
+import { PrivacyPreferenceRepository } from '../storage/privacy-preference-repository.js';
+import { EvaluatorStub } from '../evaluator/evaluator-stub.js';
 import { getLogger } from '../logger/index.js';
+import { MemoryProposalService } from '../memory/proposal-service.js';
 
 const logger = getLogger();
 
@@ -136,17 +140,25 @@ const DEFAULT_PATTERNS: ExtractionPattern[] = [
 export class MemoryExtractionWorker {
   private patterns: ExtractionPattern[];
   private readonly memoryRepo: MemoryRepository;
+  private readonly memoryProposalService: MemoryProposalService;
 
   constructor(
     private readonly db: Database.Database,
     memoryRepo?: MemoryRepository,
-    patterns?: ExtractionPattern[]
+    patterns?: ExtractionPattern[],
+    memoryProposalService?: MemoryProposalService
   ) {
     if (!db) {
       throw new Error('Database instance is required');
     }
 
     this.memoryRepo = memoryRepo ?? new MemoryRepository(db);
+    this.memoryProposalService = memoryProposalService
+      ?? new MemoryProposalService(this.memoryRepo, {
+        evaluator: new EvaluatorStub(),
+        auditRepository: new AuditRepository(db),
+        privacyPreferences: new PrivacyPreferenceRepository(db),
+      });
     this.patterns = patterns ?? DEFAULT_PATTERNS;
   }
 
@@ -373,7 +385,7 @@ export class MemoryExtractionWorker {
 
       // 构建记忆记录。私聊第一方低风险陈述走本地 L0 policy 自动 active；
       // 群聊来源的 user memory 只进入 proposed，避免单条普通群消息成为 active user fact。
-      const memoryInput: MemoryRecordInput = {
+      const outcome = await this.memoryProposalService.processCandidate({
         scope: 'user',
         canonicalUserId: data.userId,
         groupId: data.groupId,
@@ -384,7 +396,6 @@ export class MemoryExtractionWorker {
         kind: data.type === 'preference' ? 'preference' : 'fact',
         title: `${data.type}: ${data.fact}`,
         content: data.fact,
-        state: isGroupDerived ? 'proposed' : 'active',
         confidence: data.confidence,
         importance: data.importance,
         sourceContext,
@@ -401,15 +412,17 @@ export class MemoryExtractionWorker {
           actorClass: 'system_worker',
           context: isGroupDerived ? 'group_chat' : 'private_chat',
         },
-        revisionReason: isGroupDerived
-          ? 'Group-chat-derived user memory kept as proposal by L0 policy'
-          : 'Private first-party statement auto-activated by deterministic L0 policy',
-        auditSummary: isGroupDerived
-          ? 'Created proposed group-chat-derived user memory'
-          : 'Created active private-chat user memory via deterministic policy',
-      };
+      });
 
-      return await this.memoryRepo.create(memoryInput);
+      if (!outcome.memoryId) {
+        throw new MemoryExtractionError(
+          outcome.reason,
+          outcome.riskLevel === 'prohibited' ? 'MEMORY_POLICY_REJECTED' : 'MEMORY_REJECTED',
+          { riskLevel: outcome.riskLevel, findings: outcome.findings }
+        );
+      }
+
+      return outcome.memoryId;
     } catch (error) {
       logger.error(
         { err: error, userId: data.userId },
@@ -422,6 +435,10 @@ export class MemoryExtractionWorker {
           'USER_CREATE_FAILED',
           { userId: data.userId, originalError: error.message }
         );
+      }
+
+      if (error instanceof MemoryExtractionError) {
+        throw error;
       }
 
       throw new MemoryExtractionError(

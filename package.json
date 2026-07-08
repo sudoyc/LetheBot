@@ -23,10 +23,13 @@
     "deploy:pm2": "tsx src/scripts/deploy-napcat.ts --mode=pm2",
     "verify:onebot": "tsx src/scripts/verify-napcat.ts",
     "verify:napcat": "tsx src/scripts/verify-napcat.ts",
+    "acceptance:evidence-template": "tsx src/scripts/local-acceptance-evidence.ts",
+    "acceptance:validate-evidence": "tsx src/scripts/local-acceptance-evidence.ts --validate",
     "ops:backup": "tsx src/scripts/ops-maintenance.ts backup",
     "ops:restore": "tsx src/scripts/ops-maintenance.ts restore",
     "ops:retention": "tsx src/scripts/ops-maintenance.ts retention",
-    "ops:metrics": "tsx src/scripts/ops-maintenance.ts metrics"
+    "ops:metrics": "tsx src/scripts/ops-maintenance.ts metrics",
+    "ops:worker-soak": "tsx src/scripts/ops-maintenance.ts worker-soak"
   },
   "keywords": [
     "chatbot",

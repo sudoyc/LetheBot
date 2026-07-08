@@ -5,7 +5,13 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { WorkerScheduler } from '../../../src/workers/scheduler.js';
+import { BackgroundWorker } from '../../../src/workers/background.js';
+import { initDatabase, runMigration, closeDatabase } from '../../../src/storage/database.js';
+import { JobRepository } from '../../../src/storage/job-repository.js';
 
 describe('WorkerScheduler', () => {
   let scheduler: WorkerScheduler;
@@ -176,5 +182,164 @@ describe('WorkerScheduler', () => {
     await vi.advanceTimersByTimeAsync(1000);
     expect(handler1).toHaveBeenCalledTimes(2);
     expect(handler2).toHaveBeenCalledTimes(1);
+  });
+
+  it('should drive a durable background worker across repeated scheduler ticks with retry evidence', async () => {
+    const testDir = mkdtempSync(join(tmpdir(), 'lethebot-scheduler-soak-'));
+    const db = initDatabase({ path: join(testDir, 'test.db') });
+
+    try {
+      runMigration(db, join(__dirname, '../../../migrations/001_initial_schema.sql'));
+      const now = new Date('2026-07-03T00:00:00.000Z');
+      vi.setSystemTime(now);
+
+      const jobRepository = new JobRepository(db);
+      let extractionCalls = 0;
+      const durableWorker = new BackgroundWorker({
+        jobRepository,
+        workerId: 'scheduler-soak-worker',
+        leaseMs: 2_000,
+        handlers: {
+          summary: async (task) => ({ summaryId: `summary:${task.payload.conversationId}` }),
+          extraction: async () => {
+            extractionCalls += 1;
+            if (extractionCalls === 1) {
+              throw new Error('scheduled extraction transient failure');
+            }
+
+            return { extracted: 1 };
+          },
+          retention: async (task) => ({ retained: true, rawDays: task.payload.rawDays }),
+        },
+      });
+
+      const summaryJobId = durableWorker.enqueue({
+        type: 'summary',
+        payload: { conversationId: 'conv-scheduler-soak' },
+        idempotencyKey: 'summary:conv-scheduler-soak:window-1',
+        scheduledAt: now.getTime(),
+      });
+      const extractionJobId = durableWorker.enqueue({
+        type: 'extraction',
+        payload: { conversationId: 'conv-scheduler-soak', targetUserId: 'user-scheduler-soak' },
+        maxAttempts: 2,
+        scheduledAt: now.getTime() + 1,
+      });
+      const retentionJobId = durableWorker.enqueue({
+        type: 'retention',
+        payload: { rawDays: 30 },
+        scheduledAt: now.getTime() + 3_000,
+      });
+      const results: unknown[] = [];
+
+      scheduler.register({
+        name: 'durable-worker-soak',
+        intervalMs: 1_000,
+        handler: async () => {
+          results.push(await durableWorker.processNext());
+        },
+      });
+      scheduler.start();
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      scheduler.stop();
+      const resultCountAtStop = results.length;
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(results).toEqual([
+        {
+          taskId: summaryJobId,
+          status: 'completed',
+          output: { summaryId: 'summary:conv-scheduler-soak' },
+        },
+        {
+          taskId: extractionJobId,
+          status: 'failed',
+          error: 'scheduled extraction transient failure',
+        },
+        {
+          taskId: extractionJobId,
+          status: 'completed',
+          output: { extracted: 1 },
+        },
+        {
+          taskId: retentionJobId,
+          status: 'completed',
+          output: { retained: true, rawDays: 30 },
+        },
+      ]);
+      expect(results).toHaveLength(resultCountAtStop);
+      expect(durableWorker.getStatus(summaryJobId)).toBe('completed');
+      expect(durableWorker.getStatus(extractionJobId)).toBe('completed');
+      expect(durableWorker.getStatus(retentionJobId)).toBe('completed');
+
+      const jobs = db
+        .prepare('SELECT id, type, status, attempts, result FROM jobs WHERE id IN (?, ?, ?) ORDER BY type ASC')
+        .all(summaryJobId, extractionJobId, retentionJobId) as Array<{
+          id: string;
+          type: string;
+          status: string;
+          attempts: number;
+          result: string;
+        }>;
+      const extractionAttempts = db
+        .prepare('SELECT status, error, result FROM job_attempts WHERE job_id = ? ORDER BY attempt_number ASC')
+        .all(extractionJobId) as Array<{ status: string; error: string | null; result: string | null }>;
+      const runningAttempts = db
+        .prepare('SELECT COUNT(*) as count FROM job_attempts WHERE status = ?')
+        .get('running') as { count: number };
+      const heartbeat = db
+        .prepare('SELECT status, current_job_id FROM worker_heartbeats WHERE worker_id = ?')
+        .get('scheduler-soak-worker') as { status: string; current_job_id: string | null };
+
+      expect(jobs).toEqual([
+        {
+          id: extractionJobId,
+          type: 'extraction',
+          status: 'completed',
+          attempts: 2,
+          result: JSON.stringify({ extracted: 1 }),
+        },
+        {
+          id: retentionJobId,
+          type: 'retention',
+          status: 'completed',
+          attempts: 1,
+          result: JSON.stringify({ retained: true, rawDays: 30 }),
+        },
+        {
+          id: summaryJobId,
+          type: 'summary',
+          status: 'completed',
+          attempts: 1,
+          result: JSON.stringify({ summaryId: 'summary:conv-scheduler-soak' }),
+        },
+      ]);
+      expect(extractionAttempts).toEqual([
+        {
+          status: 'failed',
+          error: 'scheduled extraction transient failure',
+          result: null,
+        },
+        {
+          status: 'completed',
+          error: null,
+          result: JSON.stringify({ extracted: 1 }),
+        },
+      ]);
+      expect(runningAttempts.count).toBe(0);
+      expect(heartbeat).toEqual({
+        status: 'idle',
+        current_job_id: null,
+      });
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+    } finally {
+      closeDatabase(db);
+      rmSync(testDir, { recursive: true, force: true });
+    }
   });
 });

@@ -165,8 +165,7 @@ describe('MemoryExtractionWorker - Integration Tests', () => {
 
       // 错误被收集而不是抛出
       expect(result.matched).toBe(false);
-      expect(result.errors).toBeDefined();
-      expect(result.errors!.length).toBeGreaterThan(0);
+      expect(result.errors?.length ?? 0).toBeGreaterThan(0);
     });
   });
 

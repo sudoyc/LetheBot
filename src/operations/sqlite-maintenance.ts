@@ -12,6 +12,7 @@ import {
   statSync,
 } from 'node:fs';
 import { dirname } from 'node:path';
+import { redactSecretsInText } from '../memory/secret-scan';
 
 export interface SqliteBackupOptions {
   sourcePath: string;
@@ -47,12 +48,14 @@ export interface RetentionPolicy {
   chatMessagesDays?: number;
   auditLogDays?: number;
   disabledDeletedMemoryDays?: number;
+  eventProcessingFailuresDays?: number;
 }
 
 export interface RetentionResult {
   rawEventsDeleted: number;
   chatMessagesDeleted: number;
   auditLogDeleted: number;
+  eventProcessingFailuresDeleted: number;
   memoriesPurged: number;
   memorySourcesDeleted: number;
   memoryRevisionsDeleted: number;
@@ -73,6 +76,20 @@ export interface OperationsMetrics {
     byStatus: Record<string, number>;
     tokensTotal: number;
   };
+  contextTraces: {
+    total: number;
+  };
+  actionDecisions: {
+    total: number;
+    byDecidedBy: Record<string, number>;
+    byRiskLevel: Record<string, number>;
+    evaluatorRequired: number;
+  };
+  actionExecutions: {
+    total: number;
+    byStatus: Record<string, number>;
+    byActionType: Record<string, number>;
+  };
   memoryWrites: {
     total: number;
     byState: Record<string, number>;
@@ -88,7 +105,90 @@ export interface OperationsMetrics {
     byStatus: Record<string, number>;
     secretsRedacted: number;
   };
+  jobs: {
+    total: number;
+    byStatus: Record<string, number>;
+    byType: Record<string, number>;
+    pending: number;
+    running: number;
+    failed: number;
+    expiredRunningLeases: number;
+  };
+  jobAttempts: {
+    total: number;
+    byStatus: Record<string, number>;
+  };
+  workerHeartbeats: {
+    total: number;
+    byStatus: Record<string, number>;
+    byWorkerType: Record<string, number>;
+  };
+  eventProcessingFailures: {
+    total: number;
+    byStage: Record<string, number>;
+    byConversationType: Record<string, number>;
+  };
 }
+
+const AGENT_TURN_STATUSES = ['pending', 'running', 'completed', 'failed', 'aborted'] as const;
+const ACTION_DECIDED_BY_VALUES = ['attention', 'pi', 'evaluator'] as const;
+const RISK_LEVELS = ['low', 'medium', 'high', 'prohibited'] as const;
+const ACTION_EXECUTION_STATUSES = ['success', 'downgraded', 'failed', 'rejected'] as const;
+const ACTION_TYPES = [
+  'silent_store',
+  'silent_summarize_later',
+  'reply_short',
+  'reply_full',
+  'reply_with_tool',
+  'propose_memory',
+  'admin_digest',
+  'schedule_background_task',
+  'dm_user',
+  'react_only',
+  'send_folded_forward',
+  'ask_clarification',
+] as const;
+const MEMORY_STATES = ['proposed', 'active', 'rejected', 'superseded', 'disabled', 'deleted'] as const;
+const AUDIT_CATEGORIES = ['tool', 'memory', 'social', 'evaluator', 'system'] as const;
+const TOOL_CALL_STATUSES = ['success', 'error', 'timeout', 'rejected'] as const;
+const JOB_STATUSES = ['pending', 'running', 'completed', 'failed'] as const;
+const JOB_TYPES = [
+  'summary',
+  'extraction',
+  'retention',
+  'admin_digest',
+  'conflict',
+  'decay',
+  'consolidation',
+] as const;
+const JOB_ATTEMPT_STATUSES = ['running', 'completed', 'failed'] as const;
+const WORKER_HEARTBEAT_STATUSES = ['idle', 'running', 'stopping', 'error'] as const;
+const WORKER_TYPES = [
+  'background',
+  'summary',
+  'extraction',
+  'retention',
+  'admin_digest',
+  'conflict',
+  'decay',
+  'consolidation',
+] as const;
+const EVENT_PROCESSING_STAGES = [
+  'raw_event_store',
+  'identity_resolution',
+  'display_metadata',
+  'chat_message_store',
+  'attention_analysis',
+  'turn_create',
+  'context_building',
+  'pi_inference',
+  'social_decision',
+  'action_execution',
+  'bot_response_persist',
+  'memory_extraction',
+  'turn_complete',
+] as const;
+const CONVERSATION_TYPES = ['private', 'group'] as const;
 
 export async function backupSqliteDatabase(
   options: SqliteBackupOptions,
@@ -175,6 +275,7 @@ export function applyRetentionPolicy(
     rawEventsDeleted: 0,
     chatMessagesDeleted: 0,
     auditLogDeleted: 0,
+    eventProcessingFailuresDeleted: 0,
     memoriesPurged: 0,
     memorySourcesDeleted: 0,
     memoryRevisionsDeleted: 0,
@@ -206,6 +307,13 @@ export function applyRetentionPolicy(
       result.auditLogDeleted = db
         .prepare('DELETE FROM audit_log WHERE timestamp < ?')
         .run(auditCutoff).changes;
+    }
+
+    const eventFailureCutoff = cutoffMs(policy.eventProcessingFailuresDays, nowMs);
+    if (eventFailureCutoff !== undefined) {
+      result.eventProcessingFailuresDeleted = db
+        .prepare('DELETE FROM event_processing_failures WHERE occurred_at < ?')
+        .run(eventFailureCutoff).changes;
     }
 
     const memoryCutoff = cutoffMs(policy.disabledDeletedMemoryDays, nowMs);
@@ -258,6 +366,20 @@ export function collectOperationsMetrics(
       byStatus: countBy(db, 'agent_turns', 'status', 'started_at', sinceMs),
       tokensTotal: sumColumn(db, 'agent_turns', 'tokens_total', 'started_at', sinceMs),
     },
+    contextTraces: {
+      total: countRows(db, 'context_traces', 'created_at', sinceMs),
+    },
+    actionDecisions: {
+      total: countRows(db, 'action_decisions', 'created_at', sinceMs),
+      byDecidedBy: countBy(db, 'action_decisions', 'decided_by', 'created_at', sinceMs),
+      byRiskLevel: countBy(db, 'action_decisions', 'risk_level', 'created_at', sinceMs),
+      evaluatorRequired: sumColumn(db, 'action_decisions', 'evaluator_required', 'created_at', sinceMs),
+    },
+    actionExecutions: {
+      total: countRows(db, 'action_executions', 'executed_at', sinceMs),
+      byStatus: countBy(db, 'action_executions', 'status', 'executed_at', sinceMs),
+      byActionType: countBy(db, 'action_executions', 'action_type', 'executed_at', sinceMs),
+    },
     memoryWrites: {
       total: countRows(db, 'memory_records', 'created_at', sinceMs),
       byState: countBy(db, 'memory_records', 'state', 'created_at', sinceMs),
@@ -273,7 +395,84 @@ export function collectOperationsMetrics(
       byStatus: countBy(db, 'tool_calls', 'status', 'created_at', sinceMs),
       secretsRedacted: sumColumn(db, 'tool_calls', 'secrets_redacted', 'created_at', sinceMs),
     },
+    jobs: {
+      total: countRows(db, 'jobs', 'created_at', sinceMs),
+      byStatus: countBy(db, 'jobs', 'status', 'created_at', sinceMs),
+      byType: countBy(db, 'jobs', 'type', 'created_at', sinceMs),
+      pending: countRowsWhere(db, 'jobs', 'status = ?', ['pending'], 'created_at', sinceMs),
+      running: countRowsWhere(db, 'jobs', 'status = ?', ['running'], 'created_at', sinceMs),
+      failed: countRowsWhere(db, 'jobs', 'status = ?', ['failed'], 'created_at', sinceMs),
+      expiredRunningLeases: countRowsWhere(
+        db,
+        'jobs',
+        'status = ? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?',
+        ['running', nowMs],
+        'created_at',
+        sinceMs,
+      ),
+    },
+    jobAttempts: {
+      total: countRows(db, 'job_attempts', 'started_at', sinceMs),
+      byStatus: countBy(db, 'job_attempts', 'status', 'started_at', sinceMs),
+    },
+    workerHeartbeats: {
+      total: countRows(db, 'worker_heartbeats', 'heartbeat_at', sinceMs),
+      byStatus: countBy(db, 'worker_heartbeats', 'status', 'heartbeat_at', sinceMs),
+      byWorkerType: countBy(db, 'worker_heartbeats', 'worker_type', 'heartbeat_at', sinceMs),
+    },
+    eventProcessingFailures: {
+      total: countRows(db, 'event_processing_failures', 'occurred_at', sinceMs),
+      byStage: countBy(db, 'event_processing_failures', 'stage', 'occurred_at', sinceMs),
+      byConversationType: countBy(db, 'event_processing_failures', 'conversation_type', 'occurred_at', sinceMs),
+    },
   };
+}
+
+export function formatOperationsMetricsPrometheus(metrics: OperationsMetrics): string {
+  const lines: string[] = [
+    '# HELP lethebot_metrics_snapshot_info Count-only LetheBot operations metrics snapshot.',
+    '# TYPE lethebot_metrics_snapshot_info gauge',
+    'lethebot_metrics_snapshot_info 1',
+  ];
+
+  appendGauge(lines, 'lethebot_raw_events_total', 'Raw events stored.', metrics.rawEvents.total);
+  appendGauge(lines, 'lethebot_chat_messages_total', 'Chat messages stored.', metrics.chatMessages.total);
+  appendGauge(lines, 'lethebot_agent_turns_total', 'Agent turns stored.', metrics.agentTurns.total);
+  appendGauge(lines, 'lethebot_agent_turn_tokens_total', 'Total tokens recorded on agent turns.', metrics.agentTurns.tokensTotal);
+  appendLabelCounts(lines, 'lethebot_agent_turns_status_total', 'Agent turns by status.', 'status', metrics.agentTurns.byStatus, AGENT_TURN_STATUSES);
+  appendGauge(lines, 'lethebot_context_traces_total', 'Context traces stored.', metrics.contextTraces.total);
+  appendGauge(lines, 'lethebot_action_decisions_total', 'Action decisions stored.', metrics.actionDecisions.total);
+  appendGauge(lines, 'lethebot_action_decisions_evaluator_required_total', 'Action decisions requiring evaluator review.', metrics.actionDecisions.evaluatorRequired);
+  appendLabelCounts(lines, 'lethebot_action_decisions_decided_by_total', 'Action decisions by decider.', 'decided_by', metrics.actionDecisions.byDecidedBy, ACTION_DECIDED_BY_VALUES);
+  appendLabelCounts(lines, 'lethebot_action_decisions_risk_level_total', 'Action decisions by risk level.', 'risk_level', metrics.actionDecisions.byRiskLevel, RISK_LEVELS);
+  appendGauge(lines, 'lethebot_action_executions_total', 'Action executions stored.', metrics.actionExecutions.total);
+  appendLabelCounts(lines, 'lethebot_action_executions_status_total', 'Action executions by status.', 'status', metrics.actionExecutions.byStatus, ACTION_EXECUTION_STATUSES);
+  appendLabelCounts(lines, 'lethebot_action_executions_action_type_total', 'Action executions by action type.', 'action_type', metrics.actionExecutions.byActionType, ACTION_TYPES);
+  appendGauge(lines, 'lethebot_memory_writes_total', 'Memory records stored.', metrics.memoryWrites.total);
+  appendLabelCounts(lines, 'lethebot_memory_writes_state_total', 'Memory records by lifecycle state.', 'state', metrics.memoryWrites.byState, MEMORY_STATES);
+  appendGauge(lines, 'lethebot_policy_audit_events_total', 'Audit events stored.', metrics.policyAuditEvents.total);
+  appendLabelCounts(lines, 'lethebot_policy_audit_events_category_total', 'Audit events by category.', 'category', metrics.policyAuditEvents.byCategory, AUDIT_CATEGORIES);
+  appendLabelCounts(lines, 'lethebot_policy_audit_events_risk_level_total', 'Audit events by risk level.', 'risk_level', metrics.policyAuditEvents.byRiskLevel, RISK_LEVELS);
+  appendGauge(lines, 'lethebot_tool_calls_total', 'Tool calls stored.', metrics.toolCalls.total);
+  appendGauge(lines, 'lethebot_tool_calls_secrets_redacted_total', 'Tool calls with secret redaction evidence.', metrics.toolCalls.secretsRedacted);
+  appendLabelCounts(lines, 'lethebot_tool_calls_status_total', 'Tool calls by status.', 'status', metrics.toolCalls.byStatus, TOOL_CALL_STATUSES);
+  appendGauge(lines, 'lethebot_jobs_total', 'Durable jobs stored.', metrics.jobs.total);
+  appendGauge(lines, 'lethebot_jobs_pending_total', 'Durable jobs currently pending.', metrics.jobs.pending);
+  appendGauge(lines, 'lethebot_jobs_running_total', 'Durable jobs currently running.', metrics.jobs.running);
+  appendGauge(lines, 'lethebot_jobs_failed_total', 'Durable jobs currently failed.', metrics.jobs.failed);
+  appendGauge(lines, 'lethebot_jobs_expired_running_leases_total', 'Running durable jobs with expired leases.', metrics.jobs.expiredRunningLeases);
+  appendLabelCounts(lines, 'lethebot_jobs_status_total', 'Durable jobs by status.', 'status', metrics.jobs.byStatus, JOB_STATUSES);
+  appendLabelCounts(lines, 'lethebot_jobs_type_total', 'Durable jobs by bounded known type.', 'type', metrics.jobs.byType, JOB_TYPES);
+  appendGauge(lines, 'lethebot_job_attempts_total', 'Durable job attempts stored.', metrics.jobAttempts.total);
+  appendLabelCounts(lines, 'lethebot_job_attempts_status_total', 'Durable job attempts by status.', 'status', metrics.jobAttempts.byStatus, JOB_ATTEMPT_STATUSES);
+  appendGauge(lines, 'lethebot_worker_heartbeats_total', 'Worker heartbeat rows stored.', metrics.workerHeartbeats.total);
+  appendLabelCounts(lines, 'lethebot_worker_heartbeats_status_total', 'Worker heartbeats by status.', 'status', metrics.workerHeartbeats.byStatus, WORKER_HEARTBEAT_STATUSES);
+  appendLabelCounts(lines, 'lethebot_worker_heartbeats_type_total', 'Worker heartbeats by bounded known type.', 'worker_type', metrics.workerHeartbeats.byWorkerType, WORKER_TYPES);
+  appendGauge(lines, 'lethebot_event_processing_failures_total', 'Durable event-processing failures stored.', metrics.eventProcessingFailures.total);
+  appendLabelCounts(lines, 'lethebot_event_processing_failures_stage_total', 'Event-processing failures by bounded known stage.', 'stage', metrics.eventProcessingFailures.byStage, EVENT_PROCESSING_STAGES);
+  appendLabelCounts(lines, 'lethebot_event_processing_failures_conversation_type_total', 'Event-processing failures by conversation type.', 'conversation_type', metrics.eventProcessingFailures.byConversationType, CONVERSATION_TYPES);
+
+  return `${lines.join('\n')}\n`;
 }
 
 function cutoffMs(days: number | undefined, nowMs: number): number | undefined {
@@ -317,10 +516,42 @@ function countBy(
 
   const counts: Record<string, number> = {};
   for (const row of rows as Array<{ key: string; count: number }>) {
-    counts[row.key] = row.count;
+    const key = redactMetricKey(row.key);
+    counts[key] = (counts[key] ?? 0) + row.count;
   }
 
   return counts;
+}
+
+function redactMetricKey(value: string): string {
+  const platformRedacted = redactPlatformIdentifiers(value);
+  const redacted = redactPlatformIdentifiers(redactSecretsInText(platformRedacted).text);
+  const platformMarkerLost =
+    platformRedacted.includes('[REDACTED:platform_id]')
+    && !redacted.includes('[REDACTED:platform_id]');
+
+  return platformMarkerLost ? `${redacted} [REDACTED:platform_id]` : redacted;
+}
+
+function redactPlatformIdentifiers(value: string): string {
+  return value
+    .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
+    .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
+}
+
+function countRowsWhere(
+  db: BetterSqlite3.Database,
+  table: string,
+  whereClause: string,
+  whereParams: unknown[],
+  timestampColumn: string,
+  sinceMs?: number,
+): number {
+  const sql = sinceMs === undefined
+    ? `SELECT COUNT(*) AS count FROM ${table} WHERE ${whereClause}`
+    : `SELECT COUNT(*) AS count FROM ${table} WHERE ${whereClause} AND ${timestampColumn} >= ?`;
+  const params = sinceMs === undefined ? whereParams : [...whereParams, sinceMs];
+  return readCount(db.prepare(sql).get(...params));
 }
 
 function sumColumn(
@@ -344,4 +575,46 @@ function readCount(row: unknown): number {
 
   const value = (row as { count?: unknown }).count;
   return typeof value === 'number' ? value : 0;
+}
+
+function appendGauge(lines: string[], name: string, help: string, value: number): void {
+  lines.push(`# HELP ${name} ${help}`);
+  lines.push(`# TYPE ${name} gauge`);
+  lines.push(`${name} ${formatMetricNumber(value)}`);
+}
+
+function appendLabelCounts(
+  lines: string[],
+  name: string,
+  help: string,
+  labelName: string,
+  counts: Record<string, number>,
+  allowedValues: readonly string[],
+): void {
+  const allowed = new Set(allowedValues);
+  let other = 0;
+
+  lines.push(`# HELP ${name} ${help}`);
+  lines.push(`# TYPE ${name} gauge`);
+
+  for (const value of allowedValues) {
+    const count = counts[value];
+    if (count !== undefined) {
+      lines.push(`${name}{${labelName}="${value}"} ${formatMetricNumber(count)}`);
+    }
+  }
+
+  for (const [value, count] of Object.entries(counts)) {
+    if (!allowed.has(value)) {
+      other += count;
+    }
+  }
+
+  if (other > 0) {
+    lines.push(`${name}{${labelName}="other"} ${formatMetricNumber(other)}`);
+  }
+}
+
+function formatMetricNumber(value: number): string {
+  return Number.isFinite(value) ? String(value) : '0';
 }

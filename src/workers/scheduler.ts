@@ -6,7 +6,16 @@
 
 import { getLogger } from '../logger/index.js';
 
-const logger = getLogger();
+export interface SchedulerLogger {
+  info: (...args: unknown[]) => void;
+  warn: (...args: unknown[]) => void;
+  debug: (...args: unknown[]) => void;
+  error: (...args: unknown[]) => void;
+}
+
+export interface WorkerSchedulerOptions {
+  logger?: SchedulerLogger;
+}
 
 export interface WorkerJob {
   name: string;
@@ -20,17 +29,22 @@ export interface WorkerJob {
 export class WorkerScheduler {
   private jobs: Map<string, NodeJS.Timeout> = new Map();
   private running = false;
+  private readonly logger: SchedulerLogger;
+
+  constructor(options: WorkerSchedulerOptions = {}) {
+    this.logger = options.logger ?? getLogger();
+  }
 
   /**
    * 注册定期任务
    */
   register(job: WorkerJob): void {
     if (this.jobs.has(job.name)) {
-      logger.warn({ jobName: job.name }, 'Job already registered, skipping');
+      this.logger.warn({ jobName: job.name }, 'Job already registered, skipping');
       return;
     }
 
-    logger.info({
+    this.logger.info({
       jobName: job.name,
       intervalMs: job.intervalMs,
     }, 'Registering worker job');
@@ -42,9 +56,9 @@ export class WorkerScheduler {
     const timer = setInterval(() => {
       if (!this.running) return;
 
-      logger.debug({ jobName: job.name }, 'Running scheduled job');
+      this.logger.debug({ jobName: job.name }, 'Running scheduled job');
       job.handler().catch((error) => {
-        logger.error({
+        this.logger.error({
           error: error instanceof Error ? {
             message: error.message,
             stack: error.stack,
@@ -62,7 +76,7 @@ export class WorkerScheduler {
    * 启动调度器
    */
   start(): void {
-    logger.info('Starting worker scheduler');
+    this.logger.info('Starting worker scheduler');
     this.running = true;
   }
 
@@ -70,13 +84,13 @@ export class WorkerScheduler {
    * 停止调度器
    */
   stop(): void {
-    logger.info('Stopping worker scheduler');
+    this.logger.info('Stopping worker scheduler');
     this.running = false;
 
     // 清理所有定时器
     for (const [name, timer] of this.jobs.entries()) {
       clearInterval(timer);
-      logger.debug({ jobName: name }, 'Cleared job timer');
+      this.logger.debug({ jobName: name }, 'Cleared job timer');
     }
 
     this.jobs.clear();

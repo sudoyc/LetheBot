@@ -140,13 +140,16 @@ describe('SummaryWorker Integration', () => {
       });
 
       expect(result).not.toBeNull();
+      if (!result) {
+        throw new Error('Expected summary generation result');
+      }
       expect(result?.summaryId).toBeTruthy();
       expect(result?.summary).toContain('project');
       expect(result?.messageCount).toBe(messages.length);
       expect(result?.extractedFacts.length).toBeGreaterThan(0);
 
       // 验证摘要已存储
-      const memory = await memoryRepo.findById(result!.summaryId);
+      const memory = await memoryRepo.findById(result.summaryId);
       expect(memory).not.toBeNull();
       expect(memory?.kind).toBe('summary');
       expect(memory?.content).toContain('project');
@@ -236,11 +239,14 @@ describe('SummaryWorker Integration', () => {
       });
 
       expect(result).not.toBeNull();
+      if (!result) {
+        throw new Error('Expected summary generation result');
+      }
 
       // 检查源链接
       const sources = db
         .prepare('SELECT * FROM memory_sources WHERE memory_id = ?')
-        .all(result!.summaryId) as Array<{
+        .all(result.summaryId) as Array<{
         memory_id: string;
         source_type: string;
         source_id: string;
@@ -435,13 +441,16 @@ describe('SummaryWorker Integration', () => {
         conversationType: 'group',
         groupId: 'group-1',
       });
+      if (!privateResult || !groupResult) {
+        throw new Error('Expected private and group summary generation results');
+      }
 
       // 验证私聊摘要的可见性
-      const privateMemory = await memoryRepo.findById(privateResult!.summaryId);
+      const privateMemory = await memoryRepo.findById(privateResult.summaryId);
       expect(privateMemory?.visibility).toBe('same_user_any_context');
 
       // 验证群聊摘要的可见性
-      const groupMemory = await memoryRepo.findById(groupResult!.summaryId);
+      const groupMemory = await memoryRepo.findById(groupResult.summaryId);
       expect(groupMemory?.visibility).toBe('same_group_only');
 
       // 尝试在错误的上下文中检索

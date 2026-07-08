@@ -6,7 +6,7 @@
 
 import type Database from 'better-sqlite3';
 import { createHash } from 'node:crypto';
-import type { PiAdapter } from '../pi/pi-adapter.js';
+import type { PiAdapterInput, PiAdapterOutput } from '../pi/pi-adapter.js';
 import type { MemoryRepository } from '../storage/memory-repository.js';
 import type { MemoryRecord } from '../types/memory.js';
 import { getLogger } from '../logger/index.js';
@@ -40,6 +40,10 @@ export interface ConversationSummaryOutput {
 /**
  * 摘要配置
  */
+export interface SummaryPiRuntime {
+  runTurn(input: PiAdapterInput): Promise<PiAdapterOutput>;
+}
+
 export interface SummaryConfig {
   maxMessagesToSummarize: number;
   minMessagesToTrigger: number;
@@ -82,7 +86,7 @@ export class SummaryWorker {
 
   constructor(
     private readonly db: Database.Database,
-    private readonly piAdapter: PiAdapter,
+    private readonly piAdapter: SummaryPiRuntime,
     private readonly memoryRepo: MemoryRepository,
     config?: Partial<SummaryConfig>
   ) {
