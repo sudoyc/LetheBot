@@ -201,6 +201,159 @@ describe('E2E: Full Memory Cycle', () => {
     expect(groupContext.memory.retrievedFacts.length).toBe(0);
   });
 
+  it('should complete governed proposal lifecycle with source/revision/audit and retrieval exclusion', async () => {
+    const userId = 'user-elena';
+    const groupId = 'group-governed';
+    const conversationId = 'conv-group-governed';
+
+    await identityRepo.ensureCanonicalUser(userId);
+
+    const extraction = await memoryExtractor.extractFromTurn({
+      conversationId,
+      userId,
+      userMessage: '我喜欢在群里讨论 Rust',
+      botResponse: '收到',
+      messageId: 'msg-rust-pref',
+      timestamp: 123456,
+      conversationType: 'group',
+      groupId,
+    });
+
+    const proposalId = extraction.memoryIds[0];
+    expect(proposalId).toBeDefined();
+
+    const proposal = await memoryRepo.findById(proposalId);
+    expect(proposal?.state).toBe('proposed');
+    expect(proposal?.sourceContext).toBe('group_chat');
+
+    const noActiveBeforeApproval = await memoryRepo.retrieve({ canonicalUserId: userId });
+    expect(noActiveBeforeApproval.map((memory) => memory.id)).not.toContain(proposalId);
+
+    await memoryRepo.approve(proposalId, {
+      actor: { canonicalUserId: 'admin', actorClass: 'admin', context: 'admin_cli' },
+      reason: 'E2E approve group proposal',
+      auditSummary: `E2E approved ${proposalId}`,
+    });
+
+    const approvedContext = await contextBuilder.buildContext({
+      turnId: 'turn-governed-approved',
+      conversationId,
+      conversationType: 'group',
+      recentMessages: [],
+      targetUserId: userId,
+      groupId,
+    });
+
+    expect(approvedContext.memory.selectedMemoryIds).toContain(proposalId);
+
+    await memoryRepo.disable(proposalId, {
+      actor: { canonicalUserId: 'admin', actorClass: 'admin', context: 'admin_cli' },
+      reason: 'E2E disable approved memory',
+    });
+
+    const disabledContext = await contextBuilder.buildContext({
+      turnId: 'turn-governed-disabled',
+      conversationId,
+      conversationType: 'group',
+      recentMessages: [],
+      targetUserId: userId,
+      groupId,
+    });
+
+    expect(disabledContext.memory.selectedMemoryIds).not.toContain(proposalId);
+
+    await memoryRepo.restore(proposalId, {
+      actor: { canonicalUserId: 'admin', actorClass: 'admin', context: 'admin_cli' },
+      reason: 'E2E restore disabled memory',
+    });
+
+    const replacementId = await memoryRepo.create({
+      scope: 'user',
+      canonicalUserId: userId,
+      groupId,
+      conversationId,
+      visibility: 'same_group_only',
+      sensitivity: 'normal',
+      authority: 'user_stated',
+      kind: 'preference',
+      title: 'Updated Rust discussion preference',
+      content: 'Elena prefers Rust async-runtime discussions in this group',
+      state: 'active',
+      confidence: 0.9,
+      importance: 0.8,
+      sourceContext: 'group_chat',
+      sources: [
+        {
+          sourceType: 'chat_message',
+          sourceId: 'msg-rust-pref-update',
+          sourceTimestamp: 123999,
+          extractedBy: 'worker',
+        },
+      ],
+    });
+
+    await memoryRepo.supersede(proposalId, {
+      actor: { canonicalUserId: 'admin', actorClass: 'admin', context: 'admin_cli' },
+      reason: `E2E superseded by ${replacementId}`,
+    });
+
+    const supersededContext = await contextBuilder.buildContext({
+      turnId: 'turn-governed-superseded',
+      conversationId,
+      conversationType: 'group',
+      recentMessages: [],
+      targetUserId: userId,
+      groupId,
+    });
+
+    expect(supersededContext.memory.selectedMemoryIds).not.toContain(proposalId);
+    expect(supersededContext.memory.selectedMemoryIds).toContain(replacementId);
+
+    await memoryRepo.delete(replacementId, {
+      actor: { canonicalUserId: 'admin', actorClass: 'admin', context: 'admin_cli' },
+      reason: 'E2E delete replacement memory',
+    });
+
+    const deletedContext = await contextBuilder.buildContext({
+      turnId: 'turn-governed-deleted',
+      conversationId,
+      conversationType: 'group',
+      recentMessages: [],
+      targetUserId: userId,
+      groupId,
+    });
+
+    expect(deletedContext.memory.selectedMemoryIds).not.toContain(replacementId);
+
+    const sources = db
+      .prepare('SELECT source_id FROM memory_sources WHERE memory_id = ? ORDER BY source_id ASC')
+      .all(proposalId) as Array<{ source_id: string }>;
+    const revisions = db
+      .prepare('SELECT change_type FROM memory_revisions WHERE memory_id = ? ORDER BY revision_number ASC')
+      .all(proposalId) as Array<{ change_type: string }>;
+    const auditRows = db
+      .prepare("SELECT event_type FROM audit_log WHERE category = 'memory' AND event_id = ? ORDER BY timestamp ASC")
+      .all(proposalId) as Array<{ event_type: string }>;
+    const fkCheck = db.prepare('PRAGMA foreign_key_check').all();
+
+    expect(sources.map((source) => source.source_id)).toEqual(['msg-rust-pref']);
+    expect(revisions.map((revision) => revision.change_type)).toEqual([
+      'create',
+      'approve',
+      'disable',
+      'restore',
+      'supersede',
+    ]);
+    expect(auditRows.map((audit) => audit.event_type)).toEqual([
+      'memory.create',
+      'memory.approve',
+      'memory.disable',
+      'memory.restore',
+      'memory.supersede',
+    ]);
+    expect(fkCheck).toHaveLength(0);
+  });
+
   it('should handle conversation history in context', async () => {
     const userId = 'user-diana';
     const conversationId = 'conv-3';
