@@ -16,6 +16,7 @@ import type {
   ActorClass,
   InvocationContext,
 } from '../types/tool';
+import { redactSecretsInText } from '../memory/secret-scan.js';
 
 type LetheBotToolMetadata = Pick<
   ToolRegistryEntry,
@@ -30,6 +31,53 @@ type LetheBotToolMetadata = Pick<
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
+}
+
+
+function formatToolAdapterFailureDiagnostic(error: unknown): string {
+  if (error instanceof Error) {
+    return JSON.stringify({
+      name: redactToolDiagnosticText(error.name || 'Error'),
+      message: redactToolDiagnosticText(error.message || error.name || 'Unknown error'),
+      ...(error.stack ? { stack: '[REDACTED:stack]' } : {}),
+    });
+  }
+
+  return redactToolDiagnosticText(stringifyToolDiagnostic(error));
+}
+
+function stringifyToolDiagnostic(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (value === undefined) {
+    return 'Unknown error';
+  }
+
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function redactToolDiagnosticText(value: string): string {
+  const platformRedacted = redactPlatformIdentifiers(value);
+  const secretRedacted = redactSecretsInText(platformRedacted).text;
+  const redacted = redactPlatformIdentifiers(secretRedacted);
+  const platformMarkerLost =
+    platformRedacted.includes('[REDACTED:platform_id]')
+    && !redacted.includes('[REDACTED:platform_id]');
+
+  return platformMarkerLost ? `${redacted} [REDACTED:platform_id]` : redacted;
+}
+
+function redactPlatformIdentifiers(value: string): string {
+  return value
+    .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
+    .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
 }
 
 /**
@@ -107,7 +155,7 @@ export function convertToolsToPiFormat(
   for (const entry of entries) {
     const handler = getHandler(entry.name);
     if (!handler) {
-      console.warn(`[tool-adapter] No handler found for tool: ${entry.name}`);
+      console.warn(`[tool-adapter] No handler found for tool: ${redactToolDiagnosticText(String(entry.name))}`);
       continue;
     }
 
@@ -116,8 +164,8 @@ export function convertToolsToPiFormat(
       piTools.push(piTool);
     } catch (error) {
       console.error(
-        `[tool-adapter] Failed to convert tool ${entry.name}:`,
-        error
+        `[tool-adapter] Failed to convert tool ${redactToolDiagnosticText(String(entry.name))}:`,
+        formatToolAdapterFailureDiagnostic(error)
       );
       // Skip this tool but continue with others
     }

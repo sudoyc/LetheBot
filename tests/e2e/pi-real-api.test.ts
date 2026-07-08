@@ -20,6 +20,22 @@ import type { ToolRegistryEntry } from '../../src/types/tool.js';
 const runRealApiTests =
   process.env.LETHEBOT_RUN_REAL_API_TESTS === '1' && !!process.env.PI_API_KEY;
 
+function requirePiApiKey(): string {
+  const apiKey = process.env.PI_API_KEY;
+  if (!apiKey) {
+    throw new Error('PI_API_KEY is required when LETHEBOT_RUN_REAL_API_TESTS=1');
+  }
+  return apiKey;
+}
+
+function requireResponseText(responseText: string | undefined): string {
+  expect(responseText).toBeDefined();
+  if (responseText === undefined) {
+    throw new Error('Expected response text');
+  }
+  return responseText;
+}
+
 describe.skipIf(!runRealApiTests)('Real DeepSeek API E2E Tests', () => {
   let adapter: PiAdapter;
   let toolRegistry: ToolRegistry;
@@ -34,7 +50,7 @@ describe.skipIf(!runRealApiTests)('Real DeepSeek API E2E Tests', () => {
       policyGate,
       provider: process.env.PI_PROVIDER || 'openai',
       model: process.env.PI_MODEL || 'deepseek-chat',
-      apiKey: process.env.PI_API_KEY!,
+      apiKey: requirePiApiKey(),
       baseURL: process.env.PI_BASE_URL || 'https://api.deepseek.com/v1',
     });
   });
@@ -67,8 +83,7 @@ describe.skipIf(!runRealApiTests)('Real DeepSeek API E2E Tests', () => {
       });
 
       expect(result.status).toBe('completed');
-      expect(result.responseText).toBeDefined();
-      expect(result.responseText!.length).toBeGreaterThan(0);
+      expect(requireResponseText(result.responseText).length).toBeGreaterThan(0);
       expect(result.errorMessage).toBeUndefined();
     }, 30000); // 30s timeout for API call
 
@@ -95,9 +110,8 @@ describe.skipIf(!runRealApiTests)('Real DeepSeek API E2E Tests', () => {
       });
 
       expect(result.status).toBe('completed');
-      expect(result.responseText).toBeDefined();
       // Should contain Chinese characters
-      expect(/[一-龥]/.test(result.responseText!)).toBe(true);
+      expect(/[一-龥]/.test(requireResponseText(result.responseText))).toBe(true);
     }, 30000);
   });
 
@@ -181,9 +195,10 @@ describe.skipIf(!runRealApiTests)('Real DeepSeek API E2E Tests', () => {
       expect(result.toolCallIds).toBeDefined();
 
       // The response should mention Shanghai or the time
+      const responseText = requireResponseText(result.responseText);
       const hasRelevantContent =
-        result.responseText!.toLowerCase().includes('shanghai') ||
-        /\d{1,2}:\d{2}/.test(result.responseText!);
+        responseText.toLowerCase().includes('shanghai') ||
+        /\d{1,2}:\d{2}/.test(responseText);
       expect(hasRelevantContent).toBe(true);
     }, 30000);
 
@@ -251,9 +266,8 @@ describe.skipIf(!runRealApiTests)('Real DeepSeek API E2E Tests', () => {
       });
 
       expect(result.status).toBe('completed');
-      expect(result.responseText).toBeDefined();
       // Should mention 579 (123 + 456)
-      expect(result.responseText!.includes('579')).toBe(true);
+      expect(requireResponseText(result.responseText).includes('579')).toBe(true);
     }, 30000);
   });
 
@@ -322,9 +336,8 @@ describe.skipIf(!runRealApiTests)('Real DeepSeek API E2E Tests', () => {
       });
 
       expect(result2.status).toBe('completed');
-      expect(result2.responseText).toBeDefined();
       // Should reference blue
-      expect(result2.responseText!.toLowerCase().includes('blue')).toBe(true);
+      expect(requireResponseText(result2.responseText).toLowerCase().includes('blue')).toBe(true);
     }, 60000);
   });
 
@@ -372,7 +385,7 @@ describe.skipIf(!runRealApiTests)('Real DeepSeek API E2E Tests', () => {
         policyGate,
         provider: 'openai',
         model: 'deepseek-chat',
-        apiKey: process.env.PI_API_KEY!,
+        apiKey: requirePiApiKey(),
         baseURL: 'https://192.0.2.1:9999', // Non-routable IP
       });
 

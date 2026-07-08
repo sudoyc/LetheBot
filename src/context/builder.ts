@@ -5,17 +5,19 @@
  */
 
 import { ulid } from 'ulidx';
-import type { ContextPack, RecentMessage } from '../types/context';
+import type { ContextPack, MemoryBlock, ParticipantContext, RecentMessage } from '../types/context';
 import type { MemoryRepository } from '../storage/memory-repository';
 import type { IdentityRepository } from '../storage/identity-repository';
 import type { MemoryRecord } from '../types/memory';
 import type Database from 'better-sqlite3';
+import { redactSecretsInText } from '../memory/secret-scan';
 
 export interface BuildContextInput {
   turnId?: string;
   conversationId: string;
   conversationType: 'private' | 'group';
   recentMessages?: RecentMessage[];
+  participants?: ParticipantContext[];
   targetUserId?: string;
   canonicalUserId?: string;
   groupId?: string;
@@ -30,6 +32,11 @@ interface MemoryRetrievalResult {
     memoryId: string;
     reason: string;
   }>;
+}
+
+interface IdentityBudgetField {
+  name: string;
+  value: string;
 }
 
 export class ContextBuilder {
@@ -139,6 +146,7 @@ export class ContextBuilder {
     } = input;
     const turnId = input.turnId ?? ulid();
     const targetUserId = input.targetUserId ?? input.canonicalUserId;
+    const participants = input.participants ?? [];
 
     // 从数据库加载历史消息（如果有数据库连接）
     let recentMessages: RecentMessage[];
@@ -172,9 +180,22 @@ export class ContextBuilder {
       sourceContext: mem.sourceContext,
     }));
 
-    // 计算 token 预算
-    const tokenBudget = this.calculateTokenBudget(recentMessages, retrievedFacts);
     const injectedIdentityFields = this.buildInjectedIdentityFields(input);
+    const identityBudgetFields = this.buildIdentityBudgetFields({
+      conversationId,
+      conversationType,
+      groupId,
+      targetUserId,
+    });
+
+    // 计算 token 预算
+    const tokenBudget = this.calculateTokenBudget(
+      recentMessages,
+      memoryBlocks,
+      identityBudgetFields,
+      participants,
+      conversationType
+    );
 
     const context: ContextPack = {
       id: ulid(),
@@ -192,8 +213,9 @@ export class ContextBuilder {
         retrievedFacts: memoryBlocks,
         selectedMemoryIds: retrievedFacts.map((m) => m.id),
       },
-      participants: [],
+      participants,
       injectedIdentityFields,
+      injectedIdentityData: identityBudgetFields,
       tokenBudget,
       trace: {
         candidateMemoryIds: memoryRetrieval.candidateMemoryIds,
@@ -291,20 +313,58 @@ export class ContextBuilder {
    */
   private calculateTokenBudget(
     recentMessages: RecentMessage[],
-    retrievedFacts: Array<{ content: string }>
+    memoryBlocks: MemoryBlock[],
+    identityFields: IdentityBudgetField[],
+    participants: ParticipantContext[],
+    conversationType: 'private' | 'group'
   ) {
-    // 简化的 token 估算（1 token ≈ 2 字符）
+    // 简化的 token 估算（1 token ≈ 2 字符），但按当前 Pi prompt
+    // render 形态统计，而不是只统计裸 message/memory content。
     const recentMessagesTokens = recentMessages.reduce((sum, msg) => {
-      return sum + Math.ceil((msg.text?.length ?? 0) / 2);
+      return sum + this.estimateTextTokens(this.renderRecentMessageForBudget(msg));
     }, 0);
 
-    const memoryTokens = retrievedFacts.reduce((sum, mem) => {
-      return sum + Math.ceil(mem.content.length / 2);
-    }, 0);
+    const memoryTokens = this.estimateTextTokens(this.renderMemoryContextForBudget(memoryBlocks));
+
+    const identityFieldTokens = this.estimateTextTokens(
+      this.renderIdentityContextForBudget(identityFields)
+    );
+    const participantTokens = this.estimateTextTokens(
+      this.renderParticipantContextForBudget(participants, conversationType)
+    );
+    const identityTokens = identityFieldTokens + participantTokens;
 
     const systemTokens = 300; // 系统提示词估算
 
-    const used = recentMessagesTokens + memoryTokens + systemTokens;
+    const promptLayers = [
+      {
+        name: 'recent_messages',
+        version: 'pi-prompt-recent-message-v2',
+        tokens: recentMessagesTokens,
+      },
+      {
+        name: 'memory_context',
+        version: 'pi-prompt-memory-context-v2',
+        tokens: memoryTokens,
+      },
+      {
+        name: 'identity_fields',
+        version: 'context-builder-identity-fields-v2',
+        tokens: identityFieldTokens,
+      },
+      {
+        name: 'participant_context',
+        version: 'pi-prompt-participant-context-v2',
+        tokens: participantTokens,
+      },
+      {
+        name: 'system_prompt_estimate',
+        version: 'bounded-system-estimate-v1',
+        tokens: systemTokens,
+      },
+    ];
+
+    const used = promptLayers.reduce((sum, layer) => sum + layer.tokens, 0);
 
     return {
       max: 8000,
@@ -312,10 +372,139 @@ export class ContextBuilder {
       breakdown: {
         recentMessages: recentMessagesTokens,
         memory: memoryTokens,
-        identity: 0,
+        identity: identityTokens,
         system: systemTokens,
       },
+      promptLayers,
     };
+  }
+
+  private estimateTextTokens(text: string): number {
+    return Math.ceil(text.length / 2);
+  }
+
+  private renderRecentMessageForBudget(msg: RecentMessage): string {
+    if (msg.isFromBot) {
+      return msg.text ?? '';
+    }
+
+    const displayField = `sender_display_name=${this.formatPromptDataLiteral(msg.senderDisplayName)}`;
+    return msg.text
+      ? `${displayField}\nmessage_text:\n${msg.text}`
+      : displayField;
+  }
+
+  private renderMemoryContextForBudget(memoryBlocks: MemoryBlock[]): string {
+    const contextLines: string[] = [];
+    const userProfile = memoryBlocks.find((mem) => mem.scope === 'user' && mem.kind === 'summary');
+    const groupProfile = memoryBlocks.find((mem) => mem.scope === 'group' && mem.kind === 'summary');
+
+    if (userProfile) {
+      contextLines.push('## User Profile');
+      contextLines.push(userProfile.content);
+      contextLines.push('');
+    }
+
+    if (groupProfile) {
+      contextLines.push('## Group Context');
+      contextLines.push(groupProfile.content);
+      contextLines.push('');
+    }
+
+    if (memoryBlocks.length > 0) {
+      contextLines.push('## Relevant Facts');
+      for (const fact of memoryBlocks) {
+        contextLines.push(`- **${fact.title}**: ${fact.content}`);
+      }
+      contextLines.push('');
+    }
+
+    return contextLines.join('\n');
+  }
+
+  private renderIdentityContextForBudget(identityFields: IdentityBudgetField[]): string {
+    if (identityFields.length === 0) {
+      return '';
+    }
+
+    const contextLines = ['## Identity'];
+    for (const field of identityFields) {
+      contextLines.push(`- ${field.name}=${this.formatPromptDataLiteral(field.value)}`);
+    }
+    contextLines.push('');
+
+    return contextLines.join('\n');
+  }
+
+  private renderParticipantContextForBudget(
+    participants: ParticipantContext[],
+    conversationType: 'private' | 'group'
+  ): string {
+    if (conversationType !== 'group' || participants.length === 0) {
+      return '';
+    }
+
+    const contextLines = ['## Participants'];
+    for (const participant of participants) {
+      contextLines.push(this.renderParticipantLineForBudget(participant));
+    }
+    contextLines.push('');
+
+    return contextLines.join('\n');
+  }
+
+  private renderParticipantLineForBudget(participant: ParticipantContext): string {
+    const flags: string[] = [];
+    if (participant.isOwner) {
+      flags.push('owner');
+    }
+    if (participant.isAdmin) {
+      flags.push('admin');
+    }
+    if (participant.isTrusted) {
+      flags.push('trusted');
+    }
+
+    const parts = [`- display_name=${this.formatPromptDataLiteral(participant.displayName)}`];
+    if (flags.length > 0) {
+      parts.push(`flags=[${flags.join(', ')}]`);
+    }
+    if (participant.role) {
+      parts.push(`role=${participant.role}`);
+    }
+    if (participant.groupCard) {
+      parts.push(`group_card=${this.formatPromptDataLiteral(participant.groupCard)}`);
+    }
+
+    return parts.join(' ');
+  }
+
+  private formatPromptDataLiteral(value: string): string {
+    return JSON.stringify(this.sanitizePromptDataText(value));
+  }
+
+  private sanitizePromptDataText(value: string): string {
+    return this.redactPromptDataText(value)
+      .replace(/[\r\n]+/g, ' ')
+      .replace(/</g, '‹')
+      .replace(/>/g, '›');
+  }
+
+  private redactPromptDataText(value: string): string {
+    const platformRedacted = this.redactPlatformIdentifiers(value);
+    const secretRedacted = redactSecretsInText(platformRedacted).text;
+    const redacted = this.redactPlatformIdentifiers(secretRedacted);
+    const platformMarkerLost =
+      platformRedacted.includes('[REDACTED:platform_id]')
+      && !redacted.includes('[REDACTED:platform_id]');
+
+    return platformMarkerLost ? `${redacted} [REDACTED:platform_id]` : redacted;
+  }
+
+  private redactPlatformIdentifiers(value: string): string {
+    return value
+      .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
+      .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
   }
 
   private normalizeSenderId(senderId: string, isFromBot: boolean): string {
@@ -346,6 +535,32 @@ export class ContextBuilder {
 
     if (input.targetUserId ?? input.canonicalUserId) {
       fields.push('target_user_ref');
+    }
+
+    if (input.conversationType === 'group' && input.participants && input.participants.length > 0) {
+      fields.push('participant_context');
+    }
+
+    return fields;
+  }
+
+  private buildIdentityBudgetFields(input: {
+    conversationId: string;
+    conversationType: 'private' | 'group';
+    groupId?: string;
+    targetUserId?: string;
+  }): IdentityBudgetField[] {
+    const fields: IdentityBudgetField[] = [
+      { name: 'conversation_id', value: input.conversationId },
+      { name: 'conversation_type', value: input.conversationType },
+    ];
+
+    if (input.groupId) {
+      fields.push({ name: 'group_id', value: input.groupId });
+    }
+
+    if (input.targetUserId) {
+      fields.push({ name: 'target_user_ref', value: input.targetUserId });
     }
 
     return fields;

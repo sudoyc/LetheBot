@@ -238,6 +238,377 @@ describe('ContextBuilder', () => {
       expect(context.tokenBudget.breakdown.system).toBeGreaterThan(0);
     });
 
+    it('should account for actual injected identity fields in token budget', async () => {
+      const shortIdentityContext = await builder.buildContext({
+        turnId: 'turn-identity-short',
+        conversationId: 'group:g1',
+        conversationType: 'group',
+        recentMessages: [],
+        targetUserId: 'u1',
+        groupId: 'g1',
+      });
+
+      const longIdentityContext = await builder.buildContext({
+        turnId: 'turn-identity-long',
+        conversationId: 'group:very-long-conversation-identity-for-budgeting',
+        conversationType: 'group',
+        recentMessages: [],
+        targetUserId: 'user-very-long-target-identity-for-budgeting',
+        groupId: 'group-very-long-identity-for-budgeting',
+      });
+
+      expect(shortIdentityContext.injectedIdentityFields).toEqual(
+        expect.arrayContaining(['conversation_id', 'conversation_type', 'group_id', 'target_user_ref'])
+      );
+      expect(shortIdentityContext.tokenBudget.breakdown.identity).toBeGreaterThan(0);
+      expect(longIdentityContext.tokenBudget.breakdown.identity).toBeGreaterThan(
+        shortIdentityContext.tokenBudget.breakdown.identity
+      );
+      expect(longIdentityContext.tokenBudget.used).toBe(
+        longIdentityContext.tokenBudget.breakdown.recentMessages
+        + longIdentityContext.tokenBudget.breakdown.memory
+        + longIdentityContext.tokenBudget.breakdown.identity
+        + longIdentityContext.tokenBudget.breakdown.system
+      );
+    });
+
+    it('should prepare structured identity data and budget the rendered identity prompt', async () => {
+      const secret = 'sk-context-identity-secret-abcdefghijklmnopqrstuvwxyz';
+      const platformId = 'qq-1234567890';
+      const expectedIdentityContext = [
+        '## Identity',
+        '- conversation_id="private:[REDACTED:platform_id]"',
+        '- conversation_type="private"',
+        '- target_user_ref="[REDACTED:api_key_assignment] [REDACTED:platform_id]"',
+        '',
+      ].join('\n');
+      const rawIdentityContext = [
+        '## Identity',
+        `- conversation_id=${JSON.stringify(`private:${platformId}`)}`,
+        '- conversation_type="private"',
+        `- target_user_ref=${JSON.stringify(`api_key=${secret}-${platformId}`)}`,
+        '',
+      ].join('\n');
+
+      const context = await builder.buildContext({
+        turnId: 'turn-identity-rendered-budget',
+        conversationId: `private:${platformId}`,
+        conversationType: 'private',
+        recentMessages: [],
+        targetUserId: `api_key=${secret}-${platformId}`,
+      });
+
+      const identityLayer = context.tokenBudget.promptLayers?.find(
+        (layer) => layer.name === 'identity_fields'
+      );
+
+      expect(context.injectedIdentityFields).toEqual([
+        'conversation_id',
+        'conversation_type',
+        'target_user_ref',
+      ]);
+      expect(context.injectedIdentityData).toEqual([
+        { name: 'conversation_id', value: `private:${platformId}` },
+        { name: 'conversation_type', value: 'private' },
+        { name: 'target_user_ref', value: `api_key=${secret}-${platformId}` },
+      ]);
+      expect(identityLayer?.tokens).toBe(
+        Math.ceil(expectedIdentityContext.length / 2)
+      );
+      expect(context.tokenBudget.breakdown.identity).toBe(identityLayer?.tokens);
+      expect(identityLayer?.tokens).toBeLessThan(
+        Math.ceil(rawIdentityContext.length / 2)
+      );
+    });
+
+    it('should attach prompt layer versions and token evidence to the budget trace', async () => {
+      const context = await builder.buildContext({
+        turnId: 'turn-budget-prompt-layers',
+        conversationId: 'group:prompt-layer-budget',
+        conversationType: 'group',
+        recentMessages: [
+          {
+            messageId: 'msg-prompt-layer-budget',
+            senderId: 'user-alice',
+            text: 'Prompt layer version evidence should cover recent messages',
+            timestamp: new Date(),
+            senderDisplayName: 'Alice Prompt Layer',
+            isFromBot: false,
+          },
+        ],
+        targetUserId: 'user-alice',
+        groupId: 'group-prompt-layer-budget',
+        participants: [
+          {
+            canonicalUserId: 'user-alice',
+            displayName: 'Alice Prompt Layer',
+            groupCard: 'Prompt Layer Captain',
+            role: 'admin',
+            isOwner: false,
+            isAdmin: true,
+            isTrusted: true,
+          },
+        ],
+      });
+
+      const promptLayers = context.tokenBudget.promptLayers ?? [];
+
+      expect(promptLayers).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: 'recent_messages',
+            version: 'pi-prompt-recent-message-v2',
+            tokens: context.tokenBudget.breakdown.recentMessages,
+          }),
+          expect.objectContaining({
+            name: 'memory_context',
+            version: 'pi-prompt-memory-context-v2',
+            tokens: context.tokenBudget.breakdown.memory,
+          }),
+          expect.objectContaining({
+            name: 'identity_fields',
+            version: 'context-builder-identity-fields-v2',
+          }),
+          expect.objectContaining({
+            name: 'participant_context',
+            version: 'pi-prompt-participant-context-v2',
+          }),
+          expect.objectContaining({
+            name: 'system_prompt_estimate',
+            version: 'bounded-system-estimate-v1',
+            tokens: context.tokenBudget.breakdown.system,
+          }),
+        ])
+      );
+
+      const promptLayerTokens = promptLayers.reduce(
+        (sum, layer) => sum + layer.tokens,
+        0
+      );
+      expect(promptLayerTokens).toBe(context.tokenBudget.used);
+
+      const identityLayerTokens = promptLayers
+        .filter((layer) => layer.name === 'identity_fields' || layer.name === 'participant_context')
+        .reduce((sum, layer) => sum + layer.tokens, 0);
+      expect(identityLayerTokens).toBe(context.tokenBudget.breakdown.identity);
+    });
+
+    it('should account for prompt-rendered recent-message labels and memory titles in token budget', async () => {
+      const longDisplayName = 'Display name with enough length to affect prompt accounting';
+      const withDisplayOnlyMessage = await builder.buildContext({
+        turnId: 'turn-budget-display-label',
+        conversationId: 'private:user-alice',
+        conversationType: 'private',
+        recentMessages: [
+          {
+            messageId: 'msg-budget-display-label',
+            senderId: 'user-alice',
+            senderDisplayName: longDisplayName,
+            timestamp: new Date(),
+            isFromBot: false,
+          },
+        ],
+        targetUserId: 'user-alice',
+      });
+
+      expect(withDisplayOnlyMessage.tokenBudget.breakdown.recentMessages).toBeGreaterThan(
+        Math.ceil(longDisplayName.length / 2)
+      );
+
+      const longMemoryTitle = 'Long memory title that is rendered in the Pi context preamble and must be counted';
+      const memoryId = await memoryRepo.create({
+        scope: 'user',
+        canonicalUserId: 'user-alice',
+        visibility: 'private_only',
+        sensitivity: 'normal',
+        authority: 'user_stated',
+        kind: 'fact',
+        title: longMemoryTitle,
+        content: 'short fact',
+        state: 'active',
+        confidence: 0.9,
+        importance: 0.8,
+        sourceContext: 'private_chat',
+      });
+
+      const withMemory = await builder.buildContext({
+        turnId: 'turn-budget-memory-title',
+        conversationId: 'private:user-alice',
+        conversationType: 'private',
+        recentMessages: [],
+        targetUserId: 'user-alice',
+      });
+
+      expect(withMemory.memory.selectedMemoryIds).toContain(memoryId);
+      expect(withMemory.tokenBudget.breakdown.memory).toBeGreaterThan(
+        Math.ceil('short fact'.length / 2) + Math.ceil(longMemoryTitle.length / 2)
+      );
+    });
+
+    it('should redact assignment-shaped secret/platform display labels before token budgeting', async () => {
+      const secret = 'sk-context-budget-secret-abcdefghijklmnopqrstuvwxyz';
+      const platformId = 'qq-123456789';
+      const sensitiveDisplayName = `api_key=${secret}-${platformId}`;
+      const expectedRenderedLabel =
+        'sender_display_name="[REDACTED:api_key_assignment] [REDACTED:platform_id]"';
+      const rawRenderedLabel = `sender_display_name=${JSON.stringify(sensitiveDisplayName)}`;
+
+      const context = await builder.buildContext({
+        turnId: 'turn-budget-redacted-display-label',
+        conversationId: 'private:user-alice',
+        conversationType: 'private',
+        recentMessages: [
+          {
+            messageId: 'msg-budget-redacted-display-label',
+            senderId: 'user-alice',
+            senderDisplayName: sensitiveDisplayName,
+            timestamp: new Date(),
+            isFromBot: false,
+          },
+        ],
+      });
+
+      expect(context.tokenBudget.breakdown.recentMessages).toBe(
+        Math.ceil(expectedRenderedLabel.length / 2)
+      );
+      expect(context.tokenBudget.breakdown.recentMessages).toBeLessThan(
+        Math.ceil(rawRenderedLabel.length / 2)
+      );
+    });
+
+    it('should redact assignment-shaped secret/platform participant labels before token budgeting', async () => {
+      const displaySecret = 'sk-context-participant-display-abcdefghijklmnopqrstuvwxyz';
+      const cardSecret = 'sk-context-participant-card-abcdefghijklmnopqrstuvwxyz';
+      const displayPlatformId = 'qq-123456789';
+      const cardPlatformId = 'qq-234567890';
+      const sensitiveDisplayName = `api_key=${displaySecret}-${displayPlatformId}`;
+      const sensitiveGroupCard = `token=${cardSecret}-${cardPlatformId}`;
+      const expectedParticipantContext = [
+        '## Participants',
+        '- display_name="[REDACTED:api_key_assignment] [REDACTED:platform_id]"'
+          + ' flags=[admin, trusted]'
+          + ' role=admin'
+          + ' group_card="[REDACTED:token_assignment] [REDACTED:platform_id]"',
+        '',
+      ].join('\n');
+      const rawParticipantContext = [
+        '## Participants',
+        `- display_name=${JSON.stringify(sensitiveDisplayName)}`
+          + ' flags=[admin, trusted]'
+          + ' role=admin'
+          + ` group_card=${JSON.stringify(sensitiveGroupCard)}`,
+        '',
+      ].join('\n');
+
+      const context = await builder.buildContext({
+        turnId: 'turn-budget-redacted-participant-labels',
+        conversationId: 'group:participant-redaction-budget',
+        conversationType: 'group',
+        groupId: 'group-participant-redaction-budget',
+        recentMessages: [],
+        targetUserId: 'user-alice',
+        participants: [
+          {
+            canonicalUserId: 'user-bob',
+            displayName: sensitiveDisplayName,
+            groupCard: sensitiveGroupCard,
+            role: 'admin',
+            isOwner: false,
+            isAdmin: true,
+            isTrusted: true,
+          },
+        ],
+      });
+
+      const participantLayer = context.tokenBudget.promptLayers?.find(
+        (layer) => layer.name === 'participant_context'
+      );
+
+      expect(participantLayer?.tokens).toBe(
+        Math.ceil(expectedParticipantContext.length / 2)
+      );
+      expect(participantLayer?.tokens).toBeLessThan(
+        Math.ceil(rawParticipantContext.length / 2)
+      );
+    });
+
+    it('should carry group participant context and account for prompt-rendered participant labels', async () => {
+      const withoutParticipants = await builder.buildContext({
+        turnId: 'turn-budget-no-participants',
+        conversationId: 'group:participant-budget',
+        conversationType: 'group',
+        groupId: 'group-participant-budget',
+        recentMessages: [],
+        targetUserId: 'user-alice',
+      });
+
+      const participantDisplayName = 'Participant display label with enough text to affect budget';
+      const participantGroupCard = 'Participant group card label with enough text to affect budget';
+      const withParticipants = await builder.buildContext({
+        turnId: 'turn-budget-with-participants',
+        conversationId: 'group:participant-budget',
+        conversationType: 'group',
+        groupId: 'group-participant-budget',
+        recentMessages: [],
+        targetUserId: 'user-alice',
+        participants: [
+          {
+            canonicalUserId: 'user-bob',
+            displayName: participantDisplayName,
+            groupCard: participantGroupCard,
+            role: 'admin',
+            isOwner: false,
+            isAdmin: true,
+            isTrusted: true,
+            platformAccountId: 'qq-123456789',
+          },
+        ],
+      });
+
+      expect(withParticipants.participants).toHaveLength(1);
+      expect(withParticipants.participants[0]).toMatchObject({
+        canonicalUserId: 'user-bob',
+        displayName: participantDisplayName,
+        groupCard: participantGroupCard,
+        role: 'admin',
+        isAdmin: true,
+        isTrusted: true,
+      });
+      expect(withParticipants.injectedIdentityFields).toContain('participant_context');
+      const participantLayer = withParticipants.tokenBudget.promptLayers?.find(
+        (layer) => layer.name === 'participant_context'
+      );
+      const expectedParticipantContext = [
+        '## Participants',
+        `- display_name="${participantDisplayName}"`
+          + ' flags=[admin, trusted]'
+          + ' role=admin'
+          + ` group_card="${participantGroupCard}"`,
+        '',
+      ].join('\n');
+      const participantContextWithPlatformAccount = [
+        '## Participants',
+        `- display_name="${participantDisplayName}"`
+          + ' flags=[admin, trusted]'
+          + ' role=admin'
+          + ` group_card="${participantGroupCard}"`
+          + ' platform_account_id="[REDACTED:platform_id]"',
+        '',
+      ].join('\n');
+
+      expect(participantLayer?.tokens).toBe(
+        Math.ceil(expectedParticipantContext.length / 2)
+      );
+      expect(participantLayer?.tokens).toBeLessThan(
+        Math.ceil(participantContextWithPlatformAccount.length / 2)
+      );
+      expect(withParticipants.tokenBudget.breakdown.identity).toBeGreaterThan(
+        withoutParticipants.tokenBudget.breakdown.identity
+        + Math.ceil(participantDisplayName.length / 2)
+        + Math.ceil(participantGroupCard.length / 2)
+      );
+    });
+
     it('should retrieve group and conversation summaries with trace and identity fields', async () => {
       const groupSummaryId = await memoryRepo.create({
         scope: 'group',

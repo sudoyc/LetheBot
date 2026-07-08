@@ -27,6 +27,7 @@ import type { ToolRegistry } from '../tools/registry.js';
 import type { PolicyGate } from '../policy/gate.js';
 import type { ActorClass, InvocationContext, ToolHandler } from '../types/tool.js';
 import type { AuditEntry } from '../types/audit.js';
+import type { ToolCallRecordInput } from '../storage/tool-call-repository.js';
 import { redactSecretsInText } from '../memory/secret-scan.js';
 
 type ToolResultContent = AfterToolCallContext['result']['content'];
@@ -35,6 +36,10 @@ type AuditLevel = AuditEntry['level'];
 
 interface ToolAuditWriter {
   create(entry: Omit<AuditEntry, 'id'>): Promise<string>;
+}
+
+interface ToolCallWriter {
+  create(entry: ToolCallRecordInput): Promise<string>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -99,6 +104,7 @@ export class PiAdapter {
   private currentActor?: { canonicalUserId?: string; actorClass: ActorClass };
   private currentInvocationContext?: InvocationContext;
   private auditRepository?: ToolAuditWriter;
+  private toolCallRepository?: ToolCallWriter;
 
   constructor(options: {
     toolRegistry: ToolRegistry;
@@ -108,10 +114,12 @@ export class PiAdapter {
     apiKey?: string;
     baseUrl?: string;
     auditRepository?: ToolAuditWriter;
+    toolCallRepository?: ToolCallWriter;
   }) {
     this.toolRegistry = options.toolRegistry;
     this.policyGate = options.policyGate;
     this.auditRepository = options.auditRepository;
+    this.toolCallRepository = options.toolCallRepository;
 
     // Create model configuration
     let model: Model<Api>;
@@ -183,8 +191,7 @@ export class PiAdapter {
       // Extract result
       return this.extractOutput(input.turnId);
     } catch (error) {
-      // Log the actual error for debugging
-      console.error('[PiAdapter] runTurn failed:', error);
+      console.error('[PiAdapter] runTurn failed:', formatRuntimeFailureDiagnostic(error));
 
       return {
         turnId: input.turnId,
@@ -192,7 +199,7 @@ export class PiAdapter {
         events: this.events,
         tokensUsed: { input: 0, output: 0, total: 0 },
         status: 'failed',
-        errorMessage: error instanceof Error ? error.message : 'Unknown error',
+        errorMessage: extractRuntimeFailureMessage(error),
       };
     }
   }
@@ -292,6 +299,16 @@ export class PiAdapter {
       contextLines.push('');
     }
 
+    // Add structured identity context when ContextBuilder prepared it. Values
+    // are rendered as prompt data, not instructions.
+    if (pack.injectedIdentityData && pack.injectedIdentityData.length > 0) {
+      contextLines.push('## Identity');
+      pack.injectedIdentityData.forEach((field) => {
+        contextLines.push(formatIdentityPromptLine(field));
+      });
+      contextLines.push('');
+    }
+
     // Add participant context (for group chats)
     if (
       pack.conversation.conversationType === 'group' &&
@@ -299,12 +316,7 @@ export class PiAdapter {
     ) {
       contextLines.push('## Participants');
       pack.participants.forEach((p) => {
-        const flags = [];
-        if (p.isOwner) flags.push('owner');
-        if (p.isAdmin) flags.push('admin');
-        if (p.isTrusted) flags.push('trusted');
-        const flagsStr = flags.length > 0 ? ` [${flags.join(', ')}]` : '';
-        contextLines.push(`- ${p.displayName}${flagsStr}`);
+        contextLines.push(formatParticipantPromptLine(p));
       });
       contextLines.push('');
     }
@@ -333,13 +345,14 @@ export class PiAdapter {
       }
 
       // User messages
-      const displayName = `${msg.senderDisplayName}: `;
       messages.push({
         role: 'user',
         content: [
           {
             type: 'text',
-            text: msg.text ? `${displayName}${msg.text}` : displayName,
+            text: msg.text
+              ? `sender_display_name=${formatPromptDataLiteral(msg.senderDisplayName)}\nmessage_text:\n${msg.text}`
+              : `sender_display_name=${formatPromptDataLiteral(msg.senderDisplayName)}`,
           },
         ],
         timestamp: msg.timestamp.getTime(),
@@ -436,6 +449,7 @@ export class PiAdapter {
         parameters: entry.piSchema.input as AgentTool['parameters'], // TypeBox TSchema
 
         execute: async (toolCallId, params, _signal, _onUpdate) => {
+          const startedAt = Date.now();
           const policyResult = this.policyGate.checkToolCall({
             toolName: entry.name,
             actor: {
@@ -453,12 +467,15 @@ export class PiAdapter {
             await this.auditToolCall({
               entry,
               toolCallId,
+              turnId: input.turnId,
               params,
               status: 'rejected',
               actor: input.actor,
               invocationContext: input.invocationContext,
               summary: `${entry.name} rejected: ${reason}`,
               errorMessage: reason,
+              errorCode: policyResult.allowed ? 'EVALUATOR_REQUIRED' : 'POLICY_DENIED',
+              executionTimeMs: Date.now() - startedAt,
               redactionApplied: false,
             });
 
@@ -472,12 +489,15 @@ export class PiAdapter {
             await this.auditToolCall({
               entry,
               toolCallId,
+              turnId: input.turnId,
               params,
               status: 'error',
               actor: input.actor,
               invocationContext: input.invocationContext,
               summary: `${entry.name} failed: missing handler`,
               errorMessage: reason,
+              errorCode: 'HANDLER_NOT_FOUND',
+              executionTimeMs: Date.now() - startedAt,
               redactionApplied: false,
             });
             throw new Error(reason);
@@ -498,21 +518,21 @@ export class PiAdapter {
             this.executedToolCallIds.push(toolCallId);
 
             const formatted = this.formatToolResult(result);
-            const redacted = entry.outputSensitivity === 'secret_possible'
-              ? redactSecretsInText(formatted)
-              : { text: formatted, findings: [] };
+            const redacted = redactSecretsInText(formatted);
             const redactedDetails = this.redactStructuredValue(result);
             const redactionApplied = redacted.findings.length > 0 || redactedDetails.redacted;
 
             await this.auditToolCall({
               entry,
               toolCallId,
+              turnId: input.turnId,
               params,
               status: 'success',
               actor: input.actor,
               invocationContext: input.invocationContext,
               summary: `${entry.name} executed${redactionApplied ? ' (redacted)' : ''}`,
               output: redactedDetails.value,
+              executionTimeMs: Date.now() - startedAt,
               redactionApplied,
             });
 
@@ -529,18 +549,22 @@ export class PiAdapter {
             };
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
+            const redactedMessage = redactSecretsInText(message);
             await this.auditToolCall({
               entry,
               toolCallId,
+              turnId: input.turnId,
               params,
               status: 'error',
               actor: input.actor,
               invocationContext: input.invocationContext,
-              summary: `${entry.name} failed: ${message}`,
-              errorMessage: message,
-              redactionApplied: false,
+              summary: `${entry.name} failed: ${redactedMessage.text}`,
+              errorMessage: redactedMessage.text,
+              errorCode: 'TOOL_HANDLER_ERROR',
+              executionTimeMs: Date.now() - startedAt,
+              redactionApplied: redactedMessage.findings.length > 0,
             });
-            throw error;
+            throw new Error(redactedMessage.text);
           }
         },
       };
@@ -723,12 +747,14 @@ export class PiAdapter {
         await this.auditToolCall({
           entry: tool,
           toolCallId: context.toolCall.id,
+          turnId: this.currentTurnId,
           params: context.args,
           status: 'rejected',
           actor,
           invocationContext,
           summary: `${toolName} rejected: ${reason}`,
           errorMessage: reason,
+          errorCode: 'POLICY_DENIED',
           redactionApplied: false,
         });
       }
@@ -746,12 +772,14 @@ export class PiAdapter {
         await this.auditToolCall({
           entry: tool,
           toolCallId: context.toolCall.id,
+          turnId: this.currentTurnId,
           params: context.args,
           status: 'rejected',
           actor,
           invocationContext,
           summary: `${toolName} rejected: ${reason}`,
           errorMessage: reason,
+          errorCode: 'EVALUATOR_REQUIRED',
           redactionApplied: false,
         });
       }
@@ -898,19 +926,19 @@ export class PiAdapter {
   private async auditToolCall(input: {
     entry: ReturnType<ToolRegistry['getAll']>[number];
     toolCallId: string;
+    turnId?: string;
     params: unknown;
     status: 'success' | 'error' | 'rejected';
     actor: { canonicalUserId?: string; actorClass: ActorClass };
     invocationContext: InvocationContext;
+    requestedBy?: ToolCallRecordInput['requestedBy'];
     summary: string;
     output?: unknown;
     errorMessage?: string;
+    errorCode?: string;
+    executionTimeMs?: number;
     redactionApplied: boolean;
   }): Promise<void> {
-    if (!this.auditRepository) {
-      return;
-    }
-
     const params = this.redactStructuredValue(input.params);
     const redactionApplied = input.redactionApplied || params.redacted;
     const level = this.auditLevelForExecution(input.entry.auditLevel, redactionApplied);
@@ -932,22 +960,51 @@ export class PiAdapter {
           redactionApplied,
         };
 
-    await this.auditRepository.create({
-      timestamp: new Date(),
-      category: 'tool',
-      level,
-      eventType: this.toolAuditEventType(input.status),
-      eventId: input.toolCallId,
-      actor: {
-        canonicalUserId: input.actor.canonicalUserId,
-        actorClass: input.actor.actorClass,
+    const turnId = input.turnId ?? this.currentTurnId;
+    if (this.toolCallRepository && turnId) {
+      await this.toolCallRepository.create({
+        id: input.toolCallId,
+        turnId,
+        toolName: input.entry.name,
+        input: params.value,
+        output: input.output,
+        requestedBy: input.requestedBy ?? 'pi',
+        actor: input.actor,
         context: input.invocationContext,
-      },
-      summary: input.summary,
-      details,
-      redacted: redactionApplied || level === 'redacted_full',
-      riskLevel: this.toolRiskLevel(input.entry),
-    });
+        status: input.status,
+        errorCode: input.errorCode ?? this.defaultToolErrorCode(input.status),
+        errorMessage: input.errorMessage,
+        executionTimeMs: input.executionTimeMs,
+        secretsRedacted: redactionApplied,
+      });
+    }
+
+    if (this.auditRepository) {
+      await this.auditRepository.create({
+        timestamp: new Date(),
+        category: 'tool',
+        level,
+        eventType: this.toolAuditEventType(input.status),
+        eventId: input.toolCallId,
+        actor: {
+          canonicalUserId: input.actor.canonicalUserId,
+          actorClass: input.actor.actorClass,
+          context: input.invocationContext,
+        },
+        summary: input.summary,
+        details,
+        redacted: redactionApplied || level === 'redacted_full',
+        riskLevel: this.toolRiskLevel(input.entry),
+      });
+    }
+  }
+
+  private defaultToolErrorCode(status: 'success' | 'error' | 'rejected'): string | undefined {
+    if (status === 'success') {
+      return undefined;
+    }
+
+    return status === 'rejected' ? 'TOOL_REJECTED' : 'TOOL_ERROR';
   }
 
   private auditLevelForExecution(
@@ -998,4 +1055,106 @@ export class PiAdapter {
     this.currentActor = input.actor;
     this.currentInvocationContext = input.invocationContext;
   }
+}
+
+
+function extractRuntimeFailureMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return redactRuntimeDiagnosticText(error.message || error.name || 'Unknown error');
+  }
+
+  const text = stringifyRuntimeDiagnostic(error);
+  return redactRuntimeDiagnosticText(text || 'Unknown error');
+}
+
+function formatRuntimeFailureDiagnostic(error: unknown): string {
+  if (error instanceof Error) {
+    return JSON.stringify({
+      name: redactRuntimeDiagnosticText(error.name || 'Error'),
+      message: redactRuntimeDiagnosticText(error.message || error.name || 'Unknown error'),
+      ...(error.stack ? { stack: '[REDACTED:stack]' } : {}),
+    });
+  }
+
+  return redactRuntimeDiagnosticText(stringifyRuntimeDiagnostic(error));
+}
+
+function stringifyRuntimeDiagnostic(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (value === undefined) {
+    return 'Unknown error';
+  }
+
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function redactRuntimeDiagnosticText(value: string): string {
+  const platformRedacted = redactPlatformIdentifiers(value);
+  const secretRedacted = redactSecretsInText(platformRedacted).text;
+  const redacted = redactPlatformIdentifiers(secretRedacted);
+  const platformMarkerLost =
+    platformRedacted.includes('[REDACTED:platform_id]')
+    && !redacted.includes('[REDACTED:platform_id]');
+
+  return platformMarkerLost ? `${redacted} [REDACTED:platform_id]` : redacted;
+}
+
+function formatPromptDataLiteral(value: string): string {
+  return JSON.stringify(sanitizePromptDataText(value));
+}
+
+function formatParticipantPromptLine(participant: ContextPack['participants'][number]): string {
+  const flags = [];
+  if (participant.isOwner) flags.push('owner');
+  if (participant.isAdmin) flags.push('admin');
+  if (participant.isTrusted) flags.push('trusted');
+
+  const parts = [`- display_name=${formatPromptDataLiteral(participant.displayName)}`];
+  if (flags.length > 0) {
+    parts.push(`flags=[${flags.join(', ')}]`);
+  }
+  if (participant.role) {
+    parts.push(`role=${participant.role}`);
+  }
+  if (participant.groupCard) {
+    parts.push(`group_card=${formatPromptDataLiteral(participant.groupCard)}`);
+  }
+
+  return parts.join(' ');
+}
+
+function formatIdentityPromptLine(field: NonNullable<ContextPack['injectedIdentityData']>[number]): string {
+  return `- ${field.name}=${formatPromptDataLiteral(field.value)}`;
+}
+
+function sanitizePromptDataText(value: string): string {
+  return redactPromptDataText(value)
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/</g, '‹')
+    .replace(/>/g, '›');
+}
+
+function redactPromptDataText(value: string): string {
+  const platformRedacted = redactPlatformIdentifiers(value);
+  const secretRedacted = redactSecretsInText(platformRedacted).text;
+  const redacted = redactPlatformIdentifiers(secretRedacted);
+  const platformMarkerLost =
+    platformRedacted.includes('[REDACTED:platform_id]')
+    && !redacted.includes('[REDACTED:platform_id]');
+
+  return platformMarkerLost ? `${redacted} [REDACTED:platform_id]` : redacted;
+}
+
+function redactPlatformIdentifiers(value: string): string {
+  return value
+    .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
+    .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
 }
