@@ -165,6 +165,85 @@ describe('DeleteFileHandler', () => {
     });
   });
 
+  describe('Output Redaction', () => {
+    it('should redact secret-like paths in not-found errors', async () => {
+      const secret = 'sk-deletemissing1234567890abcdefghi';
+      const secretPath = `token=${secret}.txt`;
+
+      const result = await handler.execute({ path: secretPath }, context);
+
+      expect(result.status).toBe('error');
+      expect(result.error?.code).toBe('FILE_NOT_FOUND');
+      expect(result.secretsRedacted).toBe(true);
+      expect(result.error?.message).toContain('[REDACTED:token_assignment]');
+      expect(result.error?.message).not.toContain(secret);
+    });
+
+    it('should redact secret-like paths in directory-without-recursive errors', async () => {
+      const secret = 'sk-deletedir1234567890abcdefghi';
+      const secretPath = `token=${secret}`;
+      await fs.promises.mkdir(path.join(tempDir, secretPath));
+
+      const result = await handler.execute({ path: secretPath }, context);
+
+      expect(result.status).toBe('error');
+      expect(result.error?.code).toBe('IS_DIRECTORY');
+      expect(result.secretsRedacted).toBe(true);
+      expect(result.error?.message).toContain('[REDACTED:token_assignment]');
+      expect(result.error?.message).not.toContain(secret);
+    });
+
+    it('should redact secret-like paths in successful output and audit summary', async () => {
+      const secret = 'sk-deletepath1234567890abcdefghi';
+      const secretPath = `token=${secret}.txt`;
+      const filePath = path.join(tempDir, secretPath);
+      await fs.promises.writeFile(filePath, 'content');
+
+      const result = await handler.execute({ path: secretPath }, context);
+
+      expect(result.status).toBe('success');
+      expect(result.secretsRedacted).toBe(true);
+      expect(result.output?.path).toContain('[REDACTED:token_assignment]');
+      expect(result.auditSummary).toContain('[REDACTED:token_assignment]');
+      expect(JSON.stringify(result.output)).not.toContain(secret);
+      expect(result.auditSummary).not.toContain(secret);
+
+      const exists = await fs.promises
+        .access(filePath)
+        .then(() => true)
+        .catch(() => false);
+      expect(exists).toBe(false);
+    });
+
+    it('should preserve both markers for adjacent secret/platform paths in output and audit summary', async () => {
+      const rawAdjacent = 'sk-delete-adjacent-secret-qq-1234567890';
+      const rawPlatformId = 'qq-1234567890';
+      const rawNumericPlatformId = '1234567890';
+      const adjacentPath = `token=${rawAdjacent}.txt`;
+      const filePath = path.join(tempDir, adjacentPath);
+      await fs.promises.writeFile(filePath, 'content');
+
+      const result = await handler.execute({ path: adjacentPath }, context);
+      const serialized = JSON.stringify(result);
+
+      expect(result.status).toBe('success');
+      expect(result.secretsRedacted).toBe(true);
+      expect(result.output?.path).toContain('[REDACTED:token_assignment]');
+      expect(result.output?.path).toContain('[REDACTED:platform_id]');
+      expect(result.auditSummary).toContain('[REDACTED:token_assignment]');
+      expect(result.auditSummary).toContain('[REDACTED:platform_id]');
+      expect(serialized).not.toContain(rawAdjacent);
+      expect(serialized).not.toContain(rawPlatformId);
+      expect(serialized).not.toContain(rawNumericPlatformId);
+
+      const exists = await fs.promises
+        .access(filePath)
+        .then(() => true)
+        .catch(() => false);
+      expect(exists).toBe(false);
+    });
+  });
+
   describe('Audit Logging', () => {
     it('should include audit summary for file deletion', async () => {
       await fs.promises.writeFile(path.join(tempDir, 'test.txt'), 'content');

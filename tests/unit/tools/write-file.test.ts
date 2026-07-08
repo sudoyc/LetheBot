@@ -162,6 +162,125 @@ describe('WriteFileHandler', () => {
       expect(result.status).toBe('rejected');
       expect(result.error?.code).toBe('PATH_VALIDATION_FAILED');
     });
+
+    it('should reject allowed_paths prefix sibling writes without creating files', async () => {
+      context.sandboxPolicy.filesystem = 'allowed_paths';
+      context.allowedPaths = ['safe'];
+
+      const result = await handler.execute(
+        { path: 'safe-private/secret.txt', content: 'malicious' },
+        context
+      );
+
+      expect(result.status).toBe('rejected');
+      expect(result.error?.code).toBe('PATH_VALIDATION_FAILED');
+
+      const escapedPath = path.join(tempDir, 'safe-private/secret.txt');
+      const escapedExists = await fs.promises
+        .access(escapedPath)
+        .then(() => true)
+        .catch(() => false);
+      expect(escapedExists).toBe(false);
+    });
+
+    it('should reject writes below symlink parents escaping workspace', async () => {
+      const outsideDir = await fs.promises.mkdtemp(
+        path.join(os.tmpdir(), 'lethebot-outside-')
+      );
+      const symlinkPath = path.join(tempDir, 'outside-link');
+
+      try {
+        await fs.promises.symlink(outsideDir, symlinkPath);
+
+        const result = await handler.execute(
+          { path: 'outside-link/escaped.txt', content: 'malicious' },
+          context
+        );
+
+        expect(result.status).toBe('rejected');
+        expect(result.error?.code).toBe('PATH_VALIDATION_FAILED');
+        expect(result.error?.message).toContain('Parent directory symlink escapes workspace');
+
+        const escapedExists = await fs.promises
+          .access(path.join(outsideDir, 'escaped.txt'))
+          .then(() => true)
+          .catch(() => false);
+        expect(escapedExists).toBe(false);
+      } finally {
+        await fs.promises.rm(outsideDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('Output Redaction', () => {
+    it('should redact secret-like paths in file-exists errors', async () => {
+      const secret = 'sk-writeexist1234567890abcdefghi';
+      const secretPath = `api_key=${secret}.txt`;
+      await fs.promises.writeFile(path.join(tempDir, secretPath), 'original');
+
+      const result = await handler.execute(
+        { path: secretPath, content: 'new content', overwrite: false },
+        context
+      );
+
+      expect(result.status).toBe('error');
+      expect(result.error?.code).toBe('FILE_EXISTS');
+      expect(result.secretsRedacted).toBe(true);
+      expect(result.error?.message).toContain('[REDACTED:api_key_assignment]');
+      expect(result.error?.message).not.toContain(secret);
+    });
+
+    it('should redact secret-like paths in successful output and audit summary', async () => {
+      const secret = 'sk-writefilepath1234567890abcdefghi';
+      const secretPath = `api_key=${secret}.txt`;
+
+      const result = await handler.execute(
+        { path: secretPath, content: 'content' },
+        context
+      );
+
+      expect(result.status).toBe('success');
+      expect(result.secretsRedacted).toBe(true);
+      expect(result.output?.path).toContain('[REDACTED:api_key_assignment]');
+      expect(result.auditSummary).toContain('[REDACTED:api_key_assignment]');
+      expect(JSON.stringify(result.output)).not.toContain(secret);
+      expect(result.auditSummary).not.toContain(secret);
+
+      const writtenExists = await fs.promises
+        .access(path.join(tempDir, secretPath))
+        .then(() => true)
+        .catch(() => false);
+      expect(writtenExists).toBe(true);
+    });
+
+    it('should preserve both markers for adjacent secret/platform paths in output and audit summary', async () => {
+      const rawAdjacent = 'sk-write-adjacent-secret-qq-1234567890';
+      const rawPlatformId = 'qq-1234567890';
+      const rawNumericPlatformId = '1234567890';
+      const adjacentPath = `token=${rawAdjacent}.txt`;
+
+      const result = await handler.execute(
+        { path: adjacentPath, content: 'content' },
+        context
+      );
+      const serialized = JSON.stringify(result);
+
+      expect(result.status).toBe('success');
+      expect(result.secretsRedacted).toBe(true);
+      expect(result.output?.path).toContain('[REDACTED:token_assignment]');
+      expect(result.output?.path).toContain('[REDACTED:platform_id]');
+      expect(result.auditSummary).toContain('[REDACTED:token_assignment]');
+      expect(result.auditSummary).toContain('[REDACTED:platform_id]');
+      expect(serialized).not.toContain(rawAdjacent);
+      expect(serialized).not.toContain(rawPlatformId);
+      expect(serialized).not.toContain(rawNumericPlatformId);
+
+      const writtenExists = await fs.promises
+        .access(path.join(tempDir, adjacentPath))
+        .then(() => true)
+        .catch(() => false);
+      expect(writtenExists).toBe(true);
+    });
   });
 
   describe('Output Metadata', () => {

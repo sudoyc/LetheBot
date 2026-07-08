@@ -18,12 +18,53 @@ import { GovernanceCLI } from '../src/cli/governance';
 import { join, dirname } from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { redactSecretsInText } from '../src/memory/secret-scan';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-async function smokeTest(): Promise<void> {
+export function formatSmokeErrorForConsole(error: unknown): string {
+  return JSON.stringify(normalizeSmokeError(error));
+}
+
+function normalizeSmokeError(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    return {
+      name: redactSmokeDiagnosticText(error.name),
+      message: redactSmokeDiagnosticText(error.message),
+      stack: '[REDACTED:stack]',
+    };
+  }
+
+  if (typeof error === 'string') {
+    return {
+      message: redactSmokeDiagnosticText(error),
+    };
+  }
+
+  return {
+    message: redactSmokeDiagnosticText(String(error)),
+  };
+}
+
+function redactSmokeDiagnosticText(text: string): string {
+  const platformRedacted = redactSmokePlatformIdentifiers(text);
+  const secretRedacted = redactSecretsInText(platformRedacted).text;
+  const redacted = redactSmokePlatformIdentifiers(secretRedacted);
+  const platformMarkerLost =
+    platformRedacted.includes('[REDACTED:platform_id]') && !redacted.includes('[REDACTED:platform_id]');
+
+  return platformMarkerLost ? `${redacted} [REDACTED:platform_id]` : redacted;
+}
+
+function redactSmokePlatformIdentifiers(text: string): string {
+  return text
+    .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
+    .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
+}
+
+export async function smokeTest(): Promise<void> {
   console.log('🔥 LetheBot Smoke Test\n');
 
   const testDir = mkdtempSync(join(tmpdir(), 'lethebot-smoke-'));
@@ -153,10 +194,10 @@ async function smokeTest(): Promise<void> {
       },
       evaluatorPolicy: 'bypass',
       auditLevel: 'summary',
-      sandboxPolicy: { networkAccess: false, filesystemAccess: false, maxExecutionTimeMs: 1000 },
+      sandboxPolicy: { filesystem: 'none', network: 'none', execution: 'in_process', maxRuntimeMs: 1000 },
       outputSensitivity: 'normal',
       piSchema: { input: {}, output: {} },
-      handler: 'test',
+      handler: async () => ({ ok: true }),
     });
 
     const gate = new PolicyGate(registry);
@@ -225,14 +266,20 @@ async function smokeTest(): Promise<void> {
     console.log('   - CLI: Memory governance commands\n');
     console.log('🚀 Next steps: See docs/deployment.md for production setup');
   } catch (error) {
-    console.error('❌ Smoke test failed:', error);
+    console.error('❌ Smoke test failed:', formatSmokeErrorForConsole(error));
     process.exit(1);
   } finally {
     rmSync(testDir, { recursive: true, force: true });
   }
 }
 
-smokeTest().catch((error) => {
-  console.error('Fatal error:', error);
-  process.exit(1);
-});
+function isDirectExecution(): boolean {
+  return process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+}
+
+if (isDirectExecution()) {
+  smokeTest().catch((error) => {
+    console.error('Fatal error:', formatSmokeErrorForConsole(error));
+    process.exit(1);
+  });
+}

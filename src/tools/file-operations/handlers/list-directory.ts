@@ -12,6 +12,7 @@ import {
   PathValidator,
   type FileOperationContext,
 } from '../path-validator';
+import { redactFileOperationText } from '../redaction';
 
 interface ListDirectoryInput {
   path: string;
@@ -49,26 +50,33 @@ export class ListDirectoryHandler {
     context: FileOperationContext
   ): Promise<ToolCallResult> {
     const startTime = Date.now();
+    const redactedPathResult = redactFileOperationText(input.path);
+    const redactedInputPath = redactedPathResult.text;
+    const pathSecretsRedacted = redactedPathResult.redacted;
 
     try {
       // 1. 路径验证
       const validation = await this.validator.validate(input.path, context);
       if (!validation.allowed) {
+        const redactedReasonResult = redactFileOperationText(
+          validation.reason || 'Path validation failed'
+        );
+        const redactedReason = redactedReasonResult.text;
         return {
           toolCallId: context.toolCallId,
           status: 'rejected',
           error: {
             code: 'PATH_VALIDATION_FAILED',
-            message: validation.reason || 'Path validation failed',
+            message: redactedReason,
             details: { checks: validation.checks },
           },
           executionTimeMs: Date.now() - startTime,
-          auditSummary: `list_directory rejected: ${validation.reason}`,
-          secretsRedacted: false,
+          auditSummary: `list_directory rejected: ${redactedReason}`,
+          secretsRedacted: pathSecretsRedacted || redactedReasonResult.redacted,
         };
       }
 
-      const normalizedPath = validation.normalizedPath!;
+      const normalizedPath = validation.normalizedPath;
 
       // 2. 检查是否为目录
       const stats = await fs.promises.stat(normalizedPath);
@@ -78,11 +86,11 @@ export class ListDirectoryHandler {
           status: 'error',
           error: {
             code: 'NOT_A_DIRECTORY',
-            message: `Path is not a directory: ${input.path}`,
+            message: `Path is not a directory: ${redactedInputPath}`,
           },
           executionTimeMs: Date.now() - startTime,
           auditSummary: 'list_directory failed: not a directory',
-          secretsRedacted: false,
+          secretsRedacted: pathSecretsRedacted,
         };
       }
 
@@ -106,29 +114,36 @@ export class ListDirectoryHandler {
         );
       }
 
-      const output: ListDirectoryOutput = { entries };
+      const redactedEntries = entries.map((entry) => this.redactEntry(entry));
+      const output: ListDirectoryOutput = { entries: redactedEntries };
+      const entrySecretsRedacted = redactedEntries.some((entry, index) =>
+        entry.name !== entries[index]?.name || entry.path !== entries[index]?.path
+      );
+      const secretsRedacted = pathSecretsRedacted || entrySecretsRedacted;
 
       return {
         toolCallId: context.toolCallId,
         status: 'success',
         output,
         executionTimeMs: Date.now() - startTime,
-        auditSummary: `list_directory: ${input.path} (${entries.length} entries)`,
-        secretsRedacted: false,
+        auditSummary: `list_directory: ${redactedInputPath} (${entries.length} entries)`,
+        secretsRedacted,
       };
     } catch (error: unknown) {
       const err = error as NodeJS.ErrnoException;
       const message = err.message ?? String(error);
+      const redactedMessageResult = redactFileOperationText(message);
+      const redactedMessage = redactedMessageResult.text;
       return {
         toolCallId: context.toolCallId,
         status: 'error',
         error: {
           code: err.code || 'UNKNOWN_ERROR',
-          message,
+          message: redactedMessage,
         },
         executionTimeMs: Date.now() - startTime,
-        auditSummary: `list_directory error: ${message}`,
-        secretsRedacted: false,
+        auditSummary: `list_directory error: ${redactedMessage}`,
+        secretsRedacted: pathSecretsRedacted || redactedMessageResult.redacted,
       };
     }
   }
@@ -218,6 +233,14 @@ export class ListDirectoryHandler {
         );
       }
     }
+  }
+
+  private redactEntry(entry: DirectoryEntry): DirectoryEntry {
+    return {
+      ...entry,
+      name: redactFileOperationText(entry.name).text,
+      path: redactFileOperationText(entry.path).text,
+    };
   }
 
   /**

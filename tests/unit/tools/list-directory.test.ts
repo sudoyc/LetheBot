@@ -164,6 +164,91 @@ describe('ListDirectoryHandler', () => {
     });
   });
 
+  describe('Output Redaction', () => {
+    it('should redact secret-like entry names and paths before returning output', async () => {
+      const fileSecret = 'sk-listdirfile1234567890abcdefghi';
+      const dirSecret = 'sk-listdirdir1234567890abcdefghi';
+      const secretDirName = `token=${dirSecret}`;
+      const secretFileName = `api_key=${fileSecret}.txt`;
+      await fs.promises.mkdir(path.join(tempDir, secretDirName));
+      await fs.promises.writeFile(
+        path.join(tempDir, secretDirName, secretFileName),
+        'content'
+      );
+
+      const result = await handler.execute(
+        { path: '.', recursive: true },
+        context
+      );
+
+      const serialized = JSON.stringify(result.output);
+      expect(result.status).toBe('success');
+      expect(result.secretsRedacted).toBe(true);
+      expect(serialized).toContain('[REDACTED:token_assignment]');
+      expect(serialized).toContain('[REDACTED:api_key_assignment]');
+      expect(serialized).not.toContain(fileSecret);
+      expect(serialized).not.toContain(dirSecret);
+    });
+
+    it('should preserve both markers for adjacent secret/platform entry names and paths', async () => {
+      const rawAdjacent = 'sk-list-adjacent-secret-qq-1234567890';
+      const rawPlatformId = 'qq-1234567890';
+      const rawNumericPlatformId = '1234567890';
+      const adjacentDirName = `token=${rawAdjacent}`;
+      const adjacentFileName = `api_key=${rawAdjacent}.txt`;
+      await fs.promises.mkdir(path.join(tempDir, adjacentDirName));
+      await fs.promises.writeFile(
+        path.join(tempDir, adjacentDirName, adjacentFileName),
+        'content'
+      );
+
+      const result = await handler.execute(
+        { path: '.', recursive: true },
+        context
+      );
+      const serialized = JSON.stringify(result);
+
+      expect(result.status).toBe('success');
+      expect(result.secretsRedacted).toBe(true);
+      expect(serialized).toContain('[REDACTED:token_assignment]');
+      expect(serialized).toContain('[REDACTED:api_key_assignment]');
+      expect(serialized).toContain('[REDACTED:platform_id]');
+      expect(serialized).not.toContain(rawAdjacent);
+      expect(serialized).not.toContain(rawPlatformId);
+      expect(serialized).not.toContain(rawNumericPlatformId);
+    });
+  });
+
+  describe('Path Redaction', () => {
+    it('should redact secret-like input paths in success audit summaries', async () => {
+      const secret = 'sk-listaudit1234567890abcdefghi';
+      const secretDir = `token=${secret}`;
+      await fs.promises.mkdir(path.join(tempDir, secretDir));
+      await fs.promises.writeFile(path.join(tempDir, secretDir, 'file.txt'), 'content');
+
+      const result = await handler.execute({ path: secretDir }, context);
+
+      expect(result.status).toBe('success');
+      expect(result.secretsRedacted).toBe(true);
+      expect(result.auditSummary).toContain('[REDACTED:token_assignment]');
+      expect(result.auditSummary).not.toContain(secret);
+    });
+
+    it('should redact secret-like paths in not-a-directory errors', async () => {
+      const secret = 'sk-listnotdir1234567890abcdefghi';
+      const secretPath = `api_key=${secret}.txt`;
+      await fs.promises.writeFile(path.join(tempDir, secretPath), 'content');
+
+      const result = await handler.execute({ path: secretPath }, context);
+
+      expect(result.status).toBe('error');
+      expect(result.error?.code).toBe('NOT_A_DIRECTORY');
+      expect(result.secretsRedacted).toBe(true);
+      expect(result.error?.message).toContain('[REDACTED:api_key_assignment]');
+      expect(result.error?.message).not.toContain(secret);
+    });
+  });
+
   describe('Security Checks', () => {
     it('should reject path outside workspace', async () => {
       const result = await handler.execute({ path: '/etc' }, context);

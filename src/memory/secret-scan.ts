@@ -4,7 +4,7 @@ export interface SecretScanFinding {
 }
 
 const SECRET_PATTERNS: Array<{ name: string; regex: RegExp }> = [
-  { name: 'openai_like_api_key', regex: /\bsk-[A-Za-z0-9_-]{20,}\b/ },
+  { name: 'openai_like_api_key', regex: /(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9])/ },
   { name: 'github_token', regex: /\bghp_[A-Za-z0-9_]{20,}\b/ },
   {
     name: 'jwt',
@@ -12,16 +12,16 @@ const SECRET_PATTERNS: Array<{ name: string; regex: RegExp }> = [
   },
   { name: 'aws_access_key_id', regex: /\bAKIA[0-9A-Z]{16}\b/ },
   { name: 'private_key_block', regex: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/ },
-  { name: 'password_assignment', regex: /\b(?:password|passwd|pwd)\s*[:=]\s*['"]?\S{4,}/i },
-  { name: 'api_key_assignment', regex: /\bapi[_-]?key\s*[:=]\s*['"]?\S{4,}/i },
+  { name: 'password_assignment', regex: /(?<![A-Za-z0-9])(?:password|passwd|pwd)\s*[:=]\s*['"]?\S{4,}/i },
+  { name: 'api_key_assignment', regex: /(?<![A-Za-z0-9])api[_-]?key\s*[:=]\s*['"]?\S{4,}/i },
   {
     name: 'token_assignment',
-    regex: /\b(?:access[_-]?token|refresh[_-]?token|token)\s*[:=]\s*['"]?\S{8,}/i,
+    regex: /(?<![A-Za-z0-9])(?:access[_-]?token|refresh[_-]?token|token)\s*[:=]\s*['"]?\S{8,}/i,
   },
-  { name: 'cookie_assignment', regex: /\bcookie\s*[:=]\s*['"]?\S{8,}/i },
+  { name: 'cookie_assignment', regex: /(?<![A-Za-z0-9])cookie\s*[:=]\s*['"]?\S{8,}/i },
   {
     name: 'recovery_codes',
-    regex: /\brecovery\s*codes?\s*[:=]\s*(?:[A-Z0-9-]{4,}[\s,;]*){2,}/i,
+    regex: /(?<![A-Za-z0-9])recovery\s*codes?\s*[:=]\s*(?:[A-Z0-9-]{4,}[\s,;]*){2,}/i,
   },
 ];
 

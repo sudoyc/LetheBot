@@ -11,6 +11,7 @@ import {
   PathValidator,
   type FileOperationContext,
 } from '../path-validator';
+import { redactFileOperationText } from '../redaction';
 
 interface WriteFileInput {
   path: string;
@@ -43,6 +44,9 @@ export class WriteFileHandler {
     context: FileOperationContext
   ): Promise<ToolCallResult> {
     const startTime = Date.now();
+    const redactedPathResult = redactFileOperationText(input.path);
+    const redactedInputPath = redactedPathResult.text;
+    const pathSecretsRedacted = redactedPathResult.redacted;
 
     try {
       // 1. 检查是否为 readonly 模式
@@ -63,21 +67,25 @@ export class WriteFileHandler {
       // 2. 路径验证
       const validation = await this.validator.validate(input.path, context);
       if (!validation.allowed) {
+        const redactedReasonResult = redactFileOperationText(
+          validation.reason || 'Path validation failed'
+        );
+        const redactedReason = redactedReasonResult.text;
         return {
           toolCallId: context.toolCallId,
           status: 'rejected',
           error: {
             code: 'PATH_VALIDATION_FAILED',
-            message: validation.reason || 'Path validation failed',
+            message: redactedReason,
             details: { checks: validation.checks },
           },
           executionTimeMs: Date.now() - startTime,
-          auditSummary: `write_file rejected: ${validation.reason}`,
-          secretsRedacted: false,
+          auditSummary: `write_file rejected: ${redactedReason}`,
+          secretsRedacted: pathSecretsRedacted || redactedReasonResult.redacted,
         };
       }
 
-      const normalizedPath = validation.normalizedPath!;
+      const normalizedPath = validation.normalizedPath;
 
       // 3. 检查文件是否已存在
       let fileExists = false;
@@ -94,11 +102,11 @@ export class WriteFileHandler {
           status: 'error',
           error: {
             code: 'FILE_EXISTS',
-            message: `File already exists: ${input.path}`,
+            message: `File already exists: ${redactedInputPath}`,
           },
           executionTimeMs: Date.now() - startTime,
           auditSummary: 'write_file failed: file exists',
-          secretsRedacted: false,
+          secretsRedacted: pathSecretsRedacted,
         };
       }
 
@@ -122,7 +130,7 @@ export class WriteFileHandler {
       const stats = await fs.promises.stat(normalizedPath);
 
       const output: WriteFileOutput = {
-        path: input.path,
+        path: redactedInputPath,
         size: stats.size,
         created: !fileExists,
       };
@@ -132,22 +140,24 @@ export class WriteFileHandler {
         status: 'success',
         output,
         executionTimeMs: Date.now() - startTime,
-        auditSummary: `write_file: ${input.path} (${stats.size} bytes, ${fileExists ? 'overwritten' : 'created'})`,
-        secretsRedacted: false,
+        auditSummary: `write_file: ${redactedInputPath} (${stats.size} bytes, ${fileExists ? 'overwritten' : 'created'})`,
+        secretsRedacted: pathSecretsRedacted,
       };
     } catch (error: unknown) {
       const err = error as NodeJS.ErrnoException;
       const message = err.message ?? String(error);
+      const redactedMessageResult = redactFileOperationText(message);
+      const redactedMessage = redactedMessageResult.text;
       return {
         toolCallId: context.toolCallId,
         status: 'error',
         error: {
           code: err.code || 'UNKNOWN_ERROR',
-          message,
+          message: redactedMessage,
         },
         executionTimeMs: Date.now() - startTime,
-        auditSummary: `write_file error: ${message}`,
-        secretsRedacted: false,
+        auditSummary: `write_file error: ${redactedMessage}`,
+        secretsRedacted: pathSecretsRedacted || redactedMessageResult.redacted,
       };
     }
   }

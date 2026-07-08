@@ -10,6 +10,7 @@ import {
   PathValidator,
   type FileOperationContext,
 } from '../path-validator';
+import { redactFileOperationText } from '../redaction';
 
 interface DeleteFileInput {
   path: string;
@@ -39,6 +40,9 @@ export class DeleteFileHandler {
     context: FileOperationContext
   ): Promise<ToolCallResult> {
     const startTime = Date.now();
+    const redactedPathResult = redactFileOperationText(input.path);
+    const redactedInputPath = redactedPathResult.text;
+    const pathSecretsRedacted = redactedPathResult.redacted;
 
     try {
       // 1. 检查是否为 readonly 模式
@@ -59,21 +63,25 @@ export class DeleteFileHandler {
       // 2. 路径验证
       const validation = await this.validator.validate(input.path, context);
       if (!validation.allowed) {
+        const redactedReasonResult = redactFileOperationText(
+          validation.reason || 'Path validation failed'
+        );
+        const redactedReason = redactedReasonResult.text;
         return {
           toolCallId: context.toolCallId,
           status: 'rejected',
           error: {
             code: 'PATH_VALIDATION_FAILED',
-            message: validation.reason || 'Path validation failed',
+            message: redactedReason,
             details: { checks: validation.checks },
           },
           executionTimeMs: Date.now() - startTime,
-          auditSummary: `delete_file rejected: ${validation.reason}`,
-          secretsRedacted: false,
+          auditSummary: `delete_file rejected: ${redactedReason}`,
+          secretsRedacted: pathSecretsRedacted || redactedReasonResult.redacted,
         };
       }
 
-      const normalizedPath = validation.normalizedPath!;
+      const normalizedPath = validation.normalizedPath;
 
       // 3. 检查文件/目录是否存在
       let stats: fs.Stats;
@@ -87,11 +95,11 @@ export class DeleteFileHandler {
             status: 'error',
             error: {
               code: 'FILE_NOT_FOUND',
-              message: `File or directory not found: ${input.path}`,
+              message: `File or directory not found: ${redactedInputPath}`,
             },
             executionTimeMs: Date.now() - startTime,
             auditSummary: 'delete_file failed: file not found',
-            secretsRedacted: false,
+            secretsRedacted: pathSecretsRedacted,
           };
         }
         throw err;
@@ -104,11 +112,11 @@ export class DeleteFileHandler {
           status: 'error',
           error: {
             code: 'IS_DIRECTORY',
-            message: `Path is a directory, use recursive=true to delete: ${input.path}`,
+            message: `Path is a directory, use recursive=true to delete: ${redactedInputPath}`,
           },
           executionTimeMs: Date.now() - startTime,
           auditSummary: 'delete_file failed: directory without recursive flag',
-          secretsRedacted: false,
+          secretsRedacted: pathSecretsRedacted,
         };
       }
 
@@ -121,7 +129,7 @@ export class DeleteFileHandler {
 
       const output: DeleteFileOutput = {
         deleted: true,
-        path: input.path,
+        path: redactedInputPath,
       };
 
       return {
@@ -129,22 +137,24 @@ export class DeleteFileHandler {
         status: 'success',
         output,
         executionTimeMs: Date.now() - startTime,
-        auditSummary: `delete_file: ${input.path} (${stats.isDirectory() ? 'directory' : 'file'}, ${stats.size} bytes)`,
-        secretsRedacted: false,
+        auditSummary: `delete_file: ${redactedInputPath} (${stats.isDirectory() ? 'directory' : 'file'}, ${stats.size} bytes)`,
+        secretsRedacted: pathSecretsRedacted,
       };
     } catch (error: unknown) {
       const err = error as NodeJS.ErrnoException;
       const message = err.message ?? String(error);
+      const redactedMessageResult = redactFileOperationText(message);
+      const redactedMessage = redactedMessageResult.text;
       return {
         toolCallId: context.toolCallId,
         status: 'error',
         error: {
           code: err.code || 'UNKNOWN_ERROR',
-          message,
+          message: redactedMessage,
         },
         executionTimeMs: Date.now() - startTime,
-        auditSummary: `delete_file error: ${message}`,
-        secretsRedacted: false,
+        auditSummary: `delete_file error: ${redactedMessage}`,
+        secretsRedacted: pathSecretsRedacted || redactedMessageResult.redacted,
       };
     }
   }

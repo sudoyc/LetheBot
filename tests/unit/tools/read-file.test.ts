@@ -87,6 +87,55 @@ describe('ReadFileHandler', () => {
     });
   });
 
+  describe('Path Redaction', () => {
+    it('should redact secret-like paths in success audit summaries', async () => {
+      const secret = 'sk-readpath1234567890abcdefghi';
+      const secretPath = `api_key=${secret}.txt`;
+      await fs.promises.writeFile(path.join(tempDir, secretPath), 'normal content');
+
+      const result = await handler.execute({ path: secretPath }, context);
+
+      expect(result.status).toBe('success');
+      expect(result.secretsRedacted).toBe(true);
+      expect(result.auditSummary).toContain('[REDACTED:api_key_assignment]');
+      expect(result.auditSummary).not.toContain(secret);
+    });
+
+    it('should redact secret-like paths in file-not-found errors', async () => {
+      const secret = 'sk-readmissing1234567890abcdefghi';
+      const secretPath = `api_key=${secret}.txt`;
+
+      const result = await handler.execute({ path: secretPath }, context);
+
+      expect(result.status).toBe('error');
+      expect(result.error?.code).toBe('FILE_NOT_FOUND');
+      expect(result.secretsRedacted).toBe(true);
+      expect(result.error?.message).toContain('[REDACTED:api_key_assignment]');
+      expect(result.error?.message).not.toContain(secret);
+    });
+
+    it('should preserve both markers for adjacent secret/platform paths and contents', async () => {
+      const rawAdjacent = 'sk-read-adjacent-secret-qq-1234567890';
+      const rawPlatformId = 'qq-1234567890';
+      const rawNumericPlatformId = '1234567890';
+      const adjacentPath = `api_key=${rawAdjacent}.txt`;
+      await fs.promises.writeFile(path.join(tempDir, adjacentPath), `target=${rawAdjacent}`);
+
+      const result = await handler.execute({ path: adjacentPath }, context);
+      const serialized = JSON.stringify(result);
+
+      expect(result.status).toBe('success');
+      expect(result.secretsRedacted).toBe(true);
+      expect(result.output?.content).toContain('[REDACTED:openai_like_api_key]');
+      expect(result.output?.content).toContain('[REDACTED:platform_id]');
+      expect(result.auditSummary).toContain('[REDACTED:api_key_assignment]');
+      expect(result.auditSummary).toContain('[REDACTED:platform_id]');
+      expect(serialized).not.toContain(rawAdjacent);
+      expect(serialized).not.toContain(rawPlatformId);
+      expect(serialized).not.toContain(rawNumericPlatformId);
+    });
+  });
+
   describe('Error Handling', () => {
     it('should reject path outside workspace', async () => {
       const result = await handler.execute(
@@ -133,6 +182,20 @@ describe('ReadFileHandler', () => {
   });
 
   describe('Secret Scanning', () => {
+    it('should redact secret-like file contents before returning output', async () => {
+      const filePath = path.join(tempDir, 'secret-config.txt');
+      const secret = 'sk-1234567890abcdefghijklmnopqrstuvwxyzABCDEF';
+      await fs.promises.writeFile(filePath, `api_key=${secret}`);
+
+      const result = await handler.execute({ path: 'secret-config.txt' }, context);
+
+      expect(result.status).toBe('success');
+      expect(result.secretsRedacted).toBe(true);
+      expect(result.output?.content).toContain('[REDACTED:');
+      expect(result.output?.content).not.toContain(secret);
+      expect(JSON.stringify(result.output)).not.toContain(secret);
+    });
+
     it('should detect OpenAI-like API keys', async () => {
       const filePath = path.join(tempDir, 'config.txt');
       const content = 'OPENAI_API_KEY=sk-1234567890abcdefghijklmnopqrstuvwxyz';

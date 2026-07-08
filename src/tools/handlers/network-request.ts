@@ -4,6 +4,7 @@
  * HTTP/HTTPS 网络请求工具实现
  */
 
+import { redactSecretsInText } from '../../memory/secret-scan';
 import type { ToolRegistryEntry } from '../../types/tool';
 
 /**
@@ -186,6 +187,22 @@ export function isAllowedDomain(url: string, allowedDomains: string[]): boolean 
   return false;
 }
 
+function redactNetworkDiagnosticText(value: string): string {
+  const platformRedacted = redactPlatformIdentifiers(value);
+  const secretRedacted = redactSecretsInText(platformRedacted).text;
+  const redacted = redactPlatformIdentifiers(secretRedacted);
+  if (platformRedacted.includes('[REDACTED:platform_id]') && !redacted.includes('[REDACTED:platform_id]')) {
+    return `${redacted} [REDACTED:platform_id]`;
+  }
+  return redacted;
+}
+
+function redactPlatformIdentifiers(value: string): string {
+  return value
+    .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
+    .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
+}
+
 /**
  * 网络请求处理器实现
  */
@@ -221,8 +238,9 @@ export class NetworkRequestHandlerImpl implements NetworkRequestHandler {
       }
 
       // 准备请求选项
+      const method = input.method || 'GET';
       const options: RequestInit = {
-        method: input.method || 'GET',
+        method,
         headers: {
           'User-Agent': 'LetheBot/1.0',
           ...input.headers,
@@ -231,7 +249,7 @@ export class NetworkRequestHandlerImpl implements NetworkRequestHandler {
       };
 
       // 处理请求体
-      if (input.body && ['POST', 'PUT', 'PATCH'].includes(options.method!)) {
+      if (input.body && ['POST', 'PUT', 'PATCH'].includes(method)) {
         if (typeof input.body === 'string') {
           options.body = input.body;
         } else {
@@ -249,20 +267,21 @@ export class NetworkRequestHandlerImpl implements NetworkRequestHandler {
       // 读取响应体（限制大小）
       const maxBodySize = 1048576; // 1MB
       const bodyText = await response.text();
-      const truncated = bodyText.length > maxBodySize
-        ? bodyText.slice(0, maxBodySize) + '\n[truncated]'
-        : bodyText;
+      const redactedBodyText = redactNetworkDiagnosticText(bodyText);
+      const truncated = redactedBodyText.length > maxBodySize
+        ? redactedBodyText.slice(0, maxBodySize) + '\n[truncated]'
+        : redactedBodyText;
 
       // 构建响应头字典
       const headers: Record<string, string> = {};
       response.headers.forEach((value, key) => {
-        headers[key] = value;
+        headers[key] = redactNetworkDiagnosticText(value);
       });
 
       return {
         success: response.ok,
         status: response.status,
-        statusText: response.statusText,
+        statusText: redactNetworkDiagnosticText(response.statusText),
         headers,
         body: truncated,
         executionTimeMs: Date.now() - startTime,
@@ -270,11 +289,14 @@ export class NetworkRequestHandlerImpl implements NetworkRequestHandler {
 
     } catch (error: unknown) {
       const err = error as Error;
+      const message = err.message || 'Unknown error';
+      const redactedMessage = redactNetworkDiagnosticText(message);
+
       return {
         success: false,
         error: err.name === 'TimeoutError'
           ? 'Request timeout'
-          : err.message || 'Unknown error',
+          : redactedMessage,
         executionTimeMs: Date.now() - startTime,
       };
     }

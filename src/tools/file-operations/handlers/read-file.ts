@@ -10,6 +10,7 @@ import {
   PathValidator,
   type FileOperationContext,
 } from '../path-validator';
+import { redactFileOperationText } from '../redaction';
 
 interface ReadFileInput {
   path: string;
@@ -41,26 +42,33 @@ export class ReadFileHandler {
     context: FileOperationContext
   ): Promise<ToolCallResult> {
     const startTime = Date.now();
+    const redactedPathResult = redactFileOperationText(input.path);
+    const redactedInputPath = redactedPathResult.text;
+    const pathSecretsRedacted = redactedPathResult.redacted;
 
     try {
       // 1. 路径验证
       const validation = await this.validator.validate(input.path, context);
       if (!validation.allowed) {
+        const redactedReasonResult = redactFileOperationText(
+          validation.reason || 'Path validation failed'
+        );
+        const redactedReason = redactedReasonResult.text;
         return {
           toolCallId: context.toolCallId,
           status: 'rejected',
           error: {
             code: 'PATH_VALIDATION_FAILED',
-            message: validation.reason || 'Path validation failed',
+            message: redactedReason,
             details: { checks: validation.checks },
           },
           executionTimeMs: Date.now() - startTime,
-          auditSummary: `read_file rejected: ${validation.reason}`,
-          secretsRedacted: false,
+          auditSummary: `read_file rejected: ${redactedReason}`,
+          secretsRedacted: pathSecretsRedacted || redactedReasonResult.redacted,
         };
       }
 
-      const normalizedPath = validation.normalizedPath!;
+      const normalizedPath = validation.normalizedPath;
 
       // 2. 检查文件是否存在
       try {
@@ -71,11 +79,11 @@ export class ReadFileHandler {
           status: 'error',
           error: {
             code: 'FILE_NOT_FOUND',
-            message: `File not found or not readable: ${input.path}`,
+            message: `File not found or not readable: ${redactedInputPath}`,
           },
           executionTimeMs: Date.now() - startTime,
           auditSummary: `read_file error: file not found`,
-          secretsRedacted: false,
+          secretsRedacted: pathSecretsRedacted,
         };
       }
 
@@ -110,11 +118,13 @@ export class ReadFileHandler {
         content = await fs.promises.readFile(normalizedPath, 'utf8');
       }
 
-      // 5. 秘密扫描
-      const secretsFound = this.scanForSecrets(content);
+      // 5. 秘密扫描和输出脱敏
+      const redaction = redactFileOperationText(content);
+      const outputContent = redaction.text;
+      const secretsFound = redaction.redacted;
 
       const output: ReadFileOutput = {
-        content,
+        content: outputContent,
         size: stats.size,
         mtime: stats.mtime.toISOString(),
         encoding,
@@ -125,38 +135,25 @@ export class ReadFileHandler {
         status: 'success',
         output,
         executionTimeMs: Date.now() - startTime,
-        auditSummary: `read_file: ${input.path} (${stats.size} bytes)`,
-        secretsRedacted: secretsFound,
+        auditSummary: `read_file: ${redactedInputPath} (${stats.size} bytes)`,
+        secretsRedacted: secretsFound || pathSecretsRedacted,
       };
     } catch (error: unknown) {
       const err = error as NodeJS.ErrnoException;
       const message = err.message ?? String(error);
+      const redactedMessageResult = redactFileOperationText(message);
+      const redactedMessage = redactedMessageResult.text;
       return {
         toolCallId: context.toolCallId,
         status: 'error',
         error: {
           code: err.code || 'UNKNOWN_ERROR',
-          message,
+          message: redactedMessage,
         },
         executionTimeMs: Date.now() - startTime,
-        auditSummary: `read_file error: ${message}`,
-        secretsRedacted: false,
+        auditSummary: `read_file error: ${redactedMessage}`,
+        secretsRedacted: pathSecretsRedacted || redactedMessageResult.redacted,
       };
     }
-  }
-
-  /**
-   * 扫描内容中的秘密信息
-   */
-  private scanForSecrets(content: string): boolean {
-    // 简单的秘密检测：API 密钥模式、JWT token 等
-    const patterns = [
-      /sk-[A-Za-z0-9]{32,}/, // OpenAI-like keys
-      /ghp_[A-Za-z0-9]{36}/, // GitHub tokens
-      /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/, // JWT
-      /AKIA[0-9A-Z]{16}/, // AWS Access Key ID
-      /-----BEGIN (RSA |DSA )?PRIVATE KEY-----/, // Private keys
-    ];
-    return patterns.some((pattern) => pattern.test(content));
   }
 }

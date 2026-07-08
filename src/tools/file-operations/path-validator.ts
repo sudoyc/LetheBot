@@ -22,17 +22,25 @@ export interface FileOperationContext {
 /**
  * 路径验证结果
  */
-export interface PathValidationResult {
-  allowed: boolean;
-  normalizedPath?: string;
-  reason?: string;
-  checks: {
-    withinWorkspace: boolean;
-    noTraversal: boolean;
-    matchesAllowedPaths: boolean;
-    noSymlinkEscape: boolean;
-  };
+interface PathValidationChecks {
+  withinWorkspace: boolean;
+  noTraversal: boolean;
+  matchesAllowedPaths: boolean;
+  noSymlinkEscape: boolean;
 }
+
+export type PathValidationResult =
+  | {
+    allowed: true;
+    normalizedPath: string;
+    checks: PathValidationChecks;
+  }
+  | {
+    allowed: false;
+    normalizedPath?: undefined;
+    reason?: string;
+    checks: PathValidationChecks;
+  };
 
 /**
  * 路径验证器
