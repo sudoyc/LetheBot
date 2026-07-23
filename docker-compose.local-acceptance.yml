@@ -25,9 +25,9 @@ services:
       - ./data/snowluma-logs:/snowluma/logs
       - ./docker/local-acceptance/snowluma-entrypoint.sh:/usr/local/bin/snowluma-entrypoint.sh:ro
     ports:
-      - "5099:5099"
-      - "3000:3000"
-      - "3001:3001"
+      - "127.0.0.1:5099:5099"
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3001:3001"
     healthcheck:
       test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:5099/').then(() => process.exit(0)).catch(() => process.exit(1))\""]
       interval: 10s
@@ -37,6 +37,7 @@ services:
 
   lethebot:
     image: lethebot/lethebot-local-acceptance:latest
+    user: "${LETHEBOT_UID:-1000}:${LETHEBOT_GID:-1000}"
     build:
       context: .
       dockerfile: docker/local-acceptance/lethebot.Dockerfile
@@ -46,6 +47,7 @@ services:
       NODE_ENV: "production"
       LOG_LEVEL: "info"
       LETHEBOT_TEST: "false"
+      LETHEBOT_BACKGROUND_SUMMARY_ENABLED: "${LETHEBOT_BACKGROUND_SUMMARY_ENABLED:-false}"
       LETHEBOT_DB_PATH: "/app/data/lethebot-local-acceptance.db"
       PI_PROVIDER: "mock"
       PI_MODEL: "mock"
@@ -59,11 +61,15 @@ services:
       LETHEBOT_HEALTH_PATH: "/healthz"
       LETHEBOT_EVENT_PATH: "/onebot/event"
     volumes:
-      - ./data:/app/data
+      - type: bind
+        source: ./data/lethebot
+        target: /app/data
+        bind:
+          create_host_path: false
     ports:
-      - "6700:6700"
+      - "127.0.0.1:6700:6700"
     healthcheck:
-      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:6700/healthz').then(() => process.exit(0)).catch(() => process.exit(1))\""]
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:6700/healthz').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))\""]
       interval: 10s
       timeout: 5s
       retries: 12

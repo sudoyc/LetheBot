@@ -1,20 +1,37 @@
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
+import { createRequire } from 'node:module';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   verifyNapCatConnection,
   verifyOneBotConnection,
   verifyOneBotWebSocketConnection,
   generateNapCatConfig,
   deployLetheBot,
+  parseDeploymentCliArgs,
   NapCatConnectionError,
 } from '../../../src/scripts/deploy-napcat.js';
 import { resetConfig, ConfigValidationError } from '../../../src/config/index.js';
-import { existsSync, readFileSync, unlinkSync, mkdirSync, rmdirSync } from 'node:fs';
+import {
+  clearManagedStartupAuthorization,
+  persistManagedStartupAuthorization,
+} from '../../../src/operations/managed-startup.js';
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  unlinkSync,
+  mkdirSync,
+  rmSync,
+  symlinkSync,
+} from 'node:fs';
 import { join } from 'node:path';
 
 describe('NapCat Deployment Scripts', () => {
   const originalEnv = process.env;
   const originalWebSocket = globalThis.WebSocket;
   const testOutputDir = join(process.cwd(), 'test-output');
+  const testDeploymentRoot = join(testOutputDir, 'managed-root');
 
   beforeEach(() => {
     process.env = { ...originalEnv };
@@ -23,6 +40,23 @@ describe('NapCat Deployment Scripts', () => {
     if (!existsSync(testOutputDir)) {
       mkdirSync(testOutputDir, { recursive: true });
     }
+    mkdirSync(join(testDeploymentRoot, 'shared'), { recursive: true });
+    writeFileSync(
+      join(testDeploymentRoot, 'shared/runtime.env'),
+      [
+        'LOG_LEVEL=warn',
+        'ONEBOT_TRANSPORT=ws',
+        'NODE_ENV=development',
+        'LETHEBOT_DB_PATH=/tmp/must-not-win.db',
+        'NODE_OPTIONS=--require=/tmp/must-not-load.cjs',
+        'NODE_PATH=/tmp/must-not-resolve',
+        'LD_PRELOAD=/tmp/must-not-preload.so',
+        'LD_LIBRARY_PATH=/tmp/must-not-search',
+        'LD_AUDIT=/tmp/must-not-audit.so',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
   });
 
   afterEach(() => {
@@ -32,7 +66,7 @@ describe('NapCat Deployment Scripts', () => {
     resetConfig();
     // Cleanup test files
     try {
-      const files = ['docker-compose.yml', 'lethebot.service', 'ecosystem.config.js', '.env.test'];
+      const files = ['docker-compose.yml', 'lethebot.service', 'ecosystem.config.cjs', '.env.test'];
       for (const file of files) {
         const path = join(testOutputDir, file);
         if (existsSync(path)) {
@@ -40,7 +74,7 @@ describe('NapCat Deployment Scripts', () => {
         }
       }
       if (existsSync(testOutputDir)) {
-        rmdirSync(testOutputDir);
+        rmSync(testOutputDir, { recursive: true, force: true });
       }
     } catch {
       // Ignore cleanup errors
@@ -417,8 +451,7 @@ describe('NapCat Deployment Scripts', () => {
 
       // Cleanup
       unlinkSync(outputPath);
-      rmdirSync(join(testOutputDir, 'nested', 'path'));
-      rmdirSync(join(testOutputDir, 'nested'));
+      rmSync(join(testOutputDir, 'nested'), { recursive: true, force: true });
     });
 
     test('throws error if .env.example missing', async () => {
@@ -457,6 +490,8 @@ describe('NapCat Deployment Scripts', () => {
     });
 
     test('docker mode generates docker-compose.yml', async () => {
+      process.env.LETHEBOT_HEALTH_PATH = '/ops/health';
+      resetConfig();
       const result = await deployLetheBot({
         mode: 'docker',
         outputDir: testOutputDir,
@@ -475,49 +510,331 @@ describe('NapCat Deployment Scripts', () => {
       expect(content).toContain('ONEBOT_WS_URL=');
       expect(content).toContain('ONEBOT_HTTP_URL=');
       expect(content).toContain('LETHEBOT_BOT_QQ_ID=');
+      expect(content).toContain('${ONEBOT_TOKEN:-}');
+      expect(content).toContain('${LETHEBOT_BOT_QQ_ID:-}');
+      expect(content).toContain('${LETHEBOT_IMAGE:?Set LETHEBOT_IMAGE to a reviewed version tag or digest}');
+      expect(content).toContain('user: "${LETHEBOT_UID:-1000}:${LETHEBOT_GID:-1000}"');
+      expect(content).toContain('create_host_path: false');
+      expect(content).toContain('source: ./data/lethebot');
+      expect(content).not.toMatch(/^\s*source: \.\/data\s*$/m);
+      expect(content).toContain('PI_PROVIDER=${PI_PROVIDER:-mock}');
+      expect(content).toContain('PI_MODEL=${PI_MODEL:-mock}');
+      expect(content).toContain('PI_API_KEY=${PI_API_KEY:-}');
+      expect(content).toContain('LETHEBOT_BACKGROUND_SUMMARY_ENABLED=${LETHEBOT_BACKGROUND_SUMMARY_ENABLED:-false}');
+      expect(content).toContain('- EVALUATOR_PROVIDER');
+      expect(content).toContain('- EVALUATOR_MODEL');
+      expect(content).toContain('LETHEBOT_HEALTH_PATH=/ops/health');
+      expect(content).toContain('http://127.0.0.1:6700/ops/health');
+      expect(content).toContain('response.ok ? 0 : 1');
+      expect(content).toContain('"127.0.0.1:6700:6700"');
+      expect(content).not.toContain('http://localhost:6700/healthz');
+      expect(content).not.toContain('"wget"');
+      expect(content).not.toContain('image: node:');
+      expect(content).not.toContain('- ./:/app');
+      expect(content).not.toContain('npm install');
+      expect(content).not.toContain('pnpm install');
+      expect(content).not.toContain('pnpm build');
+      expect(content).not.toContain('pnpm start');
     });
 
     test('systemd mode generates service file', async () => {
+      const managedOutputDir = join(testDeploymentRoot, 'shared');
       const result = await deployLetheBot({
         mode: 'systemd',
-        outputDir: testOutputDir,
+        outputDir: managedOutputDir,
+        deploymentRoot: testDeploymentRoot,
         healthCheck: false,
       });
 
       expect(result.success).toBe(true);
       expect(result.message).toContain('systemd');
-      const servicePath = join(testOutputDir, 'lethebot.service');
+      const servicePath = join(managedOutputDir, 'lethebot.service');
       expect(existsSync(servicePath)).toBe(true);
 
       const content = readFileSync(servicePath, 'utf-8');
       expect(content).toContain('[Unit]');
       expect(content).toContain('[Service]');
       expect(content).toContain('[Install]');
-      expect(content).toContain('ONEBOT_TRANSPORT=');
-      expect(content).toContain('ONEBOT_WS_URL=');
-      expect(content).toContain('ONEBOT_HTTP_URL=');
-      expect(content).toContain('LETHEBOT_BOT_QQ_ID=');
+      expect(content).toContain('User=lethebot');
+      expect(content).toContain(`WorkingDirectory=${JSON.stringify(join(testDeploymentRoot, 'current'))}`);
+      expect(content).toContain(`EnvironmentFile=${JSON.stringify(join(testDeploymentRoot, 'shared/runtime.env'))}`);
+      expect(content).toContain(
+        'UnsetEnvironment=NODE_OPTIONS NODE_PATH LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT',
+      );
+      expect(content).toContain(
+        `ExecCondition=+/usr/bin/env ${JSON.stringify(process.execPath)} ${JSON.stringify(join(testDeploymentRoot, 'shared/bin/managed-startup.js'))} ${JSON.stringify('condition')} ${JSON.stringify(`--root=${testDeploymentRoot}`)} ${JSON.stringify(`--entrypoint=${join(testDeploymentRoot, 'current/dist/index.js')}`)}`,
+      );
+      expect(content).toContain(
+        `ExecStart=${JSON.stringify('/usr/bin/env')} ${JSON.stringify('NODE_ENV=production')} ${JSON.stringify(`LETHEBOT_DB_PATH=${join(testDeploymentRoot, 'shared/data/lethebot.db')}`)} ${JSON.stringify(process.execPath)} ${JSON.stringify(join(testDeploymentRoot, 'current/dist/index.js'))}`,
+      );
+      expect(content).not.toContain('LETHEBOT_MANAGED_ROOT=');
+      expect(existsSync(join(managedOutputDir, 'bin/managed-startup.js'))).toBe(true);
+      expect(existsSync(join(managedOutputDir, 'bin/release-artifact.js'))).toBe(true);
+      expect(readFileSync(join(managedOutputDir, 'bin/package.json'), 'utf8'))
+        .toBe('{"private":true,"type":"module"}\n');
+      const manifest = JSON.parse(
+        readFileSync(join(managedOutputDir, 'bin/manifest.json'), 'utf8'),
+      ) as {
+        schemaVersion: number;
+        protocolVersion: number;
+        files: Record<string, string>;
+      };
+      expect(manifest).toEqual({
+        schemaVersion: 1,
+        protocolVersion: 3,
+        files: {
+          'managed-startup.js': createHash('sha256')
+            .update(readFileSync(join(managedOutputDir, 'bin/managed-startup.js')))
+            .digest('hex'),
+          'release-artifact.js': createHash('sha256')
+            .update(readFileSync(join(managedOutputDir, 'bin/release-artifact.js')))
+            .digest('hex'),
+        },
+      });
+      expect(content).not.toContain(`WorkingDirectory=${JSON.stringify(process.cwd())}`);
+      expect(content).not.toContain('EnvironmentFile=-');
+      expect(content).not.toContain('User=root');
+      expect(content).not.toContain('Environment="ONEBOT_TRANSPORT=');
+      expect(content).not.toContain('Environment="ONEBOT_WS_URL=');
+      expect(content).not.toContain('Environment="ONEBOT_HTTP_URL=');
+      expect(content).not.toContain('Environment="ONEBOT_TOKEN=');
+      expect(content).not.toContain('Environment="LETHEBOT_BOT_QQ_ID=');
+      expect(result.details?.configPath).toBe(join(testDeploymentRoot, 'shared/runtime.env'));
     });
 
     test('pm2 mode generates ecosystem config', async () => {
+      const managedOutputDir = join(testDeploymentRoot, 'shared');
       const result = await deployLetheBot({
         mode: 'pm2',
-        outputDir: testOutputDir,
+        outputDir: managedOutputDir,
+        deploymentRoot: testDeploymentRoot,
         healthCheck: false,
       });
 
       expect(result.success).toBe(true);
       expect(result.message).toContain('pm2');
-      const ecosystemPath = join(testOutputDir, 'ecosystem.config.js');
+      const ecosystemPath = join(managedOutputDir, 'ecosystem.config.cjs');
       expect(existsSync(ecosystemPath)).toBe(true);
 
       const content = readFileSync(ecosystemPath, 'utf-8');
       expect(content).toContain('module.exports');
       expect(content).toContain('apps:');
-      expect(content).toContain('ONEBOT_TRANSPORT');
-      expect(content).toContain('ONEBOT_WS_URL');
-      expect(content).toContain('ONEBOT_HTTP_URL');
-      expect(content).toContain('LETHEBOT_BOT_QQ_ID');
+      expect(content).toContain('parseEnv(readFileSync(');
+      expect(content).toContain(JSON.stringify(join(testDeploymentRoot, 'shared/runtime.env')));
+      expect(content).toContain("delete runtimeEnv[name]");
+      expect(content).not.toContain('process.env.');
+
+      const require = createRequire(import.meta.url);
+      const ecosystem = require(ecosystemPath) as {
+        apps?: Array<{
+          script?: string;
+          interpreter?: string;
+          args?: string[];
+          stop_exit_codes?: number[];
+          cwd?: string;
+          env?: {
+            NODE_ENV?: string;
+            LOG_LEVEL?: string;
+            ONEBOT_TRANSPORT?: string;
+            LETHEBOT_DB_PATH?: string;
+          };
+          error_file?: string;
+          out_file?: string;
+        }>;
+      };
+      expect(ecosystem.apps).toHaveLength(1);
+      expect(ecosystem.apps?.[0]).toMatchObject({
+        script: join(testDeploymentRoot, 'shared/bin/managed-startup.js'),
+        interpreter: process.execPath,
+        args: [
+          'launch',
+          `--root=${testDeploymentRoot}`,
+          `--entrypoint=${join(testDeploymentRoot, 'current/dist/index.js')}`,
+        ],
+        stop_exit_codes: [78],
+        cwd: join(testDeploymentRoot, 'current'),
+        env: {
+          NODE_ENV: 'production',
+          LOG_LEVEL: 'warn',
+          ONEBOT_TRANSPORT: 'ws',
+          LETHEBOT_DB_PATH: join(testDeploymentRoot, 'shared/data/lethebot.db'),
+        },
+        error_file: join(testDeploymentRoot, 'shared/logs/pm2-error.log'),
+        out_file: join(testDeploymentRoot, 'shared/logs/pm2-out.log'),
+      });
+      expect(ecosystem.apps?.[0]?.env).not.toHaveProperty('LETHEBOT_MANAGED_ROOT');
+      for (const name of [
+        'NODE_OPTIONS',
+        'NODE_PATH',
+        'LD_PRELOAD',
+        'LD_LIBRARY_PATH',
+        'LD_AUDIT',
+      ]) {
+        expect(ecosystem.apps?.[0]?.env).not.toHaveProperty(name);
+      }
+      expect(existsSync(join(managedOutputDir, 'bin/managed-startup.js'))).toBe(true);
+      expect(result.details?.configPath).toBe(join(testDeploymentRoot, 'shared/runtime.env'));
+    });
+
+    test('generated stable launcher gates an old release without an in-release hook', async () => {
+      const rootDir = join(testOutputDir, 'stable-gate-root');
+      const sharedDir = join(rootDir, 'shared');
+      mkdirSync(join(sharedDir, 'data'), { recursive: true });
+      mkdirSync(join(sharedDir, 'logs'), { recursive: true });
+      writeFileSync(join(sharedDir, 'runtime.env'), 'NODE_ENV=production\n', 'utf8');
+      const markerPath = join(sharedDir, 'old-release-started');
+      for (const releaseId of ['A', 'B']) {
+        const releaseDir = join(rootDir, 'releases', releaseId);
+        mkdirSync(join(releaseDir, 'dist'), { recursive: true });
+        mkdirSync(join(releaseDir, 'migrations'), { recursive: true });
+        mkdirSync(join(releaseDir, 'node_modules'), { recursive: true });
+        writeFileSync(
+          join(releaseDir, 'dist/index.js'),
+          `import { appendFileSync } from 'node:fs';\nappendFileSync(${JSON.stringify(markerPath)}, 'started\\n');\n`,
+          'utf8',
+        );
+        writeFileSync(join(releaseDir, 'migrations/001_initial_schema.sql'), 'SELECT 1;\n');
+        writeFileSync(join(releaseDir, 'package.json'), '{"type":"module"}\n');
+        writeFileSync(join(releaseDir, 'pnpm-lock.yaml'), "lockfileVersion: '9.0'\n");
+      }
+      symlinkSync('releases/B', join(rootDir, 'current'));
+      const operationId = '11111111-1111-4111-8111-111111111111';
+      const statePath = join(rootDir, '.activation-state.json');
+      writeFileSync(statePath, `${JSON.stringify({
+        schemaVersion: 1,
+        operationId,
+        operationKind: 'activation',
+        candidateReleaseId: 'B',
+        originalPointers: { current: 'A', previous: null },
+        targetPointers: { current: 'B', previous: 'A' },
+      })}\n`, { mode: 0o600 });
+
+      const deployment = await deployLetheBot({
+        mode: 'pm2',
+        outputDir: sharedDir,
+        deploymentRoot: rootDir,
+        healthCheck: false,
+      });
+      expect(deployment.success).toBe(true);
+      persistManagedStartupAuthorization({ rootDir, operationId, releaseId: 'B' });
+      const gatePath = join(sharedDir, 'bin/managed-startup.js');
+      const entrypointPath = join(rootDir, 'current/dist/index.js');
+      const launch = () => spawnSync(process.execPath, [
+        gatePath,
+        'launch',
+        `--root=${rootDir}`,
+        `--entrypoint=${entrypointPath}`,
+      ], { cwd: rootDir, encoding: 'utf8' });
+
+      const first = launch();
+      expect(first.status, first.stderr).toBe(0);
+      expect(readFileSync(markerPath, 'utf8')).toBe('started\n');
+
+      const automaticRestart = launch();
+      expect(automaticRestart.status).toBe(78);
+      expect(readFileSync(markerPath, 'utf8')).toBe('started\n');
+
+      clearManagedStartupAuthorization(rootDir, operationId);
+      rmSync(statePath);
+      const confirmedRestart = launch();
+      expect(confirmedRestart.status, confirmedRestart.stderr).toBe(0);
+      expect(readFileSync(markerPath, 'utf8')).toBe('started\nstarted\n');
+    });
+
+    test('systemd and pm2 modes require an absolute deployment root', async () => {
+      for (const mode of ['systemd', 'pm2'] as const) {
+        const missing = await deployLetheBot({
+          mode,
+          outputDir: testOutputDir,
+          healthCheck: false,
+        });
+        const relative = await deployLetheBot({
+          mode,
+          outputDir: testOutputDir,
+          deploymentRoot: 'relative-managed-root',
+          healthCheck: false,
+        });
+        const specifier = await deployLetheBot({
+          mode,
+          outputDir: testOutputDir,
+          deploymentRoot: '/srv/lethebot/%n',
+          healthCheck: false,
+        });
+        const variable = await deployLetheBot({
+          mode,
+          outputDir: testOutputDir,
+          deploymentRoot: '/srv/lethebot/${HOME}',
+          healthCheck: false,
+        });
+
+        expect(missing.success).toBe(false);
+        expect(missing.message).toContain('absolute deployment root');
+        expect(relative.success).toBe(false);
+        expect(relative.message).toContain('absolute deployment root');
+        expect(specifier.success).toBe(false);
+        expect(specifier.message).toContain('absolute deployment root');
+        expect(variable.success).toBe(false);
+        expect(variable.message).toContain('absolute deployment root');
+      }
+    });
+
+    test('generated deployment artifacts reference runtime env without embedding secrets or platform ids', async () => {
+      const secret = 'sk-deploy-artifact-secret-should-not-leak';
+      const platformId = '1234567890';
+      process.env.ONEBOT_TRANSPORT = 'ws';
+      process.env.ONEBOT_HTTP_URL = `http://localhost:3000/${secret}/qq-${platformId}`;
+      process.env.ONEBOT_WS_URL = `ws://localhost:3001/${secret}/qq-${platformId}`;
+      process.env.ONEBOT_TOKEN = `token-${secret}-qq-${platformId}`;
+      process.env.LETHEBOT_BOT_QQ_ID = platformId;
+      resetConfig();
+
+      for (const mode of ['docker', 'systemd', 'pm2'] as const) {
+        const modeOutputDir = mode === 'docker'
+          ? join(testOutputDir, mode)
+          : join(testDeploymentRoot, 'shared');
+        mkdirSync(modeOutputDir, { recursive: true });
+        const result = await deployLetheBot({
+          mode,
+          outputDir: modeOutputDir,
+          ...(
+            mode === 'systemd' || mode === 'pm2'
+              ? { deploymentRoot: testDeploymentRoot }
+              : {}
+          ),
+          healthCheck: false,
+        });
+
+        expect(result.success).toBe(true);
+        const fileName =
+          mode === 'docker'
+            ? 'docker-compose.yml'
+            : mode === 'systemd'
+              ? 'lethebot.service'
+              : 'ecosystem.config.cjs';
+        const content = readFileSync(join(modeOutputDir, fileName), 'utf-8');
+
+        expect(content).not.toContain(secret);
+        expect(content).not.toContain(platformId);
+        expect(content).not.toContain(`qq-${platformId}`);
+        expect(content).not.toContain(process.env.ONEBOT_TOKEN);
+        if (mode === 'docker') {
+          expect(content).toContain('${ONEBOT_WS_URL:?Set ONEBOT_WS_URL in .env or shell}');
+          expect(content).toContain('${ONEBOT_HTTP_URL:?Set ONEBOT_HTTP_URL in .env or shell}');
+          expect(content).toContain('${ONEBOT_TOKEN:-}');
+          expect(content).toContain('${LETHEBOT_BOT_QQ_ID:-}');
+        }
+        if (mode === 'systemd') {
+          expect(content).toContain(`EnvironmentFile=${JSON.stringify(join(testDeploymentRoot, 'shared/runtime.env'))}`);
+          expect(content).not.toContain('Environment="ONEBOT_WS_URL=');
+          expect(content).not.toContain('Environment="ONEBOT_HTTP_URL=');
+          expect(content).not.toContain('Environment="ONEBOT_TOKEN=');
+          expect(content).not.toContain('Environment="LETHEBOT_BOT_QQ_ID=');
+        }
+        if (mode === 'pm2') {
+          expect(content).toContain('parseEnv(readFileSync(');
+          expect(content).not.toContain('process.env.');
+        }
+      }
     });
 
     test('fails with invalid configuration', async () => {
@@ -533,6 +850,220 @@ describe('NapCat Deployment Scripts', () => {
       expect(result.success).toBe(false);
       expect(result.message).toContain('Configuration validation failed');
       expect(result.error).toBeInstanceOf(ConfigValidationError);
+    });
+
+    test('checked-in Dockerfiles build and preflight reviewed source for the runtime port', () => {
+      const dockerfile = readFileSync(join(process.cwd(), 'Dockerfile'), 'utf-8');
+      const acceptanceDockerfile = readFileSync(
+        join(process.cwd(), 'docker/local-acceptance/lethebot.Dockerfile'),
+        'utf-8',
+      );
+      const localCompose = readFileSync(
+        join(process.cwd(), 'docker-compose.local-acceptance.yml'),
+        'utf-8',
+      );
+      const frameworkCompose = readFileSync(
+        join(process.cwd(), 'docker-compose.snowluma-framework.yml'),
+        'utf-8',
+      );
+      const dockerignore = readFileSync(join(process.cwd(), '.dockerignore'), 'utf-8');
+
+      expect(dockerfile).toContain('corepack prepare pnpm@9.0.0 --activate');
+      expect(dockerfile).toContain('pnpm install --frozen-lockfile');
+      expect(dockerfile).toContain('RUN pnpm build');
+      expect(dockerfile).toContain('RUN pnpm release:preflight');
+      expect(dockerfile).toContain('RUN pnpm prune --prod');
+      expect(dockerfile).toContain(
+        `RUN node --input-type=module --eval "await import('./dist/scripts/verify-napcat.js')"`,
+      );
+      expect(dockerfile).toContain('COPY src ./src');
+      expect(dockerfile).toContain('COPY migrations ./migrations');
+      expect(dockerfile).toContain('COPY --from=build /app/dist ./dist');
+      expect(dockerfile).not.toContain('COPY . .');
+      expect(dockerfile).toContain('chown node:node /app/data');
+      expect(dockerfile).toContain('chmod 700 /app/data');
+      expect(dockerfile).toContain('USER node');
+      expect(dockerfile).toContain('umask 077 && exec node dist/index.js');
+      expect(dockerfile).toContain('EXPOSE 6700');
+      expect(dockerfile).not.toContain('EXPOSE 8080');
+      expect(acceptanceDockerfile).toContain('pnpm install --frozen-lockfile');
+      expect(acceptanceDockerfile).toContain('FROM node:22-bookworm-slim AS build');
+      expect(acceptanceDockerfile).toContain('COPY tsconfig.json ./');
+      expect(acceptanceDockerfile).toContain('COPY src ./src');
+      expect(acceptanceDockerfile).toContain('COPY migrations ./migrations');
+      expect(acceptanceDockerfile).toContain('RUN pnpm build');
+      expect(acceptanceDockerfile).toContain('RUN pnpm release:preflight');
+      expect(acceptanceDockerfile).toContain('RUN pnpm prune --prod');
+      expect(acceptanceDockerfile).toContain(
+        `RUN node --input-type=module --eval "await import('./dist/scripts/verify-napcat.js')"`,
+      );
+      expect(acceptanceDockerfile).toContain('COPY --from=build /app/dist ./dist');
+      expect(acceptanceDockerfile).not.toContain('COPY . .');
+      expect(acceptanceDockerfile).toContain('chown node:node /app/data');
+      expect(acceptanceDockerfile).toContain('chmod 700 /app/data');
+      expect(acceptanceDockerfile).toContain('USER node');
+      expect(acceptanceDockerfile).toContain('umask 077 && exec node dist/index.js');
+      expect(acceptanceDockerfile).toContain('EXPOSE 6700');
+      for (const compose of [localCompose, frameworkCompose]) {
+        expect(compose).toContain('user: "${LETHEBOT_UID:-1000}:${LETHEBOT_GID:-1000}"');
+        expect(compose).toContain('create_host_path: false');
+        expect(compose).toContain('source: ./data/lethebot');
+        expect(compose).toContain('127.0.0.1:6700:6700');
+      }
+      expect(localCompose).toContain('127.0.0.1:5099:5099');
+      expect(localCompose).toContain('127.0.0.1:3000:3000');
+      expect(localCompose).toContain('127.0.0.1:3001:3001');
+      expect(frameworkCompose).toContain('127.0.0.1:5900:5900');
+      expect(frameworkCompose).toContain('127.0.0.1:6081:6081');
+      expect(frameworkCompose).toContain('127.0.0.1:5099:5099');
+      expect(frameworkCompose).toContain('127.0.0.1:3000:3000');
+      expect(frameworkCompose).toContain('127.0.0.1:3001:3001');
+      expect(dockerignore).toContain('.env');
+      expect(dockerignore).toContain('data/');
+      expect(dockerignore).toContain('logs/');
+      expect(dockerignore).toContain('*.db');
+      expect(dockerignore).toContain('*.db-wal');
+      expect(dockerignore).toContain('*.db-shm');
+      expect(dockerignore).toContain('.env.*');
+      expect(dockerignore).toContain('.npmrc');
+      expect(dockerignore).toContain('.git/');
+      expect(dockerignore).toContain('backups/');
+      expect(dockerignore).toContain('*.pem');
+      expect(dockerignore).toContain('*.key');
+    });
+
+    test('parses explicit deployment output and config paths and rejects missing values', () => {
+      expect(parseDeploymentCliArgs([
+        '--mode=configure',
+        '--output-dir',
+        '/tmp/lethebot-deploy-output',
+        '--config-path=/tmp/lethebot-runtime.env',
+        '--no-health-check',
+      ])).toEqual({
+        mode: 'configure',
+        outputDir: '/tmp/lethebot-deploy-output',
+        configPath: '/tmp/lethebot-runtime.env',
+        verifyNapCat: false,
+        healthCheck: false,
+      });
+
+      expect(parseDeploymentCliArgs([
+        '--mode=systemd',
+        '--deployment-root',
+        '/srv/lethebot',
+        '--output-dir=/srv/lethebot/shared',
+      ])).toEqual({
+        mode: 'systemd',
+        outputDir: '/srv/lethebot/shared',
+        deploymentRoot: '/srv/lethebot',
+        verifyNapCat: false,
+        healthCheck: true,
+      });
+
+      for (const args of [
+        ['--output-dir'],
+        ['--config-path='],
+        ['--deployment-root='],
+        ['--mode=unknown'],
+        ['--mode=docker', '--config-path=/tmp/ignored.env'],
+        ['--mode=docker', '--deployment-root=/srv/lethebot'],
+        ['--mode=systemd'],
+        [
+          '--mode=systemd',
+          '--deployment-root=/srv/lethebot',
+          '--output-dir=/tmp/lethebot-deploy-output',
+        ],
+        ['--mode=pm2', '--deployment-root=relative-root'],
+        ['--mode=systemd', '--deployment-root=/srv/lethebot/%n'],
+        ['--mode=systemd', '--deployment-root=/srv/lethebot/${HOME}'],
+        [
+          '--mode=systemd',
+          '--deployment-root=/srv/lethebot',
+          '--deployment-root=/srv/lethebot-other',
+        ],
+        ['--unknown=sk-secret-qq-1234567890'],
+      ]) {
+        expect(() => parseDeploymentCliArgs(args)).toThrow('Invalid deployment arguments');
+      }
+    });
+
+    test('spawned deployment CLI honors output and config paths without root artifacts', () => {
+      const tsxBin = join(process.cwd(), 'node_modules/.bin/tsx');
+      const script = join(process.cwd(), 'src/scripts/deploy-napcat.ts');
+      const cliOutputDir = join(testOutputDir, 'spawned-output');
+      const cliConfigPath = join(testOutputDir, 'spawned-config', '.env.generated');
+      const env = {
+        ...process.env,
+        ONEBOT_HTTP_URL: 'http://localhost:3000',
+        ONEBOT_WS_URL: 'ws://localhost:3001/',
+        LETHEBOT_PORT: '6700',
+      };
+
+      const defaultConfigure = spawnSync(tsxBin, [
+        script,
+        '--mode=configure',
+        `--output-dir=${cliOutputDir}`,
+        '--no-health-check',
+      ], { cwd: process.cwd(), env, encoding: 'utf8' });
+      expect(defaultConfigure.status, defaultConfigure.stderr).toBe(0);
+      expect(existsSync(join(cliOutputDir, '.env'))).toBe(true);
+
+      const configure = spawnSync(tsxBin, [
+        script,
+        '--mode=configure',
+        `--config-path=${cliConfigPath}`,
+        `--output-dir=${cliOutputDir}`,
+        '--no-health-check',
+      ], { cwd: process.cwd(), env, encoding: 'utf8' });
+      expect(configure.status, configure.stderr).toBe(0);
+      expect(existsSync(cliConfigPath)).toBe(true);
+
+      const docker = spawnSync(tsxBin, [
+        script,
+        '--mode=docker',
+        `--output-dir=${cliOutputDir}`,
+        '--no-health-check',
+      ], { cwd: process.cwd(), env, encoding: 'utf8' });
+      expect(docker.status, docker.stderr).toBe(0);
+      expect(existsSync(join(cliOutputDir, 'docker-compose.yml'))).toBe(true);
+      expect(existsSync(join(process.cwd(), 'docker-compose.yml'))).toBe(false);
+      expect(existsSync(join(process.cwd(), 'ecosystem.config.cjs'))).toBe(false);
+      expect(existsSync(join(process.cwd(), 'lethebot.service'))).toBe(false);
+
+      const quotedWorkDir = join(testOutputDir, "checkout-'quoted");
+      const quotedDeploymentRoot = join(testOutputDir, "managed-'quoted");
+      const quotedOutputDir = join(quotedDeploymentRoot, 'shared');
+      mkdirSync(join(quotedDeploymentRoot, 'shared'), { recursive: true });
+      writeFileSync(
+        join(quotedDeploymentRoot, 'shared/runtime.env'),
+        'ONEBOT_TRANSPORT=ws\n',
+        'utf8',
+      );
+      mkdirSync(quotedWorkDir, { recursive: true });
+      const pm2 = spawnSync(tsxBin, [
+        script,
+        '--mode=pm2',
+        `--output-dir=${quotedOutputDir}`,
+        `--deployment-root=${quotedDeploymentRoot}`,
+        '--no-health-check',
+      ], { cwd: quotedWorkDir, env, encoding: 'utf8' });
+      expect(pm2.status, pm2.stderr).toBe(0);
+      const quotedEcosystemPath = join(quotedOutputDir, 'ecosystem.config.cjs');
+      const require = createRequire(import.meta.url);
+      const quotedEcosystem = require(quotedEcosystemPath) as {
+        apps?: Array<{ cwd?: string }>;
+      };
+      expect(quotedEcosystem.apps?.[0]?.cwd).toBe(join(quotedDeploymentRoot, 'current'));
+      expect(quotedEcosystem.apps?.[0]?.cwd).not.toBe(quotedWorkDir);
+
+      const invalid = spawnSync(tsxBin, [
+        script,
+        '--unknown=sk-cli-deploy-secret-qq-1234567890',
+      ], { cwd: process.cwd(), env, encoding: 'utf8' });
+      expect(invalid.status).toBe(1);
+      expect(invalid.stderr).toContain('Invalid deployment arguments');
+      expect(invalid.stderr).not.toContain('sk-cli-deploy-secret');
+      expect(invalid.stderr).not.toContain('1234567890');
     });
 
     test('verifies NapCat connection when requested', async () => {

@@ -5,15 +5,36 @@
  * Supports Docker, systemd, and PM2 deployment modes
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import {
+  chmodSync,
+  lstatSync,
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  mkdirSync,
+} from 'node:fs';
+import { createHash } from 'node:crypto';
+import { basename, join, dirname, isAbsolute, resolve } from 'node:path';
+import { ModuleKind, ScriptTarget, transpileModule } from 'typescript';
+import { MANAGED_STARTUP_PROTOCOL_VERSION } from '../operations/managed-startup.js';
 import {
   loadNapCatConfig,
   ConfigValidationError,
   type NapCatConfig,
 } from '../config/index.js';
+import {
+  verifyNapCatConnection,
+  verifyOneBotConnection,
+  verifyOneBotWebSocketConnection,
+} from './onebot-verification.js';
 import { fileURLToPath } from 'node:url';
 import { redactSecretsInText } from '../memory/secret-scan.js';
+
+export {
+  verifyNapCatConnection,
+  verifyOneBotConnection,
+  verifyOneBotWebSocketConnection,
+};
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -49,19 +70,6 @@ interface StatusResponse {
   };
 }
 
-interface VerifyWebSocketEvent {
-  data?: unknown;
-}
-
-interface VerifyWebSocketLike {
-  send(data: string): void;
-  close(code?: number, reason?: string): void;
-  addEventListener(
-    event: 'open' | 'message' | 'error' | 'close',
-    handler: (event: VerifyWebSocketEvent) => void,
-  ): void;
-}
-
 /**
  * Deployment mode
  */
@@ -74,6 +82,7 @@ export interface DeploymentOptions {
   mode: DeploymentMode;
   configPath?: string;
   outputDir?: string;
+  deploymentRoot?: string;
   healthCheck?: boolean;
   verifyNapCat?: boolean;
   healthCheckTimeout?: number;
@@ -137,170 +146,6 @@ export class PortConflictError extends Error {
     super(message);
     this.name = 'PortConflictError';
   }
-}
-
-/**
- * Verify OneBot HTTP connection.
- */
-export async function verifyNapCatConnection(
-  httpUrl: string,
-  token?: string,
-): Promise<boolean> {
-  try {
-    const url = `${httpUrl}/get_login_info`;
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    };
-
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
-    }
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-
-    const response = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({}),
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      console.error(`OneBot HTTP API returned ${response.status}: ${redactForDisplay(response.statusText)}`);
-      return false;
-    }
-
-    const result = (await response.json()) as StatusResponse;
-
-    if (result.status === 'ok' || result.retcode === 0) {
-      const nickname = typeof result.data?.nickname === 'string' ? result.data.nickname : 'Unknown';
-      console.log(`✓ OneBot HTTP connection verified: ${redactForDisplay(nickname)}`);
-      return true;
-    }
-
-    const message = typeof result.message === 'string' ? result.message : 'Unknown error';
-    console.error(`OneBot HTTP API error: ${redactForDisplay(message)}`);
-    return false;
-  } catch (error) {
-    if (error instanceof Error) {
-      if (error.name === 'AbortError') {
-        console.error('OneBot HTTP connection timeout (5s)');
-      } else {
-        console.error(`OneBot HTTP connection failed: ${redactForDisplay(error.message)}`);
-      }
-    }
-    return false;
-  }
-}
-
-export async function verifyOneBotConnection(config: NapCatConfig): Promise<boolean> {
-  if (config.transport === 'ws') {
-    return verifyOneBotWebSocketConnection(config.wsUrl, config.token);
-  }
-  return verifyNapCatConnection(config.httpUrl, config.token);
-}
-
-export function verifyOneBotWebSocketConnection(
-  wsUrl: string,
-  token?: string,
-): Promise<boolean> {
-  return new Promise((resolve) => {
-    const echo = `verify-onebot-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-    const timeout = setTimeout(() => {
-      console.error('OneBot WebSocket connection timeout (5s)');
-      cleanup(false);
-    }, 5000);
-
-    let settled = false;
-    let socket: VerifyWebSocketLike | null = null;
-
-    const cleanup = (result: boolean): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timeout);
-      try {
-        socket?.close(1000, 'verify complete');
-      } catch {
-        // Ignore close errors during verification cleanup.
-      }
-      resolve(result);
-    };
-
-    try {
-      socket = new WebSocket(buildWebSocketUrl(wsUrl, token)) as unknown as VerifyWebSocketLike;
-    } catch (error) {
-      clearTimeout(timeout);
-      console.error(`OneBot WebSocket connection failed: ${display(error)}`);
-      resolve(false);
-      return;
-    }
-
-    socket.addEventListener('open', () => {
-      socket?.send(JSON.stringify({ action: 'get_login_info', params: {}, echo }));
-    });
-    socket.addEventListener('message', (event) => {
-      const text = websocketPayloadToString(event.data);
-      if (!text) {
-        return;
-      }
-
-      try {
-        const parsed = JSON.parse(text) as StatusResponse;
-        if (parsed.echo !== echo) {
-          return;
-        }
-        if (parsed.status === 'ok' || parsed.retcode === 0) {
-          const nickname = typeof parsed.data?.nickname === 'string' ? parsed.data.nickname : 'Unknown';
-          console.log(`✓ OneBot WebSocket connection verified: ${redactForDisplay(nickname)}`);
-          cleanup(true);
-          return;
-        }
-
-        const message = typeof parsed.message === 'string' ? parsed.message : 'Unknown error';
-        console.error(`OneBot WebSocket API error: ${redactForDisplay(message)}`);
-        cleanup(false);
-      } catch (error) {
-        console.error(`OneBot WebSocket parse error: ${display(error)}`);
-        cleanup(false);
-      }
-    });
-    socket.addEventListener('error', () => {
-      console.error('OneBot WebSocket connection failed');
-      cleanup(false);
-    });
-    socket.addEventListener('close', () => {
-      cleanup(false);
-    });
-  });
-}
-
-function buildWebSocketUrl(wsUrl: string, token?: string): string {
-  const url = new URL(wsUrl);
-  if (token) {
-    url.searchParams.set('access_token', token);
-  }
-  return url.toString();
-}
-
-function websocketPayloadToString(payload: unknown): string {
-  if (typeof payload === 'string') {
-    return payload;
-  }
-  if (Buffer.isBuffer(payload)) {
-    return payload.toString('utf8');
-  }
-  if (payload instanceof ArrayBuffer) {
-    return Buffer.from(payload).toString('utf8');
-  }
-  if (ArrayBuffer.isView(payload)) {
-    return Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength).toString('utf8');
-  }
-  return '';
 }
 
 /**
@@ -394,26 +239,42 @@ export async function waitForHealthy(
  * Generate Docker Compose configuration
  */
 function generateDockerCompose(config: NapCatConfig): string {
-  return `version: '3.8'
-
-services:
+  return `services:
   lethebot:
-    image: node:22-alpine
+    image: \${LETHEBOT_IMAGE:?Set LETHEBOT_IMAGE to a reviewed version tag or digest}
     container_name: lethebot
-    working_dir: /app
+    user: "\${LETHEBOT_UID:-1000}:\${LETHEBOT_GID:-1000}"
     volumes:
-      - ./:/app
-      - ./data:/app/data
+      - type: bind
+        source: ./data/lethebot
+        target: /app/data
+        bind:
+          create_host_path: false
     ports:
-      - "${config.serverPort}:${config.serverPort}"
+      - "127.0.0.1:${config.serverPort}:${config.serverPort}"
     environment:
       - NODE_ENV=production
-      - LOG_LEVEL=${process.env.LOG_LEVEL || 'info'}
-      - ONEBOT_TRANSPORT=${config.transport}
-      - ONEBOT_HTTP_URL=${config.httpUrl}
-      - ONEBOT_WS_URL=${config.wsUrl}
-      - ONEBOT_TOKEN=${config.token || ''}
-      - LETHEBOT_BOT_QQ_ID=${config.botQqId || ''}
+      - LOG_LEVEL=\${LOG_LEVEL:-info}
+      - LETHEBOT_TEST=\${LETHEBOT_TEST:-false}
+      - LETHEBOT_BACKGROUND_SUMMARY_ENABLED=\${LETHEBOT_BACKGROUND_SUMMARY_ENABLED:-false}
+      - PI_PROVIDER=\${PI_PROVIDER:-mock}
+      - PI_MODEL=\${PI_MODEL:-mock}
+      - PI_BASE_URL=\${PI_BASE_URL:-}
+      - PI_API_KEY=\${PI_API_KEY:-}
+      - PI_TURN_TIMEOUT_MS=\${PI_TURN_TIMEOUT_MS:-120000}
+      - EVALUATOR_PROVIDER
+      - EVALUATOR_MODEL
+      - EVALUATOR_BASE_URL
+      - EVALUATOR_API_KEY
+      - EVALUATOR_TIMEOUT_MS=\${EVALUATOR_TIMEOUT_MS:-30000}
+      - EVALUATOR_MAX_RETRIES=\${EVALUATOR_MAX_RETRIES:-1}
+      - EVALUATOR_TEMPERATURE=\${EVALUATOR_TEMPERATURE:-0}
+      - EVALUATOR_PROMPT_VERSION=\${EVALUATOR_PROMPT_VERSION:-lethebot-governance-v1}
+      - ONEBOT_TRANSPORT=\${ONEBOT_TRANSPORT:-${config.transport}}
+      - ONEBOT_HTTP_URL=\${ONEBOT_HTTP_URL:?Set ONEBOT_HTTP_URL in .env or shell}
+      - ONEBOT_WS_URL=\${ONEBOT_WS_URL:?Set ONEBOT_WS_URL in .env or shell}
+      - ONEBOT_TOKEN=\${ONEBOT_TOKEN:-}
+      - LETHEBOT_BOT_QQ_ID=\${LETHEBOT_BOT_QQ_ID:-}
       - LETHEBOT_PORT=${config.serverPort}
       - LETHEBOT_HOST=${config.serverHost}
       - LETHEBOT_HEALTH_PATH=${config.healthCheckPath}
@@ -421,10 +282,9 @@ services:
       - LETHEBOT_METRICS_PATH=${config.metricsPath}
       - LETHEBOT_EVENT_PATH=${config.eventPath}
       - LETHEBOT_DB_PATH=/app/data/lethebot.db
-    command: sh -c "npm install -g pnpm && pnpm install && pnpm build && pnpm start"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:${config.serverPort}/healthz"]
+      test: ["CMD-SHELL", "node -e \\"fetch('http://127.0.0.1:${config.serverPort}${config.healthCheckPath}').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))\\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -435,30 +295,28 @@ services:
 /**
  * Generate systemd service file
  */
-function generateSystemdService(config: NapCatConfig, workDir: string): string {
+function generateSystemdService(deploymentRoot: string): string {
+  const currentDir = join(deploymentRoot, 'current');
+  const sharedDir = join(deploymentRoot, 'shared');
+  const gatePath = join(sharedDir, 'bin', 'managed-startup.js');
+  const entrypointPath = join(currentDir, 'dist/index.js');
+  const literal = (value: string): string => JSON.stringify(value);
+  if (/[%$\r\n]/.test(process.execPath)) {
+    throw new Error('Node executable path contains unsupported systemd expansion characters');
+  }
+
   return `[Unit]
 Description=LetheBot - QQ Bot with Memory
 After=network.target
 
 [Service]
 Type=simple
-User=${process.env.USER || 'lethebot'}
-WorkingDirectory=${workDir}
-Environment="NODE_ENV=production"
-Environment="LOG_LEVEL=${process.env.LOG_LEVEL || 'info'}"
-Environment="ONEBOT_TRANSPORT=${config.transport}"
-Environment="ONEBOT_HTTP_URL=${config.httpUrl}"
-Environment="ONEBOT_WS_URL=${config.wsUrl}"
-Environment="ONEBOT_TOKEN=${config.token || ''}"
-Environment="LETHEBOT_BOT_QQ_ID=${config.botQqId || ''}"
-Environment="LETHEBOT_PORT=${config.serverPort}"
-Environment="LETHEBOT_HOST=${config.serverHost}"
-Environment="LETHEBOT_HEALTH_PATH=${config.healthCheckPath}"
-Environment="LETHEBOT_READINESS_PATH=${config.readinessPath}"
-Environment="LETHEBOT_METRICS_PATH=${config.metricsPath}"
-Environment="LETHEBOT_EVENT_PATH=${config.eventPath}"
-Environment="LETHEBOT_DB_PATH=${workDir}/data/lethebot.db"
-ExecStart=${process.execPath} ${workDir}/dist/index.js
+User=lethebot
+WorkingDirectory=${literal(currentDir)}
+EnvironmentFile=${literal(join(sharedDir, 'runtime.env'))}
+UnsetEnvironment=NODE_OPTIONS NODE_PATH LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT
+ExecCondition=+/usr/bin/env ${literal(process.execPath)} ${literal(gatePath)} ${literal('condition')} ${literal(`--root=${deploymentRoot}`)} ${literal(`--entrypoint=${entrypointPath}`)}
+ExecStart=${literal('/usr/bin/env')} ${literal('NODE_ENV=production')} ${literal(`LETHEBOT_DB_PATH=${join(sharedDir, 'data/lethebot.db')}`)} ${literal(process.execPath)} ${literal(entrypointPath)}
 Restart=always
 RestartSec=10
 
@@ -470,38 +328,116 @@ WantedBy=multi-user.target
 /**
  * Generate PM2 ecosystem configuration
  */
-function generatePM2Ecosystem(config: NapCatConfig, workDir: string): string {
-  return `module.exports = {
+function generatePM2Ecosystem(deploymentRoot: string): string {
+  const literal = (value: string): string => JSON.stringify(value);
+  const currentDir = join(deploymentRoot, 'current');
+  const sharedDir = join(deploymentRoot, 'shared');
+  const entrypointPath = join(currentDir, 'dist/index.js');
+
+  return `const { readFileSync } = require('node:fs');
+const { parseEnv } = require('node:util');
+
+const runtimeEnv = parseEnv(readFileSync(${literal(join(sharedDir, 'runtime.env'))}, 'utf8'));
+for (const name of ['NODE_OPTIONS', 'NODE_PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT']) {
+  delete runtimeEnv[name];
+}
+
+module.exports = {
   apps: [{
     name: 'lethebot',
-    script: '${workDir}/dist/index.js',
-    cwd: '${workDir}',
+    script: ${literal(join(sharedDir, 'bin/managed-startup.js'))},
+    interpreter: ${literal(process.execPath)},
+    args: [
+      ${literal('launch')},
+      ${literal(`--root=${deploymentRoot}`)},
+      ${literal(`--entrypoint=${entrypointPath}`)}
+    ],
+    cwd: ${literal(currentDir)},
     instances: 1,
     autorestart: true,
+    stop_exit_codes: [78],
     watch: false,
     max_memory_restart: '1G',
     env: {
+      ...runtimeEnv,
       NODE_ENV: 'production',
-      LOG_LEVEL: '${process.env.LOG_LEVEL || 'info'}',
-      ONEBOT_TRANSPORT: '${config.transport}',
-      ONEBOT_HTTP_URL: '${config.httpUrl}',
-      ONEBOT_WS_URL: '${config.wsUrl}',
-      ONEBOT_TOKEN: '${config.token || ''}',
-      LETHEBOT_BOT_QQ_ID: '${config.botQqId || ''}',
-      LETHEBOT_PORT: '${config.serverPort}',
-      LETHEBOT_HOST: '${config.serverHost}',
-      LETHEBOT_HEALTH_PATH: '${config.healthCheckPath}',
-      LETHEBOT_READINESS_PATH: '${config.readinessPath}',
-      LETHEBOT_METRICS_PATH: '${config.metricsPath}',
-      LETHEBOT_EVENT_PATH: '${config.eventPath}',
-      LETHEBOT_DB_PATH: '${workDir}/data/lethebot.db'
+      LETHEBOT_DB_PATH: ${literal(join(sharedDir, 'data/lethebot.db'))}
     },
-    error_file: '${workDir}/logs/pm2-error.log',
-    out_file: '${workDir}/logs/pm2-out.log',
+    error_file: ${literal(join(sharedDir, 'logs/pm2-error.log'))},
+    out_file: ${literal(join(sharedDir, 'logs/pm2-out.log'))},
     log_date_format: 'YYYY-MM-DD HH:mm:ss Z'
   }]
 };
 `;
+}
+
+function writeManagedStartupAssets(outputDir: string): void {
+  const binDir = join(outputDir, 'bin');
+  mkdirSync(binDir, { recursive: true, mode: 0o755 });
+  const sources = [
+    {
+      input: new URL('../operations/release-artifact.ts', import.meta.url),
+      output: join(binDir, 'release-artifact.js'),
+    },
+    {
+      input: new URL('../operations/managed-startup.ts', import.meta.url),
+      output: join(binDir, 'managed-startup.js'),
+    },
+  ];
+  const generated = new Map<string, string>();
+  for (const source of sources) {
+    const compiled = transpileModule(readFileSync(source.input, 'utf8'), {
+      compilerOptions: {
+        module: ModuleKind.ES2022,
+        target: ScriptTarget.ES2022,
+        sourceMap: false,
+        declaration: false,
+      },
+      fileName: source.input.pathname,
+      reportDiagnostics: true,
+    });
+    if (compiled.diagnostics && compiled.diagnostics.length > 0) {
+      throw new Error('Managed startup asset could not be generated');
+    }
+    writeManagedStartupAsset(source.output, compiled.outputText, 0o555);
+    generated.set(basename(source.output), compiled.outputText);
+  }
+  const packagePath = join(binDir, 'package.json');
+  writeManagedStartupAsset(packagePath, '{"private":true,"type":"module"}\n', 0o444);
+  const manifest = {
+    schemaVersion: 1,
+    protocolVersion: MANAGED_STARTUP_PROTOCOL_VERSION,
+    files: {
+      'managed-startup.js': createHash('sha256')
+        .update(generated.get('managed-startup.js') as string)
+        .digest('hex'),
+      'release-artifact.js': createHash('sha256')
+        .update(generated.get('release-artifact.js') as string)
+        .digest('hex'),
+    },
+  };
+  writeManagedStartupAsset(
+    join(binDir, 'manifest.json'),
+    `${JSON.stringify(manifest)}\n`,
+    0o444,
+  );
+}
+
+function writeManagedStartupAsset(path: string, content: string, mode: number): void {
+  if (existsSync(path)) {
+    const stats = lstatSync(path);
+    if (
+      !stats.isFile()
+      || stats.isSymbolicLink()
+      || readFileSync(path, 'utf8') !== content
+    ) {
+      throw new Error('Existing managed startup asset differs from the reviewed output');
+    }
+    chmodSync(path, mode);
+    return;
+  }
+  writeFileSync(path, content, { encoding: 'utf8', mode });
+  chmodSync(path, mode);
 }
 
 /**
@@ -512,13 +448,28 @@ export async function deployLetheBot(
 ): Promise<DeploymentResult> {
   const {
     mode,
-    configPath = '.env',
     outputDir = process.cwd(),
     healthCheck: enableHealthCheck = true,
     verifyNapCat = false,
   } = options;
+  const configPath = options.configPath
+    ?? (mode === 'configure' ? join(outputDir, '.env') : '.env');
 
   try {
+    const managedMode = mode === 'systemd' || mode === 'pm2';
+    if (managedMode && !isValidDeploymentRoot(options.deploymentRoot)) {
+      throw new Error('Systemd and PM2 deployments require an absolute deployment root');
+    }
+    if (!managedMode && options.deploymentRoot !== undefined) {
+      throw new Error('Deployment root is only supported for systemd and PM2 deployments');
+    }
+    const deploymentRoot = options.deploymentRoot
+      ? resolve(options.deploymentRoot)
+      : '';
+    if (managedMode && resolve(outputDir) !== join(deploymentRoot, 'shared')) {
+      throw new Error('Managed deployment output must be the deployment shared directory');
+    }
+
     // Special mode: just generate config
     if (mode === 'configure') {
       const outputPath = configPath || '.env';
@@ -583,7 +534,6 @@ export async function deployLetheBot(
       }
     }
 
-    const workDir = process.cwd();
     if (!existsSync(outputDir)) {
       mkdirSync(outputDir, { recursive: true });
     }
@@ -601,7 +551,8 @@ export async function deployLetheBot(
       console.log('  docker-compose up -d');
     } else if (mode === 'systemd') {
       console.log('Generating systemd service file...');
-      const serviceContent = generateSystemdService(config, workDir);
+      writeManagedStartupAssets(outputDir);
+      const serviceContent = generateSystemdService(deploymentRoot);
       const servicePath = join(outputDir, 'lethebot.service');
       writeFileSync(servicePath, serviceContent, 'utf-8');
       console.log(`✓ lethebot.service written to ${redactForDisplay(servicePath)}`);
@@ -615,10 +566,11 @@ export async function deployLetheBot(
       console.log('  sudo journalctl -u lethebot -f');
     } else if (mode === 'pm2') {
       console.log('Generating PM2 ecosystem configuration...');
-      const ecosystemContent = generatePM2Ecosystem(config, workDir);
-      const ecosystemPath = join(outputDir, 'ecosystem.config.js');
+      writeManagedStartupAssets(outputDir);
+      const ecosystemContent = generatePM2Ecosystem(deploymentRoot);
+      const ecosystemPath = join(outputDir, 'ecosystem.config.cjs');
       writeFileSync(ecosystemPath, ecosystemContent, 'utf-8');
-      console.log(`✓ ecosystem.config.js written to ${redactForDisplay(ecosystemPath)}`);
+      console.log(`✓ ecosystem.config.cjs written to ${redactForDisplay(ecosystemPath)}`);
       console.log('\nTo start the service, run:');
       console.log(`  pm2 start ${redactForDisplay(ecosystemPath)}`);
       console.log('\nTo manage the service:');
@@ -641,7 +593,9 @@ export async function deployLetheBot(
       success: true,
       message: `Deployment configuration generated for ${mode}`,
       details: {
-        configPath,
+        configPath: deploymentRoot
+          ? join(deploymentRoot, 'shared/runtime.env')
+          : configPath,
         serverUrl,
         oneBotUrl: config.transport === 'ws' ? config.wsUrl : config.httpUrl,
         napCatUrl: config.httpUrl,
@@ -657,26 +611,119 @@ export async function deployLetheBot(
   }
 }
 
+export interface DeploymentCliOptions extends DeploymentOptions {
+  mode: DeploymentMode;
+  verifyNapCat: boolean;
+  healthCheck: boolean;
+}
+
+const DEPLOYMENT_MODES = new Set<DeploymentMode>(['docker', 'systemd', 'pm2', 'configure']);
+
+export function parseDeploymentCliArgs(args: string[]): DeploymentCliOptions {
+  let mode: DeploymentMode = 'configure';
+  let outputDir: string | undefined;
+  let configPath: string | undefined;
+  let deploymentRoot: string | undefined;
+  let verifyNapCat = false;
+  let healthCheck = true;
+  const seenValueOptions = new Set<string>();
+
+  const readValue = (index: number, option: string): { value: string; nextIndex: number } => {
+    const argument = args[index];
+    if (!argument) {
+      throw new Error('Invalid deployment arguments');
+    }
+
+    const equalsPrefix = `${option}=`;
+    if (argument.startsWith(equalsPrefix)) {
+      const value = argument.slice(equalsPrefix.length);
+      if (!value) {
+        throw new Error('Invalid deployment arguments');
+      }
+      return { value, nextIndex: index };
+    }
+
+    const value = args[index + 1];
+    if (argument !== option || !value || value.startsWith('--')) {
+      throw new Error('Invalid deployment arguments');
+    }
+    return { value, nextIndex: index + 1 };
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === '--verify-napcat' || argument === '--verify-onebot') {
+      verifyNapCat = true;
+      continue;
+    }
+    if (argument === '--no-health-check') {
+      healthCheck = false;
+      continue;
+    }
+
+    const option = ['--mode', '--output-dir', '--config-path', '--deployment-root'].find((candidate) => {
+      return argument === candidate || argument?.startsWith(`${candidate}=`);
+    });
+    if (!option || seenValueOptions.has(option)) {
+      throw new Error('Invalid deployment arguments');
+    }
+    seenValueOptions.add(option);
+
+    const parsed = readValue(index, option);
+    index = parsed.nextIndex;
+    if (option === '--mode') {
+      if (!DEPLOYMENT_MODES.has(parsed.value as DeploymentMode)) {
+        throw new Error('Invalid deployment arguments');
+      }
+      mode = parsed.value as DeploymentMode;
+    } else if (option === '--output-dir') {
+      outputDir = parsed.value;
+    } else if (option === '--deployment-root') {
+      deploymentRoot = parsed.value;
+    } else {
+      configPath = parsed.value;
+    }
+  }
+
+  const managedMode = mode === 'systemd' || mode === 'pm2';
+  const resolvedDeploymentRoot = deploymentRoot ? resolve(deploymentRoot) : undefined;
+  const resolvedOutputDir = resolve(outputDir ?? process.cwd());
+  if (
+    (configPath && mode !== 'configure')
+    || (managedMode && !isValidDeploymentRoot(deploymentRoot))
+    || (!managedMode && deploymentRoot !== undefined)
+    || (managedMode
+      && resolvedDeploymentRoot !== undefined
+      && resolvedOutputDir !== join(resolvedDeploymentRoot, 'shared'))
+  ) {
+    throw new Error('Invalid deployment arguments');
+  }
+
+  return {
+    mode,
+    ...(outputDir ? { outputDir } : {}),
+    ...(configPath ? { configPath } : {}),
+    ...(resolvedDeploymentRoot ? { deploymentRoot: resolvedDeploymentRoot } : {}),
+    verifyNapCat,
+    healthCheck,
+  };
+}
+
+function isValidDeploymentRoot(value: string | undefined): value is string {
+  return value !== undefined && isAbsolute(value) && !/[%$\r\n]/.test(value);
+}
+
 /**
  * CLI entry point
  */
 async function main() {
-  const args = process.argv.slice(2);
-  const modeArg = args.find((arg) => arg.startsWith('--mode='));
-  const mode = (modeArg?.split('=')[1] ?? 'configure') as DeploymentMode;
-
-  const verifyArg = args.includes('--verify-napcat') || args.includes('--verify-onebot');
-  const noHealthCheck = args.includes('--no-health-check');
+  const options = parseDeploymentCliArgs(process.argv.slice(2));
 
   console.log('╔════════════════════════════════════════╗');
   console.log('║  LetheBot OneBot Deployment Tool      ║');
   console.log('╚════════════════════════════════════════╝\n');
 
-  const result = await deployLetheBot({
-    mode,
-    verifyNapCat: verifyArg,
-    healthCheck: !noHealthCheck,
-  });
+  const result = await deployLetheBot(options);
 
   console.log('\n' + '═'.repeat(42));
   if (result.success) {

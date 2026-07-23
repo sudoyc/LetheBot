@@ -6,7 +6,8 @@
 
 import { loadNapCatConfig } from '../config/index.js';
 import { redactSecretsInText } from '../memory/secret-scan.js';
-import { verifyOneBotConnection } from './deploy-napcat.js';
+import { verifyOneBotConnection } from './onebot-verification.js';
+import { pathToFileURL } from 'node:url';
 
 function redactForDisplay(value: string): string {
   const platformRedacted = redactPlatformIdentifiers(value);
@@ -51,8 +52,8 @@ async function main() {
       console.log('✓ OneBot runtime connection successful');
       console.log('\nYou can now deploy LetheBot with:');
       console.log('  pnpm run deploy:docker');
-      console.log('  pnpm run deploy:systemd');
-      console.log('  pnpm run deploy:pm2');
+      console.log('  pnpm run deploy:systemd -- --deployment-root=<absolute-root> --output-dir=<artifact-dir>');
+      console.log('  pnpm run deploy:pm2 -- --deployment-root=<absolute-root> --output-dir=<absolute-root>/shared');
       process.exit(0);
     } else {
       console.log('✗ OneBot runtime connection failed');
@@ -71,4 +72,7 @@ async function main() {
   }
 }
 
-main();
+const invokedPath = process.argv[1];
+if (invokedPath && import.meta.url === pathToFileURL(invokedPath).href) {
+  void main();
+}

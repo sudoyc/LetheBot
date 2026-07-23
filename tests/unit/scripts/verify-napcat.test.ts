@@ -1,8 +1,16 @@
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 describe('verify-napcat CLI', () => {
+  it('does not load the dev-only deployment generator in the standalone runtime graph', () => {
+    const source = readFileSync(join(process.cwd(), 'src/scripts/verify-napcat.ts'), 'utf8');
+
+    expect(source).not.toContain("from './deploy-napcat.js'");
+    expect(source).toContain('pathToFileURL(invokedPath).href');
+  });
+
   it('redacts secret-like URLs and platform identifiers from operator output', () => {
     const tsxBin = join(process.cwd(), 'node_modules/.bin/tsx');
     const rawSecret = 'sk-verify-napcat-url-secret-should-not-print';
