@@ -27,4 +27,15 @@ coverage/
 .DS_Store
 .idea/
 .vscode/
+*~
 
+# Local scratch artifacts
+/.schema\ chat_messages
+/count_lines.sh
+/src/count_lines.sh
+/tests/count_lines.sh
+/prompt.md
+/test-deepseek-direct.mjs
+/test-deepseek.js
+/test-pi-debug.mjs
+/test-pi-simple.mjs
