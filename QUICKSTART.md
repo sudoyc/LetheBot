@@ -1,10 +1,14 @@
 # LetheBot 快速启动指南
 
+> 当前权威入口是 [docs/README.md](./docs/README.md)，真实 QQ/Provider 验收请使用
+> [Local Container Acceptance](./docs/local-container-acceptance.md) 和
+> [Real Provider E2E Guide](./tests/e2e/README.md)。本指南不允许隐式读取本地凭据文件。
+
 ## 前置条件
 
 - Node.js >= 22.0.0
 - pnpm >= 9.0.0
-- DeepSeek API key（保存在 `~/deepseek` 文件）
+- Provider API key（可选；仅在显式 opt-in 的真实 Provider 测试/运行中通过环境变量注入）
 - NapCat 运行中（可选，用于 QQ 集成）
 
 ## 安装
@@ -30,9 +34,9 @@ LOG_LEVEL=info
 
 # Pi Agent (DeepSeek)
 PI_PROVIDER=openai
-PI_MODEL=deepseek-v4-flash
-PI_BASE_URL=https://api.deepseek.com
-# API key 会自动从 ~/deepseek 读取
+PI_MODEL=deepseek-chat
+PI_BASE_URL=https://api.deepseek.com/v1
+# 真实运行时显式注入 PI_API_KEY；不要把 key 写入仓库或依赖 ~/deepseek fallback
 
 # OneBot (NapCat)
 ONEBOT_HTTP_URL=http://localhost:3000
@@ -42,22 +46,17 @@ LETHEBOT_PORT=6700
 LETHEBOT_DB_PATH=./data/lethebot.db
 ```
 
-### 3. 验证 DeepSeek 连接
+### 3. 验证 Provider 连接（显式 opt-in）
 
 ```bash
-node test-deepseek.js
+LETHEBOT_RUN_REAL_API_TESTS=1 \
+PI_API_KEY='<redacted-provider-key>' \
+pnpm exec vitest run tests/e2e/pi-real-api.test.ts --silent
 ```
 
-预期输出：
-```
-🧪 Testing DeepSeek Integration
-✅ API key loaded from /home/ycyc/deepseek
-🤖 Creating Pi Agent...
-📤 Sending test message...
-✅ Response received:
-   Hi from DeepSeek!
-🎉 DeepSeek integration working!
-```
+没有显式 `LETHEBOT_RUN_REAL_API_TESTS=1` 和 Provider key 时，该 suite 会跳过
+真实网络调用。不要使用 root scratch `test-deepseek*.js` 作为验收证据。完整要求见
+`tests/e2e/README.md`。
 
 ## 启动
 
@@ -149,17 +148,15 @@ Bot 应该回复 DeepSeek 生成的响应。
 
 ## 常见问题
 
-### API Key 未找到
+### API Key 未配置
 
 ```
 ❌ No API key found, Pi Agent may not work
 ```
 
-**解决方案：**
-```bash
-echo "sk-your-deepseek-api-key" > ~/deepseek
-chmod 600 ~/deepseek
-```
+**解决方案：**通过受控的进程环境或 Docker Compose 环境显式注入
+`PI_API_KEY`，然后重启 LetheBot。不要把 key 写入仓库，也不要创建
+`~/deepseek` 这类隐式 fallback。
 
 ### NapCat 连接失败
 
@@ -265,7 +262,7 @@ LetheBot
 ## 文档
 
 - [架构文档](./docs/architecture.md)
-- [Pi Agent 集成](./docs/pi-agent-integration.md)
+- [Pi Agent 集成](./docs/pi-integration.md)
 - [工具注册](./docs/tool-registry.md)
 - [策略门](./docs/security-privacy.md)
 - [记忆系统](./docs/memory-system.md)
@@ -273,6 +270,6 @@ LetheBot
 ## 支持
 
 遇到问题？检查：
-1. [Loop State](./docs/loop-state.md) - 最新开发状态
+1. [Current Goal State](./docs/long-running-goal-state.md) - 最新证据和下一步
 2. [Test Strategy](./docs/test-strategy.md) - 测试覆盖
-3. [Troubleshooting](./docs/pi-agent-integration.md#troubleshooting) - 常见问题
+3. [Troubleshooting](./docs/troubleshooting.md) - 常见问题

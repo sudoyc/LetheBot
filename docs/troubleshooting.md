@@ -1,407 +1,301 @@
 # Troubleshooting Guide
 
-Common issues and practical solutions for LetheBot.
+This guide covers credential-free, non-destructive LetheBot diagnostics. Keep
+runtime credentials in the process environment or the managed
+`shared/runtime.env`; LetheBot does not load `.env` implicitly. Never paste
+credential values, private QQ identifiers, raw chat rows, or unredacted logs
+into an issue or shared evidence file.
+
+Commands that contact a real provider or SnowLuma/OneBot can create external
+traffic or social side effects. Run them only with explicit authorization and
+follow [Local Container Acceptance](local-container-acceptance.md) for the
+controlled flow. The checks below do not require those calls.
+
+## Start With Bounded Health Checks
+
+Check the local application endpoints and aggregate database health first:
+
+```bash
+curl --fail --silent --show-error http://127.0.0.1:6700/healthz
+curl --fail --silent --show-error http://127.0.0.1:6700/readyz
+pnpm ops:doctor -- --db="${LETHEBOT_DB_PATH:-./data/lethebot.db}"
+```
+
+`/healthz`, `/readyz`, and `ops:doctor` return bounded status and counts. They
+must not return database paths, tokens, raw exception text, chat content, or
+platform identifiers. See [Operations](operations.md) for response fields and
+maintenance semantics.
+
+For a managed host deployment, inspect the service without copying its full
+environment:
+
+```bash
+systemctl status lethebot --no-pager
+journalctl -u lethebot --since "15 minutes ago" --no-pager
+```
+
+The runtime applies log redaction, but still review output before sharing it.
+
+## Configuration Without Secret Disclosure
+
+Use the same explicit environment file that the service manager uses. This
+prints presence flags, not credential values:
+
+```bash
+RUNTIME_ENV=/srv/lethebot/shared/runtime.env
+node --env-file="$RUNTIME_ENV" -e '
+console.log({
+  dbPathConfigured: Boolean(process.env.LETHEBOT_DB_PATH),
+  piProvider: process.env.PI_PROVIDER ?? "unset",
+  piModelConfigured: Boolean(process.env.PI_MODEL),
+  piKeyConfigured: Boolean(process.env.PI_API_KEY?.trim()),
+  evaluatorIdentityOverridden: Boolean(
+    process.env.EVALUATOR_PROVIDER || process.env.EVALUATOR_MODEL
+  ),
+  evaluatorKeyConfigured: Boolean(process.env.EVALUATOR_API_KEY?.trim()),
+  onebotTransport: process.env.ONEBOT_TRANSPORT ?? "unset",
+  onebotHttpConfigured: Boolean(process.env.ONEBOT_HTTP_URL),
+  onebotWsConfigured: Boolean(process.env.ONEBOT_WS_URL),
+  onebotTokenConfigured: Boolean(process.env.ONEBOT_TOKEN?.trim()),
+  botIdConfigured: Boolean(process.env.LETHEBOT_BOT_QQ_ID?.trim()),
+});'
+```
+
+For a checkout-local runtime, set `RUNTIME_ENV=.env`. Do not print the file or
+put a token literal in shell history. The current variable names and explicit
+loading examples are in [Deployment](deployment.md) and `.env.example`.
 
 ## OneBot Connection Problems
 
-### Check SnowLuma / OneBot Status
+If health is good but readiness reports `adapter.ready=false`:
 
-```bash
-# Check if SnowLuma is running
-ps aux | grep -i snowluma
+1. Confirm the configured transport is `ws` or `http` using the bounded check
+   above.
+2. Confirm SnowLuma/NapCat is running through its own service manager and
+   inspect its local redacted logs.
+3. Check that `ONEBOT_WS_URL` or `ONEBOT_HTTP_URL` matches the selected
+   transport and that both sides agree on whether `ONEBOT_TOKEN` is configured.
+4. In reverse HTTP mode, confirm SnowLuma targets
+   `LETHEBOT_HOST`, `LETHEBOT_PORT`, and `LETHEBOT_EVENT_PATH` as documented in
+   [Deployment](deployment.md).
+5. Confirm `LETHEBOT_BOT_QQ_ID` is configured for exact group mention matching.
 
-# Check SnowLuma logs
-tail -f /path/to/snowluma/logs/latest.log
+`pnpm verify:onebot` performs a real OneBot connection check. It is not a local
+unit diagnostic: run it only when SnowLuma/OneBot access is authorized. Do not
+replace it with ad hoc message, friend-list, or group-list API calls.
 
-# Test OneBot HTTP API endpoint
-curl -X POST http://localhost:3000/get_login_info
-```
+## Pi Runtime Failures
 
-Expected response:
-```json
-{
-  "status": "ok",
-  "retcode": 0,
-  "data": {
-    "user_id": 123456789,
-    "nickname": "BotName"
-  }
-}
-```
+For a non-mock provider, startup fails closed when `PI_API_KEY` is absent. Use
+the bounded configuration check above to confirm presence without revealing the
+value. Also confirm:
 
-### Port Configuration
+- `PI_PROVIDER` and `PI_MODEL` name the intended configured provider/model.
+- `PI_BASE_URL` is the provider API root expected by the Pi adapter, not a
+  chat-completions operation URL.
+- `PI_TURN_TIMEOUT_MS` is an integer in `1..2147483647` (default `120000`);
+  expiry requests cooperative abort and then waits for Pi to settle.
+- the service manager injects the reviewed runtime environment explicitly.
+- redacted application logs and `pnpm cli list-event-failures --stage pi_inference --include-details`
+  show a bounded diagnostic rather than a raw provider response.
 
-Check that the transport and port in your `.env` match SnowLuma's configuration:
+Real-provider verification is opt-in and consumes external service capacity.
+Use the authorized procedure in [the E2E README](../tests/e2e/README.md); do not
+probe a provider with a credential literal embedded in a command.
 
-```bash
-# In LetheBot .env
-grep -E 'ONEBOT_TRANSPORT|ONEBOT_WS_URL|ONEBOT_HTTP_URL' .env
-# ONEBOT_TRANSPORT=ws uses ONEBOT_WS_URL; ONEBOT_TRANSPORT=http uses ONEBOT_HTTP_URL.
+## Evaluator Runtime Failures
 
-# Test HTTP port when using HTTP API
-nc -zv localhost 3000
-```
+The non-test social/tool evaluator inherits the complete Pi
+provider/model/base/key identity when evaluator provider and model are both
+unset. If either identity field is set, both are required and the separate path
+does not inherit the Pi endpoint or key. Check only the presence flags above,
+then confirm:
 
-If port is in use:
-```bash
-# Find what's using the port
-lsof -i :3000
+- `EVALUATOR_PROVIDER` and `EVALUATOR_MODEL` are either both absent or both set;
+- a separate non-mock identity has `EVALUATOR_API_KEY` configured explicitly;
+- `EVALUATOR_TIMEOUT_MS` is in `1..2147483647`, retries are in `0..10`, and
+  temperature is in `0..1`;
+- test/mock operation deliberately uses `LETHEBOT_TEST=true` or evaluator
+  identity `mock` / `mock`.
 
-# Change port in both SnowLuma config and LetheBot .env
-```
-
-### Test with curl
-
-```bash
-# Send a test message
-curl -X POST http://localhost:3000/send_private_msg \
-  -H "Content-Type: application/json" \
-  -d '{
-    "user_id": 123456789,
-    "message": "test"
-  }'
-
-# Get friend list
-curl -X POST http://localhost:3000/get_friend_list
-
-# Get group list
-curl -X POST http://localhost:3000/get_group_list
-```
-
-## Pi API Call Failures
-
-### API Key Location
-
-```bash
-# Check if API key is set
-grep PI_API_KEY .env
-
-# Verify key format (should start with sk- for OpenAI-compatible)
-cat .env | grep PI_API_KEY
-```
-
-If missing:
-```bash
-echo "PI_API_KEY=sk-your-key-here" >> .env
-```
-
-### Model Configuration
-
-**Using DeepSeek:**
-```bash
-# .env should have:
-PI_API_KEY=sk-your-deepseek-key
-PI_BASE_URL=https://api.deepseek.com
-PI_MODEL=deepseek-chat
-```
-
-Test:
-```bash
-curl https://api.deepseek.com/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-your-key" \
-  -d '{
-    "model": "deepseek-chat",
-    "messages": [{"role": "user", "content": "test"}]
-  }'
-```
-
-**Using OpenAI:**
-```bash
-# .env should have:
-PI_API_KEY=sk-your-openai-key
-PI_BASE_URL=https://api.openai.com/v1
-PI_MODEL=gpt-4o-mini
-```
-
-### baseUrl Format
-
-Common mistakes:
-```bash
-# ❌ Wrong
-PI_BASE_URL=https://api.deepseek.com/v1/chat/completions
-
-# ✅ Correct
-PI_BASE_URL=https://api.deepseek.com
-
-# ❌ Wrong (trailing slash)
-PI_BASE_URL=https://api.deepseek.com/
-
-# ✅ Correct
-PI_BASE_URL=https://api.deepseek.com
-```
-
-Test API connection:
-```bash
-# From project root
-pnpm tsx tests/test-pi-api.ts
-```
+Startup configuration or credential failure never falls back to the stub.
+During a turn, provider errors, timeout, invalid/oversized JSON, or wrong-domain
+output fail closed with bounded diagnostics. Do not paste a provider response or
+credential into logs to diagnose it. Background memory extraction remains on
+the stub pending its durable job/turn evaluator-authority decision.
 
 ## Database Errors
 
-### Path Configuration
+### Path And Permissions
+
+The current variable is `LETHEBOT_DB_PATH`. For the default local path:
 
 ```bash
-# Check database path in .env
-grep DB_PATH .env
-
-# Verify directory exists and is writable
-ls -la data/
-touch data/test.txt && rm data/test.txt
+install -d -m 700 ./data
+test -f "${LETHEBOT_DB_PATH:-./data/lethebot.db}"
+for file in \
+  "${LETHEBOT_DB_PATH:-./data/lethebot.db}" \
+  "${LETHEBOT_DB_PATH:-./data/lethebot.db}-wal" \
+  "${LETHEBOT_DB_PATH:-./data/lethebot.db}-shm"; do
+  test ! -e "$file" || chmod 600 "$file"
+done
+pnpm ops:doctor -- --db="${LETHEBOT_DB_PATH:-./data/lethebot.db}"
 ```
 
-If permission denied:
+On a managed host, the fixed `lethebot` service account needs read/write access
+to `shared/data`, while the database remains mode `600`. Do not make the
+database world-readable to resolve an ownership problem. Writable application
+startup enforces `0600` for the resolved main DB and existing WAL/SHM files on
+POSIX; readonly `ops:doctor` intentionally does not change modes.
+
+### Schema Or Integrity Problems
+
+Application startup applies the current initial migration idempotently.
+`ops:doctor` opens the database read-only and checks required tables,
+`PRAGMA integrity_check`, and foreign keys. Do not reset or manually edit a
+production database when that check fails.
+
+Use the tested backup and restore flow instead:
+
 ```bash
-chmod 755 data/
-chmod 644 data/lethebot.db
+mkdir -p ./backups
+pnpm ops:backup -- \
+  --db="${LETHEBOT_DB_PATH:-./data/lethebot.db}" \
+  --out=./backups/lethebot-recovery.db
+
+pnpm ops:restore -- \
+  --backup=./backups/lethebot-recovery.db \
+  --db=./data/restore-check.db
+
+pnpm ops:doctor -- --db=./data/restore-check.db
 ```
 
-### Migration Issues
+Replacing the service database is a stopped-service operation. After verifying
+the restored copy, follow the exact overwrite procedure in
+[Operations](operations.md). Restore refuses a target with live WAL/SHM
+sidecars; do not delete journal, WAL, or SHM files to force it through.
+
+### Database Locked
+
+Identify the process that owns the configured database and stop LetheBot through
+its service manager so the application can drain accepted work and close
+SQLite cleanly:
 
 ```bash
-# Check current schema
-sqlite3 data/lethebot.db ".schema"
-
-# If schema is wrong, reset database
-rm data/lethebot.db
-pnpm run migrate
-
-# Verify migrations ran
-sqlite3 data/lethebot.db "SELECT name FROM sqlite_master WHERE type='table';"
+lsof -- "${LETHEBOT_DB_PATH:-./data/lethebot.db}"
+systemctl stop lethebot
 ```
 
-Expected tables:
-- `conversations`
-- `messages`
-- `memory_entries`
-- `memory_mentions`
+Do not use an unscoped process kill or remove SQLite sidecars. If a clean stop
+does not release the database, preserve the files, capture bounded service
+status, and diagnose on a verified copy.
 
-### Permission Problems
+## Test And Build Failures
+
+Start from the narrowest failing test, then run the release gate:
 
 ```bash
-# Check file permissions
-ls -la data/lethebot.db
-
-# Fix permissions
-chmod 644 data/lethebot.db
-
-# If using systemd service, check user
-ps aux | grep lethebot
-# Database should be writable by that user
+pnpm exec vitest run tests/unit/path/to/example.test.ts --silent
+pnpm typecheck
+pnpm lint
+pnpm release:check
 ```
 
-## Test Failures
-
-### Clear Cache
+For watch mode, use `pnpm test`. If dependencies are incomplete, preserve the
+reviewed lockfile:
 
 ```bash
-# Remove build artifacts
-rm -rf dist/
-
-# Clear Vitest cache
-rm -rf node_modules/.vitest/
-
-# Clear TypeScript build info
-rm -rf tsconfig.tsbuildinfo
-
-# Reinstall dependencies
-pnpm install
+pnpm install --frozen-lockfile
+pnpm build
 ```
 
-### Dependency Re-install
+Do not delete `pnpm-lock.yaml` as a cache-recovery step. Dependency and lockfile
+changes are reviewed code. `dist/` may be rebuilt with `pnpm build`; the release
+gate also rebuilds and preflights it.
+
+For module-resolution failures, inspect current configuration without dumping
+runtime environment files:
 
 ```bash
-# Remove node_modules and lockfile
-rm -rf node_modules/ pnpm-lock.yaml
-
-# Clean pnpm cache
-pnpm store prune
-
-# Fresh install
-pnpm install
-
-# Rebuild if needed
-pnpm run build
+pnpm list --depth 0
+rg -n '"type"|"module"|"moduleResolution"' package.json tsconfig.json
+pnpm typecheck
 ```
 
-### Run Tests in Isolation
+## Message Delivery Failures
+
+Do not test delivery by sending an ad hoc private or group message. First:
+
+1. Check `/healthz` and `/readyz`.
+2. Inspect the affected turn with `pnpm cli why --turn <turn-id>`.
+3. Inspect bounded action/tool failures with `pnpm cli list-event-failures`,
+   `pnpm cli list-tool-calls --status error`, and the operator commands in
+   [Operations](operations.md).
+4. Confirm the action decision, execution status, and stored bot-response
+   evidence are linked before treating a transport response as delivery proof.
+
+When real message delivery is authorized, use the private/group acceptance
+sequence in [Local Container Acceptance](local-container-acceptance.md). That
+procedure records aggregate redacted evidence and avoids unrelated recipients.
+
+## Environment Setup
+
+For a local mock-only setup:
 
 ```bash
-# Run specific test file
-pnpm test tests/unit/memory.test.ts
-
-# Run with verbose output
-pnpm test --reporter=verbose
-
-# Run in watch mode
-pnpm test --watch
-
-# Run without coverage
-pnpm test --coverage=false
-```
-
-### Common Test Issues
-
-**Error: "Cannot find module"**
-```bash
-# Rebuild TypeScript
-pnpm run build
-
-# Check tsconfig paths
-cat tsconfig.json | grep paths
-```
-
-**Error: "Database locked"**
-```bash
-# Close any open connections
-pkill -f lethebot
-
-# Remove lock file if exists
-rm data/lethebot.db-journal
-
-# Use in-memory database for tests (check vitest.config.ts)
-```
-
-## Message Sending Failures
-
-### Check OneBot API Response
-
-```bash
-# Enable debug logging in .env
-LOG_LEVEL=debug
-
-# Run bot and watch logs
-pnpm start | tee bot.log
-
-# Check for API errors
-grep -i error bot.log
-grep -i "send_private_msg" bot.log
-```
-
-### Verify Conversation ID Format
-
-```bash
-# Query database for conversation
-sqlite3 data/lethebot.db "SELECT * FROM conversations WHERE platform_conversation_id='123456789';"
-
-# Check message records
-sqlite3 data/lethebot.db "SELECT * FROM messages ORDER BY created_at DESC LIMIT 10;"
-```
-
-Conversation ID should match:
-- Private chat: QQ user ID (number)
-- Group chat: Group ID (number)
-
-### Test Message Sending Manually
-
-```bash
-# Send test message via OneBot API
-curl -X POST http://localhost:3000/send_private_msg \
-  -H "Content-Type: application/json" \
-  -d '{
-    "user_id": 123456789,
-    "message": "Manual test"
-  }'
-
-# Check response
-# retcode should be 0
-# data.message_id should be present
-```
-
-### Common OneBot Error Codes
-
-- `retcode: 100` - API call format error
-- `retcode: 200` - OneBot API error (check NapCat logs)
-- `retcode: 1400` - No such user/group
-- `retcode: 1404` - Message send failed (rate limit, blocked, etc.)
-
-Check NapCat documentation for complete error code list.
-
-## Environment Setup Issues
-
-### Missing .env File
-
-```bash
-# Copy example
+pnpm install --frozen-lockfile
 cp .env.example .env
-
-# Edit required fields
-nano .env
+pnpm typecheck
+pnpm lint
+pnpm test:run
 ```
 
-Required variables:
-- `ONEBOT_PORT`
-- `PI_API_KEY`
-- `PI_BASE_URL`
-- `PI_MODEL`
-- `DB_PATH`
-
-### TypeScript Build Errors
+The application does not automatically load the copied file. Start a configured
+local runtime explicitly with:
 
 ```bash
-# Check TypeScript version
-pnpm list typescript
-
-# Rebuild
-pnpm run build
-
-# Check for type errors
-pnpm run typecheck
+pnpm build
+NODE_ENV=production node --env-file=.env dist/index.js
 ```
 
-### Runtime Import Errors
+Current core variables are:
+
+- `LETHEBOT_DB_PATH`
+- `LETHEBOT_TEST`
+- `LETHEBOT_HOST`, `LETHEBOT_PORT`, and the health/readiness/metrics/event paths
+- `PI_PROVIDER`, `PI_MODEL`, optional `PI_BASE_URL`, `PI_API_KEY`, and
+  `PI_TURN_TIMEOUT_MS` for a real provider
+- optional paired `EVALUATOR_PROVIDER` / `EVALUATOR_MODEL`, optional
+  `EVALUATOR_BASE_URL`, `EVALUATOR_API_KEY`, and evaluator timeout/retry/
+  temperature/prompt-version controls
+- `ONEBOT_TRANSPORT`, `ONEBOT_WS_URL`, `ONEBOT_HTTP_URL`, and optional `ONEBOT_TOKEN`
+- `LETHEBOT_BOT_QQ_ID`
+
+## Performance And Maintenance
+
+Use aggregate metrics and a read-only doctor check before changing the
+database:
 
 ```bash
-# Ensure all dependencies are installed
-pnpm install
-
-# Check package.json type field
-grep '"type"' package.json
-# Should be "module" for ESM
-
-# Verify file extensions in imports
-# Should use .js not .ts in compiled output
+pnpm ops:metrics -- --db="${LETHEBOT_DB_PATH:-./data/lethebot.db}"
+pnpm ops:doctor -- --db="${LETHEBOT_DB_PATH:-./data/lethebot.db}"
 ```
 
-## Performance Issues
+Do not run `VACUUM`, mutate indexes, or experiment on the live service database
+as an initial diagnostic. Take a verified backup, restore to a disposable path,
+and reproduce there. Provider latency checks are real external calls and follow
+the same explicit authorization requirement as other provider acceptance.
 
-### Slow Pi API Responses
+## Reporting A Problem
 
-```bash
-# Test API latency
-time curl https://api.deepseek.com/v1/chat/completions \
-  -H "Authorization: Bearer $PI_API_KEY" \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}'
+Include:
 
-# Enable request logging
-LOG_LEVEL=debug pnpm start
-```
+1. the failing command and exit status;
+2. bounded `/healthz`, `/readyz`, `ops:doctor`, or test output;
+3. the current revision and package-manager version;
+4. minimal reproduction steps;
+5. whether the issue occurs with the mock/fake runtime or only with an
+   authorized real provider/OneBot runtime.
 
-Consider:
-- Using faster model (e.g., `deepseek-chat` vs `gpt-4`)
-- Reducing max tokens in prompt
-- Caching frequent queries
-
-### Database Slowdown
-
-```bash
-# Check database size
-ls -lh data/lethebot.db
-
-# Analyze database
-sqlite3 data/lethebot.db "ANALYZE;"
-
-# Vacuum to reclaim space
-sqlite3 data/lethebot.db "VACUUM;"
-
-# Check for missing indexes
-sqlite3 data/lethebot.db ".schema" | grep -i index
-```
-
-## Getting More Help
-
-1. Check logs with `LOG_LEVEL=debug`
-2. Search existing issues on GitHub
-3. Provide full error messages when reporting
-4. Include relevant config (redact API keys)
-5. Share minimal reproduction steps
+Redact credentials, private platform identifiers, raw messages, filesystem
+secrets, database rows, and unbounded stack traces before sharing evidence.

@@ -26,6 +26,13 @@ Treat the following as sensitive or governed:
 
 QQ user IDs and group IDs are governed operational identity data. They are not equivalent to API secrets, but they should not be dumped into ordinary prompt context or public output unless the current task needs them.
 
+Operator digests and worker outputs are also display/evidence boundaries.
+`admin_digest` may count failed jobs/actions/tools/audit rows, but returned
+samples and generated audit details must redact dynamic IDs and classifier
+strings before exposure, including job type, action type, tool name, and audit
+event type, while leaving raw local DB rows available for exact owner/admin
+lookup.
+
 ## Retention
 
 Retention should be configurable by storage class:
@@ -61,10 +68,19 @@ Users should be able to request:
 
 P0 may expose these controls through owner/admin CLI first. Ordinary user requests can become admin digests or evaluator-mediated actions until self-service commands exist.
 
+Implemented account unlink uses `platform_accounts.status=disabled` as a
+reversible local tombstone. `unlink-platform-account qq <platform-account-id>`
+updates the mapping and redacted identity audit evidence in one transaction.
+Inactive mappings cannot resolve to the previous canonical user or be
+automatically reactivated. A newly claimed inactive-account event keeps only
+its governed raw event and ingress receipt; it does not reach display/history,
+chat, turn/context, Pi, action, send, or memory-extraction paths and is not
+classified as an event-processing failure.
+
 Implemented durable opt-outs are stored in `privacy_preferences`:
 
-- `proactive_dm=opted_out` rejects proactive `dm_user` actions during action execution. User-requested DM actions are not blocked by this preference.
-- `memory_association=opted_out` rejects user-scoped memory candidates before durable `memory_records` writes. Rejections are auditable without storing candidate content.
+- `proactive_dm=opted_out` rejects proactive `dm_user` actions during action execution. User-requested DM actions are not blocked by this preference. `dm_user.target.userId` is the gateway delivery user ID, while opt-out enforcement uses `dm_user.target.canonicalUserId`; proactive DMs without a canonical target are rejected before any privacy lookup or gateway send. `dm_user` execution evidence records bounded proactive metadata (`dm_proactive`, trigger, opt-out status, redaction level, and cooldown key) after redacting free-text reason/cooldown material.
+- `memory_association=opted_out` rejects user-scoped memory candidates before durable `memory_records` writes, including `propose_memory` action execution. Rejections are auditable without copying candidate content into execution evidence.
 - Privacy preference reasons and audit details are redacted before durable storage. Adjacent secret/platform fragments such as `sk-...-qq-...` and assignment-shaped operator reasons such as `api_key=sk-...-qq-...` preserve both marker classes without storing raw values.
 - Opt-out `reason` text is operator metadata, not prompt memory. Secret-like
   values and QQ/platform-ID-like values are redacted before durable
@@ -102,6 +118,14 @@ Ordinary prompts must not receive:
 - raw audit traces unless in owner/admin debug mode.
 
 Platform IDs may be included when the current task needs them, but they should be structured fields rather than natural-language background.
+
+Pi SDK session state must not become an unbudgeted prompt side channel. The
+shared adapter serializes streamed and non-streamed turns through one FIFO lease,
+resets the SDK transcript before installing each turn's context, and does not
+release ownership until prompt/idle settlement and output or generator cleanup
+finish. Only the current `ContextPack` may supply prior conversation history; a
+previous user or group's retained SDK messages must never enter a later provider
+request. A queued turn's timeout begins only after it owns that lease.
 
 `ContextTraceRepository` stores replayable `/why` evidence with a storage final
 guard: rejected-memory reasons, applied filter strings, injected identity-field
@@ -160,6 +184,11 @@ storing raw values. Assignment-shaped adjacent diagnostics such as
 keys. Job payloads, idempotency keys, worker IDs, and job IDs
 remain local control/lookup evidence and must be redacted at display/share
 boundaries.
+Automatic extraction job payloads contain only a canonical chat-message
+reference and canonical target-user reference; they do not copy inbound chat or
+bot-response text. The extractor logs bounded error names/codes rather than
+downstream `Error` objects because an evaluator or repository error can echo
+ordinary matched chat text that secret/platform-ID redaction would not remove.
 `BackgroundWorker.list()` is an operator diagnostic projection over queued work:
 it redacts task type, payload, and idempotency-key display values before return
 without mutating the raw in-memory task state or durable job rows used for local
@@ -218,10 +247,23 @@ as `targetUserId`, `recipientGroupIds`, and `ownerMessageId`, and
 action-execution `downgraded_reason`, `error_code`, `error_message`, and
 `audit_entry` before insertion. Exact local control/lookup keys remain stable
 when they match the internal cooldown-key shape: `target.conversationId` /
-`target.userId` / `target.groupId`, `constraints.cooldownKey`,
+`target.userId` / `target.canonicalUserId` / `target.groupId`, `constraints.cooldownKey`,
 `cooldown:<cooldownKey>` suppressors, and `executed_message_id` are local
 owner/admin evidence and must be redacted at display/share boundaries instead
 of being mutated in storage.
+The exact unredacted decision is committed only through a versioned keyed HMAC
+in `action_decisions.execution_binding`; neither the process-local key nor raw
+payload is durable. The same commitment covers the exact durable evaluator
+outcome and request/version/actor/context/source/timestamp/domain/turn/risk/
+confidence authority metadata and the turn's conversation/trigger source.
+Creation clones the complete input before validation. Executor verification
+recomputes redaction for durable-row comparison, requires the decision to remain
+the turn's current decision, carries the verified source across later awaits,
+and never reloads redacted action JSON for side effects. This avoids placing
+secret/platform-bearing execution payloads in SQLite while preventing a caller
+from reusing a decision ID with a different plan, evaluator authority, or
+provenance source. Superseded decisions, null legacy bindings, and bindings from
+another process are non-executable.
 
 Agent-turn and app-level failure diagnostics are governed before exposure or
 persistence. Thrown Pi/runtime errors and non-completed Pi turn error messages
@@ -271,6 +313,19 @@ redact secret-like and QQ/platform-ID-like substrings, including adjacent
 SQL literals such as `api_key=sk-...-qq-...` must likewise preserve both
 `[REDACTED:api_key_assignment]` and `[REDACTED:platform_id]` marker classes
 without printing raw fragments.
+On POSIX, writable `initDatabase()` treats SQLite file mode as a privacy
+boundary: it creates or remediates the resolved main database and existing
+WAL/SHM sidecars to `0600` before serving. It does not mutate the global umask,
+and readonly opens do not change filesystem state. Private parent-directory
+ownership remains required; Windows deployments use restrictive ACLs instead.
+The container runs as a non-root numeric identity, and its bind directory plus
+SQLite main/WAL/SHM files must share that owner. A legacy root-owned `0600`
+database requires a stopped-service ownership migration; weakening its mode or
+recursively changing co-located SnowLuma state is not an acceptable workaround.
+Checked local stacks expose only a dedicated LetheBot data directory to the
+application and bind VNC/WebUI/OneBot/application ports to loopback. Sharing a
+numeric UID does not authorize LetheBot to see SnowLuma config, QQ state, or
+logs.
 
 OneBot deployment and verification operator output is governed display data.
 `deploy-napcat` / `verify-napcat` may need raw URLs and tokens for the local
@@ -340,6 +395,11 @@ Durable event-processing failure diagnostics must use internal IDs and hashes
 only. They must not store platform IDs, message text, display names, or raw
 error strings; operator inspection commands should show hashed correlation
 fields and redacted details only.
+
+The event-processing admission ledger stores only its internal raw-event lookup
+key, bounded lifecycle states/reason codes, and timestamps. Startup recovery
+logs and metrics expose aggregate counts only; they must not copy the normalized
+payload, message text, platform identifiers, parser diagnostics, or raw errors.
 
 ## Tool Safety
 

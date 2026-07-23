@@ -25,7 +25,7 @@
 
 ## 2. Worktree Hygiene
 
-1. 不提交或保留测试生成的部署文件，例如 root `docker-compose.yml`、`lethebot.service`、`ecosystem.config.js`，除非它们是明确交付物。
+1. 不提交或保留测试生成的部署文件，例如 root `docker-compose.yml`、`lethebot.service`、`ecosystem.config.cjs`，除非它们是明确交付物。
 2. 不提交 `.env`、logs、SQLite db、API key、QQ private identifiers。
 3. 修改文档中的完成状态时，必须同时写入验证日期和证据命令。
 4. 不做与当前 phase 无关的格式化/重构。

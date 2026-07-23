@@ -17,6 +17,7 @@ LetheBot's tool system consists of:
 ```typescript
 import { ToolRegistry } from './tools/registry';
 import type { ToolRegistryEntry } from './types/tool';
+import { weatherHandler } from './tools/handlers/weather';
 
 const toolRegistry = new ToolRegistry();
 
@@ -82,8 +83,8 @@ const weatherTool: ToolRegistryEntry = {
     },
   },
 
-  // Handler: implementation
-  handler: './handlers/weather', // module path
+  // Handler: resolved function; request.signal carries cancellation/deadline
+  handler: weatherHandler,
 };
 
 // Register the tool
@@ -118,7 +119,7 @@ const adminTool: ToolRegistryEntry = {
     input: { type: 'object', properties: {} },
     output: { type: 'object', properties: {} },
   },
-  handler: './handlers/admin',
+  handler: async () => ({ ok: true }),
 };
 ```
 
@@ -163,7 +164,7 @@ const publicTool: ToolRegistryEntry = {
       },
     },
   },
-  handler: './handlers/search',
+  handler: async () => ({ results: [] }),
 };
 ```
 
@@ -189,7 +190,7 @@ const personalTool: ToolRegistryEntry = {
   sandboxPolicy: {
     filesystem: 'none',
     network: 'restricted',
-    execution: 'subprocess',
+    execution: 'in_process',
     maxRuntimeMs: 10000,
     allowedDomains: ['calendar.google.com'],
   },
@@ -209,7 +210,7 @@ const personalTool: ToolRegistryEntry = {
       },
     },
   },
-  handler: './handlers/calendar',
+  handler: async () => ({ events: [] }),
 };
 ```
 
@@ -379,7 +380,7 @@ describe('ToolRegistry', () => {
         input: { type: 'object' },
         output: { type: 'object' },
       },
-      handler: './test',
+      handler: async () => ({ ok: true }),
     };
 
     registry.register(tool);
@@ -411,7 +412,7 @@ describe('ToolRegistry', () => {
         input: { type: 'object' },
         output: { type: 'object' },
       },
-      handler: './test',
+      handler: async () => ({ ok: true }),
     };
 
     registry.register(tool);
@@ -453,7 +454,7 @@ describe('ToolRegistry - Permissions', () => {
         input: { type: 'object' },
         output: { type: 'object' },
       },
-      handler: './admin',
+      handler: async () => ({ ok: true }),
     };
 
     registry.register(tool);
@@ -525,7 +526,7 @@ describe('PolicyGate', () => {
         input: { type: 'object' },
         output: { type: 'object' },
       },
-      handler: './public',
+      handler: async () => ({ ok: true }),
     };
 
     registry.register(publicTool);
@@ -579,14 +580,14 @@ describe('PolicyGate', () => {
       sandboxPolicy: {
         filesystem: 'none',
         network: 'allowed',
-        execution: 'subprocess',
+        execution: 'in_process',
       },
       outputSensitivity: 'sensitive',
       piSchema: {
         input: { type: 'object' },
         output: { type: 'object' },
       },
-      handler: './sensitive',
+      handler: async () => ({ ok: true }),
     };
 
     registry.register(sensitiveData);
@@ -606,6 +607,7 @@ describe('PolicyGate', () => {
 ## Summary
 
 - **ToolRegistry** manages tool metadata and permissions
+- **Handlers** are resolved functions and receive a required per-call abort signal
 - **PolicyGate** enforces L0 permission checks before execution
 - Tools define capabilities, permissions, sandbox policies, and schemas
 - Permission checks validate both actor class and invocation context

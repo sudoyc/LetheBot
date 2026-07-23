@@ -2,54 +2,34 @@
 
 This document lists decisions that the implementing agent **must escalate to the user** rather than deciding independently. These are ambiguous product, security, or technical-debt decisions where the agent's judgment is insufficient.
 
+Phase labels in example prompts are illustrative only. Current authority,
+requirement status, and blockers come from `long-running-goal-state.md`; no
+remote host, credential, provider call, or QQ session is assumed available.
+
 ---
 
 ## Product Decisions
 
 ### Memory Auto-Activation Thresholds
 
-**What:** When is memory auto-activated vs proposed?
+**Resolved default:** D11 fixes private auto-active confidence at `0.85` and
+requires group-derived user memory to remain `same_group_only` and `proposed`.
+Do not re-escalate those defaults during the active reliability repair.
 
-**Agent must ask:**
-- What confidence threshold triggers auto-activation? (e.g., >0.8)
-- What counts as "low risk" vs "medium risk" memory?
-- Is group-derived user preference medium-risk or high-risk by default?
-
-**Example escalation:**
-```
-I need to decide when to auto-activate memory. Current design says:
-- Low-risk: auto-active
-- Medium-risk: auto-active with conservative visibility
-- High-risk: proposal/admin digest
-
-For "user prefers short replies" extracted from group chat:
-- Is this medium-risk (auto-active with same_group_only visibility)?
-- Or high-risk (proposal first)?
-
-Please clarify the risk threshold.
-```
+Escalate only a requested change to that product policy, a new memory class that
+does not fit the existing risk model, or evidence that the locked policy creates
+a privacy/integrity contradiction.
 
 ### Cooldown Values
 
-**What:** How long is "just spoke" for cooldown?
+**Resolved repair policy:** D9 makes strong `@bot`, reply-to-bot, and command
+candidates bypass the local base cooldown. Unmentioned questions use a
+15-second delay, 120-second thread window, two interventions per group per ten
+minutes, and suppression above five messages per ten seconds or after a human
+answer.
 
-**Agent must ask:**
-- Cooldown for bot's own messages in group? (e.g., 60 seconds)
-- Cooldown for same-user repeated @bot? (e.g., 10 seconds)
-- Cooldown for high-speed chat suppression? (e.g., >5 messages/10sec)
-
-**Example escalation:**
-```
-Need concrete cooldown durations:
-1. Bot replied in group -> wait ___ seconds before replying again
-2. Same user @bot twice -> wait ___ seconds between replies
-3. Group high-speed chat (>___ msg/10sec) -> suppress proactive replies
-
-Please provide specific durations or confirm defaults:
-- Own message cooldown: 60s
-- Repeated mention: 10s
-- High-speed threshold: 5 msg/10sec
-```
+Escalate only when adding a new throttle dimension, changing those locked
+values, or deciding how a new proactive action shares the group budget.
 
 ### Platform Admin Boundary
 
@@ -81,70 +61,54 @@ Please confirm which capabilities apply.
 **What:** Should tests use a real model API?
 
 **Agent must ask:**
-- Is it acceptable to call real Pi/OpenAI API during Phase G tests?
-- Should we require env var (e.g., `LETHEBOT_PI_API_KEY`) to be set explicitly?
-- Or should Phase G tests use mock Pi only, with real API in Phase M?
+- Is a real provider call explicitly authorized for this task?
+- Is `PI_API_KEY` supplied through the reviewed process environment?
+- Which opt-in provider test/runbook and evidence boundary is authorized?
 
 **Example escalation:**
 ```
-Phase G acceptance requires testing Pi SDK adapter with real model.
+The remaining LIVE requirement needs a controlled real-provider run.
 
 Options:
-A. Use real API if LETHEBOT_PI_API_KEY is set, skip test otherwise
-B. Use mock Pi only; defer real API to Phase M
-C. Require real API key for Phase G to pass
+A. Authorize the documented opt-in real-provider run with explicit environment injection
+B. Keep real-provider evidence blocked; continue credential-free deterministic work
+C. Explicitly reduce scope and do not claim the original production-ready objective
 
 Which approach?
 ```
 
-### Real NapCat Connection
+### Real SnowLuma / NapCat / QQ Connection
 
-**What:** Should Phase E connect to real NapCat on arqelvps?
+**What:** Is a controlled real OneBot/QQ session authorized and available?
 
 **Agent must ask:**
-- Is Phase E acceptance blocked on real NapCat connection?
-- Or can Phase E pass with FakeOneBot only, and defer real connection to Phase M?
-- If real connection required: should it be in CI or manual verification only?
+- Is local SnowLuma/NapCat/QQ login and message interaction authorized?
+- Which controlled bot account/group and Framework runbook may be used?
+- Is the check manual/local only, with redacted evidence kept outside the repo?
 
 **Example escalation:**
 ```
-Phase E: NapCat / OneBot adapter
+Real SnowLuma / OneBot / QQ acceptance
 
-Can pass with:
-A. FakeOneBot tests only (real connection deferred to Phase M)
-B. Manual real NapCat smoke test on arqelvps (not in CI)
-C. Automated real NapCat integration test (requires arqelvps access in CI)
+Options:
+A. Authorize the controlled local Framework flow and redacted evidence collection
+B. Keep LIVE blocked and continue remaining local deterministic work
+C. Explicitly reduce scope; FakeOneBot remains deterministic evidence only
 
 Which requirement?
 ```
 
 ### Audit Log Retention
 
-**What:** How long to keep full audit logs?
+**Resolved defaults:** D11 sets 90 days for raw/chat/failure evidence, 365 days
+for audit, and 90 days for rejected/disabled/deleted memory. Existing immediate
+retrieval exclusion, user deletion, tombstone, and secret-redaction contracts
+still apply.
 
-**Agent must ask:**
-- Default retention for raw_events? (e.g., 30 days, 90 days, forever)
-- Default retention for audit_log full-level entries? (e.g., 7 days)
-- Is there a GDPR/privacy consideration for raw QQ message retention?
-
-**Example escalation:**
-```
-Need audit retention policy:
-
-1. raw_events (contains full message text):
-   - Retain: ___ days (or forever)
-   - Configurable via LETHEBOT_RAW_EVENT_RETENTION_DAYS
-
-2. audit_log (level=full, contains tool I/O):
-   - Retain: ___ days
-   - Owner/admin-only access
-
-3. Privacy consideration:
-   - Users can request their raw_events deletion?
-   - Or raw_events are audit-only and not deletable?
-
-Please define retention and deletion policy.
-```
+Escalate a change to these periods, full-purge/tombstone semantics, a legal or
+regulatory requirement, or a new storage class without an existing retention
+owner. Routine implementation of the locked values does not require another
+product question.
 
 ---
 
@@ -152,23 +116,23 @@ Please define retention and deletion policy.
 
 ### Test Requires Real Credentials but Missing
 
-**What:** Phase acceptance test needs real credential (Pi API key, NapCat, etc.) but it's not available.
+**What:** A required live check needs a credential/session that is unavailable or unauthorized.
 
 **Agent must ask:**
-- Should the phase be blocked until credential is provided?
-- Or should the test be marked `test.skip()` with a clear reason?
-- Or should we implement a degraded acceptance (mock-only)?
+- Is the exact external action authorized now?
+- Should the opt-in test remain skipped with the blocker recorded?
+- Is there other independent local work to finish before declaring `BLOCKED_EXTERNAL`?
 
 **Example escalation:**
 ```
-Phase G acceptance test requires real Pi API key, but LETHEBOT_PI_API_KEY is not set.
+LIVE real-provider evidence requires `PI_API_KEY`, but no authorized credential is available.
 
 Options:
-A. Block Phase G, wait for credential
-B. Skip test with warning: "Skipped: no real Pi API key"
-C. Pass with mock Pi only (degraded acceptance)
+A. Authorize and provide the explicit environment for the opt-in run
+B. Keep the opt-in test skipped and record `BLOCKED_EXTERNAL` only after local work is exhausted
+C. Explicitly reduce scope; do not count mock evidence as a real-provider pass
 
-Current recommendation: B (skip with warning, note in phase-acceptance.md)
+Current recommendation: B unless the user explicitly authorizes A.
 
 Confirm or override?
 ```
@@ -183,7 +147,7 @@ Confirm or override?
 
 **Example escalation:**
 ```
-Phase H: Context Orchestrator + Memory Retrieval
+Context Orchestrator + Memory Retrieval
 
 Implementation note: ContextBuilder and MemoryRetrieval are tightly coupled and both small.
 
@@ -209,10 +173,11 @@ Confirm?
 ```
 Conflict found:
 
-- architecture.md says: "Attention Engine outputs action candidates"
-- social-action-model.md says: "Pi outputs ActionDecision"
+- architecture.md says: "Attention Engine outputs fast classification signals"
+- social-action-model.md says: "SocialDecisionService constructs ActionDecision after Pi and optional evaluator review"
 
-contracts.md resolved this as: Attention does fast classification only; Pi outputs ActionDecision.
+contracts.md resolved this as: Attention classifies, Pi supplies a candidate
+response, and SocialDecisionService owns the durable ActionDecision.
 
 Should I update architecture.md and social-action-model.md to match contracts.md?
 
@@ -229,21 +194,21 @@ Or is there a nuance I'm missing?
 
 **Agent must ask:**
 - Checkpoint current progress and stop cleanly?
-- Or continue if current phase is almost done?
+- Or continue if the current verified slice is almost done?
 
 **Example escalation:**
 ```
 Context usage: 72% (DEGRADING tier)
 
-Current phase: Phase F (Attention + execution profiles)
+Current slice: Attention execution-profile wiring
 Progress: 4/5 tasks complete, last task is small (update tests)
 
 Options:
 A. Checkpoint now, stop, write handoff
-B. Finish Phase F (one small task left), then stop
-C. Continue to Phase G (risk quality degradation)
+B. Finish the current slice, verify it, then reassess the critical path
+C. Open another slice immediately (risk quality degradation)
 
-Recommendation: B (finish Phase F first)
+Recommendation: B
 
 Confirm?
 ```
@@ -266,13 +231,15 @@ Attempts:
 2. Fixed memory retrieval query -> still fails
 3. Added debug logging -> memory IS excluded, but test assertion wrong
 
-Root cause: Test expects memory to be excluded from ContextPack.memory.retrievedFacts,
-but current design allows it in retrievedFacts with a "filtered" flag.
+Root cause: Test expected a filtered marker inside
+ContextPack.memory.retrievedFacts, but current ContextBuilder hard-excludes
+inaccessible memory before token selection and records rejection evidence in
+the context trace instead.
 
 Options:
-A. Change test to check for "filtered" flag
-B. Change implementation to hard-exclude from retrievedFacts
-C. Clarify design: should filtered memories be in retrievedFacts or not?
+A. Change the test to assert exclusion from retrievedFacts and inspect the trace
+B. Change the documented context contract and implementation together
+C. Clarify whether a different operator-only rejection view is required
 
 Need design clarification.
 ```
@@ -306,9 +273,8 @@ Need design clarification.
 - Choosing between two equivalent SQL index strategies → pick the simpler one
 
 ❌ **MUST escalate these:**
-- Choosing memory auto-activation confidence threshold (0.7? 0.8? 0.9?) → escalate
-- Deciding if group-derived user preference is medium or high risk → escalate
-- Setting cooldown duration in seconds → escalate
+- Changing the locked D11 memory threshold or group-derived-memory policy → escalate
+- Changing the locked D9 delay, thread, traffic, or intervention limits → escalate
 - Classifying a QQ operation as platform_admin or not → escalate
 - Handling missing Pi API key (block, skip, or mock?) → escalate
 - Resolving conflicting guidance between two design docs → escalate

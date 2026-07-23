@@ -1,9 +1,13 @@
 # Next Full Implementation Plan
 
-**Status:** current implementation plan, created 2026-07-03.
+**Status:** superseded planning snapshot, created 2026-07-03. It is not the
+current roadmap or completion evidence; revalidate every gap against current
+code, tests, and `long-running-goal-state.md` before acting on it.
+
 **Scope:** complete all core LetheBot functions described by the canonical architecture, not only the first QQ reply loop.
 
-This document replaces the old MVP/post-MVP phase plans for forward development. Historical plans were moved to `docs/archive/` and are context only.
+This document replaced older MVP/post-MVP phase plans at the time it was
+written. It is now retained as planning context only.
 
 ## 1. Purpose
 
@@ -19,7 +23,8 @@ LetheBot should become a persistent, local-first QQ chatbot with:
 - user/admin governance for inspect, disable, delete, supersede, and explain;
 - reproducible local and container acceptance.
 
-The next development loop should finish the entire architecture by closing the gaps between current code and the target behavior.
+The 2026-07-03 snapshot proposed closing the then-observed gaps between current
+code and the target behavior in one development loop.
 
 ## 2. Authority and Evidence
 
@@ -329,7 +334,7 @@ Evidence:
 - Passing deterministic gates or explicit failure/debt list.
 - Final report includes commands, changed files, and known gaps.
 
-## 6. Recommended Phase Order
+## 6. Historical Proposed Phase Order
 
 ### Phase 0 — Baseline and docs cleanup
 
@@ -339,7 +344,7 @@ Exit criteria:
 
 - `git status --short` reviewed.
 - Typecheck/test/lint status known.
-- Docs archive and current plan are in place.
+- Docs archive and this planning snapshot are in place.
 
 ### Phase 1 — Turn lifecycle persistence
 

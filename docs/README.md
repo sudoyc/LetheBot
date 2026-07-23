@@ -2,11 +2,14 @@
 
 This directory is the implementation-facing documentation set for LetheBot.
 
-Current docs are split into three classes:
+Current docs are split into four classes:
 
 1. **Canonical architecture and constraints** — must be read before changing related code.
-2. **Next implementation plan** — the current full-function development roadmap.
-3. **Archive** — historical prompts, loop states, completion reports, discussion logs, and retired plans. Archive files are useful context only; they are not completion evidence.
+2. **Active operational state** — the mutable long-running checkpoint and its
+   execution constraints; this is current coordination state, not completion proof.
+3. **Planning references** — useful hypotheses and sequencing ideas that must be
+   revalidated against current code/tests before use.
+4. **Archive** — historical prompts, loop states, completion reports, discussion logs, and retired plans. Archive files are useful context only; they are not completion evidence.
 
 ## Canonical Reading Order
 
@@ -14,30 +17,44 @@ Current docs are split into three classes:
 2. [Architecture](architecture.md)
 3. [Design Decisions](design-decisions.md)
 4. [Long-Term Development Constraints](long-term-development-constraints.md)
-5. [Next Full Implementation Plan](next-full-implementation-plan.md)
-6. [Contracts](contracts.md)
-7. [Data Model](data-model.md)
-8. [SQLite Schema](sqlite-schema.md)
-9. [Memory System](memory-system.md)
-10. [Identity Model](identity-model.md)
-11. [Context Orchestration](context-orchestration.md)
-12. [Social Action Model](social-action-model.md)
-13. [Agent Governance](agent-governance.md)
-14. [Tool Registry](tool-registry.md)
-15. [Pi Integration](pi-integration.md)
-16. [Security and Privacy](security-privacy.md)
-17. [Tech Stack](tech-stack.md)
-18. [Deployment](deployment.md)
-19. [Local Container Acceptance](local-container-acceptance.md)
-20. [Operations](operations.md)
-21. [Troubleshooting](troubleshooting.md)
-22. [Test Strategy](test-strategy.md)
+5. [Contracts](contracts.md)
+6. [Data Model](data-model.md)
+7. [SQLite Schema](sqlite-schema.md)
+8. [Memory System](memory-system.md)
+9. [Identity Model](identity-model.md)
+10. [Context Orchestration](context-orchestration.md)
+11. [Social Action Model](social-action-model.md)
+12. [Agent Governance](agent-governance.md)
+13. [Tool Registry](tool-registry.md)
+14. [Pi Integration](pi-integration.md)
+15. [Security and Privacy](security-privacy.md)
+16. [Tech Stack](tech-stack.md)
+17. [Deployment](deployment.md)
+18. [Local Container Acceptance](local-container-acceptance.md)
+19. [Operations](operations.md)
+20. [Troubleshooting](troubleshooting.md)
+21. [Test Strategy](test-strategy.md)
 
 ## Focus Documents
 
 - [Long-Term Development Constraints](long-term-development-constraints.md) — hard evidence, architecture, memory, privacy, testing, and Git constraints.
-- [Next Full Implementation Plan](next-full-implementation-plan.md) — the current roadmap for completing all LetheBot functions, not only MVP behavior.
-- [Next Full Implementation `/goal` Prompt](prompts/next-full-implementation-goal.md) — copy-paste prompt for the next development loop.
+- [Long-Running Goal State](long-running-goal-state.md) — mutable current
+  requirement/evidence checkpoint and ordered repair route; this is the only
+  mutable status document and is never completion proof by itself.
+- [Group Chat Reliability Constraints](group-chat-reliability-constraints.md) —
+  scoped speaker, quote, Attention, evaluator, memory-truthfulness, sequencing,
+  and verification invariants for the active repair.
+- [Group Chat Reliability `/goal` Prompt](prompts/group-chat-reliability-goal.md)
+  — active scoped execution prompt for the current reliability repair.
+- [Long-Horizon Full Completion Constraints](one-shot-full-completion-constraints.md) — resumable supervisor-loop, checkpoint, critical-path, stop, and completion rules for a goal spanning many verified slices.
+- [Long-Horizon Full Completion `/goal` Prompt](prompts/one-shot-full-completion-goal.md) — umbrella production-readiness prompt; use it only when that broader objective is explicitly selected.
+- [Next Full Implementation Plan](next-full-implementation-plan.md) — superseded
+  2026-07-03 planning snapshot; use only as a hypothesis after checking current
+  implementation, tests, and the active requirement matrix.
+
+Do not maintain a second current roadmap, gap-analysis log, or loop-state file.
+Stable decisions belong in `design-decisions.md`; current evidence and the exact
+next slice belong only in `long-running-goal-state.md`.
 
 ## Supporting References
 
@@ -59,7 +76,8 @@ Rules:
 
 - Do not use archive docs as proof that a feature currently works.
 - If archive content conflicts with current code, tests, or canonical docs, current evidence wins.
-- New work should update canonical docs and the current implementation plan, not resurrect old loop-state files.
+- New work should update canonical docs and the active checkpoint, not resurrect
+  old loop-state files or treat a superseded plan as current evidence.
 
 ## Design Center
 

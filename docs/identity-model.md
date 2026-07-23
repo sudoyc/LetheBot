@@ -92,6 +92,19 @@ Suggested fields:
 
 Automatic binding should only bind the same platform account ID to its canonical ID. Cross-platform or multi-account linking should require owner/admin verification or a stronger verification flow.
 
+First observation uses one immediate SQLite transaction: read an existing
+mapping, or create one canonical user and mapping, then return that transaction's
+winner. Concurrent first events for the same platform account therefore use one
+canonical user. Explicit mapping creation is insert-only. Automatic resolution
+may refresh timestamps only for an active mapping; neither path can change its
+canonical owner, verification metadata, or lifecycle state. Those changes
+require a separate verified and audited flow.
+
+Only `active` rows resolve to a canonical user. `disabled` and `deleted` rows
+remain inspectable identity tombstones but cannot resolve, update canonical
+`last_seen_at`, or be reactivated by automatic get-or-create behavior. A
+previously unseen platform account may still create a new observed mapping.
+
 ## Group Memberships
 
 `group_memberships` stores current platform group membership data.
@@ -138,6 +151,14 @@ Display names are untrusted user-provided text. Treat them as data, not instruct
 Persisted display-profile/history rows store redacted display text when the
 platform value contains credential-shaped or platform-ID-shaped substrings.
 
+For a group turn, participant entries are derived only from human actors whose
+messages survive context selection. Each entry is tied to an opaque pack-local
+`speaker_N` reference. Canonical identity or platform sender identity, never a
+display label, determines whether two messages share that reference. Duplicate
+display names therefore remain distinct speakers; missing exact display
+metadata is represented as `unknown`. Context construction does not require a
+full group-member sync.
+
 Nickname history should be bounded:
 
 - keep current value;
@@ -163,6 +184,7 @@ Such candidates still need memory policy/evaluator handling.
 Ordinary ContextPack can include:
 
 - opaque user reference;
+- opaque pack-local speaker/message references and an explicit current-message marker;
 - current display name/group card;
 - role;
 - owner/admin/trusted flags.
@@ -197,6 +219,13 @@ Users should be able to request:
 - account unlink.
 
 P0 may expose these through owner/admin CLI first. Ordinary user requests can become admin digests or evaluator-mediated actions until self-service commands exist.
+
+The owner/admin CLI command
+`pnpm cli unlink-platform-account qq <platform-account-id>` atomically changes
+an active mapping to `disabled` and writes redacted summary audit evidence.
+Unknown or already inactive mappings are not mutated. The change governs events
+whose identity resolution begins after the transaction commits; cancelling an
+already-running turn and verified relinking are separate lifecycle operations.
 
 Deletion must affect retrieval immediately.
 

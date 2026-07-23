@@ -90,32 +90,28 @@ LetheBot/
 
 ## Current Status
 
-The current evidence-based recovery status is tracked in [docs/loop-state-recovery.md](docs/loop-state-recovery.md). Do not rely on older completion-count claims without rerunning the gates.
+The only mutable evidence/status checkpoint is
+[docs/long-running-goal-state.md](docs/long-running-goal-state.md). Do not use
+old loop-state files, gap analyses, prompt files, or historical test counts as
+current completion evidence.
 
-Latest verified local gates from the recovery log:
+The latest controlled audit found the OneBot transport, SQLite persistence,
+outbound delivery, and extraction worker operational. It also found that the
+bot is not yet reliably usable for multi-person quoted group conversation:
+historical speakers collapse in prompt context, quote relations do not reach
+Pi, ordinary relevance is conflated with evaluator risk, and group continuity
+has no active/selected memory or summaries.
 
-- `pnpm typecheck`: pass
-- `pnpm lint`: pass with 0 errors and documented warnings
-- `pnpm test:run`: pass in the default deterministic suite
+The active repair is defined by:
 
-Implemented capabilities include:
+- [Group Chat Reliability Constraints](docs/group-chat-reliability-constraints.md)
+- [Group Chat Reliability Goal Prompt](docs/prompts/group-chat-reliability-goal.md)
+- [Test Strategy Behavior Matrix](docs/test-strategy.md#conversation-reliability-matrix)
+- [Local Container Behavior Canary](docs/local-container-acceptance.md#验收步骤)
 
-- Core TypeScript contracts and SQLite storage with migrations
-- Governed memory repository with source/revision/audit links
-- Context builder with retrieval filters and trace fields
-- Pi adapter integration with mockable tests
-- Tool registry, policy gate, sandbox/path validation, and audit coverage
-- Background memory extraction and summary worker paths
-- Governance CLI for memory list/state changes, context explanation, and display profile redaction
-- OneBot/NapCat HTTP adapter path with auth, CQ mention parsing, health checks, and fake/local tests
-- SQLite operations helpers for backup/restore, retention, and metrics
-
-Still requires controlled live validation before production claims:
-
-- Real NapCat soak test
-- Full social action executor/router beyond the adapter-level reply path
-- Scheduled/durable operations automation
-- Optional governance UI beyond the CLI
+Healthy containers or a delivered message are not production-readiness claims.
+The checkpoint records the exact evidence, ordered repair route, and remaining
+acceptance gates.
 
 ## Documentation
 
@@ -124,7 +120,8 @@ Start here:
 - [Agent Instructions](AGENTS.md) - Contribution rules
 - [Documentation Index](docs/README.md) - All design docs
 - [Architecture](docs/architecture.md) - System design
-- [MVP Roadmap](docs/mvp-roadmap.md) - Development phases
+- [Current Goal State](docs/long-running-goal-state.md) - Current evidence and ordered repair route
+- [Reliability Constraints](docs/group-chat-reliability-constraints.md) - Active scoped invariants
 - [Deployment Guide](docs/deployment.md) - Production setup
 
 Key concepts:
@@ -174,4 +171,3 @@ See [Tech Stack](docs/tech-stack.md) for details.
 ## License
 
 (To be determined)
-

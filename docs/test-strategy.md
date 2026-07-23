@@ -1,614 +1,318 @@
 # Test Strategy
 
-This document defines the testing approach for LetheBot, including P0 regression tests, phase acceptance criteria, and test organization.
+This document describes the test surfaces and commands that exist in the
+current LetheBot repository. Tests use Vitest and TypeScript. The default gate
+is deterministic and credential-free.
 
-## Test Pyramid
+## Required Gates
 
-```
-         ┌─────────────┐
-         │  Live Soak  │  Phase M only, real NapCat
-         │   Testing   │
-         └─────────────┘
-       ┌───────────────────┐
-       │   Integration     │  Phase D+, FakeOneBot
-       │     Tests         │
-       └───────────────────┘
-    ┌──────────────────────────┐
-    │      Unit Tests          │  All phases
-    │  (modules, functions)    │
-    └──────────────────────────┘
-```
-
-**P0 focus:** Unit tests + Integration tests with FakeOneBot. Live soak testing is Phase M only.
-
----
-
-## P0 Regression Tests (Must Pass Every Phase)
-
-These tests must pass from the phase they're introduced onwards. They are the minimum safety net.
-
-### 1. Memory Boundaries (Phase H onwards)
-
-```typescript
-describe('Memory Boundaries - P0 Regression', () => {
-  test('deleted memory immediately excluded from retrieval', async () => {
-    const bot = setupTestBot();
-    
-    // Create memory
-    const memId = await bot.memory.create({
-      scope: 'user',
-      canonicalUserId: 'user-alice',
-      visibility: 'private_only',
-      content: 'secret data',
-      state: 'active',
-    });
-    
-    // Verify retrieval works
-    let results = await bot.memory.retrieve({ userId: 'user-alice' });
-    expect(results).toContainMemory(memId);
-    
-    // Delete memory
-    await bot.memory.delete(memId);
-    
-    // Verify immediately excluded
-    results = await bot.memory.retrieve({ userId: 'user-alice' });
-    expect(results).not.toContainMemory(memId);
-  });
-  
-  test('disabled memory immediately excluded from retrieval', async () => {
-    const bot = setupTestBot();
-    
-    const memId = await bot.memory.create({
-      scope: 'user',
-      canonicalUserId: 'user-alice',
-      visibility: 'same_user_any_context',
-      content: 'user preference',
-      state: 'active',
-    });
-    
-    // Disable memory
-    await bot.memory.disable(memId);
-    
-    // Verify excluded
-    const results = await bot.memory.retrieve({ userId: 'user-alice' });
-    expect(results).not.toContainMemory(memId);
-  });
-  
-  test('private_only memory not injected into group context', async () => {
-    const bot = setupTestBot();
-    const gateway = bot.gateway as FakeOneBot;
-    
-    // User tells bot a secret in private chat
-    gateway.simulatePrivateMessage({
-      senderId: 'user-alice',
-      text: '/remember 我的密码是 secret123',
-    });
-    await bot.processEvents();
-    
-    // Verify memory created with private_only
-    const memories = await bot.memory.retrieve({ userId: 'user-alice' });
-    expect(memories.some(m => m.visibility === 'private_only')).toBe(true);
-    
-    // User asks in group
-    gateway.simulateGroupMessage({
-      groupId: 'public-group',
-      senderId: 'user-alice',
-      text: '@bot 我的密码是什么',
-      mentionsBot: true,
-    });
-    await bot.processEvents();
-    
-    // Verify context pack did not include private_only memory
-    const contextPack = await bot.getLastContextPack();
-    expect(contextPack.memory.retrievedFacts.some(
-      m => m.content.includes('secret123')
-    )).toBe(false);
-    
-    // Verify bot's reply does not leak
-    const sent = gateway.getLastSentMessage();
-    expect(sent.content.text).not.toContain('secret123');
-  });
-  
-  test('superseded memory not retrieved', async () => {
-    const bot = setupTestBot();
-    
-    // Create original memory
-    const oldId = await bot.memory.create({
-      scope: 'user',
-      canonicalUserId: 'user-alice',
-      content: 'prefers short replies',
-      state: 'active',
-    });
-    
-    // Create new memory that supersedes old
-    const newId = await bot.memory.create({
-      scope: 'user',
-      canonicalUserId: 'user-alice',
-      content: 'prefers detailed replies',
-      state: 'active',
-    });
-    
-    await bot.memory.supersede(oldId, newId);
-    
-    // Verify only new is retrieved
-    const results = await bot.memory.retrieve({ userId: 'user-alice' });
-    expect(results).toContainMemory(newId);
-    expect(results).not.toContainMemory(oldId);
-  });
-});
-```
-
-### 2. Execution Profiles (Phase F onwards)
-
-```typescript
-describe('Execution Profiles - P0 Regression', () => {
-  test('silent_fast_path: ordinary group message does not call Pi', async () => {
-    const bot = setupTestBot();
-    const gateway = bot.gateway as FakeOneBot;
-    const piSpy = jest.spyOn(bot.pi, 'run');
-    
-    gateway.simulateGroupMessage({
-      groupId: 'casual-chat',
-      senderId: 'user-bob',
-      text: '今天天气不错',
-      mentionsBot: false,
-    });
-    await bot.processEvents();
-    
-    // Verify Pi was NOT called
-    expect(piSpy).not.toHaveBeenCalled();
-    
-    // Verify raw event stored
-    const events = await bot.storage.getRawEvents({ limit: 1 });
-    expect(events[0].type).toBe('chat.message.received');
-    
-    // Verify no message sent
-    gateway.assertNoMessageSent();
-  });
-  
-  test('reply_fast_path: @bot triggers Pi but not evaluator for low-risk', async () => {
-    const bot = setupTestBot();
-    const gateway = bot.gateway as FakeOneBot;
-    const piSpy = jest.spyOn(bot.pi, 'run');
-    const evaluatorSpy = jest.spyOn(bot.evaluator, 'evaluate');
-    
-    gateway.simulateGroupMessage({
-      groupId: 'support',
-      senderId: 'user-alice',
-      text: '@bot 你好',
-      mentionsBot: true,
-    });
-    await bot.processEvents();
-    
-    // Verify Pi was called
-    expect(piSpy).toHaveBeenCalled();
-    
-    // Verify evaluator was NOT called (low-risk reply)
-    expect(evaluatorSpy).not.toHaveBeenCalled();
-    
-    // Verify reply sent
-    gateway.assertMessageSent(/你好|hi/i);
-  });
-  
-  test('risk_path: proactive DM triggers evaluator', async () => {
-    const bot = setupTestBot();
-    const evaluatorSpy = jest.spyOn(bot.evaluator, 'evaluate');
-    
-    // Pi proposes proactive DM
-    await bot.pi.run({
-      contextPack: buildTestContext(),
-      actionHint: 'dm_user',
-    });
-    
-    // Verify evaluator was called
-    expect(evaluatorSpy).toHaveBeenCalled();
-    const call = evaluatorSpy.mock.calls[0][0];
-    expect(call.actions.some(a => a.type === 'dm_user')).toBe(true);
-  });
-});
-```
-
-### 3. Policy Gates (Phase J onwards)
-
-```typescript
-describe('Policy Gates - P0 Regression', () => {
-  test('evaluatorPolicy=bypass does not bypass permissions', async () => {
-    const bot = setupTestBot();
-    
-    // Register tool with bypass evaluator but restricted permissions
-    await bot.tools.register({
-      name: 'dangerous_tool',
-      evaluatorPolicy: 'bypass',
-      permissions: {
-        allowedActors: ['owner'],
-        allowedContexts: ['admin_cli'],
-      },
-      capabilities: ['shell_exec'],
-      handler: async () => ({ output: 'executed' }),
-    });
-    
-    // Try to call from regular user in group
-    const result = await bot.tools.call({
-      toolName: 'dangerous_tool',
-      input: {},
-      actor: { canonicalUserId: 'user-bob', actorClass: 'user' },
-      context: 'group_chat',
-    });
-    
-    // Verify rejected due to permissions
-    expect(result.status).toBe('rejected');
-    expect(result.error.code).toBe('PERMISSION_DENIED');
-  });
-  
-  test('evaluatorPolicy=bypass does not bypass L0 hard policy', async () => {
-    const bot = setupTestBot();
-    
-    // Create memory with state=deleted
-    const memId = await bot.memory.create({
-      scope: 'user',
-      canonicalUserId: 'user-alice',
-      content: 'deleted data',
-      state: 'deleted',
-    });
-    
-    // Try to retrieve with evaluator bypass
-    const results = await bot.memory.retrieve({
-      userId: 'user-alice',
-      bypassEvaluator: true,  // this should not matter
-    });
-    
-    // Verify deleted memory still excluded (L0 policy)
-    expect(results).not.toContainMemory(memId);
-  });
-  
-  test('evaluatorPolicy=required enforces LLM review', async () => {
-    const bot = setupTestBot();
-    const evaluatorSpy = jest.spyOn(bot.evaluator, 'evaluate');
-    
-    // Register tool requiring evaluator
-    await bot.tools.register({
-      name: 'sensitive_tool',
-      evaluatorPolicy: 'required',
-      capabilities: ['modifies_memory'],
-      handler: async () => ({ output: 'done' }),
-    });
-    
-    // Call the tool
-    await bot.tools.call({
-      toolName: 'sensitive_tool',
-      input: {},
-      actor: { canonicalUserId: 'user-alice', actorClass: 'user' },
-      context: 'private_chat',
-    });
-    
-    // Verify evaluator was called
-    expect(evaluatorSpy).toHaveBeenCalled();
-  });
-});
-```
-
-### 4. Identity Boundaries (Phase C onwards)
-
-```typescript
-describe('Identity Boundaries - P0 Regression', () => {
-  test('QQ IDs are operational data, not in ordinary memory content', async () => {
-    const bot = setupTestBot();
-    const gateway = bot.gateway as FakeOneBot;
-    
-    gateway.simulatePrivateMessage({
-      senderId: 'qq-123456',
-      text: '/remember 我喜欢 Python',
-    });
-    await bot.processEvents();
-    
-    // Verify memory created
-    const memories = await bot.memory.retrieve({ platformAccountId: 'qq-123456' });
-    expect(memories.some(m => m.content.includes('Python'))).toBe(true);
-    
-    // Verify QQ ID is NOT in memory content
-    expect(memories.every(m => !m.content.includes('qq-123456'))).toBe(true);
-    
-    // Verify QQ ID is in mapping table
-    const mapping = await bot.identity.getMapping('qq', 'qq-123456');
-    expect(mapping).toBeDefined();
-    expect(mapping.canonicalUserId).toBeTruthy();
-  });
-  
-  test('nickname change does not auto-create user memory', async () => {
-    const bot = setupTestBot();
-    const gateway = bot.gateway as FakeOneBot;
-    
-    // User changes nickname
-    gateway.simulateGroupMessage({
-      senderId: 'user-alice',
-      senderCard: 'Alice-New-Name',
-      text: '大家好',
-    });
-    await bot.processEvents();
-    
-    // Verify display profile updated
-    const display = await bot.identity.getDisplayProfile('user-alice');
-    expect(display.currentDisplayName).toBe('Alice-New-Name');
-    
-    // Verify NO user memory auto-created
-    const memories = await bot.memory.retrieve({ userId: 'user-alice' });
-    expect(memories.every(m => m.kind !== 'preference')).toBe(true);
-  });
-});
-```
-
----
-
-## Phase Acceptance Tests
-
-Each phase has specific acceptance criteria. Tests must pass before moving to next phase.
-
-### Phase A: Repository Foundation
-
-```typescript
-describe('Phase A Acceptance', () => {
-  test('TypeScript compiles without errors', async () => {
-    const result = await exec('pnpm typecheck');
-    expect(result.exitCode).toBe(0);
-  });
-  
-  test('linter passes', async () => {
-    const result = await exec('pnpm lint');
-    expect(result.exitCode).toBe(0);
-  });
-  
-  test('test runner works', async () => {
-    const result = await exec('pnpm test --passWithNoTests');
-    expect(result.exitCode).toBe(0);
-  });
-  
-  test('config loader works', async () => {
-    process.env.LETHEBOT_TEST = 'value';
-    const config = loadConfig();
-    expect(config.test).toBe('value');
-  });
-});
-```
-
-### Phase B: Core Contracts
-
-```typescript
-describe('Phase B Acceptance', () => {
-  test('all contract interfaces validate correctly', () => {
-    // Valid examples pass
-    const validMessage: ChatMessageReceived = buildValidChatMessage();
-    expect(() => validateChatMessageReceived(validMessage)).not.toThrow();
-    
-    // Invalid examples fail
-    const invalidMessage = { ...validMessage, type: undefined };
-    expect(() => validateChatMessageReceived(invalidMessage)).toThrow();
-  });
-  
-  test('schema validation catches missing required fields', () => {
-    const incomplete: Partial<MemoryRecord> = {
-      id: 'mem-123',
-      // missing scope, visibility, etc.
-    };
-    expect(() => validateMemoryRecord(incomplete)).toThrow(/required.*scope/i);
-  });
-});
-```
-
-### Phase C: Storage Foundation
-
-```typescript
-describe('Phase C Acceptance', () => {
-  test('migrations run on empty DB', async () => {
-    const db = await createTestDatabase();
-    await runMigrations(db);
-    
-    // Verify tables exist
-    const tables = await db.query('SELECT name FROM sqlite_master WHERE type="table"');
-    expect(tables.map(t => t.name)).toContain('raw_events');
-    expect(tables.map(t => t.name)).toContain('memory_records');
-  });
-  
-  test('repository tests pass', async () => {
-    const repo = new MemoryRepository(testDb);
-    
-    // Create
-    const id = await repo.create(testMemory);
-    expect(id).toBeTruthy();
-    
-    // Read
-    const mem = await repo.findById(id);
-    expect(mem.content).toBe(testMemory.content);
-    
-    // Delete
-    await repo.delete(id);
-    const deleted = await repo.findById(id);
-    expect(deleted).toBeNull();
-  });
-  
-  test('deletion immediately affects retrieval', async () => {
-    const repo = new MemoryRepository(testDb);
-    
-    const id = await repo.create({ ...testMemory, state: 'active' });
-    
-    // Verify retrieval works
-    let results = await repo.retrieve({ state: 'active' });
-    expect(results.some(m => m.id === id)).toBe(true);
-    
-    // Delete
-    await repo.delete(id);
-    
-    // Verify immediately excluded
-    results = await repo.retrieve({ state: 'active' });
-    expect(results.some(m => m.id === id)).toBe(false);
-  });
-});
-```
-
-### Phase D: Gateway Simulator
-
-```typescript
-describe('Phase D Acceptance', () => {
-  test('FakeOneBot implements GatewayAdapter', () => {
-    const gateway = new FakeOneBot();
-    expect(gateway).toImplementInterface(GatewayAdapter);
-  });
-  
-  test('simulated private message becomes internal event', async () => {
-    const gateway = new FakeOneBot();
-    const bot = new LetheBot({ gateway });
-    
-    gateway.simulatePrivateMessage({
-      senderId: 'user-alice',
-      text: '你好',
-    });
-    await bot.processEvents();
-    
-    const events = await bot.storage.getRawEvents({ limit: 1 });
-    expect(events[0].type).toBe('chat.message.received');
-    expect(events[0].message.content.text).toBe('你好');
-  });
-  
-  test('response router can send to fake sink', async () => {
-    const gateway = new FakeOneBot();
-    const bot = new LetheBot({ gateway });
-    
-    await bot.responseRouter.send({
-      conversationId: 'private:user-alice',
-      content: { text: 'test reply' },
-    });
-    
-    const sent = gateway.getLastSentMessage();
-    expect(sent.content.text).toBe('test reply');
-  });
-});
-```
-
-### Phase G: Pi Runtime Adapter
-
-```typescript
-describe('Phase G Acceptance', () => {
-  test('can call Pi SDK, can handle response', async () => {
-    const pi = new PiSdkAdapter({ model: 'test-model' });
-    
-    const result = await pi.run({
-      contextPack: buildTestContext({ text: '你好' }),
-    });
-    
-    expect(result.responseText).toBeTruthy();
-    expect(result.actionDecision).toBeDefined();
-  });
-  
-  test('fake private message triggers Pi, response routes back', async () => {
-    const gateway = new FakeOneBot();
-    const bot = new LetheBot({ gateway });
-    
-    gateway.simulatePrivateMessage({
-      senderId: 'user-alice',
-      text: '你好',
-    });
-    await bot.processEvents();
-    
-    // Verify Pi was called and reply sent
-    gateway.assertMessageSent();
-    const sent = gateway.getLastSentMessage();
-    expect(sent.conversationId).toContain('user-alice');
-  });
-});
-```
-
----
-
-## Test Organization
-
-```
-tests/
-├── unit/
-│   ├── memory/
-│   │   ├── repository.test.ts
-│   │   ├── retrieval.test.ts
-│   │   └── revisions.test.ts
-│   ├── identity/
-│   │   ├── registry.test.ts
-│   │   └── display.test.ts
-│   ├── tools/
-│   │   └── registry.test.ts
-│   └── ...
-├── integration/
-│   ├── regression/
-│   │   ├── memory-boundaries.test.ts
-│   │   ├── execution-profiles.test.ts
-│   │   ├── policy-gates.test.ts
-│   │   └── identity-boundaries.test.ts
-│   ├── phase-acceptance/
-│   │   ├── phase-a.test.ts
-│   │   ├── phase-b.test.ts
-│   │   └── ...
-│   └── scenarios/
-│       ├── silent-fast-path.test.ts
-│       ├── reply-fast-path.test.ts
-│       └── memory-visibility.test.ts
-├── fakes/
-│   ├── fake-onebot.ts
-│   ├── fake-onebot.test.ts
-│   └── test-helpers.ts
-└── live/  (Phase M only)
-    └── soak.test.ts
-```
-
----
-
-## Test Execution Strategy
-
-### During Development (Phase-by-Phase)
+Use the narrowest relevant test while developing, then run the applicable
+repository gate.
 
 ```bash
-# Run only current phase tests
-pnpm test:phase-c
+# One file or one regression
+pnpm exec vitest run tests/unit/pi/pi-adapter.test.ts --silent
+pnpm exec vitest run tests/integration/e2e-conversation.test.ts -t "failed turn" --silent
 
-# Run P0 regression (all introduced tests up to current phase)
-pnpm test:regression
+# All default deterministic tests
+pnpm test:run
 
-# Run full suite
-pnpm test
+# Static checks
+pnpm typecheck
+pnpm lint
+git diff --check
+
+# Release gate: typecheck, lint, build, artifact preflight, default tests, diff hygiene
+pnpm release:check
 ```
 
-### Before Phase Transition
+`pnpm test` starts Vitest's interactive development mode. Automation and
+completion evidence use `pnpm test:run` or `pnpm release:check`.
+
+Do not hardcode pass counts in stable documentation. Counts change as focused
+regressions are added; command exit status and the current output are evidence.
+
+## Test Layers
+
+### Unit Tests
+
+`tests/unit/` covers module contracts and edge behavior, including:
+
+- event, memory, context, action, audit, tool, identity, and agent types;
+- repositories and SQLite migration compatibility;
+- attention, policy, action execution, evaluator, Pi, and tool boundaries;
+- worker leases, attempts, retries, heartbeats, and idempotency;
+- configuration, logging, redaction, deployment helpers, acceptance helpers,
+  and operations helpers.
+
+Unit tests should use deterministic inputs and avoid network access, local
+credential files, real account identifiers, and persistent workspace data.
+
+### Gateway Fakes
+
+`tests/fakes/fake-onebot.ts` is the protocol-level fake for OneBot behavior.
+Gateway and integration tests use it or local in-process HTTP/WebSocket fixtures
+to prove normalization, send behavior, authentication, reconnect handling, and
+capability fallbacks without contacting QQ or SnowLuma.
+
+### Integration Tests
+
+`tests/integration/` exercises boundaries across real repository modules. Major
+surfaces include:
+
+- raw-event-first persistence and ingress admission recovery;
+- identity resolution, context history, memory extraction/retrieval/injection,
+  and the full conversation chain;
+- action decisions/executions, tool and audit links, turn failure behavior, and
+  graceful shutdown;
+- file operations, application activation/rollback, maintenance commands, and
+  generated deployment behavior.
+
+Persistence tests use disposable databases. A behavior that changes durable
+state should assert the relevant rows and lifecycle transitions and finish with
+an empty `PRAGMA foreign_key_check` result.
+
+### Deterministic End-to-End Tests
+
+The default suite includes credential-free end-to-end coverage such as
+`tests/e2e/full-memory-cycle.test.ts`. It also includes the deterministic guard
+in `tests/e2e/deepseek-real-api.test.ts`.
+
+`tests/e2e/pi-real-api.test.ts` is opt-in and skipped by default. Its presence
+in a default Vitest run is not real-provider evidence.
+
+### Phase Acceptance Scaffold
+
+`tests/phase-acceptance/phase-a.test.ts` retains the repository-foundation
+acceptance check. Current completion evidence comes from the focused suites and
+`pnpm release:check`, not from nonexistent per-phase package scripts.
+
+## Critical Regression Invariants
+
+Tests should preserve these P0 boundaries.
+
+### Persistence And Traceability
+
+- Raw events exist before derived chat, turn, action, tool, job, or memory rows.
+- The event -> chat -> turn -> context -> decision -> execution chain remains
+  queryable and foreign-key clean.
+- A matching automatic extraction candidate commits its inbound chat row and
+  reference-only job atomically before Attention can return; reply, evaluator,
+  and send outcomes do not control admission.
+- A deferred group question commits its derived chat row, source-bound
+  Attention candidate, and exact `{ candidateId }` job together; a failed
+  enqueue leaves none of those derived rows.
+- Caught failures become bounded, redacted, durable terminal evidence.
+- Startup recovery is idempotent and does not replay work whose external
+  delivery state is unknown.
+- A recorded delayed delivery may be reused on worker retry, but tests must not
+  describe this as external exactly-once delivery. They must retain a
+  fail-closed case for an indeterminate turn/send and acknowledge the crash
+  interval between QQ/OneBot acceptance and local execution evidence.
+
+### Memory And Context Privacy
+
+- Deleted, disabled, superseded, expired, secret, prohibited, or invisible
+  memory is excluded immediately.
+- Long-term memory writes retain scope, owner, source, timestamp, confidence,
+  lifecycle, revision, and audit evidence.
+- Visibility filtering happens before retrieval limits and token budgeting.
+- Private/user/group context never leaks into an incompatible scope.
+- Platform identifiers, display metadata, secrets, and raw tool output are
+  minimized and redacted before prompt, audit, or operator display.
+- Outbound memory wording is authorized only by the exact selected active record
+  or fully committed same-turn `memory.propose` effect; unsafe unsupported
+  propositions are neutralized without being echoed.
+
+### Authority Boundaries
+
+- `evaluatorPolicy=bypass` never bypasses L0 policy, permissions, sandboxing,
+  output handling, audit, or the action executor.
+- Pi and evaluators propose; governed services and executors own durable state
+  and external effects.
+- QQ governance reparses persisted raw/chat/account evidence and requires the
+  configured bot owner or the persisted owner/admin role of the exact current
+  group; recognized unauthorized commands receive deterministic denial.
+- Group governance listing never exposes private/global/other-group memory,
+  even to the bot owner, and group owner/admin forget cannot cross the same
+  group-safe boundary.
+- Recognized QQ governance runs before Attention in a zero-token local turn and
+  calls no Pi, evaluator, or tool. Replies still use the action executor;
+  duplicate ingress, successful delivery, handled send failure, and thrown
+  persistence failure retain their distinct durable contracts.
+- Prepared local tool effects and their terminal evidence commit atomically.
+- Output limits and cooperative deadlines remain bounded; tests cover
+  pre-abort, timer expiry, synchronous elapsed overruns, wait-for-settlement,
+  cleanup/reuse, fixed failure evidence, and no late prepared-effect commit
+  without inventing rollback semantics for already-completed external effects.
+
+### Operations
+
+- Health, readiness, metrics, backup, restore, retention, worker soak, release
+  activation, rollback, and shutdown tests use disposable local state.
+- Worker soak evidence must sustain enqueue and successful completion across
+  three time windows, include a late enqueue, observe no empty load-phase poll,
+  and terminally drain every tracked job; an initial burst followed by idle
+  polling is not sufficient.
+- Operator output contains aggregate or redacted evidence, not raw chats,
+  secrets, private identifiers, or sensitive paths.
+- Offline release-preflight tests do not start the guarded application.
+  Application rollback rehearsal does start real built LetheBot A/B child
+  processes, but only with mock Pi, loopback-isolated HTTP OneBot, synthetic
+  SQLite, bounded probes/stops, and aggregate path-free output; it does not call
+  providers or QQ.
+
+## Conversation Reliability Matrix
+
+Transport and persistence assertions are necessary but do not prove that a
+multi-person conversation is usable. The active group reliability repair uses
+the following behavior scenarios. Fixtures must be synthetic and
+content-minimal; never copy live messages, names, identifiers, provider output,
+or database rows into the repository.
+
+| ID | Scenario | Required deterministic assertions |
+|---|---|---|
+| `REL-CTX-01` | Three or more human speakers, including duplicate display names | Each selected human has a distinct opaque `speakerRef`; repeated messages from the same human reuse it; current speaker is explicit; no prompt-visible ref contains a platform/canonical ID. |
+| `REL-CTX-02` | Historical display metadata changes or is unavailable | Identity stays attached to the same opaque ref; display data is an untrusted optional label; unavailable display uses an explicit unknown label rather than another speaker's data. |
+| `REL-QUOTE-01` | Current message replies to a same-conversation bot or human message inside the rolling window | Context identifies current message, exact target message ref, target speaker ref, and bot/human role; Pi rendering and token budget include the relation. |
+| `REL-QUOTE-02` | Reply target is older than the rolling window, missing, or from another conversation | One bounded same-conversation lookup may include the older target; missing targets are marked unresolved; cross-conversation targets are rejected and cannot trigger/influence the turn. |
+| `REL-ATT-01` | Low-risk direct mention/reply/question combinations | Addressing selects the reply fast path independently of risk; combining relevance signals does not invoke the risk evaluator; strong-trigger cooldown behavior remains as locked in D9. |
+| `REL-ATT-02` | Unmentioned question and later group activity | Chat/candidate/job persistence is atomic; no Pi/send/claim occurs before the local-ingress-based 15-second due time; the exact source is revalidated; expiry at 120 seconds, an explicit human reply, more than five exact-group messages per ten seconds, and the two-response exact-group/ten-minute budget produce bounded terminal suppressor/decision/job-attempt evidence. An unsuppressed recheck is proactive and carries `delayed_recheck`; retry reuses the one decision and recorded terminal turn/delivery without duplicating local work; group isolation and foreign keys remain clean. |
+| `REL-ADMIN-01` | Narrative management text, recognized member command, and exact-group admin command | Narrative and prefix collisions stay ordinary; every recognized family is intercepted before Attention; unauthorized members receive fixed denial and authorized invalid syntax receives usage. The local non-proactive reply action, execution, delivered bot row, zero-token turn, and admission agree, with zero Pi/evaluator/tool calls. |
+| `REL-EVAL-01` | Provider returns valid, fenced, malformed, extra-field, or schema-invalid evaluator output | Native structured mode is used when supported; at most one correction attempt is separately ledgered; terminal governed failure stays fail-closed with durable bounded evidence and no external effect. |
+| `REL-EVAL-02` | Ordinary response candidate versus actually risky action | Ordinary relevance never depends on evaluator parsing; a true-risk evaluator failure does not become an unexplained failed admission. |
+| `REL-MEM-01` | No memory effect, proposal success/failure, active memory, and unrelated or ambiguous evidence | No effect, failed/partial proposal, inactive/unselected memory, target mismatch, unsafe proposition, and unrelated or ambiguous evidence produce neutral wording; a fully committed same-turn `memory.propose` effect produces pending-review wording; only exact selected active evidence permits durable wording. Returned and stored decisions carry the same guard suppressor and action text, delivered text equals the persisted bot response, the turn retains the pre-guard Pi draft, ordinary non-claim language is unchanged, and foreign keys remain clean. |
+| `REL-MEM-02` | Private recall, group proposal, opted-in group summary, and restart | Private memory recalls only in allowed scope; group-derived user memory stays proposed/same-group; summary requires per-group opt-in; approved memory remains available after process/container restart. |
+| `REL-MEM-03` | Opted-in group-summary frozen-window continuity | Canonical local-ingress planning freezes exact post-budget sources; discovery/action routes converge; policy races and invalid source sets fail before Provider/effect; later old-clock rows cannot join; completed windows are disjoint and terminally failed windows do not block newer sources; pending/running sources survive retention; final memory and invocation sources match; integrity and foreign keys remain clean. |
+| `REL-GOV-01` | QQ/CLI list, forget, summary lifecycle, and prior-turn explanation | The 512-character exact parser, one canonical raw/chat derivation, canonical `qq-group-[1-9][0-9]{4,11}` scope, and persisted identity proof enforce bot-owner/exact-group authority; group listing/forget stay group-safe while private bot-owner and known-ID authority follow their wider contracts. Forget is immediately unretrievable with revision/audit evidence and bounded ID/decision projections. Summary is default-off, idempotent, generation/audit bound, cancel-on-disable, and no-backfill across persisted chat ingress, pending-normalization raw ingress, or rollback/future clocks; redacted policy audits correlate through `groupIdHash`. The mutation/audit and reply decision commit atomically before send; injected decision failure rolls them back. `/why` selects only the latest prior exact-conversation ingress. CLI records `local_admin`; replies, titles, stderr, and audit bodies are bounded/redacted, deduplicated, executor-routed, and preserve the completed-turn/failed-execution contract on handled send failure. Integrity and foreign keys remain clean. |
+| `REL-RET-01` | At least 12 synthetic retrieval queries, each with one expected same-scope source, eight or more newer/higher-importance same-scope distractors, and incompatible-scope records | Existing ranking may skip R8 only when the expected source is selected in 12/12 under production count/token limits, incompatible selections are zero, and selection/rejection trace reasons are complete; otherwise query/FTS/quote/thread ranking is required. |
+| `REL-SCOPE-01` | Similar users/messages across two groups | History, quote targets, participant refs, memory, action targets, and bot responses remain in the exact conversation; integrity and foreign-key checks are clean. |
+
+Minimum test ownership:
+
+- context and quote scenarios:
+  `tests/integration/context-history.test.ts`,
+  `tests/unit/context/builder.test.ts`, and
+  `tests/unit/pi/pi-adapter.test.ts`;
+- Attention/action scenarios:
+  Attention unit tests, `tests/unit/actions/social-decision-service.test.ts`,
+  `tests/unit/attention/delayed-attention-service.test.ts`, scheduled/unsupported
+  type coverage in `tests/unit/workers/background.test.ts`, schema-v5 migration
+  and retention tests, and focused `REL-ATT-02` flows in
+  `tests/integration/e2e-conversation.test.ts`;
+- evaluator scenarios:
+  `tests/unit/evaluator/model-evaluator.test.ts` and
+  `tests/unit/evaluator/pi-ai-client.test.ts` across social, memory, and tool
+  domains, plus schema-migration/model-invocation repository tests and DB-backed
+  social, memory, and required-tool terminal evidence;
+- memory-claim truthfulness:
+  `tests/unit/actions/memory-claim-truthfulness.test.ts` for evidence binding,
+  correction, safe echo, and ordinary-language boundaries, plus the focused
+  `REL-MEM-01` flow in `tests/integration/e2e-conversation.test.ts` for action,
+  delivery, bot-response, raw-draft, and foreign-key integrity;
+- memory/governance/worker scenarios:
+  focused memory extraction, retrieval/injection, summary-worker, governance,
+  scheduler, and full-memory-cycle suites. `REL-MEM-03` additionally belongs to
+  the group-summary job service, index wiring, action executor, SQLite
+  maintenance, summary integration, and frozen-window conversation E2E suites.
+- QQ governance grammar, source proof, authority, redaction, listing, forget,
+  summary, and `/why` service behavior:
+  `tests/unit/governance/qq-command.test.ts`,
+  `tests/unit/governance/service.test.ts`,
+  `tests/unit/config/index.test.ts`, and
+  `tests/unit/storage/group-summary-policy-repository.test.ts`;
+- QQ/CLI governance integration:
+  focused `REL-ADMIN-01`/`REL-GOV-01` flows in
+  `tests/integration/e2e-conversation.test.ts` own pre-Attention routing,
+  decisions/executions, delivery/failure, deduplication, and exact-conversation
+  isolation; `tests/integration/cli-main.test.ts` owns shared-service
+  `local_admin` delete/summary lifecycle, parser failures, redaction, and
+  integrity;
+- query-aware retrieval:
+  `tests/integration/query-aware-memory-retrieval.test.ts` owns the 12-case
+  current/quote/thread by private-user/group-user/group-fact/conversation-fact
+  matrix, including 51-record same-scope and cross-owner pre-limit cases,
+  incompatible group/conversation boundaries, competing query/scope order,
+  complete bounded-candidate accounting and durable evidence round-trip, token
+  limits, and integrity/foreign keys. ContextBuilder, repository, FTS-query, ContextTrace,
+  governance `/why`, and memory-search suites own the focused compatibility
+  boundaries.
+
+`BASIC_USABLE` requires `REL-CTX-01/02`, `REL-QUOTE-01/02`, `REL-ATT-01`,
+`REL-ADMIN-01`, `REL-EVAL-01/02`, `REL-MEM-01`, and `REL-SCOPE-01`, plus the
+controlled live canary. `TARGET_COMPLETE` additionally requires
+`REL-ATT-02`, `REL-MEM-02/03`, `REL-GOV-01`, `REL-RET-01`, restart evidence, and
+the complete live behavior matrix. A transport-only fake or a healthy live
+container cannot satisfy either milestone.
+
+The generated local-acceptance evidence template names every row above and the
+R0 deterministic/release baseline. Each row has a fixed scenario ID, expected
+classification, generated verification command, and required behavior plus
+bounded actual classification, passed/total counts, durable-chain status, and
+pass/fail result. `--require-complete` requires each row to be checked with a
+passing actual/result, equal positive counts, and verified durable linkage. It
+also requires the controlled direct delivered-reply p95 to be at most 15,000
+ms, rejects content outside the generated template structure, and limits
+placeholder replacements to typed status/count/latency values, fixed safe or
+redacted paths, real calendar timestamps/dates, and bounded internal/redacted
+labels rather than free-form text.
+
+## Test Data And Time
+
+- Prefer fixed timestamps and synthetic IDs that cannot be confused with real
+  accounts.
+- Use fresh migrated temporary SQLite databases for persistence flows and clean
+  them in `finally`/test teardown.
+- For delayed Attention, use the worker's deterministic `now` override to test
+  the instant before and at `scheduled_at`; do not sleep for 15 or 120 seconds.
+  Anchor policy windows to synthetic local ingress/admission time, not the
+  platform message clock, so clock-skew behavior remains deterministic.
+- Use fake timers only around the behavior under test, restore real timers in
+  teardown, and assert stale timers cannot affect reused objects.
+- Seed deliberate secret/platform-shaped values only to prove redaction; never
+  use real credentials or account data.
+
+## Real Provider And Live QQ Evidence
+
+Real provider tests require explicit opt-in and credentials. Follow
+[the E2E provider guide](../tests/e2e/README.md); do not read implicit local
+credential files or turn a skipped test into a pass claim.
+The governed-tool probe must join its durable evaluator decision to exactly one
+completed evaluator invocation with matching request, domain, owner, sources,
+provider/model/prompt identity, and timestamps. A non-placeholder
+`evaluator_version` without that link is only declared metadata, not
+real-provider evidence.
+
+Real SnowLuma/NapCat/QQ acceptance is a separate controlled workflow. It
+requires explicit runtime/session authorization and redacted evidence produced
+through [Local Container Acceptance](local-container-acceptance.md). Completion
+requires both validators:
 
 ```bash
-# Must pass before moving to next phase
-pnpm test:regression && pnpm typecheck && pnpm lint
+pnpm acceptance:validate-evidence -- /tmp/lethebot-acceptance-evidence.md
+pnpm acceptance:validate-evidence -- /tmp/lethebot-acceptance-evidence.md --require-complete
 ```
 
-### CI/CD (Future)
+FakeOneBot, local HTTP/WebSocket fixtures, release checks, and an unfilled
+evidence template do not substitute for live acceptance.
+The default validator is a heuristic secret/platform/raw-label scan and does
+not prove arbitrary free-form text share-safe. Human review remains required.
+`--require-complete` additionally enforces the generated template structure,
+the full structured R0-R8 matrix, successful status/count/durable-chain values,
+required health/readiness/metrics redaction attestations, and the latency bound;
+it still does not execute commands or authenticate operator declarations.
 
-```bash
-# Quick feedback loop
-pnpm test:unit
+## Adding Or Changing Behavior
 
-# Full safety net
-pnpm test:all
+1. State the observable failure and acceptance criterion.
+2. Add a focused failing regression or another falsifiable check.
+3. Make the smallest architecture-compliant change.
+4. Run the focused test and affected subsystem suite.
+5. For TypeScript behavior changes, run typecheck and lint.
+6. For persistence changes, assert rows, rollback/lifecycle behavior, and clean
+   foreign keys on a fresh database.
+7. Run `pnpm release:check` for cross-cutting changes and before completion
+   claims.
 
-# Live integration (Phase M+, requires arqelvps access)
-pnpm test:live
-```
-
----
-
-## Coverage Goals
-
-- **Unit tests:** >80% line coverage for core modules
-- **Integration tests:** All P0 regression tests + phase acceptance
-- **Live tests:** Phase M soak test (multi-day)
-
-P0 does not require 100% coverage. Focus on critical boundaries and regression prevention.
-
----
-
-## Test Doubles Strategy
-
-- **FakeOneBot:** Simulates QQ/NapCat gateway (Phase D+)
-- **Mock Pi:** For testing without real model API (Phase G+)
-- **In-memory DB:** For fast unit tests (Phase C+)
-- **Real NapCat:** Only for Phase M live soak
-
-Default to fakes for speed. Use real components only for final integration verification.
+Do not weaken or skip a test to make a gate pass unless the test contradicts a
+confirmed current contract; document that decision when it occurs.

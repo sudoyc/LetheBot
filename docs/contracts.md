@@ -2,12 +2,14 @@
 
 This document defines the TypeScript interfaces and data schemas that form the contracts between LetheBot's modules. These are the "cannot guess" boundaries for implementation.
 
-**Status:** Draft for loop engineering. Exact field names can evolve during Phase B, but the ownership boundaries must stay stable.
+**Status:** Architecture contract reference. Current TypeScript types,
+repositories, migrations, and tests are authoritative for exact implemented
+field names; the ownership boundaries here remain normative.
 
 ## Design Principles
 
 1. **Explicit over implicit:** Every boundary has a typed interface.
-2. **Immutable event sourcing:** Raw events and action decisions are append-only.
+2. **Append-only event sourcing:** Raw events are append-only while retained, and action decisions are append-only.
 3. **Separation of concerns:** Gateway doesn't know about memory; Pi doesn't write directly to storage.
 4. **Testability:** Every interface can be mocked or faked.
 
@@ -39,6 +41,11 @@ interface ChatMessageReceived extends InternalEvent {
   source: 'gateway';
   platform: 'qq';
 
+  ingress: {
+    transport: 'http' | 'ws';
+    platformEventId?: string;
+  };
+
   message: {
     messageId: string;  // platform message ID
     conversationId: string;
@@ -47,6 +54,8 @@ interface ChatMessageReceived extends InternalEvent {
     groupId?: string;  // if group
     senderId: string;  // platform user ID
     senderRole?: 'member' | 'admin' | 'owner';
+    senderDisplayName?: string;
+    senderCard?: string;
 
     content: {
       text?: string;
@@ -77,6 +86,80 @@ interface QuotedMessage {
   text?: string;
 }
 ```
+
+For a valid normalized OneBot `message_id`, ingestion claims one canonical raw
+event by `(platform, type, conversationId, platformEventId)`. Conversation is
+part of the key and transport is not: the same message ID in another
+conversation is distinct, while HTTP and WebSocket deliveries of the same key
+deduplicate. Missing, malformed, or wrong-namespace message IDs use a bounded
+local `messageId` and omit `platformEventId`; those deliveries have no
+cross-delivery deduplication guarantee.
+
+The first successful claimant owns the stored normalized payload, event
+timestamp, internal event ID, and payload-level ingress transport. A retry with
+changed content never overwrites that canonical row. The claim transaction also
+appends an `accepted` receipt and creates one `event_processing_admissions` row
+in `accepted` state. Later matching deliveries append `duplicate` receipts
+linked to the same raw event and record their actual transport and receipt time;
+they never create or repair an admission. Only a new accepted claim is enqueued
+for downstream identity, chat, turn, action, and delivery work. Any failure to
+write the raw event, accepted receipt, or admission rolls back all three.
+
+An accepted receipt proves the canonical claim committed, not that asynchronous
+turn processing completed. The admission moves through
+`accepted -> processing -> completed|failed`; inactive-account and silent paths
+still end as `completed`. The compare-and-set transition to `processing` occurs
+before identity, derived chat, turn, Pi, tool, action, or send work. Ignored
+packets and failed claim transactions create no receipt or admission. HTTP
+accepted and duplicate deliveries return the bounded success response; a claim
+transaction failure returns bounded HTTP 503 and can be retried after the
+underlying fault is fixed. WebSocket duplicates have no outbound response side
+effect.
+
+At startup, ingress remains closed while the application reconciles the ledger
+and waits for the configured gateway transport to become ready. It rehydrates
+and strictly validates the stored normalized event, including its ISO
+timestamp, raw-row identity fields, and matching accepted receipt. A valid
+`accepted` row with no chat, turn, or event-failure evidence can be claimed once
+and replayed. A `processing` row is eligible only when a fresh read under an
+immediate SQLite transaction proves the same strict event validity, exactly one
+matching accepted receipt, and no chat, trigger-turn, or event-failure evidence.
+A guarded compare-and-set then resets it to the canonical `accepted` shape; only
+the single winning reset is queued for replay. Malformed or contradictory
+accepted rows and ineligible processing rows that still remain `processing`
+become `interrupted_review`; a reset that loses to another state transition is
+never enqueued and that newer state is left untouched. In the same SQLite
+transaction, linked `pending`/`running` turns become `aborted`, receive a bounded
+recovery marker and `completed_at`, while completed/failed/aborted turns and
+context/action/execution/bot-response evidence remain unchanged. If the turn
+update fails, the admission transition rolls back. Terminal admissions and
+legacy raw rows without admissions remain inert. Startup reconciliation assumes
+the previous application process is stopped; it is not a multi-instance lease
+or ownership protocol.
+
+Graceful application shutdown closes ingress admission before draining work.
+An HTTP event whose request body completes after admission closes receives the
+same bounded 503 and creates no raw event or receipt; WebSocket ingress receives
+a failed disposition and is not claimed. Already accepted event tasks and
+already started scheduler handlers are awaited while the gateway remains
+available for outbound completion. HTTP listener close, scheduler drain, and
+event-task drain start together; the gateway and SQLite connection close only
+after all three settle. Repeated stop requests share one shutdown sequence.
+There is intentionally no timer that closes SQLite under unresolved work. After
+a supervisor hard kill, a `processing` admission with any
+chat, turn, or failure evidence remains delivery/effect-unknown and startup
+quarantines it instead of risking a duplicate external effect. Automatic
+recovery is limited to valid `accepted` work and guarded-reset processing work
+that is proved evidence-empty.
+
+The `raw_events.payload` for this path is the normalized internal event, not the
+original OneBot wire object. Deduplication lasts only while the canonical raw
+row exists; explicit retention may delete unpinned raw rows and cascade their
+receipts and terminal admission, after which the same platform key can be
+accepted again. `accepted` and `processing` admissions pin their raw row until
+they reach a terminal state. A `pending` or `running` delayed-Attention job also
+pins its candidate's raw/chat source; terminal jobs release that retention
+guard.
 
 Unsupported OneBot inbound post types such as `notice`, `request`,
 `meta_event`, `message_sent`, and unknown/future post types such as
@@ -184,6 +267,12 @@ create extra outbound WebSocket sends, leak malformed identifier fragments
 through emitted events/readiness, or resolve/remove unrelated pending WebSocket
 API requests.
 
+Downstream ingestion, context traces, memory visibility checks, and Pi/tool
+policy context use the gateway-normalized group identifier (`qq-group-<digits>`)
+without stripping the prefix. This keeps durable `chat_messages.group_id`,
+`context_traces.group_id`, display-profile `source_group_id`, and tool
+`allowedGroupIds` / `deniedGroupIds` policy values comparable by exact string.
+
 For OneBot top-level `time`, accept only finite numeric Unix seconds and convert
 them to internal `Date` timestamps. Malformed string/object/array/boolean/null,
 `NaN`, and `Infinity` values must fall back to the receipt-time window rather
@@ -266,6 +355,14 @@ pending request is created, the adapter must clear that pending request, redact
 the caller/readiness diagnostic, and avoid unhandled internal promise
 rejections.
 
+WebSocket lifecycle callbacks are owned by the socket that registered them.
+Only the current socket may change readiness, resolve/reject pending requests,
+or dispatch ingress; stale `open`, `message`, `error`, and `close` callbacks from
+a stopped or superseded socket are ignored. An unexpected close of the current
+socket schedules one fixed-delay replacement, while adapter stop cancels the
+timer. Pending sends reject on their current connection loss and are not
+replayed automatically because delivery may already have occurred.
+
 ### 1.3 Gateway Capabilities
 
 ```typescript
@@ -291,6 +388,12 @@ interface GatewayCapabilities {
 }
 ```
 
+Current real `OneBotAdapter` capability reports are conservative and must match
+implemented gateway side effects: `reactions.emojiLike=false`,
+`reactions.faceMessage=true`, and all `foldedForward` fields are `false` until
+real OneBot/NapCat folded-forward node APIs are wired. Fake gateways may expose
+stronger capabilities only for deterministic executor tests.
+
 ---
 
 ## 2. Identity & Display
@@ -311,6 +414,19 @@ interface PlatformAccountMapping {
   lastSeenAt: Date;
 }
 ```
+
+Canonical identity resolution uses only `status=active` mappings. Repository
+inspection may return disabled/deleted mappings so callers can distinguish an
+inactive tombstone from an account that has never been observed; create-or-get
+helpers must create only when no row exists and must not reactivate an inactive
+row. First-seen create-or-get is one immediate transaction with read-winner
+semantics, so concurrent events cannot return different canonical users for one
+platform account. Explicit mapping creation is insert-only. Automatic resolution
+may refresh timestamps only for an active mapping; neither path can change its
+canonical owner, verification metadata, or lifecycle state. Runtime events from
+inactive mappings retain the raw ingress claim and
+receipt but stop before display metadata, chat-message, turn, context, Pi,
+action, or memory-extraction work.
 
 ### 2.2 Display Profile
 
@@ -344,9 +460,18 @@ interface NicknameHistoryEntry {
 ### 3.1 Context Pack
 
 ```typescript
+interface MemorySelectionEvidence {
+  memoryId: string;
+  querySources: Array<'current_message' | 'quoted_message' | 'recent_thread'>;
+  retrievalMethods: Array<'scoped_rank' | 'fts'>;
+  scopeAffinity: 'exact_conversation' | 'exact_group' | 'same_user' | 'global';
+  retrievalRank: number;  // positive, 1-based final candidate order
+  selectionReason: 'profile_priority' | 'query_match' | 'ranked_fallback';
+}
+
 interface ContextPack {
   id: string;  // ULID
-  turnId: string;  // ties to agent_runs
+  turnId: string;  // ties to agent_turns
   createdAt: Date;
 
   conversation: {
@@ -357,6 +482,8 @@ interface ContextPack {
 
   // Recent messages (token-budgeted)
   recentMessages: RecentMessage[];
+  currentMessageRef?: MessageRef;
+  replyReference?: ReplyReference;
 
   // Memory (visibility-filtered)
   memory: {
@@ -371,6 +498,16 @@ interface ContextPack {
 
   // Injected identity fields (for audit)
   injectedIdentityFields: string[];  // e.g., ['current_display_name', 'sender_role']
+  injectedIdentityData?: Array<{ name: string; value: string }>;
+
+  // Retrieval/injection trace (not necessarily rendered into the prompt)
+  trace?: {
+    candidateMemoryIds: string[];
+    selectedMemoryIds: string[];
+    rejectedMemories: Array<{ memoryId: string; reason: string }>;
+    memorySelections?: MemorySelectionEvidence[];
+    filtersApplied: string[];
+  };
 
   // Token budget tracking
   tokenBudget: {
@@ -382,6 +519,7 @@ interface ContextPack {
       identity: number;
       system: number;
     };
+    promptLayers?: Array<{ name: string; version: string; tokens: number }>;
   };
 }
 
@@ -392,11 +530,31 @@ interface RecentMessage {
   text?: string;
   timestamp: Date;
   isFromBot: boolean;
+  senderRole?: 'member' | 'admin' | 'owner';
+
+  // Assigned after token-budget selection; opaque and local to this pack.
+  messageRef?: MessageRef;
+  speakerRef?: SpeakerRef;
+  isCurrent?: boolean;
+}
+
+type MessageRef = `message_${number}`;
+type SpeakerRef = `speaker_${number}`;
+
+interface ReplyReference {
+  status: 'resolved' | 'unresolved';
+  sourceMessageRef: MessageRef;
+  targetMessageRef?: MessageRef;
+  targetSpeakerRef?: SpeakerRef;
+  targetRole?: 'human' | 'bot';
+  targetInRollingWindow?: boolean;
 }
 
 interface MemoryBlock {
+  id?: string;  // compatibility alias
   memoryId: string;
   scope: string;
+  kind?: 'preference' | 'fact' | 'constraint' | 'summary' | 'reflection' | 'procedure';
   title: string;
   content: string;
   confidence: number;
@@ -404,7 +562,8 @@ interface MemoryBlock {
 }
 
 interface ParticipantContext {
-  canonicalUserId: string;
+  canonicalUserId?: string;
+  speakerRef?: SpeakerRef;
 
   // Display (untrusted user-provided data)
   displayName: string;
@@ -445,6 +604,7 @@ interface ActionDecision {
   // Evaluator metadata (if applicable)
   evaluatorRequired: boolean;
   evaluatorPassed?: boolean;
+  evaluatorDecisionId?: string;
   evaluatorPromptId?: string;
 }
 
@@ -458,9 +618,12 @@ interface ActionPlan {
   constraints: {
     evaluatorRequired?: boolean;
     cooldownKey?: string;
+    cooldownSeconds?: number;
     maxResponseTokens?: number;
     redactionLevel?: 'none' | 'light' | 'strict';
     capabilities?: string[];  // required gateway capabilities
+    proactive?: boolean;
+    proactiveTrigger?: 'user_requested' | 'tool_result' | 'memory_review' | 'safety_or_privacy' | 'reminder';
   };
 
   reason: string;
@@ -483,17 +646,208 @@ type ActionType =
 interface ActionTarget {
   conversationId: string;
   conversationType: 'private' | 'group';
-  userId?: string;  // for dm_user
+  userId?: string;  // platform delivery user ID for private replies / dm_user
+  canonicalUserId?: string;  // canonical user ID for privacy/governance checks
   groupId?: string;
+}
+
+type BackgroundTaskActionType =
+  | 'summary'
+  | 'extraction'
+  | 'consolidation'
+  | 'decay'
+  | 'conflict'
+  | 'admin_digest'
+  | 'retention';
+
+interface BackgroundTaskActionRequest {
+  type: BackgroundTaskActionType;
+  payload?: Record<string, unknown>;
+  idempotencyKey?: string;
+  scheduledAt?: number | Date;
+  maxAttempts?: number;
+}
+
+interface AutomaticExtractionTaskPayload {
+  sourceChatMessageId: string;  // canonical chat_messages.id
+  targetUserId: string;         // canonical user ID, not a platform account ID
+}
+
+interface DelayedAttentionTaskPayload {
+  candidateId: string;          // exact one-key internal worker payload
+}
+
+interface GroupSummaryTaskPayload {
+  conversationId: string;
+  conversationType: 'group';
+  groupId: string;
+  windowVersion: 1;
+  sourceChatMessageIds: string[]; // ordered, unique, 1..50 post-budget chat IDs
+  candidateCount: number;         // eligible pre-budget candidate count
+}
+
+interface MemoryProposalRequest {
+  scope: 'user' | 'group' | 'conversation' | 'global';
+  canonicalUserId?: string; // required for user scope
+  groupId?: string;         // required for group scope unless target.groupId exists
+  kind: 'preference' | 'fact' | 'constraint' | 'summary' | 'reflection' | 'procedure';
+  title: string;
+  content: string;
+  confidence: number;       // 0.0 - 1.0
+  sourceContext: string;    // action executor does not persist this raw value
 }
 
 interface ActionPayload {
   text?: string;
   toolCall?: ToolCallRequest;
   memoryProposal?: MemoryProposalRequest;
+  backgroundTask?: BackgroundTaskActionRequest;
   reaction?: string;
+  messageId?: string;  // target message for react_only
 }
 ```
+
+`attention_recheck` is a known internal durable worker type with the exact
+`DelayedAttentionTaskPayload` shape. It is deliberately absent from
+`BackgroundTaskActionType`: ordinary action plans cannot manufacture delayed
+Attention work; only the source-bound Attention admission path may create it.
+
+`ActionDecision` intentionally exposes no reusable execution token. Creation
+returns a detached snapshot and stores a process-keyed HMAC commitment in the
+durable action row. The commitment covers the exact evaluator outcome and its
+durable request ID, version, actor/context, source-event list, timestamps,
+domain, turn, risk, and confidence metadata, plus the turn's conversation and
+trigger event. Creation snapshots the complete input before authority
+validation. `ActionExecutor` clones and verifies that full envelope, the
+persisted/evaluator evidence, and the turn's current `action_decision_id`
+synchronously before its first awaited effect, then uses only the verified clone
+and verified turn source. Redacted `action_decisions.actions` is not an
+executable serialization. Superseded decisions, null legacy bindings, and
+bindings from another repository/process are inspection-only and fail closed.
+
+After turn and evaluator authority validation, action-decision creation applies
+the deterministic memory-claim guard before constructing, redacting, binding,
+or persisting the decision. Durable-memory wording is supported only by the
+exact proposition in a currently active, in-scope memory selected by this
+turn's ContextTrace. A fully committed same-turn `memory.propose` effect may be
+described only as pending review. Missing, failed, unrelated, unselected,
+inactive, ambiguous, or target-mismatched evidence produces neutral wording and
+adds the fixed `memory_claim_truthfulness_guard` suppressor. A planned action is
+not evidence of an effect, and this guard does not mutate memory state.
+
+Automatic extraction stores only `AutomaticExtractionTaskPayload` in the
+durable job. A deterministic candidate check commits that job with the canonical
+inbound chat row in one local transaction before Attention can return or later
+Pi/action/send work can fail. The handler reloads text, conversation type/group,
+and timestamp from that row, verifies that its current active platform-account
+mapping resolves to `targetUserId`, and rejects bot/non-gateway or mismatched
+sources. It never trusts copied user/bot text in the job payload. For group
+sources, the worker reapplies the same bounded exact pattern set as admission so
+nested reports, hypotheticals, wants, or needs cannot become a broader secondary
+match. Bot-response persistence and successful turn completion form a later
+separate local transaction. Pending/running automatic extraction jobs pin their
+source chat row against retention until the job becomes terminal or durable
+memory provenance takes over.
+
+For `dm_user`, `ActionTarget.userId` is the gateway delivery identifier (for
+OneBot/QQ, the normalized platform user ID such as `qq-<digits>`). Privacy and
+governance checks must use `ActionTarget.canonicalUserId` instead. A proactive
+`dm_user` cannot satisfy proactive-DM opt-out enforcement by looking up the
+platform delivery ID as if it were the canonical user ID.
+
+`SocialDecisionService` uses the same identity split for base private reply
+actions. Private action targets persisted in `action_decisions.actions` carry
+the platform sender ID in `target.userId` for gateway delivery and the actor's
+canonical user ID in `target.canonicalUserId` for governance/audit continuity.
+Group reply targets keep `target.groupId` and do not treat the group sender as a
+DM delivery target.
+For social evaluation, an outbound group intervention is proactive when the
+inbound event neither mentions the bot nor has a verified `reply_to_bot`
+Attention signal. The same boolean is stored in the locally constructed action
+constraint and evaluator request; a raw reply-to-message field targeting a
+human does not make the intervention reactive. Private turns and directly
+addressed group turns are non-proactive. Normalized group owner/admin roles are
+represented as `group_admin` in social evaluator actor evidence.
+Evaluator `modifiedAction` output may change the action type, payload, and
+reason, and may add or strengthen constraints, but it must not replace the
+locally constructed `ActionTarget` or weaken locally derived control
+constraints. The service re-anchors modified actions to the original target and
+merges constraints before persistence so model/evaluator output cannot retarget
+delivery, swap canonical governance identity, drop evaluator-required status,
+remove or shorten cooldowns, including through `downgradeAction.cooldownSeconds`,
+clear a locally derived proactive marker, raise local response-token budgets,
+lower redaction strictness, or remove locally required capabilities.
+The structured evaluator result reason and social-action narrative copies
+derived from it are storage-redacted and bounded to 2,048 characters including
+the truncation marker. Evaluated action persistence also requires social
+request/result domains, coherent passed/risk/confidence metadata, the turn's
+trigger event in `sourceEventIds`, and existing raw-event sources. A passing
+result must reconstruct the final non-`silent_store` action exactly from the
+reviewed proposed action plus the evaluator modification/downgrade. Downgrade
+results require a matching `downgradeAction.from`, and a passing result cannot
+claim `riskLevel="prohibited"`. A final all-`silent_store` plan remains allowed
+when deterministic cooldown suppression removes the reviewed outward action.
+
+`admin_digest` actions are executed by scheduling a durable `admin_digest` job;
+the execution result links the `action_executions` row to `jobs` through
+`executed.jobId` / `executed_job_id` instead of sending a gateway message.
+The generated `action:admin_digest:<decisionId>` idempotency key is preserved
+for single actions and receives a deterministic `:actionN` suffix only when one
+decision contains multiple `admin_digest` durable-job actions.
+`propose_memory` actions are executed by creating a governed proposed memory
+through `MemoryRepository.create`; they do not auto-activate memory and do not
+send a gateway message. The executor requires a traceable turn source, links the
+new memory to the triggering `raw_event`, persists
+`action_executions.executed_memory_id`, and returns `executed.memoryId`.
+Secret/prohibited content is rejected by deterministic memory policy before any
+memory row is written. User-scoped proposals also honor
+`memory_association=opted_out` during action execution: the executor rejects the
+action before source lookup or memory creation and records a rejected
+`action_executions` row whose rejection evidence does not copy candidate
+content.
+`silent_summarize_later` actions are executed by scheduling a durable `summary`
+job and perform no gateway send. Private summaries use the generated
+`action:silent_summarize_later:<decisionId>:summary` idempotency, with a
+deterministic `:actionN` suffix only for duplicate actions in the same generated
+durable-job idempotency group. The execution result links through
+`executed.jobId` / `executed_job_id`. The stored job payload contains bounded
+action provenance, target conversation fields, and a redacted reason summary
+rather than raw prompt/action payload text. Because this is durable job
+scheduling rather than a pure no-op, prohibited or evaluator-unapproved
+decisions are rejected before any `jobs` row is created.
+For group targets, the action target must also equal the verified triggering
+chat row's exact conversation and group. A single governed summary job service
+checks the enabled policy, strips caller-supplied scope/window fields, plans the
+canonical local-ingress window, and freezes `GroupSummaryTaskPayload`. Mutable
+`messageRange` / `timeRange` fields are not authoritative for group jobs. One
+valid pending/running exact-scope window is reused before replanning. Otherwise
+the service derives `summary:group-window:v1:*` from group/conversation scope,
+policy generation, and the ordered sources; route-specific caller keys do not
+control group idempotency. Policy and source revalidation plus the `jobs` and
+`group_summary_job_bindings` inserts are atomic. Sources already governed by a
+summary or reserved by an existing frozen window, including a terminally failed
+one, cannot overlap.
+Private summary jobs remain unbound. Missing, contradictory, cross-group, or
+ambiguous trigger scope fails before job creation.
+`schedule_background_task` actions follow the same durable-job linkage for
+known local task types (`summary`, `extraction`, `consolidation`, `decay`,
+`conflict`, `admin_digest`, and `retention`): the executor writes a generated
+`action:schedule_background_task:<decisionId>:<taskType>` idempotency key,
+preserving that backward-compatible key for single actions and appending
+`:action1`, `:action2`, ... only for duplicate same-type durable jobs inside one
+decision for non-group tasks and private summaries. The executor persists
+redacted worker-consumable task fields at top level plus bounded audit provenance
+and `taskPayload`, and ignores any raw action-provided idempotency key so secrets
+or platform IDs do not become durable job lookup keys.
+Its group `summary` variant uses the same exact trigger-source, frozen-window,
+and policy-bound service as discovery and `silent_summarize_later`. The handler
+parses a nonempty, unique, bounded frozen list before Provider access. Execution
+rejects missing, reordered, cross-scope, pre-epoch, or ContextBuilder-omitted
+sources, and later rows cannot enter the window. The matching binding, enabled
+generation, and current unexpired job-attempt authority are checked around
+Provider use; the exact snapshot is reread before the governed write. Final
+FK-backed `memory_sources` equals the frozen set. Deterministic policy/binding
+failures are non-retryable job failures.
 
 ### 4.2 Action Execution Result
 
@@ -540,7 +894,7 @@ interface ActionExecutionResult {
 
 ```typescript
 interface MemoryRecord {
-  id: string;  // ULID
+  id: string;  // stable opaque ID; some worker effects use a versioned hash
 
   // Ownership
   scope: 'global' | 'user' | 'group' | 'conversation' | 'tool' | 'system';
@@ -560,7 +914,13 @@ interface MemoryRecord {
   content: string;
 
   // Lifecycle
-  state: 'proposed' | 'active' | 'superseded' | 'disabled' | 'deleted';
+  state: 'proposed' | 'active' | 'rejected' | 'superseded' | 'disabled' | 'deleted';
+  // Repository lifecycle updates cannot transition an existing record back to
+  // proposed; proposal state is created only by governed memory creation.
+  // Repository approve/reject operations require current state=proposed.
+  // Other repository state changes must follow the lifecycle state machine:
+  // active -> disabled/deleted/superseded, disabled/rejected/deleted -> active
+  // restore or deletion where applicable, superseded -> deleted.
   confidence: number;  // 0.0 - 1.0
   importance: number;  // 0.0 - 1.0
 
@@ -579,14 +939,74 @@ interface MemoryRecord {
 ### 5.2 Memory Source Link
 
 ```typescript
-interface MemorySource {
-  memoryId: string;
+interface MemorySourceInput {
   sourceType: 'raw_event' | 'chat_message' | 'tool_output' | 'worker_extraction' | 'user_command';
   sourceId: string;
+  sourceTimestamp?: Date | number;
+  extractedBy?: 'user' | 'evaluator' | 'tool' | 'worker';
+  external?: boolean;
+}
+
+interface MemorySourceRow {
+  memoryId: string;
+  sourceType: MemorySourceInput['sourceType'];
+  sourceId: string;
   sourceTimestamp: Date;
-  extractedBy?: 'user' | 'evaluator' | 'worker';
+  extractedBy?: MemorySourceInput['extractedBy'];
+  resolutionState: 'internal' | 'external' | 'legacy_unresolved';
+  rawEventId?: string;
+  chatMessageId?: string;
+  toolCallId?: string;
+  jobId?: string;
+  jobAttemptId?: string;
 }
 ```
+
+Repository-backed creation requires a non-empty `sources[]`; `sourceContext`
+describes policy context and never supplies source identity. New internal
+sources resolve inside the create transaction: `raw_event` to `raw_events.id`,
+`chat_message` to `chat_messages.id`, `tool_output` to a successful
+`tool_calls.id`, and `worker_extraction` to exactly one completed extraction
+job or completed attempt. A worker link also requires a separate raw/chat source
+on the same request that is referenced by the job payload/result evidence.
+
+Only `user_command` may be opaque. It requires `external=true`, an `admin_cli`
+actor context, and an `admin_cli` source context; internal types reject the
+external flag. New writes never create `legacy_unresolved` rows. Compatibility
+migration may retain that state for historical provenance that cannot be
+resolved safely.
+
+Source IDs must be non-empty and unique within one create request, source
+timestamps must be finite, and optional lifecycle `expiresAt` must be finite.
+Omitted, malformed, orphaned, wrong-table, or semantically unusable evidence
+rejects the transaction before any memory, source, revision, audit, or FTS row
+survives. No `memory:<memoryId>` fallback is created.
+
+Repository retrieval/search applies lifecycle, sensitivity, and context
+visibility predicates before applying result limits. Private-only or otherwise
+inaccessible records cannot consume the limited candidate window for group
+contexts.
+Context assembly must pass the current conversation context into prompt-eligible
+memory retrieval and use separate scoped lookups for same-group or
+same-conversation memory so context-local IDs do not accidentally become broad
+metadata filters for all user/global memories.
+It may derive bounded FTS queries only from the explicit current message, an
+exactly resolved same-conversation quote, and the recent same-conversation
+thread. Each FTS call retains the route's SQL boundary predicates before its
+limit. The query text, tokens, MATCH syntax, message IDs, and BM25 values are
+ephemeral. ContextTrace persists only the fixed `MemorySelectionEvidence`
+categories above, ordered exactly like `selectedMemoryIds`; rejection reasons
+continue to account for every other bounded candidate.
+
+The current record's `evaluatorDecisionId` describes the latest governed
+mutation, not immutable creation authority. A lifecycle write uses its explicit
+evaluator decision when supplied; otherwise it writes
+`policy:l0:<target-state>:<memory-id>` to the record, new revision, and audit.
+It never inherits the previous mutation's ID. Creation authority remains in
+revision 1's decision column and snapshot plus the `memory.create` audit. Durable
+extraction retry validates those immutable create fields and ignores legitimate
+later lifecycle identity, confidence, importance, and state changes.
+
 
 ### 5.3 Memory Revision
 
@@ -600,7 +1020,7 @@ interface MemoryRevision {
   newState: Partial<MemoryRecord>;
 
   reason: string;
-  changeType: 'create' | 'update' | 'supersede' | 'disable' | 'delete' | 'restore';
+  changeType: 'create' | 'update' | 'approve' | 'reject' | 'supersede' | 'disable' | 'delete' | 'restore';
 
   actor: string;  // canonical_user_id or 'system'
   evaluatorDecisionId?: string;
@@ -645,8 +1065,8 @@ interface ToolRegistryEntry {
     output: object;  // JSON schema
   };
 
-  // Handler
-  handler: string;  // module path or function reference
+  // Resolved handler function
+  handler: ToolHandler;
 }
 
 type ToolCapability =
@@ -697,7 +1117,45 @@ interface SandboxPolicy {
   allowedPaths?: string[];
   allowedDomains?: string[];
 }
+
+interface ToolHandlerRequest {
+  toolCallId: string;
+  turnId: string;
+  toolName: string;
+  signal: AbortSignal;
+  evaluatorDecisionId?: string;
+  sourceEventIds?: string[];
+  input: unknown;
+  actor: {
+    canonicalUserId?: string;
+    actorClass: ActorClass;
+    groupId?: string;
+  };
+  context: InvocationContext;
+}
+
+type ToolHandler = (request: ToolHandlerRequest) => Promise<unknown>;
 ```
+
+Optional `maxRuntimeMs` and `maxOutputBytes` metadata must be positive safe
+integers, and `maxRuntimeMs` may not exceed the host timer maximum
+`2147483647`. Immediately before handler invocation, after policy and evaluator
+checks, the Pi wrappers compose the optional Pi signal and registered runtime
+limit into the required handler signal. A pre-aborted call never invokes the
+handler. Upstream cancellation records `error / TOOL_EXECUTION_ABORTED`; runtime
+expiry records `timeout / TOOL_RUNTIME_LIMIT_EXCEEDED`. Both use fixed messages,
+await actual handler settlement, and prevent a late result or prepared local
+effect from becoming success.
+
+The output limit must be at least the computed stable truncation envelope size
+(currently `87` UTF-8 bytes). After secret/platform redaction, PiAdapter
+independently bounds prompt text and JSON-serialized durable output. Truncated
+output carries `[TRUNCATED:tool_output]`; oversized structured output is replaced
+with `{ truncated: true, originalBytes, preview }`. A handler that resolves
+inside its runtime boundary remains `success` / `tool.executed`, including a
+prepared local effect that commits once with the bounded terminal pair.
+Cancellation is cooperative: a non-cooperative in-process handler is still
+awaited, and already-performed external effects cannot be rolled back.
 
 ### 6.2 Tool Call
 
@@ -713,6 +1171,7 @@ interface ToolCallRequest {
   actor: {
     canonicalUserId?: string;
     actorClass: ActorClass;
+    groupId?: string;  // runtime policy context for group-scoped permissions
   };
 
   context: InvocationContext;
@@ -749,7 +1208,7 @@ interface AgentTurn {
   conversationId: string;
 
   // Input
-  triggerEvent: InternalEvent;
+  triggerEvent: { id: string; type: string };
   contextPackId: string;
 
   // Pi interaction
@@ -759,7 +1218,7 @@ interface AgentTurn {
 
   // Output
   actionDecisionId?: string;
-  responseText?: string;
+  responseText?: string;  // pre-action-guard Pi draft
   toolCalls: string[];  // ToolCallRequest IDs
 
   // Lifecycle
@@ -775,6 +1234,94 @@ interface AgentTurn {
   };
 }
 ```
+
+For completed reply turns, `responseText` preserves the Pi draft before the
+memory-claim guard. The executable action decision, delivered message, and
+persisted `bot.response` evidence use the guarded action payload instead.
+
+The production `PiAdapter.runTurn()` invocation has a cooperative deadline from
+`PI_TURN_TIMEOUT_MS` (default `120000`, valid range `1..2147483647`). Deadline
+expiry calls Pi abort once, awaits prompt/idle settlement, and returns a stable
+failed result before the application terminalizes the durable turn. This does
+not promise forced termination when a provider or in-process tool ignores the
+abort signal, and it does not currently change the unused streaming-turn
+lifecycle.
+
+Because `PiAdapter` owns one mutable SDK Agent, every `runTurn()` and
+`streamTurn()` invocation acquires the same FIFO lease before resetting or
+installing turn state. The adapter resets the retained SDK transcript under that
+lease and releases it only after the prompt and idle state settle and the result
+is captured or generator cleanup completes. Queued `runTurn()` deadlines begin
+after lease acquisition. Closing a streamed turn early aborts an active Agent run
+and awaits prompt plus idle settlement before releasing the next turn; the
+streaming surface still has no automatic deadline.
+
+After a pending turn exists, caught context, action-decision, bot-response
+persistence, or completion-write failures terminalize it as `failed`, set
+`completedAt`, and write linked coarse `event_processing_failures` evidence when
+that failure ledger remains writable. Local `bot.response` raw-event and
+bot-self chat-message rows commit in one SQLite transaction: a late chat-row
+failure rolls back the matching raw row while already completed external-send
+and action-execution evidence remains unchanged. This does not make an external
+platform send transactional with SQLite and does not guarantee terminalization
+when the terminal state write itself is unavailable.
+
+### 7.2 Structured Evaluator Invocation
+
+The non-test social and evaluator-required tool paths use a stateless model
+evaluator. Each call contains one bounded user message, no tools, and no retained
+session history. Prompt projection omits durable turn/source/owner identifiers
+and social delivery targets, applies secret/platform redaction per structured
+value, and caps the serialized prompt at 16,384 UTF-8 bytes with a visible
+truncation marker. The completion is capped at 16,384 UTF-8 bytes and must be one
+strict domain-specific JSON object.
+For `openai-completions`, the installed Pi client also adds
+`response_format={type:"json_object"}` through the provider payload hook without
+copying tools or transcript state. Other API families keep their native payload
+unchanged.
+
+The model cannot supply durable authority metadata. LetheBot generates the
+decision ID and decided-at timestamp locally, copies the request ID from the
+original request, and derives evaluator version from configured
+provider/model/prompt version. A first-call JSON parse or strict schema failure
+terminalizes call 1 and permits exactly one fresh correction call. The correction
+prompt does not include the invalid response, and parsing remains strict; a
+second invalid result is terminal. Timeout, provider, empty, oversized,
+persistence, and other runtime failures do not enter the correction path and
+fail closed with bounded diagnostics. `LETHEBOT_TEST=true` or explicit evaluator identity
+`mock` / `mock` selects the rule-driven stub; non-mock credential/configuration
+failures never fall back to it.
+
+Automatic background memory extraction uses the same configured evaluator and
+persists its structured decision under the exact current extraction job
+attempt. The decision and governed memory or rejection-audit effect commit in
+one immediate transaction. Both before and after the synchronous effect, the
+attempt must be running, current by attempt number, owned by the matching
+worker/lease owner, and unexpired; lost authority rolls back the whole effect.
+
+Every non-mock model evaluation first creates call 1 as a running
+`purpose='evaluator'` `model_invocations` row with the exact turn or job-attempt
+owner, request/domain, configured provider/model/prompt version, and ordered raw
+event sources. Call 2 is allowed only after matching call 1 durably fails with
+`invalid_structured_output`; it must keep that exact owner, identity, and ordered
+source set. No call 3 is valid. Valid structured output terminalizes its row as
+`completed` with token counts plus only a response hash/byte count; timeout,
+abort, Provider, empty, oversized, and invalid-structured-output failures
+terminalize it without creating a decision. A successful result carries the
+locally assigned invocation ID for the call that succeeded. The tool, social, or memory decision writer revalidates the complete binding
+and stores it in the nullable unique
+`evaluator_decisions.model_invocation_id` foreign key inside the existing business
+transaction. Stub/local/legacy decisions keep that field null. A completed but
+unlinked invocation proves that a local Provider call completed before downstream
+persistence failed; it does not count as reviewed-action evidence. Neither prompt
+nor response content is stored in this ledger.
+
+After terminal model-evaluator failure, domain services retain fail-closed
+business evidence without manufacturing a decision: social persists an
+evaluator-required, explicitly failed all-`silent_store` action decision; memory
+persists one idempotent bounded rejection audit and no memory; a required tool
+persists rejected `tool_calls` and `tool.rejected` audit rows with
+`EVALUATOR_ERROR` and never invokes its handler.
 
 ---
 
@@ -808,7 +1355,7 @@ interface AuditEntry {
   redacted: boolean;
 
   // Risk flags
-  riskLevel?: 'low' | 'medium' | 'high';
+  riskLevel?: 'low' | 'medium' | 'high' | 'prohibited';
   evaluatorDecisionId?: string;
 }
 ```
@@ -838,7 +1385,7 @@ The Attention Engine does NOT build full ActionDecision. It only does fast class
 
 ```typescript
 interface AttentionSignals {
-  classification: 'silent' | 'needs_response' | 'needs_evaluation';
+  classification: 'silent' | 'defer' | 'needs_response' | 'needs_evaluation';
 
   // Basic trigger signals
   triggerScore: number;  // 0.0 - 1.0
@@ -848,11 +1395,140 @@ interface AttentionSignals {
   suppressors: string[];  // e.g., ['high_speed_chat', 'bot_spoke_recently']
 
   // Recommended path
-  recommendedPath: 'silent_fast_path' | 'reply_fast_path' | 'risk_path';
+  recommendedPath:
+    | 'silent_fast_path'
+    | 'delayed_recheck'
+    | 'reply_fast_path'
+    | 'risk_path';
 }
 ```
 
-**Design rationale:** This keeps silent_fast_path truly fast. ActionDecision is only constructed by Pi or Evaluator when actually needed.
+**Design rationale:** This keeps `silent_fast_path` truly fast. Pi supplies the
+candidate response, the evaluator may review risky plans, and
+`SocialDecisionService` constructs and persists the `ActionDecision` only when
+a turn reaches the social-decision stage.
+
+For an otherwise unaddressed QQ group question, the current engine emits
+`classification='defer'` and `recommendedPath='delayed_recheck'`. The ingress
+handler creates no turn, calls neither Pi nor the evaluator, and performs no
+gateway send. It commits the derived `chat_messages` row, one source-bound
+`attention_candidates` row, and one scheduled `attention_recheck` job in the
+same immediate SQLite transaction. Candidate/job creation is idempotent by the
+canonical raw-event source, and the job payload must be exactly
+`{ candidateId: string }`.
+
+Delayed policy time is anchored to local ingress, not the OneBot/platform event
+clock. `attention_candidates.observed_at` equals `raw_events.created_at`, and
+eligibility also requires the matching accepted receipt `received_at` and
+admission `accepted_at` to equal that value. `not_before_at` is exactly 15,000 ms
+after `observed_at`; `expires_at` is exactly 120,000 ms after it.
+
+At or after `not_before_at`, the durable handler reconstructs the strict stored
+`ChatMessageReceived` from the canonical raw/chat rows and revalidates that it
+still matches the deferred policy. Under an immediate transaction, a new
+decision requires the exact candidate/job binding and current unexpired
+job-attempt lease. There is at most one decision per candidate. Suppression is
+selected in this order:
+
+1. `thread_expired` when `now >= expires_at`;
+2. `human_answer` for a later non-bot gateway message explicitly replying to
+   the source message in the same conversation and group;
+3. `high_traffic` when at least six non-bot QQ gateway messages fall in the
+   exact group's rolling 10-second window; or
+4. `group_budget_exhausted` when that group already has two `respond` decisions
+   in the rolling 10-minute window.
+
+When none applies, inserting `outcome='respond'` reserves the group budget in
+that same transaction. Re-entry changes the stored deferred signals to
+`needs_response` / `reply_fast_path`, adds `delayed_recheck` to
+`triggerReasons`, and runs the ordinary turn pipeline with
+`sourceAlreadyPersisted`; it does not reinsert the raw event or chat message.
+The unmentioned group response is still locally marked proactive, so its action
+and evaluator request retain `proactive=true` and evaluator review is required.
+
+The completed job result is content-free and bounded. Suppression returns the
+candidate/decision IDs, `outcome`, and suppressor ID/code pairs. Response returns
+the candidate/decision/turn IDs, optional action decision/execution IDs, and a
+`deliveryRecorded` boolean. On retry, the service reuses the single decision;
+the response handler reuses a locally delivered or completed terminal turn and
+rejects pending/running or action-started evidence whose delivery state is
+indeterminate. This prevents a second send when durable evidence exists, but it
+does not claim external exactly-once if the process fails after QQ accepts a send
+and before local execution/delivery evidence is committed.
+
+Retention excludes candidate source raw/chat rows while the linked job is
+`pending` or `running`. After the job becomes terminal, source retention may
+delete those rows; the schema cascades deletion through the candidate,
+decision, and suppressors while preserving the independent `jobs` and
+`job_attempts` history.
+
+`triggerScore` is bounded relevance telemetry, not a risk score. Combining
+`@bot`, verified reply-to-bot, private-message, and question signals never
+selects `risk_path` by itself. QQ governance commands are intercepted before
+Attention and therefore are not Attention relevance or risk signals.
+
+### 9.1 QQ Governance Commands
+
+The complete case-sensitive grammar is `/memory`, `/memory forget <memory-id>`,
+`/memory summary status|enable|disable`, and `/why`. Parsing is deterministic:
+surrounding/inter-token whitespace is allowed, recognized input is bounded to
+512 characters, and a memory ID matches
+`[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`. Malformed `/memory` or `/why` families
+remain recognized; an authorized actor receives deterministic usage output,
+while an unauthorized actor receives the same denial as for valid syntax.
+Prefix collisions such as `/memoryx` or `/whyever`, generic `!` commands, and
+natural-language management text remain ordinary input.
+
+After identity/display handling, a recognized family commits its derived chat
+row and creates a local `provider=local`, `model=qq-governance-v1` turn before
+the normal Attention call. `GovernanceService` then rereads exactly one matching
+canonical QQ gateway raw row, derived chat row, normalized stored payload, and
+active account/canonical-user mapping. Any mismatch fails source verification;
+the service reparses the persisted chat text and derives authority again rather
+than trusting the application event or parser result.
+
+QQ authority is the optional configured `LETHEBOT_BOT_OWNER_QQ_ID` matching the
+normalized sender account exactly, or a stored `owner`/`admin` role in the exact
+current group. Every recognized unauthorized command returns the same bounded
+denial. A group `/memory` listing is limited to non-secret, non-deleted exact
+group/conversation records and same-group user records; it excludes private,
+global, and other-group records even for the bot owner. A broad private-chat
+listing is available only to that configured bot owner. Group owner/admin
+`forget` is restricted to the same group-safe record set. A bot owner or
+`local_admin` CLI may forget a known ID broadly; unavailable, deleted, and
+unauthorized IDs are indistinguishable. Forget uses the memory repository's
+normal deleted-state revision/audit transaction, so retrieval exclusion is
+immediate.
+
+Summary commands require a group source and apply to exactly its persisted
+group. Missing policy means disabled. A changed enable/disable state advances
+the generation and records actor/source audit evidence; requesting the current
+state is an idempotent no-op. Disable prevents enqueue/retrieval and atomically
+marks bound pending summary jobs failed/canceled without deleting retained
+summary memory. Re-enable establishes a later eligibility boundary and does not
+backfill the disabled interval. `/why` reports only bounded/redacted counts and
+status for the latest prior QQ turn in the exact conversation, ordered by
+canonical raw-event ingress; the command turn and every other conversation are
+excluded.
+
+The service result becomes one low-risk, `decidedBy='attention'`,
+`evaluatorRequired=false`, `proactive=false` reply action and is executed through
+`ActionExecutor`; group uses `reply_short` and private uses `reply_full`. No
+recognized command calls Pi, an evaluator, or a tool. A successful execution
+stores exactly the delivered reply as `bot.response` and completes the local
+turn with zero tokens. Canonical ingress deduplication prevents a duplicate
+turn, governance effect, or send. A handled `SEND_MESSAGE_FAILED` result leaves
+the local turn completed, preserves the durable failed action execution, and
+creates no `bot.response` or event-processing failure. Thrown governance,
+repository, post-send response-persistence, or turn-finalization errors use the
+ordinary failed-turn/admission path, including the `governance_command` failure
+stage when applicable.
+
+CLI `delete-memory` and
+`memory-summary <status|enable|disable> --group <groupId>` call the same service
+with actor `local_admin` and invocation context `admin_cli`. CLI output is
+bounded/redacted; QQ and CLI policy mutations share the same lifecycle,
+cancellation, and audit implementation.
 
 ---
 
@@ -880,17 +1556,25 @@ interface AttentionSignals {
 
 **Chosen:** Current granularity is appropriate.
 
-**Rationale:** ParticipantContext includes exactly what's needed for policy decisions (role, trust flags) and prompt rendering (displayName), plus optional platformAccountId when debugging/disambiguation is needed. Not too much, not too little.
+**Rationale:** ParticipantContext includes exactly what's needed for policy
+decisions (role, trust flags) and prompt rendering (displayName), plus optional
+platformAccountId when debugging/disambiguation is needed. Group packs derive
+participants only from selected human message actors and bind them to opaque
+pack-local `speaker_N` references. Display labels are metadata, never identity;
+duplicate labels remain distinct speakers and missing display metadata renders
+as `unknown`.
 
 ---
 
 ## 11. Implementation Guidance
 
-For current implementation sequencing, tests, and acceptance criteria, see:
+For current implementation evidence, sequencing, tests, and acceptance criteria, see:
 
-- **`docs/next-full-implementation-plan.md`** - current full-function roadmap and phase order
+- **`docs/long-running-goal-state.md`** - active requirement/evidence checkpoint
+- **`docs/one-shot-full-completion-constraints.md`** - long-horizon execution and proof rules
 - **`docs/test-strategy.md`** - deterministic regression tests and acceptance criteria
 - **`docs/fake-gateway-design.md`** - test harness interface and test scenarios
 - **`docs/sqlite-schema.md`** - complete database schema with indexes
 
-Historical phase-by-phase task lists were moved to `docs/archive/plans/` and should not be treated as current completion evidence.
+`docs/next-full-implementation-plan.md` and historical phase-by-phase task lists
+are planning context only and must not be treated as current completion evidence.

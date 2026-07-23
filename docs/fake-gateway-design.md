@@ -1,14 +1,15 @@
 # Fake Gateway Test Harness
 
-This document defines the test double for OneBot/NapCat gateway, used in Phase D and all subsequent phases for testing without a real QQ connection.
+This document defines the deterministic OneBot/NapCat gateway test double used
+without a real QQ connection.
 
 ## Design Goals
 
-1. **Enable Phase D-G testing without real NapCat**
-2. **Simulate all message types** (private, group, @bot, reply-to-bot, reactions)
-3. **Verify bot's outgoing messages** (assertions on sent content)
+1. **Enable credential-free gateway and conversation testing**
+2. **Simulate private/group messages, @bot, and reply-to-bot inputs**
+3. **Verify outgoing messages and reactions** (assertions on recorded effects)
 4. **Control capabilities** (enable/disable reactions, folded forward)
-5. **Simulate timing and concurrency** (message order, rapid-fire)
+5. **Exercise deterministic ordering and rapid-fire event delivery**
 
 ---
 
@@ -26,10 +27,8 @@ class FakeOneBot implements GatewayAdapter {
   disconnect(): Promise<void>;
   
   // Simulate incoming messages
-  simulatePrivateMessage(options: SimulatePrivateMessageOptions): SimulatedMessage;
-  simulateGroupMessage(options: SimulateGroupMessageOptions): SimulatedMessage;
-  simulateReaction(messageId: string, emoji: string): void;
-  simulateGroupMemberUpdate(options: SimulateGroupMemberUpdateOptions): void;
+  simulatePrivateMessage(options: SimulatePrivateMessageOptions): void;
+  simulateGroupMessage(options: SimulateGroupMessageOptions): void;
   
   // Control capabilities
   setCapabilities(capabilities: Partial<GatewayCapabilities>): void;
@@ -38,11 +37,12 @@ class FakeOneBot implements GatewayAdapter {
   getSentMessages(): SentMessage[];
   getLastSentMessage(): SentMessage | undefined;
   getSentReactions(): SentReaction[];
+  getLastSentReaction(): SentReaction | undefined;
   
   // Assertions
-  assertMessageSent(matcher: MessageMatcher): void;
+  assertMessageSent(matcher?: MessageMatcher): void;
   assertNoMessageSent(): void;
-  assertReactionSent(messageId: string, emoji: string): void;
+  assertReactionSent(messageId: string, emoji?: string): void;
   
   // Reset state
   reset(): void;
@@ -56,19 +56,10 @@ class FakeOneBot implements GatewayAdapter {
 ```typescript
 interface FakeOneBotConfig {
   // Default bot ID
-  botId: string;  // default: 'fake-bot-123'
+  botId?: string;  // default: 'fake-bot-123'
   
   // Default capabilities
   capabilities?: Partial<GatewayCapabilities>;
-  
-  // Behavior
-  autoIncrement?: {
-    messageIds?: boolean;  // auto-generate message IDs
-    userIds?: boolean;  // auto-generate user IDs
-  };
-  
-  // Timing simulation
-  deliveryDelayMs?: number;  // simulate network delay
 }
 ```
 
@@ -94,11 +85,10 @@ interface SimulatePrivateMessageOptions {
 }
 
 // Usage
-const msg = fakeGateway.simulatePrivateMessage({
+fakeGateway.simulatePrivateMessage({
   senderId: 'user-alice',
   text: '你好',
 });
-// Returns SimulatedMessage with generated messageId
 ```
 
 ### Group Message
@@ -125,7 +115,7 @@ interface SimulateGroupMessageOptions {
 }
 
 // Usage
-const msg = fakeGateway.simulateGroupMessage({
+fakeGateway.simulateGroupMessage({
   groupId: 'group-tech',
   senderId: 'user-bob',
   text: '@bot 帮我查一下',
@@ -134,20 +124,9 @@ const msg = fakeGateway.simulateGroupMessage({
 });
 ```
 
-### Return Type
-
-```typescript
-interface SimulatedMessage {
-  messageId: string;
-  conversationId: string;
-  conversationType: 'private' | 'group';
-  senderId: string;
-  timestamp: Date;
-  
-  // Useful for chaining
-  waitForReply(timeoutMs?: number): Promise<SentMessage>;
-}
-```
+The simulation methods emit the normalized event synchronously and return
+`void`. Supply `messageId` explicitly when a test needs to reference the inbound
+message later.
 
 ---
 
@@ -161,15 +140,9 @@ interface SentMessage {
   conversationId: string;
   conversationType: 'private' | 'group';
   
-  content: {
-    text?: string;
-    media?: MediaAttachment[];
-  };
+  content: MessageContent;
   
   sentAt: Date;
-  
-  // If folded forward
-  foldedForward?: boolean;
 }
 
 // Usage
@@ -177,6 +150,24 @@ const sent = fakeGateway.getSentMessages();
 expect(sent).toHaveLength(1);
 expect(sent[0].content.text).toContain('你好');
 ```
+
+### Get Sent Reactions
+
+```typescript
+interface SentReaction {
+  messageId: string;  // target/source message ID reacted to
+  emoji: string;
+  sentAt: Date;
+}
+
+const reactions = fakeGateway.getSentReactions();
+expect(reactions[0]).toMatchObject({ messageId: 'msg-123', emoji: '👍' });
+expect(fakeGateway.getLastSentReaction()?.emoji).toBe('👍');
+```
+
+`sendReaction()` records reaction side effects separately from sent messages, so
+tests can distinguish true reaction delivery from face/text fallback messages.
+`reset()` clears both sent messages and sent reactions.
 
 ### Assertions
 
@@ -199,6 +190,7 @@ fakeGateway.assertNoMessageSent();
 
 // Assert reaction sent
 fakeGateway.assertReactionSent('msg-123', '👍');
+fakeGateway.assertReactionSent('msg-123');
 ```
 
 ---
@@ -223,135 +215,99 @@ fakeGateway.setCapabilities({
 
 ## Test Scenarios
 
-### Scenario 1: Silent Fast Path
+### Scenario 1: Normalized Group Event
 
 ```typescript
-test('silent_fast_path: ordinary group message without @bot', () => {
+test('emits one normalized group event synchronously', () => {
   const gateway = new FakeOneBot();
-  const bot = new LetheBot({ gateway });
-  
+  const events: ChatMessageReceived[] = [];
+  gateway.on('message', (event) => events.push(event));
+
   gateway.simulateGroupMessage({
     groupId: 'casual-chat',
     senderId: 'user-alice',
     text: '今天天气不错',
     mentionsBot: false,
   });
-  
-  // Wait for processing
-  await bot.processEvents();
-  
-  // Assert no message sent
-  gateway.assertNoMessageSent();
-  
-  // Assert raw event was stored
-  const events = await bot.storage.getRawEvents({ limit: 1 });
+
+  expect(events).toHaveLength(1);
   expect(events[0].type).toBe('chat.message.received');
+  expect(events[0].message.conversationId).toBe('group:casual-chat');
 });
 ```
 
-### Scenario 2: Reply Fast Path
+### Scenario 2: Exact Bot Mention
 
 ```typescript
-test('reply_fast_path: @bot in group triggers reply', async () => {
+test('recognizes the configured bot in a CQ mention', () => {
+  const gateway = new FakeOneBot({ botId: '3889000770' });
+  let received: ChatMessageReceived | undefined;
+  gateway.on('message', (event) => { received = event; });
+
+  gateway.simulateGroupMessage({
+    text: '[CQ:at,qq=3889000770] 你好',
+  });
+
+  expect(received?.message.mentionsBot).toBe(true);
+  expect(received?.message.mentions).toEqual(['qq-3889000770']);
+});
+```
+
+### Scenario 3: Outbound Reaction Recording
+
+```typescript
+test('records a reaction separately from messages', async () => {
   const gateway = new FakeOneBot();
-  const bot = new LetheBot({ gateway });
-  
-  const msg = gateway.simulateGroupMessage({
+
+  await gateway.sendReaction('msg-123', '👍');
+
+  gateway.assertReactionSent('msg-123');
+  expect(gateway.getLastSentReaction()?.emoji).toBe('👍');
+  gateway.reset();
+  expect(gateway.getSentReactions()).toHaveLength(0);
+});
+```
+
+### Scenario 4: Quoted Reply Metadata
+
+```typescript
+test('preserves quote and reply-to metadata', () => {
+  const gateway = new FakeOneBot();
+  let received: ChatMessageReceived | undefined;
+  gateway.on('message', (event) => { received = event; });
+
+  gateway.simulateGroupMessage({
     groupId: 'tech-support',
-    senderId: 'user-bob',
-    text: '@bot 你好',
-    mentionsBot: true,
+    text: '继续',
+    mentionsBot: false,
+    replyToMessageId: 'bot-msg-1',
+    quote: { messageId: 'bot-msg-1', text: '上一条回复' },
   });
-  
-  await bot.processEvents();
-  
-  // Assert reply sent
-  gateway.assertMessageSent(/你好|hi/i);
-  
-  const sent = gateway.getLastSentMessage();
-  expect(sent.conversationId).toBe('group:tech-support');
+
+  expect(received?.message.replyToMessageId).toBe('bot-msg-1');
+  expect(received?.message.content.quote?.messageId).toBe('bot-msg-1');
 });
 ```
 
-### Scenario 3: Capability Fallback
+### Scenario 5: Rapid-Fire Ordering
 
 ```typescript
-test('react_only falls back when emojiLike unsupported', async () => {
+test('emits rapid-fire messages in call order', () => {
   const gateway = new FakeOneBot();
-  gateway.setCapabilities({
-    reactions: { emojiLike: false, faceMessage: true },
-  });
-  
-  const bot = new LetheBot({ gateway });
-  
-  gateway.simulateGroupMessage({
-    text: '@bot 点个赞',
-    mentionsBot: true,
-  });
-  
-  await bot.processEvents();
-  
-  // Should fall back to face message
-  const sent = gateway.getLastSentMessage();
-  expect(sent.content.text).toMatch(/[\u{1F44D}\[赞\]]/u);  // face or emoji in text
-});
-```
+  const messageIds: string[] = [];
+  gateway.on('message', (event) => messageIds.push(event.message.messageId));
 
-### Scenario 4: Memory Visibility
-
-```typescript
-test('private_only memory not leaked to group', async () => {
-  const gateway = new FakeOneBot();
-  const bot = new LetheBot({ gateway });
-  
-  // User tells bot a secret in private chat
-  gateway.simulatePrivateMessage({
-    senderId: 'user-alice',
-    text: '/remember 我的密码是 secret123',
-  });
-  await bot.processEvents();
-  
-  // User asks in group
-  gateway.simulateGroupMessage({
-    groupId: 'public-group',
-    senderId: 'user-alice',
-    text: '@bot 我的密码是什么',
-    mentionsBot: true,
-  });
-  await bot.processEvents();
-  
-  // Assert bot does not leak the password
-  const sent = gateway.getLastSentMessage();
-  expect(sent.content.text).not.toContain('secret123');
-  expect(sent.content.text).toMatch(/私聊|隐私|不能在群里/);
-});
-```
-
-### Scenario 5: Concurrent Messages
-
-```typescript
-test('handles rapid-fire group messages gracefully', async () => {
-  const gateway = new FakeOneBot();
-  const bot = new LetheBot({ gateway });
-  
-  // Simulate 10 rapid messages
-  for (let i = 0; i < 10; i++) {
-    gateway.simulateGroupMessage({
-      senderId: `user-${i}`,
-      text: `消息 ${i}`,
-      mentionsBot: false,
-    });
+  for (let i = 0; i < 10; i += 1) {
+    gateway.simulateGroupMessage({ text: `消息 ${i}`, mentionsBot: false });
   }
-  
-  await bot.processEvents();
-  
-  // Assert most messages triggered silent_fast_path
-  const sent = gateway.getSentMessages();
-  expect(sent.length).toBeLessThan(3);  // bot should not spam
-  
-  // Assert all events stored
-  const events = await bot.storage.getRawEvents({ limit: 20 });
-  expect(events.length).toBeGreaterThanOrEqual(10);
+
+  expect(messageIds).toHaveLength(10);
+  expect(messageIds).toEqual([
+    'fake-msg-000001', 'fake-msg-000002', 'fake-msg-000003',
+    'fake-msg-000004', 'fake-msg-000005', 'fake-msg-000006',
+    'fake-msg-000007', 'fake-msg-000008', 'fake-msg-000009',
+    'fake-msg-000010',
+  ]);
 });
 ```
 
@@ -359,22 +315,22 @@ test('handles rapid-fire group messages gracefully', async () => {
 
 ## Implementation Notes
 
-### P0 Scope
+### Current Deterministic Scope
 
-For Phase D, implement:
+The current harness provides:
 - ✅ `simulatePrivateMessage`
 - ✅ `simulateGroupMessage`
 - ✅ `getSentMessages` / `getLastSentMessage`
+- ✅ `getSentReactions` / `getLastSentReaction`
 - ✅ `assertMessageSent` / `assertNoMessageSent`
+- ✅ `assertReactionSent`
 - ✅ `setCapabilities`
 - ✅ `reset`
 
-### P1 (Later Phases)
+### Possible Extensions
 
 - `simulateReaction`
 - `simulateGroupMemberUpdate`
-- `getSentReactions`
-- `SimulatedMessage.waitForReply`
 - Timing simulation (deliveryDelayMs)
 
 ### Integration with Real Gateway
@@ -388,11 +344,13 @@ interface GatewayAdapter {
   
   // Real gateway uses these to send
   sendMessage(target: MessageTarget, content: MessageContent): Promise<string>;
-  sendReaction(messageId: string, emoji: string): Promise<void>;
+  sendReaction?(messageId: string, emoji: string): Promise<void>;
+  getCapabilities(): GatewayCapabilities;
   
   // Event emitter for incoming messages
   on(event: 'message', handler: (msg: ChatMessageReceived) => void): void;
   on(event: 'error', handler: (error: Error) => void): void;
+  off(event: 'message' | 'error', handler: (...args: unknown[]) => void): void;
 }
 ```
 
@@ -400,50 +358,36 @@ interface GatewayAdapter {
 
 ## File Location
 
-Suggested structure:
+Current test locations:
 
 ```
 tests/
 ├── fakes/
 │   ├── fake-onebot.ts          # FakeOneBot class
 │   ├── fake-onebot.test.ts     # Self-tests for FakeOneBot
-│   └── index.ts
+│   └── ...
 └── integration/
-    ├── silent-fast-path.test.ts
-    ├── reply-fast-path.test.ts
-    ├── memory-visibility.test.ts
+    ├── e2e-conversation.test.ts
+    ├── memory-injection.test.ts
     └── ...
 ```
 
 ---
 
-## Open Question
+## Event Delivery Semantics
 
-**Q: Should FakeOneBot auto-trigger bot's event processing, or require explicit `bot.processEvents()`?**
-
-**Decision: Option B - Manual trigger (explicit for tests)**
-
-```typescript
-gateway.simulateGroupMessage({ text: '@bot hi' });
-await bot.processEvents();  // Explicit control
-```
-
-**Rationale:** 
-- Tests have full control over timing
-- Async behavior is explicit and easier to understand  
-- Can set up additional state before triggering
-- Option A (auto-trigger) can be added later as a convenience mode
+`simulatePrivateMessage` and `simulateGroupMessage` emit their normalized event
+synchronously to registered listeners and return `void`. Application-level
+async processing is owned by the listener/runtime under test; there is no
+`bot.processEvents()` API on `FakeOneBot`. Tests that exercise the full app use
+the current integration harness and await that runtime's own completion signal.
 
 ---
 
-## Real NapCat for Integration Testing
+## Real Runtime Verification
 
-For Phase E (real OneBot adapter) and Phase M (live soak test), a real NapCat instance is available on `arqelvps` in a Docker container.
-
-This can be used for:
-- Integration smoke tests with real QQ protocol
-- Verifying OneBot v11 WebSocket behavior
-- Testing real reactions, folded forward, and platform admin features
-- Multi-day soak testing
-
-P0 tests should still use FakeOneBot for speed and isolation. Real NapCat is for final integration verification only.
+No remote host, account session, or credential is assumed by this document.
+Real SnowLuma/NapCat/QQ checks require explicit authorization and must follow
+`local-container-acceptance.md` with redacted evidence. Default deterministic
+tests continue to use FakeOneBot for speed, isolation, and repeatability; fake
+coverage does not substitute for the required live private/group acceptance.
