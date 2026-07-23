@@ -6,7 +6,7 @@
 
 import * as path from 'path';
 import * as fs from 'fs';
-import type { SandboxPolicy } from '../../types/tool';
+import type { SandboxPolicy } from '../../types/tool.js';
 
 /**
  * 文件操作上下文
@@ -14,9 +14,21 @@ import type { SandboxPolicy } from '../../types/tool';
 export interface FileOperationContext {
   toolCallId: string;
   turnId: string;
+  signal: AbortSignal;
   workspaceRoot: string;
   sandboxPolicy: SandboxPolicy;
   allowedPaths?: string[];
+}
+
+export function throwIfFileOperationAborted(signal: AbortSignal): void {
+  if (!signal.aborted) {
+    return;
+  }
+
+  const error = new Error('File operation aborted') as NodeJS.ErrnoException;
+  error.name = 'AbortError';
+  error.code = 'ABORT_ERR';
+  throw error;
 }
 
 /**
@@ -51,13 +63,20 @@ export class PathValidator {
     return relative === '' || (relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative));
   }
 
-  private async realpathNearestExistingAncestor(candidatePath: string): Promise<string> {
+  private async realpathNearestExistingAncestor(
+    candidatePath: string,
+    signal: AbortSignal
+  ): Promise<string> {
     let current = candidatePath;
 
     while (true) {
+      throwIfFileOperationAborted(signal);
       try {
-        return await fs.promises.realpath(current);
+        const realPath = await fs.promises.realpath(current);
+        throwIfFileOperationAborted(signal);
+        return realPath;
       } catch (err: unknown) {
+        throwIfFileOperationAborted(signal);
         const error = err as NodeJS.ErrnoException;
         if (error.code !== 'ENOENT') {
           throw err;
@@ -79,8 +98,10 @@ export class PathValidator {
     requestedPath: string,
     context: FileOperationContext
   ): Promise<PathValidationResult> {
+    throwIfFileOperationAborted(context.signal);
     const workspaceRoot = path.resolve(context.workspaceRoot);
     const realWorkspaceRoot = await fs.promises.realpath(workspaceRoot);
+    throwIfFileOperationAborted(context.signal);
     const checks = {
       withinWorkspace: false,
       noTraversal: false,
@@ -150,6 +171,7 @@ export class PathValidator {
     // 5. 检查符号链接逃逸
     try {
       const realPath = await fs.promises.realpath(normalized);
+      throwIfFileOperationAborted(context.signal);
       checks.noSymlinkEscape = this.isWithinBoundary(realPath, realWorkspaceRoot);
       if (!checks.noSymlinkEscape) {
         return {
@@ -159,11 +181,15 @@ export class PathValidator {
         };
       }
     } catch (err: unknown) {
+      throwIfFileOperationAborted(context.signal);
       const error = err as NodeJS.ErrnoException;
       // 文件不存在时，检查父目录
       if (error.code === 'ENOENT') {
         try {
-          const realParent = await this.realpathNearestExistingAncestor(normalized);
+          const realParent = await this.realpathNearestExistingAncestor(
+            normalized,
+            context.signal
+          );
           checks.noSymlinkEscape = this.isWithinBoundary(realParent, realWorkspaceRoot);
           if (!checks.noSymlinkEscape) {
             return {
@@ -173,6 +199,7 @@ export class PathValidator {
             };
           }
         } catch {
+          throwIfFileOperationAborted(context.signal);
           // 父目录也不存在，允许创建
           checks.noSymlinkEscape = true;
         }
@@ -186,6 +213,7 @@ export class PathValidator {
       }
     }
 
+    throwIfFileOperationAborted(context.signal);
     return {
       allowed: true,
       normalizedPath: normalized,

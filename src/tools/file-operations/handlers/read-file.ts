@@ -5,12 +5,13 @@
  */
 
 import * as fs from 'fs';
-import type { ToolCallResult } from '../../../types/tool';
+import type { ToolCallResult } from '../../../types/tool.js';
 import {
   PathValidator,
+  throwIfFileOperationAborted,
   type FileOperationContext,
-} from '../path-validator';
-import { redactFileOperationText } from '../redaction';
+} from '../path-validator.js';
+import { redactFileOperationText } from '../redaction.js';
 
 interface ReadFileInput {
   path: string;
@@ -47,6 +48,8 @@ export class ReadFileHandler {
     const pathSecretsRedacted = redactedPathResult.redacted;
 
     try {
+      throwIfFileOperationAborted(context.signal);
+
       // 1. 路径验证
       const validation = await this.validator.validate(input.path, context);
       if (!validation.allowed) {
@@ -71,9 +74,11 @@ export class ReadFileHandler {
       const normalizedPath = validation.normalizedPath;
 
       // 2. 检查文件是否存在
+      throwIfFileOperationAborted(context.signal);
       try {
         await fs.promises.access(normalizedPath, fs.constants.R_OK);
       } catch {
+        throwIfFileOperationAborted(context.signal);
         return {
           toolCallId: context.toolCallId,
           status: 'error',
@@ -88,7 +93,9 @@ export class ReadFileHandler {
       }
 
       // 3. 检查文件大小
+      throwIfFileOperationAborted(context.signal);
       const stats = await fs.promises.stat(normalizedPath);
+      throwIfFileOperationAborted(context.signal);
       const maxSize = context.sandboxPolicy.maxOutputBytes || 1048576;
       if (stats.size > maxSize) {
         return {
@@ -108,15 +115,24 @@ export class ReadFileHandler {
       const encoding = input.encoding || 'utf8';
       let content: string;
 
+      throwIfFileOperationAborted(context.signal);
       if (encoding === 'base64') {
-        const buffer = await fs.promises.readFile(normalizedPath);
+        const buffer = await fs.promises.readFile(normalizedPath, {
+          signal: context.signal,
+        });
         content = buffer.toString('base64');
       } else if (encoding === 'binary') {
-        const buffer = await fs.promises.readFile(normalizedPath);
+        const buffer = await fs.promises.readFile(normalizedPath, {
+          signal: context.signal,
+        });
         content = buffer.toString('binary');
       } else {
-        content = await fs.promises.readFile(normalizedPath, 'utf8');
+        content = await fs.promises.readFile(normalizedPath, {
+          encoding: 'utf8',
+          signal: context.signal,
+        });
       }
+      throwIfFileOperationAborted(context.signal);
 
       // 5. 秘密扫描和输出脱敏
       const redaction = redactFileOperationText(content);

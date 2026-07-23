@@ -4,11 +4,13 @@
  * 统一导出存储层模块
  */
 
-export * from './database';
-export * from './memory-repository';
-export * from './identity-repository';
-export * from './context-trace-repository';
-export * from './turn-repository';
-export * from './tool-call-repository';
-export * from './job-repository';
-export * from './privacy-preference-repository';
+export * from './database.js';
+export * from './memory-repository.js';
+export * from './identity-repository.js';
+export * from './context-trace-repository.js';
+export * from './turn-repository.js';
+export * from './tool-call-repository.js';
+export * from './job-repository.js';
+export * from './group-summary-policy-repository.js';
+export * from './privacy-preference-repository.js';
+export * from './model-invocation-repository.js';

@@ -2,11 +2,12 @@
  * Network Request Tool Handler Tests
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   validateUrl,
   isAllowedDomain,
   NetworkRequestHandlerImpl,
+  networkRequestToolEntry,
   type NetworkRequestInput,
 } from '../../../../src/tools/handlers/network-request';
 
@@ -138,6 +139,11 @@ describe('NetworkRequestHandlerImpl', () => {
 
   beforeEach(() => {
     handler = new NetworkRequestHandlerImpl(['example.com', '*.api.test.com']);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   it('should reject invalid URLs', async () => {
@@ -392,6 +398,146 @@ describe('NetworkRequestHandlerImpl', () => {
 
     const call = mockFetch.mock.calls[0][1] as RequestInit;
     expect(call.signal).toBeDefined();
+  });
+
+  it('should forward the tool request signal into the network handler', async () => {
+    const signal = new AbortController().signal;
+    const executeSpy = vi
+      .spyOn(NetworkRequestHandlerImpl.prototype, 'execute')
+      .mockResolvedValue({
+        success: true,
+        executionTimeMs: 0,
+      });
+
+    await networkRequestToolEntry.handler({
+      toolCallId: 'tc-network-signal',
+      turnId: 'turn-network-signal',
+      toolName: 'network_request',
+      signal,
+      input: { url: 'https://example.com' },
+      actor: { actorClass: 'owner' },
+      context: 'private_chat',
+    });
+
+    expect(executeSpy).toHaveBeenCalledWith(
+      { url: 'https://example.com' },
+      signal
+    );
+  });
+
+  it('should compose upstream cancellation with the input timeout and clean both hooks', async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const addListenerSpy = vi.spyOn(controller.signal, 'addEventListener');
+    const removeListenerSpy = vi.spyOn(controller.signal, 'removeEventListener');
+    let fetchSignal: AbortSignal | undefined;
+    let hooksCleanedBeforeFetchAbort = false;
+
+    global.fetch = vi.fn((_url, options) => {
+      fetchSignal = options?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        fetchSignal?.addEventListener('abort', () => {
+          hooksCleanedBeforeFetchAbort = vi.getTimerCount() === 0
+            && removeListenerSpy.mock.calls.length === 1;
+          const error = new Error('fetch aborted');
+          error.name = 'AbortError';
+          reject(error);
+        }, { once: true });
+      });
+    });
+
+    const execution = handler.execute(
+      { url: 'https://example.com', timeout: 30_000 },
+      controller.signal
+    );
+    expect(fetchSignal).toBeDefined();
+    expect(fetchSignal).not.toBe(controller.signal);
+
+    controller.abort('sk-upstream-reason-must-not-leak');
+    const result = await execution;
+
+    expect(fetchSignal?.aborted).toBe(true);
+    expect(hooksCleanedBeforeFetchAbort).toBe(true);
+    expect(result).toMatchObject({
+      success: false,
+      error: 'Request aborted',
+    });
+    expect(JSON.stringify(result)).not.toContain('sk-upstream-reason-must-not-leak');
+    expect(addListenerSpy).toHaveBeenCalledWith(
+      'abort',
+      expect.any(Function),
+      { once: true }
+    );
+    expect(removeListenerSpy).toHaveBeenCalledWith(
+      'abort',
+      expect.any(Function)
+    );
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('should clean the composed cancellation hooks after a successful request', async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const removeListenerSpy = vi.spyOn(controller.signal, 'removeEventListener');
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: new Headers(),
+      text: async () => 'ok',
+    });
+
+    const result = await handler.execute(
+      { url: 'https://example.com', timeout: 30_000 },
+      controller.signal
+    );
+
+    expect(result.success).toBe(true);
+    expect(removeListenerSpy).toHaveBeenCalledWith(
+      'abort',
+      expect.any(Function)
+    );
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('should retain the input timeout while an upstream signal remains active', async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const removeListenerSpy = vi.spyOn(controller.signal, 'removeEventListener');
+    let fetchSignal: AbortSignal | undefined;
+
+    global.fetch = vi.fn((_url, options) => {
+      fetchSignal = options?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        fetchSignal?.addEventListener('abort', () => {
+          const error = new Error('fetch aborted');
+          error.name = 'AbortError';
+          reject(error);
+        }, { once: true });
+      });
+    });
+
+    const execution = handler.execute(
+      { url: 'https://example.com', timeout: 100 },
+      controller.signal
+    );
+    await vi.advanceTimersByTimeAsync(99);
+    expect(fetchSignal?.aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    const result = await execution;
+
+    expect(fetchSignal?.aborted).toBe(true);
+    expect(controller.signal.aborted).toBe(false);
+    expect(result).toMatchObject({
+      success: false,
+      error: 'Request timeout',
+    });
+    expect(removeListenerSpy).toHaveBeenCalledWith(
+      'abort',
+      expect.any(Function)
+    );
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('should handle timeout errors', async () => {

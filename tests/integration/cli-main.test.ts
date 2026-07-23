@@ -4,12 +4,117 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type Database from 'better-sqlite3';
-import { initDatabase, runMigration, closeDatabase } from '../../src/storage/database';
+import { initDatabase, runMigrations, closeDatabase } from '../../src/storage/database';
 import { MemoryRepository } from '../../src/storage/memory-repository';
+import { GroupSummaryPolicyRepository } from '../../src/storage/group-summary-policy-repository';
 import { JobRepository } from '../../src/storage/job-repository';
 import { ToolCallRepository } from '../../src/storage/tool-call-repository';
 import { ActionRepository } from '../../src/actions/action-repository';
 import { BackgroundWorker } from '../../src/workers/background';
+
+const DEFAULT_MEMORY_SOURCE_ID = 'raw-cli-memory-source';
+
+class CliTestMemoryRepository extends MemoryRepository {
+  constructor(private readonly database: Database.Database) {
+    super(database);
+  }
+
+  override create(
+    input: Parameters<MemoryRepository['create']>[0]
+  ): Promise<string> {
+    let sources = input.sources;
+    if (!sources) {
+      const now = Date.now();
+      const sourceCount = this.database.prepare(
+        'SELECT COUNT(*) AS count FROM raw_events WHERE id LIKE ?'
+      ).get(`${DEFAULT_MEMORY_SOURCE_ID}-%`) as { count: number };
+      const sourceIndex = sourceCount.count + 1;
+      const sourceId = `${DEFAULT_MEMORY_SOURCE_ID}-${sourceIndex}`;
+      const chatMessageId = `msg-cli-memory-source-${sourceIndex}`;
+      const isGroupSource = input.scope === 'group'
+        || input.visibility === 'same_group_only'
+        || (input.scope === 'conversation' && input.groupId !== undefined);
+      const senderCanonicalUserId = input.scope === 'user'
+        ? (input.canonicalUserId ?? 'user-cli')
+        : 'user-cli';
+      const platformAccountId = `cli-memory-source-account-${sourceIndex}`;
+      const conversationId = input.conversationId
+        ?? (isGroupSource
+          ? `group:${input.groupId ?? 'cli-memory-source'}`
+          : `private:${senderCanonicalUserId}`);
+
+      const senderExists = this.database.prepare(
+        'SELECT 1 FROM canonical_users WHERE id = ?'
+      ).get(senderCanonicalUserId) !== undefined;
+      if (senderExists) {
+        this.database.prepare(
+          `INSERT INTO platform_accounts (
+            platform, platform_account_id, canonical_user_id, account_type,
+            verified_level, status, first_seen_at, last_seen_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(
+          'qq',
+          platformAccountId,
+          senderCanonicalUserId,
+          isGroupSource ? 'group_member' : 'private',
+          'observed',
+          'active',
+          now,
+          now,
+        );
+      }
+      this.database.prepare(
+        `INSERT INTO raw_events (
+          id, type, timestamp, source, platform, conversation_id, payload, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        sourceId,
+        'chat.message.received',
+        now,
+        'gateway',
+        'qq',
+        conversationId,
+        '{}',
+        now,
+      );
+      this.database.prepare(
+        `INSERT INTO chat_messages (
+          id, raw_event_id, message_id, conversation_id, conversation_type,
+          group_id, sender_id, text, timestamp
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        chatMessageId,
+        sourceId,
+        `platform-${chatMessageId}`,
+        conversationId,
+        isGroupSource ? 'group' : 'private',
+        isGroupSource ? (input.groupId ?? null) : null,
+        platformAccountId,
+        'Synthetic CLI memory provenance',
+        now,
+      );
+      sources = [
+        {
+          sourceType: 'raw_event' as const,
+          sourceId,
+          extractedBy: 'evaluator',
+        },
+      ];
+    }
+
+    const usesExternalUserCommand = sources.some(
+      (source) => source.sourceType === 'user_command' && source.external === true
+    );
+
+    return super.create({
+      ...input,
+      sources,
+      actor: input.actor ?? (usesExternalUserCommand
+        ? { actorClass: 'admin', context: 'admin_cli' }
+        : undefined),
+    });
+  }
+}
 
 describe('CLI main command parser', () => {
   let testDir: string;
@@ -21,8 +126,8 @@ describe('CLI main command parser', () => {
     testDir = mkdtempSync(join(tmpdir(), 'lethebot-cli-main-'));
     dbPath = join(testDir, 'cli.db');
     db = initDatabase({ path: dbPath });
-    runMigration(db, join(process.cwd(), 'migrations/001_initial_schema.sql'));
-    memoryRepo = new MemoryRepository(db);
+    runMigrations(db, join(process.cwd(), 'migrations'));
+    memoryRepo = new CliTestMemoryRepository(db);
 
     const now = Date.now();
     db.prepare('INSERT INTO canonical_users (id, created_at, last_seen_at) VALUES (?, ?, ?)').run(
@@ -44,7 +149,7 @@ describe('CLI main command parser', () => {
       closeDatabase(db);
     }
     db = initDatabase({ path: dbPath });
-    memoryRepo = new MemoryRepository(db);
+    memoryRepo = new CliTestMemoryRepository(db);
   }
 
   function runCliWithEnv(
@@ -69,7 +174,7 @@ describe('CLI main command parser', () => {
     });
 
     db = initDatabase({ path: dbPath });
-    memoryRepo = new MemoryRepository(db);
+    memoryRepo = new CliTestMemoryRepository(db);
 
     return {
       stdout: result.stdout.trim(),
@@ -94,6 +199,65 @@ describe('CLI main command parser', () => {
     expect(result.status).toBe(1);
     expect(result.stdout).toBe('');
     expect(result.stderr).toContain(expectedError);
+  }
+
+  function insertCanonicalMemorySourceChatMessage(input: {
+    id: string;
+    rawEventId: string;
+    conversationId: string;
+    conversationType: 'private' | 'group';
+    groupId?: string;
+    senderId: string;
+    timestamp: number;
+  }): void {
+    db.prepare(
+      `INSERT OR IGNORE INTO platform_accounts (
+        platform, platform_account_id, canonical_user_id, account_type,
+        verified_level, status, first_seen_at, last_seen_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'qq',
+      input.senderId,
+      input.senderId,
+      input.conversationType === 'group' ? 'group_member' : 'private',
+      'observed',
+      'active',
+      input.timestamp,
+      input.timestamp,
+    );
+    db.prepare(
+      `INSERT INTO raw_events (
+        id, type, timestamp, source, platform, conversation_id, payload, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      input.rawEventId,
+      'chat.message.received',
+      input.timestamp,
+      'gateway',
+      'qq',
+      input.conversationId,
+      '{}',
+      input.timestamp,
+    );
+    db.prepare(
+      `INSERT INTO chat_messages (
+        id, raw_event_id, message_id, conversation_id, conversation_type,
+        group_id, sender_id, text, has_media, has_quote, mentions_bot, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      input.id,
+      input.rawEventId,
+      `platform-${input.id}`,
+      input.conversationId,
+      input.conversationType,
+      input.groupId ?? null,
+      input.senderId,
+      'fixture source',
+      0,
+      0,
+      0,
+      input.timestamp,
+    );
   }
 
   function insertMemoryReviewAudit(
@@ -189,6 +353,7 @@ describe('CLI main command parser', () => {
         {
           sourceType: 'user_command',
           sourceId: 'cli-seed-command',
+          external: true,
           extractedBy: 'human',
         },
       ],
@@ -541,6 +706,7 @@ describe('CLI main command parser', () => {
         {
           sourceType: 'user_command',
           sourceId: 'source-cli-legacy-memory-classification',
+          external: true,
           extractedBy: 'human',
         },
       ],
@@ -765,6 +931,7 @@ describe('CLI main command parser', () => {
         {
           sourceType: 'user_command',
           sourceId: 'cli-filter-validation-seed',
+          external: true,
           extractedBy: 'human',
         },
       ],
@@ -2192,6 +2359,7 @@ describe('CLI main command parser', () => {
         {
           sourceType: 'user_command',
           sourceId: 'cli-limit-validation-seed',
+          external: true,
           extractedBy: 'human',
         },
       ],
@@ -2703,10 +2871,14 @@ describe('CLI main command parser', () => {
     const secret = 'sk-cli-why-action-secret-abcdefghijklmnopqrstuvwxyz';
     const rawPlatformId = 'qq-2345678901';
     const rawExecutedMessageId = 'qq-3456789012';
+    const rawExecutedMemoryId = 'mem-qq-4567890123';
     const turnId = 'turn-cli-why-action';
     const decisionId = `decision-cli-why-action-${secret}-${rawPlatformId}`;
     const successExecutionId = `execution-cli-why-action-success-${secret}-${rawExecutedMessageId}`;
+    const memoryExecutionId = `execution-cli-why-action-memory-${secret}-${rawExecutedMemoryId}`;
     const failedExecutionId = `execution-cli-why-action-failed-${secret}-${rawPlatformId}`;
+    const successToolCallId = `tool-cli-why-success-${secret}-${rawPlatformId}`;
+    const failedToolCallId = `tool-cli-why-error-${secret}-${rawPlatformId}`;
 
     db.prepare(
       `INSERT INTO raw_events (id, type, timestamp, source, platform, conversation_id, payload, created_at)
@@ -2821,6 +2993,26 @@ describe('CLI main command parser', () => {
       ],
       createdAt: new Date(now + 1),
     });
+    db.prepare(
+      `INSERT INTO memory_records (
+        id, scope, visibility, sensitivity, authority, kind, title, content,
+        state, confidence, importance, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      rawExecutedMemoryId,
+      'global',
+      'owner_admin_only',
+      'normal',
+      'inferred',
+      'summary',
+      'CLI why action memory',
+      'Action execution created a memory proposal',
+      'proposed',
+      0.8,
+      0.5,
+      now,
+      now,
+    );
     await actionRepo.createExecution({
       id: successExecutionId,
       actionDecisionId: decisionId,
@@ -2830,6 +3022,16 @@ describe('CLI main command parser', () => {
       auditLevel: 'summary',
       auditEntry: `sent reply with api_key=${secret}-${rawPlatformId}`,
       executedAt: new Date(now + 2),
+    });
+    await actionRepo.createExecution({
+      id: memoryExecutionId,
+      actionDecisionId: decisionId,
+      actionType: 'propose_memory',
+      status: 'success',
+      executedMemoryId: rawExecutedMemoryId,
+      auditLevel: 'summary',
+      auditEntry: `created memory proposal with api_key=${secret}-${rawPlatformId}`,
+      executedAt: new Date(now + 3),
     });
     await actionRepo.createExecution({
       id: failedExecutionId,
@@ -2845,7 +3047,38 @@ describe('CLI main command parser', () => {
       },
       auditLevel: 'redacted_full',
       auditEntry: `failed dm_user with token=${secret}-${rawPlatformId}`,
-      executedAt: new Date(now + 3),
+      executedAt: new Date(now + 4),
+    });
+
+    const toolRepo = new ToolCallRepository(db);
+    await toolRepo.create({
+      id: successToolCallId,
+      turnId,
+      toolName: `memory.search-${secret}-${rawPlatformId}`,
+      input: { query: `tool input should not print api_key=${secret}-${rawPlatformId}` },
+      output: { result: `tool output should not print token=${secret}-${rawPlatformId}` },
+      requestedBy: 'pi',
+      actor: { canonicalUserId: `qq-tool-actor-${rawPlatformId}-${secret}`, actorClass: 'user' },
+      context: 'group_chat',
+      status: 'success',
+      executionTimeMs: 17,
+      secretsRedacted: false,
+      createdAt: now + 4,
+    });
+    await toolRepo.create({
+      id: failedToolCallId,
+      turnId,
+      toolName: `network.request-${secret}-${rawPlatformId}`,
+      input: { url: `https://example.invalid/${secret}/${rawPlatformId}` },
+      requestedBy: 'pi',
+      actor: { canonicalUserId: `qq-tool-actor-${rawPlatformId}-${secret}`, actorClass: 'user' },
+      context: 'group_chat',
+      status: 'error',
+      errorCode: `NETWORK_${rawPlatformId}_${secret}`,
+      errorMessage: `tool handler failed token=${secret}-${rawPlatformId}`,
+      executionTimeMs: 29,
+      secretsRedacted: false,
+      createdAt: now + 5,
     });
 
     const beforeCounts = {
@@ -2853,6 +3086,7 @@ describe('CLI main command parser', () => {
       actionExecutions: db.prepare('SELECT COUNT(*) AS count FROM action_executions').get() as { count: number },
       auditLog: db.prepare('SELECT COUNT(*) AS count FROM audit_log').get() as { count: number },
       contextTraces: db.prepare('SELECT COUNT(*) AS count FROM context_traces').get() as { count: number },
+      toolCalls: db.prepare('SELECT COUNT(*) AS count FROM tool_calls').get() as { count: number },
     };
 
     const output = expectSuccessfulCli(['why', '--turn', turnId]);
@@ -2872,27 +3106,381 @@ describe('CLI main command parser', () => {
     expect(output).toContain('execution-cli-why-action-success-[REDACTED:openai_like_api_key]');
     expect(output).toContain('reply_short:success');
     expect(output).toContain('message=[REDACTED:platform_id]');
+    expect(output).toContain('execution-cli-why-action-memory-[REDACTED:openai_like_api_key]');
+    expect(output).toContain('propose_memory:success');
+    expect(output).toContain('memory=mem-[REDACTED:platform_id]');
     expect(output).toContain('execution-cli-why-action-failed-[REDACTED:openai_like_api_key]');
     expect(output).toContain('dm_user:failed');
     expect(output).toContain('downgraded_from=reply_full');
     expect(output).toContain('cooldown fallback');
     expect(output).toContain('error_code=SEND_FAILED_[REDACTED:platform_id]');
     expect(output).toContain('adapter rejected');
+    expect(output).toContain('Tool calls:');
+    expect(output).toContain('tool-cli-why-success-[REDACTED:openai_like_api_key]');
+    expect(output).toContain('memory.search-[REDACTED:openai_like_api_key]');
+    expect(output).toContain('success');
+    expect(output).toContain('requested_by=pi');
+    expect(output).toContain('duration_ms=17');
+    expect(output).toContain('tool-cli-why-error-[REDACTED:openai_like_api_key]');
+    expect(output).toContain('network.request-[REDACTED:openai_like_api_key]');
+    expect(output).toContain('error_code=NETWORK_[REDACTED:platform_id]_[REDACTED:openai_like_api_key]');
+    expect(output).toContain('tool handler failed');
+    expect(output).toContain('duration_ms=29');
     expect(output).toContain('[REDACTED:api_key_assignment]');
     expect(output).toContain('[REDACTED:platform_id]');
     expect(output).not.toContain(secret);
     expect(output).not.toContain(rawPlatformId);
     expect(output).not.toContain(rawExecutedMessageId);
+    expect(output).not.toContain(rawExecutedMemoryId);
     expect(output).not.toContain('api_key=');
     expect(output).not.toContain('token=');
     expect(output).not.toContain('raw action why event should not print');
     expect(output).not.toContain('action why message should not print');
+    expect(output).not.toContain('tool input should not print');
+    expect(output).not.toContain('tool output should not print');
+    expect(output).not.toContain('https://example.invalid');
 
     reopenDb();
     expect(db.prepare('SELECT COUNT(*) AS count FROM action_decisions').get()).toEqual(beforeCounts.actionDecisions);
     expect(db.prepare('SELECT COUNT(*) AS count FROM action_executions').get()).toEqual(beforeCounts.actionExecutions);
     expect(db.prepare('SELECT COUNT(*) AS count FROM audit_log').get()).toEqual(beforeCounts.auditLog);
     expect(db.prepare('SELECT COUNT(*) AS count FROM context_traces').get()).toEqual(beforeCounts.contextTraces);
+    expect(db.prepare('SELECT COUNT(*) AS count FROM tool_calls').get()).toEqual(beforeCounts.toolCalls);
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('spawns why command for failed turns with linked redacted tool-call evidence', async () => {
+    const now = Date.now();
+    const secret = 'sk-cli-why-failed-tool-secret-abcdefghijklmnopqrstuvwxyz';
+    const rawPlatformId = 'qq-4567890123';
+    const turnId = `turn-cli-why-failed-tool-${secret}-${rawPlatformId}`;
+    const rejectedToolCallId = `tool-cli-why-rejected-${secret}-${rawPlatformId}`;
+    const erroredToolCallId = `tool-cli-why-error-${secret}-${rawPlatformId}`;
+    const rejectedPayload = `rejected input payload should not print api_key=${secret}-${rawPlatformId}`;
+    const erroredPayload = `errored input payload should not print token=${secret}-${rawPlatformId}`;
+    const hiddenOutput = `tool output payload should not print token=${secret}-${rawPlatformId}`;
+
+    db.prepare(
+      `INSERT INTO raw_events (id, type, timestamp, source, platform, conversation_id, payload, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'evt-cli-why-failed-tool',
+      'chat.message.received',
+      now,
+      'gateway',
+      'qq',
+      'private:cli-why-failed-tool',
+      JSON.stringify({ text: `raw failed tool why event should not print ${secret}` }),
+      now,
+    );
+    db.prepare(
+      `INSERT INTO chat_messages (
+        id, raw_event_id, message_id, conversation_id, conversation_type,
+        sender_id, text, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'msg-cli-why-failed-tool',
+      'evt-cli-why-failed-tool',
+      'platform-cli-why-failed-tool',
+      'private:cli-why-failed-tool',
+      'private',
+      rawPlatformId,
+      `failed tool why message should not print ${secret}`,
+      now,
+    );
+    db.prepare(
+      `INSERT INTO agent_turns (
+        id, conversation_id, trigger_event_id, context_pack_id,
+        pi_model, pi_provider, status, response_text, started_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      turnId,
+      'private:cli-why-failed-tool',
+      'evt-cli-why-failed-tool',
+      'ctx-cli-why-failed-tool',
+      'mock',
+      'mock',
+      'failed',
+      `runtime failure should not print api_key=${secret}-${rawPlatformId}`,
+      now,
+      now + 1,
+    );
+    db.prepare(
+      `INSERT INTO context_traces (
+        id, turn_id, conversation_id, conversation_type, group_id,
+        candidate_memory_ids, selected_memory_ids, rejected_memories,
+        filters_applied, injected_identity_fields, recent_message_ids,
+        token_budget, memories, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'ctx-cli-why-failed-tool',
+      turnId,
+      'private:cli-why-failed-tool',
+      'private',
+      null,
+      JSON.stringify([]),
+      JSON.stringify([]),
+      JSON.stringify([]),
+      JSON.stringify(['state=active']),
+      JSON.stringify(['conversation_id', 'conversation_type']),
+      JSON.stringify(['msg-cli-why-failed-tool']),
+      JSON.stringify({
+        max: 8000,
+        used: 18,
+        breakdown: { recentMessages: 4, memory: 0, identity: 4, system: 10 },
+      }),
+      JSON.stringify([]),
+      now,
+    );
+
+    const toolRepo = new ToolCallRepository(db);
+    await toolRepo.create({
+      id: rejectedToolCallId,
+      turnId,
+      toolName: `memory.propose-${secret}-${rawPlatformId}`,
+      input: { payload: rejectedPayload },
+      requestedBy: 'pi',
+      actor: { canonicalUserId: `user-${rawPlatformId}-${secret}`, actorClass: 'user' },
+      context: 'private_chat',
+      status: 'rejected',
+      errorCode: `EVALUATOR_REQUIRED_${rawPlatformId}_${secret}`,
+      errorMessage: `Tool requires evaluator review api_key=${secret}-${rawPlatformId}`,
+      executionTimeMs: 3,
+      secretsRedacted: false,
+      createdAt: now + 2,
+    });
+    await toolRepo.create({
+      id: erroredToolCallId,
+      turnId,
+      toolName: `network.request-${secret}-${rawPlatformId}`,
+      input: { payload: erroredPayload },
+      output: { payload: hiddenOutput },
+      requestedBy: 'pi',
+      actor: { canonicalUserId: `user-${rawPlatformId}-${secret}`, actorClass: 'user' },
+      context: 'private_chat',
+      status: 'error',
+      errorCode: `TOOL_HANDLER_ERROR_${rawPlatformId}_${secret}`,
+      errorMessage: `handler failed token=${secret}-${rawPlatformId}`,
+      executionTimeMs: 11,
+      secretsRedacted: false,
+      createdAt: now + 3,
+    });
+
+    const beforeRows = {
+      turns: db.prepare('SELECT * FROM agent_turns ORDER BY id').all(),
+      contextTraces: db.prepare('SELECT * FROM context_traces ORDER BY id').all(),
+      toolCalls: db.prepare('SELECT * FROM tool_calls ORDER BY id').all(),
+      auditLog: db.prepare('SELECT * FROM audit_log ORDER BY id').all(),
+    };
+    const rejectedStored = db
+      .prepare('SELECT input, error_code, error_message, secrets_redacted FROM tool_calls WHERE id = ?')
+      .get(rejectedToolCallId) as {
+        input: string;
+        error_code: string;
+        error_message: string;
+        secrets_redacted: number;
+      };
+    const erroredStored = db
+      .prepare('SELECT input, output, error_code, error_message, secrets_redacted FROM tool_calls WHERE id = ?')
+      .get(erroredToolCallId) as {
+        input: string;
+        output: string;
+        error_code: string;
+        error_message: string;
+        secrets_redacted: number;
+      };
+    expect(JSON.stringify([rejectedStored, erroredStored])).toContain('[REDACTED:platform_id]');
+    expect(JSON.stringify([rejectedStored, erroredStored])).toContain('[REDACTED:api_key_assignment]');
+    expect(JSON.stringify([rejectedStored, erroredStored])).not.toContain(secret);
+    expect(JSON.stringify([rejectedStored, erroredStored])).not.toContain(rawPlatformId);
+    expect(rejectedStored.secrets_redacted).toBe(1);
+    expect(erroredStored.secrets_redacted).toBe(1);
+
+    const output = expectSuccessfulCli(['why', '--turn', turnId]);
+
+    expect(output).toContain('ContextPack: ctx-cli-why-failed-tool (stored)');
+    expect(output).toContain('Tool calls:');
+    expect(output).toContain('tool-cli-why-rejected-[REDACTED:openai_like_api_key]');
+    expect(output).toContain('memory.propose-[REDACTED:openai_like_api_key]');
+    expect(output).toContain('rejected');
+    expect(output).toContain('requested_by=pi');
+    expect(output).toContain('duration_ms=3');
+    expect(output).toContain('error_code=EVALUATOR_REQUIRED_[REDACTED:platform_id]_[REDACTED:openai_like_api_key]');
+    expect(output).toContain('requires evaluator review');
+    expect(output).toContain('tool-cli-why-error-[REDACTED:openai_like_api_key]');
+    expect(output).toContain('network.request-[REDACTED:openai_like_api_key]');
+    expect(output).toContain('error');
+    expect(output).toContain('duration_ms=11');
+    expect(output).toContain('error_code=TOOL_HANDLER_ERROR_[REDACTED:platform_id]_[REDACTED:openai_like_api_key]');
+    expect(output).toContain('handler failed');
+    expect(output).toContain('[REDACTED:api_key_assignment]');
+    expect(output).toContain('[REDACTED:platform_id]');
+    expect(output).not.toContain(secret);
+    expect(output).not.toContain(rawPlatformId);
+    expect(output).not.toContain('api_key=');
+    expect(output).not.toContain('token=');
+    expect(output).not.toContain('runtime failure should not print');
+    expect(output).not.toContain('raw failed tool why event should not print');
+    expect(output).not.toContain('failed tool why message should not print');
+    expect(output).not.toContain('rejected input payload should not print');
+    expect(output).not.toContain('errored input payload should not print');
+    expect(output).not.toContain('tool output payload should not print');
+
+    reopenDb();
+    expect(db.prepare('SELECT * FROM agent_turns ORDER BY id').all()).toEqual(beforeRows.turns);
+    expect(db.prepare('SELECT * FROM context_traces ORDER BY id').all()).toEqual(beforeRows.contextTraces);
+    expect(db.prepare('SELECT * FROM tool_calls ORDER BY id').all()).toEqual(beforeRows.toolCalls);
+    expect(db.prepare('SELECT * FROM audit_log ORDER BY id').all()).toEqual(beforeRows.auditLog);
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('spawns why command with react_only side-effect labels', async () => {
+    const now = Date.now();
+    const turnId = 'turn-cli-why-react-only';
+    const decisionId = 'decision-cli-why-react-only';
+
+    db.prepare(
+      `INSERT INTO raw_events (id, type, timestamp, source, platform, conversation_id, payload, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'evt-cli-why-react-only',
+      'chat.message.received',
+      now,
+      'gateway',
+      'qq',
+      'private:cli-why-react-only',
+      JSON.stringify({ text: 'react-only why trigger' }),
+      now,
+    );
+    db.prepare(
+      `INSERT INTO chat_messages (
+        id, raw_event_id, message_id, conversation_id, conversation_type,
+        sender_id, text, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'msg-cli-why-react-only',
+      'evt-cli-why-react-only',
+      'platform-cli-why-react-only',
+      'private:cli-why-react-only',
+      'private',
+      'qq-cli-why-react-user',
+      'react-only why trigger',
+      now,
+    );
+    db.prepare(
+      `INSERT INTO agent_turns (
+        id, conversation_id, trigger_event_id, context_pack_id,
+        pi_model, pi_provider, status, started_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      turnId,
+      'private:cli-why-react-only',
+      'evt-cli-why-react-only',
+      'ctx-cli-why-react-only',
+      'mock',
+      'mock',
+      'completed',
+      now,
+    );
+    db.prepare(
+      `INSERT INTO context_traces (
+        id, turn_id, conversation_id, conversation_type, group_id,
+        candidate_memory_ids, selected_memory_ids, rejected_memories,
+        filters_applied, injected_identity_fields, recent_message_ids,
+        token_budget, memories, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'ctx-cli-why-react-only',
+      turnId,
+      'private:cli-why-react-only',
+      'private',
+      null,
+      JSON.stringify([]),
+      JSON.stringify([]),
+      JSON.stringify([]),
+      JSON.stringify(['state=active']),
+      JSON.stringify(['conversation_id', 'conversation_type']),
+      JSON.stringify(['msg-cli-why-react-only']),
+      JSON.stringify({
+        max: 8000,
+        used: 12,
+        breakdown: { recentMessages: 4, memory: 0, identity: 2, system: 6 },
+      }),
+      JSON.stringify([]),
+      now,
+    );
+
+    const actionRepo = new ActionRepository(db);
+    await actionRepo.createDecision({
+      id: decisionId,
+      turnId,
+      decidedBy: 'pi',
+      riskLevel: 'medium',
+      confidence: 0.84,
+      evaluatorRequired: false,
+      actions: [
+        {
+          type: 'react_only',
+          priority: 3,
+          target: {
+            conversationId: 'private:cli-why-react-only',
+            conversationType: 'private',
+            userId: 'qq-cli-why-react-user',
+          },
+          payload: { reaction: '👍', messageId: 'msg-cli-why-react-source' },
+          constraints: {},
+          reason: 'True reaction path',
+        },
+      ],
+      reasons: ['Use a lightweight reaction'],
+      suppressors: [],
+      createdAt: new Date(now + 1),
+    });
+    await actionRepo.createExecution({
+      id: 'execution-cli-why-react-true',
+      actionDecisionId: decisionId,
+      actionType: 'react_only',
+      status: 'success',
+      auditLevel: 'summary',
+      auditEntry: 'True reaction path; gateway_reaction=true',
+      executedAt: new Date(now + 2),
+    });
+    await actionRepo.createExecution({
+      id: 'execution-cli-why-react-fallback',
+      actionDecisionId: decisionId,
+      actionType: 'react_only',
+      status: 'downgraded',
+      executedMessageId: 'msg-cli-why-react-fallback',
+      downgradedFrom: 'react_only',
+      downgradedReason: 'Gateway emoji-like reaction unavailable or failed; sent face-message fallback',
+      auditLevel: 'summary',
+      auditEntry: 'Fallback reaction path; face_message_fallback=true',
+      executedAt: new Date(now + 3),
+    });
+    await actionRepo.createExecution({
+      id: 'execution-cli-why-react-silent',
+      actionDecisionId: decisionId,
+      actionType: 'react_only',
+      status: 'downgraded',
+      downgradedFrom: 'react_only',
+      downgradedReason: 'Gateway reaction and face-message fallback unavailable; stored silently',
+      auditLevel: 'summary',
+      auditEntry: 'Silent reaction path; silent_reaction_fallback=true',
+      executedAt: new Date(now + 4),
+    });
+
+    const output = expectSuccessfulCli(['why', '--turn', turnId]);
+
+    expect(output).toContain('Action executions:');
+    expect(output).toContain('execution-cli-why-react-true:react_only:success');
+    expect(output).toContain('effect=true_reaction');
+    expect(output).toContain('execution-cli-why-react-fallback:react_only:downgraded');
+    expect(output).toContain('message=msg-cli-why-react-fallback');
+    expect(output).toContain('effect=face_message_fallback');
+    expect(output).toContain('execution-cli-why-react-silent:react_only:downgraded');
+    expect(output).toContain('effect=silent_reaction_fallback');
+
+    reopenDb();
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 
@@ -3157,9 +3745,10 @@ describe('CLI main command parser', () => {
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 
-  it('spawns why command without --turn against the latest stored context trace', () => {
+  it('spawns why command without --turn against the latest stored context trace', async () => {
     const now = Date.now();
     const secret = 'sk-abcdefghijklmnopqrstuvwxyz123456';
+    const rawPlatformId = 'qq-7654321098';
 
     db.prepare(
       `INSERT INTO raw_events (id, type, timestamp, source, platform, conversation_id, payload, created_at)
@@ -3321,6 +3910,45 @@ describe('CLI main command parser', () => {
       now,
     );
 
+    const toolRepo = new ToolCallRepository(db);
+    await toolRepo.create({
+      id: `tool-cli-why-older-${secret}-${rawPlatformId}`,
+      turnId: 'turn-cli-why-older',
+      toolName: `older.tool-${secret}-${rawPlatformId}`,
+      input: { payload: `older tool input should not print api_key=${secret}-${rawPlatformId}` },
+      requestedBy: 'pi',
+      actor: { canonicalUserId: `user-older-${rawPlatformId}-${secret}`, actorClass: 'user' },
+      context: 'private_chat',
+      status: 'error',
+      errorCode: `OLDER_TOOL_${rawPlatformId}_${secret}`,
+      errorMessage: `older tool error should not print token=${secret}-${rawPlatformId}`,
+      executionTimeMs: 9,
+      secretsRedacted: false,
+      createdAt: now - 19,
+    });
+    await toolRepo.create({
+      id: `tool-cli-why-latest-${secret}-${rawPlatformId}`,
+      turnId: 'turn-cli-why-latest',
+      toolName: `latest.tool-${secret}-${rawPlatformId}`,
+      input: { payload: `latest tool input should not print api_key=${secret}-${rawPlatformId}` },
+      output: { payload: `latest tool output should not print token=${secret}-${rawPlatformId}` },
+      requestedBy: 'pi',
+      actor: { canonicalUserId: `user-latest-${rawPlatformId}-${secret}`, actorClass: 'user' },
+      context: 'private_chat',
+      status: 'rejected',
+      errorCode: `LATEST_TOOL_${rawPlatformId}_${secret}`,
+      errorMessage: `latest tool rejection summary token=${secret}-${rawPlatformId}`,
+      executionTimeMs: 13,
+      secretsRedacted: false,
+      createdAt: now + 1,
+    });
+
+    const beforeRows = {
+      turns: db.prepare('SELECT * FROM agent_turns ORDER BY id').all(),
+      contextTraces: db.prepare('SELECT * FROM context_traces ORDER BY id').all(),
+      toolCalls: db.prepare('SELECT * FROM tool_calls ORDER BY id').all(),
+    };
+
     const output = expectSuccessfulCli(['why']);
 
     expect(output).toContain('Context explanation for turn turn-cli-why-latest');
@@ -3329,17 +3957,37 @@ describe('CLI main command parser', () => {
     expect(output).toContain('Selected memories: mem-cli-why-latest-selected');
     expect(output).toContain('Candidate memories: mem-cli-why-latest-candidate');
     expect(output).toContain('Rejected memories:');
+    expect(output).toContain('Tool calls:');
+    expect(output).toContain('tool-cli-why-latest-[REDACTED:openai_like_api_key]');
+    expect(output).toContain('latest.tool-[REDACTED:openai_like_api_key]');
+    expect(output).toContain('rejected');
+    expect(output).toContain('requested_by=pi');
+    expect(output).toContain('duration_ms=13');
+    expect(output).toContain('error_code=LATEST_TOOL_[REDACTED:platform_id]_[REDACTED:openai_like_api_key]');
+    expect(output).toContain('latest tool rejection summary');
     expect(output).toContain('[REDACTED:');
     expect(output).not.toContain('turn-cli-why-older');
     expect(output).not.toContain('ctx-cli-why-older');
     expect(output).not.toContain('mem-cli-why-older-selected');
+    expect(output).not.toContain('tool-cli-why-older');
+    expect(output).not.toContain('older.tool');
     expect(output).not.toContain(secret);
+    expect(output).not.toContain(rawPlatformId);
+    expect(output).not.toContain('api_key=');
+    expect(output).not.toContain('token=');
     expect(output).not.toContain('latest message text should not print');
     expect(output).not.toContain('latest stored title should not print');
+    expect(output).not.toContain('latest tool input should not print');
+    expect(output).not.toContain('latest tool output should not print');
     expect(output).not.toContain('older message text should not print');
     expect(output).not.toContain('older stored title should not print');
+    expect(output).not.toContain('older tool input should not print');
+    expect(output).not.toContain('older tool error should not print');
 
     reopenDb();
+    expect(db.prepare('SELECT * FROM agent_turns ORDER BY id').all()).toEqual(beforeRows.turns);
+    expect(db.prepare('SELECT * FROM context_traces ORDER BY id').all()).toEqual(beforeRows.contextTraces);
+    expect(db.prepare('SELECT * FROM tool_calls ORDER BY id').all()).toEqual(beforeRows.toolCalls);
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 
@@ -3355,6 +4003,15 @@ describe('CLI main command parser', () => {
       now,
       now
     );
+
+    insertCanonicalMemorySourceChatMessage({
+      id: 'msg-cli-why-rebuilt-source',
+      rawEventId: 'evt-cli-why-rebuilt-source',
+      conversationId: 'private:cli-memory-source',
+      conversationType: 'private',
+      senderId: rawUser,
+      timestamp: now,
+    });
 
     const memoryId = await memoryRepo.create({
       id: 'mem-cli-why-rebuilt-selected',
@@ -3431,6 +4088,9 @@ describe('CLI main command parser', () => {
     expect(output).toContain('(rebuilt)');
     expect(output).toContain('Conversation: private:cli-why-rebuilt');
     expect(output).toContain(`Selected memories: ${memoryId}`);
+    expect(output).toContain(
+      `Memory selection evidence: ${memoryId}:query_match:current_message:same_user:via=scoped_rank+fts:rank=1`,
+    );
     expect(output).toContain(`Candidate memories: ${memoryId}`);
     expect(output).toContain('Rejected memories: []');
     expect(output).toContain('Filters: state=active, sensitivity!=secret/prohibited, contextType=private');
@@ -3470,6 +4130,15 @@ describe('CLI main command parser', () => {
       now,
       now
     );
+
+    insertCanonicalMemorySourceChatMessage({
+      id: 'msg-cli-why-conversation-source',
+      rawEventId: 'evt-cli-why-conversation-source',
+      conversationId: 'private:cli-memory-source',
+      conversationType: 'private',
+      senderId: rawUser,
+      timestamp: now,
+    });
 
     const memoryId = await memoryRepo.create({
       id: 'mem-cli-why-conversation-selected',
@@ -3589,11 +4258,40 @@ describe('CLI main command parser', () => {
     const rawConversation = `group:cli-why-conversation-qq-6789012345-${secret}`;
     const redactedMessageRowId = `msg-cli-why-group-conversation-${secret}`;
 
+    new GroupSummaryPolicyRepository(db).setEnabled({
+      groupId: rawGroup,
+      enabled: true,
+      authority: {
+        kind: 'bot_owner',
+        actorUserId: 'test-bot-owner',
+        invocationContext: 'admin_cli',
+      },
+      now,
+    });
+
     db.prepare('INSERT INTO canonical_users (id, created_at, last_seen_at) VALUES (?, ?, ?)').run(
       rawUser,
       now,
       now
     );
+
+    insertCanonicalMemorySourceChatMessage({
+      id: 'msg-cli-why-group-private-source',
+      rawEventId: 'evt-cli-why-group-private-source',
+      conversationId: 'private:cli-why-group-private-source',
+      conversationType: 'private',
+      senderId: rawUser,
+      timestamp: now,
+    });
+    insertCanonicalMemorySourceChatMessage({
+      id: 'msg-cli-why-group-conversation-source',
+      rawEventId: 'evt-cli-why-group-conversation-source',
+      conversationId: 'group:cli-memory-source',
+      conversationType: 'group',
+      groupId: rawGroup,
+      senderId: 'user-cli',
+      timestamp: now,
+    });
 
     const privateMemoryId = await memoryRepo.create({
       id: 'mem-cli-why-group-conversation-private-rejected',
@@ -4277,9 +4975,15 @@ describe('CLI main command parser', () => {
     const missingDelete = runCli(['delete-memory', `missing-${secret}`]);
     expect(missingDelete.status).toBe(1);
     expect(missingDelete.stdout).toBe('');
-    expect(missingDelete.stderr).toContain('[REDACTED:openai_like_api_key]');
-    expect(missingDelete.stderr).toContain('not found');
+    expect(missingDelete.stderr).toBe('❌ Memory [redacted-id] not found');
     expect(missingDelete.stderr).not.toContain(secret);
+
+    const hostileDeleteId = `${'x'.repeat(129)}\n\u001b[31mqq-12345`;
+    const hostileDelete = runCli(['delete-memory', hostileDeleteId]);
+    expect(hostileDelete.status).toBe(1);
+    expect(hostileDelete.stdout).toBe('');
+    expect(hostileDelete.stderr).toBe('❌ Memory [redacted-id] not found');
+    expect(hostileDelete.stderr).not.toContain('12345');
 
     const missingApprove = runCli(['approve-memory', `missing-${secret}`]);
     expect(missingApprove.status).toBe(1);
@@ -4338,6 +5042,56 @@ describe('CLI main command parser', () => {
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 
+  it('bounds and single-lines post-parser command errors without mutation', () => {
+    const secret = 'sk-abcdefghijklmnopqrstuvwxyz123456';
+    const rawQqId = '12345';
+    const hostileId = `missing-${secret}-qq-${rawQqId}\n\u001b[31m-${'x'.repeat(10_000)}`;
+    const profileFailure = `forced profile failure ${secret} qq-${rawQqId}\n\u001b[31m-${'x'.repeat(10_000)}`;
+    db.exec(`
+      CREATE TRIGGER fail_hostile_profile_audit
+      BEFORE INSERT ON audit_log
+      WHEN NEW.event_type = 'display_profile.redact'
+      BEGIN
+        SELECT RAISE(ABORT, '${profileFailure}');
+      END
+    `);
+    const beforeRows = {
+      memories: db.prepare('SELECT * FROM memory_records ORDER BY id').all(),
+      revisions: db.prepare('SELECT * FROM memory_revisions ORDER BY id').all(),
+      audit: db.prepare('SELECT * FROM audit_log ORDER BY id').all(),
+    };
+
+    const results = [
+      runCli(['show-memory', hostileId]),
+      runCli(['disable-memory', hostileId]),
+      runCli(['enable-memory', hostileId]),
+      runCli(['why', '--turn', hostileId]),
+      runCli(['redact-display-profile', hostileId]),
+    ];
+
+    for (const result of results) {
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe('');
+      expect(result.stderr.length).toBeLessThanOrEqual(2_048);
+      expect(result.stderr).toContain('[REDACTED:openai_like_api_key]');
+      expect(result.stderr).toContain('[REDACTED:platform_id]');
+      expect(result.stderr).not.toContain(secret);
+      expect(result.stderr).not.toContain(rawQqId);
+      expect(result.stderr).not.toContain('\n');
+      expect(result.stderr).not.toContain('\u001b');
+    }
+
+    reopenDb();
+    db.exec('DROP TRIGGER IF EXISTS fail_hostile_profile_audit');
+    expect({
+      memories: db.prepare('SELECT * FROM memory_records ORDER BY id').all(),
+      revisions: db.prepare('SELECT * FROM memory_revisions ORDER BY id').all(),
+      audit: db.prepare('SELECT * FROM audit_log ORDER BY id').all(),
+    }).toEqual(beforeRows);
+    expect(db.prepare('PRAGMA integrity_check').pluck().get()).toBe('ok');
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
   it('spawns memory lifecycle with redacted durable audit summary and details', async () => {
     const secret = 'sk-abcdefghijklmnopqrstuvwxyz123456';
     const memoryId = `legacy_qq-123456789_${secret}`;
@@ -4360,20 +5114,20 @@ describe('CLI main command parser', () => {
         {
           sourceType: 'user_command',
           sourceId: 'cli-lifecycle-durable-audit-source',
+          external: true,
         },
       ],
     });
 
     const stdout = expectSuccessfulCli(['delete-memory', memoryId]);
-    expect(stdout).toContain('✅ Memory');
-    expect(stdout).toContain('[REDACTED:openai_like_api_key]');
-    expect(stdout).toContain('[REDACTED:platform_id]');
+    expect(stdout).toBe('✅ Memory [redacted-id] deleted');
     expect(stdout).not.toContain(secret);
     expect(stdout).not.toContain('123456789');
 
     const auditRows = db
       .prepare(
-        `SELECT event_type, event_id, summary, details, redacted
+        `SELECT event_type, event_id, actor_user_id, actor_class,
+                invocation_context, summary, details, redacted
          FROM audit_log
          WHERE category = 'memory' AND event_id = ?
          ORDER BY timestamp ASC, id ASC`
@@ -4381,6 +5135,9 @@ describe('CLI main command parser', () => {
       .all(memoryId) as Array<{
         event_type: string;
         event_id: string;
+        actor_user_id: string | null;
+        actor_class: string;
+        invocation_context: string;
         summary: string;
         details: string;
         redacted: number;
@@ -4393,11 +5150,35 @@ describe('CLI main command parser', () => {
 
       const details = JSON.parse(row.details) as Record<string, unknown>;
       const serializedAuditBody = `${row.summary}\n${JSON.stringify(details)}`;
-      expect(serializedAuditBody).toContain('[REDACTED:openai_like_api_key]');
-      expect(serializedAuditBody).toContain('[REDACTED:platform_id]');
       expect(serializedAuditBody).not.toContain(secret);
       expect(serializedAuditBody).not.toContain('123456789');
     }
+
+    const createAudit = auditRows.find((row) => row.event_type === 'memory.create');
+    const serializedCreateAudit = `${createAudit?.summary}\n${createAudit?.details}`;
+    expect(serializedCreateAudit).toContain('[REDACTED:openai_like_api_key]');
+    expect(serializedCreateAudit).toContain('[REDACTED:platform_id]');
+
+    const deleteAudit = auditRows.find((row) => row.event_type === 'memory.delete');
+    expect(deleteAudit).toMatchObject({
+      actor_user_id: 'local_admin',
+      actor_class: 'admin',
+      invocation_context: 'admin_cli',
+      redacted: 1,
+    });
+    expect(JSON.parse(deleteAudit?.details ?? '{}')).toMatchObject({
+      governanceActor: 'local_admin',
+      memoryId: '[redacted-id]',
+      policyDecision: expect.stringMatching(
+        /^policy:l0:deleted:sha256:[0-9a-f]{64}$/,
+      ),
+    });
+    expect(
+      db.prepare(
+        `SELECT actor FROM memory_revisions
+         WHERE memory_id = ? AND change_type = 'delete'`
+      ).get(memoryId)
+    ).toEqual({ actor: 'local_admin' });
 
     const displayedAudit = JSON.parse(
       expectSuccessfulCli(['list-audit', '--event-id', memoryId, '--include-details'])
@@ -4411,6 +5192,254 @@ describe('CLI main command parser', () => {
     expect(serializedDisplayedAudit).toContain('[REDACTED:platform_id]');
     expect(serializedDisplayedAudit).not.toContain(secret);
     expect(serializedDisplayedAudit).not.toContain('123456789');
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('spawns memory-summary through default-off, idempotent changes, cancellation, and re-enable', () => {
+    const rawQqId = '123456789';
+    const groupId = `qq-group-${rawQqId}`;
+    const outputs: string[] = [];
+    const runSummary = (action: 'status' | 'enable' | 'disable'): string => {
+      const output = expectSuccessfulCli(['memory-summary', action, '--group', groupId]);
+      outputs.push(output);
+      return output;
+    };
+
+    expect(runSummary('status')).toBe(
+      'Group summary policy: state=disabled changed=false canceled_jobs=0'
+    );
+    expect(runSummary('disable')).toBe(
+      'Group summary policy: state=disabled changed=false canceled_jobs=0'
+    );
+    expect(runSummary('enable')).toBe(
+      'Group summary policy: state=enabled changed=true canceled_jobs=0'
+    );
+    expect(runSummary('status')).toBe(
+      'Group summary policy: state=enabled changed=false canceled_jobs=0'
+    );
+    expect(runSummary('enable')).toBe(
+      'Group summary policy: state=enabled changed=false canceled_jobs=0'
+    );
+
+    const enabledPolicy = new GroupSummaryPolicyRepository(db).get(groupId);
+    expect(enabledPolicy).toMatchObject({ state: 'enabled', generation: 1 });
+    const bindNow = Math.max(Date.now(), enabledPolicy?.eligibleAfter ?? 0);
+    const jobId = new JobRepository(db).enqueue({
+      id: 'job-cli-memory-summary-pending',
+      type: 'summary',
+      payload: {
+        conversationId: 'group:cli-memory-summary',
+        conversationType: 'group',
+        groupId,
+      },
+      now: bindNow,
+      scheduledAt: bindNow + 60_000,
+    });
+    new GroupSummaryPolicyRepository(db).bindSummaryJob({
+      jobId,
+      groupId,
+      conversationId: 'group:cli-memory-summary',
+      now: bindNow,
+    });
+
+    expect(runSummary('disable')).toBe(
+      'Group summary policy: state=disabled changed=true canceled_jobs=1'
+    );
+    expect(runSummary('status')).toBe(
+      'Group summary policy: state=disabled changed=false canceled_jobs=0'
+    );
+    expect(runSummary('disable')).toBe(
+      'Group summary policy: state=disabled changed=false canceled_jobs=0'
+    );
+    expect(runSummary('enable')).toBe(
+      'Group summary policy: state=enabled changed=true canceled_jobs=0'
+    );
+    expect(runSummary('status')).toBe(
+      'Group summary policy: state=enabled changed=false canceled_jobs=0'
+    );
+
+    for (const output of outputs) {
+      expect(output.length).toBeLessThan(100);
+      expect(output).toMatch(
+        /^Group summary policy: state=(enabled|disabled) changed=(true|false) canceled_jobs=\d+$/
+      );
+      expect(output).not.toContain(groupId);
+      expect(output).not.toContain(rawQqId);
+      expect(output).not.toContain('generation');
+      expect(output).not.toContain('eligibleAfter');
+      expect(output).not.toContain('auditId');
+      expect(output).not.toContain('{');
+    }
+
+    expect(
+      db.prepare(
+        `SELECT state, generation, eligible_after IS NOT NULL AS has_eligible_after
+         FROM group_summary_policies WHERE group_id = ?`
+      ).get(groupId)
+    ).toEqual({ state: 'enabled', generation: 3, has_eligible_after: 1 });
+    expect(
+      db.prepare(
+        `SELECT status, error, result, lease_owner, lease_expires_at
+         FROM jobs WHERE id = ?`
+      ).get(jobId)
+    ).toEqual({
+      status: 'failed',
+      error: 'group_summary_policy_disabled',
+      result: JSON.stringify({ code: 'group_summary_policy_disabled' }),
+      lease_owner: null,
+      lease_expires_at: null,
+    });
+    expect(
+      db.prepare(
+        `SELECT cancellation_code, canceled_at IS NOT NULL AS was_canceled
+         FROM group_summary_job_bindings WHERE job_id = ?`
+      ).get(jobId)
+    ).toEqual({
+      cancellation_code: 'group_summary_policy_disabled',
+      was_canceled: 1,
+    });
+
+    const auditRows = db.prepare(
+      `SELECT actor_user_id, actor_class, invocation_context, details, redacted
+       FROM audit_log
+       WHERE event_type = 'group.summary_policy_changed'
+       ORDER BY json_extract(details, '$.generation')`
+    ).all() as Array<{
+      actor_user_id: string;
+      actor_class: string;
+      invocation_context: string;
+      details: string;
+      redacted: number;
+    }>;
+    expect(auditRows).toHaveLength(3);
+    for (const row of auditRows) {
+      expect(row).toMatchObject({
+        actor_user_id: 'local_admin',
+        actor_class: 'admin',
+        invocation_context: 'admin_cli',
+        redacted: 1,
+      });
+      expect(row.details).toContain('[REDACTED:platform_id]');
+      expect(row.details).not.toContain(rawQqId);
+    }
+    const groupIdHashes = auditRows.map((row) => (
+      JSON.parse(row.details) as { groupIdHash: string }
+    ).groupIdHash);
+    expect(new Set(groupIdHashes).size).toBe(1);
+    expect(groupIdHashes[0]).toMatch(/^[0-9a-f]{64}$/);
+    expect(auditRows.map((row) => JSON.parse(row.details))).toEqual([
+      expect.objectContaining({
+        oldState: 'disabled',
+        newState: 'enabled',
+        generation: 1,
+        authority: 'local_admin',
+        canceledJobCount: 0,
+      }),
+      expect.objectContaining({
+        oldState: 'enabled',
+        newState: 'disabled',
+        generation: 2,
+        authority: 'local_admin',
+        canceledJobCount: 1,
+      }),
+      expect.objectContaining({
+        oldState: 'disabled',
+        newState: 'enabled',
+        generation: 3,
+        authority: 'local_admin',
+        canceledJobCount: 0,
+      }),
+    ]);
+    expect(db.prepare('PRAGMA integrity_check').pluck().get()).toBe('ok');
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('rejects malformed memory-summary invocations before mutation and without leaking values', () => {
+    const secret = 'sk-cli-memory-summary-parser-abcdefghijklmnopqrstuvwxyz';
+    const rawQqId = '234567890';
+    const groupId = `qq-group-${rawQqId}-${secret}`;
+    const canonicalGroupId = `qq-group-${rawQqId}`;
+    const invalidAction = `rotate-${secret}-qq-${rawQqId}`;
+    const unknownOption = `--unknown-${secret}-qq-${rawQqId}`;
+    const extraValue = `extra-${secret}-qq-${rawQqId}`;
+    const beforeRows = {
+      policies: db.prepare('SELECT * FROM group_summary_policies ORDER BY group_id').all(),
+      bindings: db.prepare('SELECT * FROM group_summary_job_bindings ORDER BY job_id').all(),
+      jobs: db.prepare('SELECT * FROM jobs ORDER BY id').all(),
+      audit: db.prepare('SELECT * FROM audit_log ORDER BY id').all(),
+    };
+
+    const results = [
+      runCliWithEnv(
+        ['memory-summary', invalidAction, '--group', canonicalGroupId],
+        { LETHEBOT_DB_PATH: testDir },
+      ),
+      runCli(['memory-summary']),
+      runCli(['memory-summary', '--group', canonicalGroupId]),
+      runCli(['memory-summary', 'status']),
+      runCli(['memory-summary', 'status', '--group']),
+      runCli(['memory-summary', 'status', '--group', '']),
+      runCli(['memory-summary', 'status', '--group', ` ${groupId}`]),
+      runCli(['memory-summary', 'status', '--group', groupId]),
+      runCli(['memory-summary', 'status', '--group', canonicalGroupId, extraValue]),
+      runCli(['memory-summary', 'status', '--group', canonicalGroupId, unknownOption]),
+    ];
+
+    for (const result of results) {
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).not.toContain(secret);
+      expect(result.stderr).not.toContain(rawQqId);
+      expect(result.stderr).not.toContain(groupId);
+      expect(result.stderr).not.toContain('src/cli');
+      expect(result.stderr).not.toContain('governance/service');
+      expect(result.stderr).not.toContain('SQLITE');
+      expect(result.stderr).not.toContain('TypeError');
+      expect(result.stderr).not.toContain('\n    at ');
+    }
+    expect(results[0]?.stderr).toBe(
+      '❌ Invalid memory summary action; expected status, enable, or disable'
+    );
+    expect(results[1]?.stderr).toContain("required option '--group <groupId>' not specified");
+    expect(results[2]?.stderr).toContain("missing required argument 'action'");
+    expect(results[3]?.stderr).toContain("required option '--group <groupId>' not specified");
+    expect(results[4]?.stderr).toContain("option '--group <groupId>' argument missing");
+    expect(results[5]?.stderr).toBe('❌ Group ID must be a non-empty trimmed value');
+    expect(results[6]?.stderr).toBe('❌ Group ID must be a non-empty trimmed value');
+    expect(results[7]?.stderr).toBe('❌ Group ID must use qq-group-<5-12 digit QQ id>');
+    expect(results[8]?.stderr).toContain("too many arguments for 'memory-summary'");
+    expect(results[9]?.stderr).toContain('error: unknown option');
+    expect(results[9]?.stderr).toContain('[REDACTED:openai_like_api_key]');
+    expect(results[9]?.stderr).toContain('[REDACTED:platform_id]');
+
+    const hostileUnknownOption = `--${secret}-qq-${rawQqId}-${'x'.repeat(10_000)}\n\u001b[31m`;
+    const hostile = runCli([
+      'memory-summary',
+      'status',
+      '--group',
+      `qq-group-${rawQqId}`,
+      hostileUnknownOption,
+    ]);
+    expect(hostile.status).toBe(1);
+    expect(hostile.stdout).toBe('');
+    expect(hostile.stderr.length).toBeLessThanOrEqual(2_048);
+    expect(hostile.stderr).toContain('error: unknown option');
+    expect(hostile.stderr).toContain('[REDACTED:openai_like_api_key]');
+    expect(hostile.stderr).toContain('[REDACTED:platform_id]');
+    expect(hostile.stderr).not.toContain(secret);
+    expect(hostile.stderr).not.toContain(rawQqId);
+    expect(hostile.stderr).not.toContain('\n');
+    expect(hostile.stderr).not.toContain('\u001b');
+
+    reopenDb();
+    const afterRows = {
+      policies: db.prepare('SELECT * FROM group_summary_policies ORDER BY group_id').all(),
+      bindings: db.prepare('SELECT * FROM group_summary_job_bindings ORDER BY job_id').all(),
+      jobs: db.prepare('SELECT * FROM jobs ORDER BY id').all(),
+      audit: db.prepare('SELECT * FROM audit_log ORDER BY id').all(),
+    };
+    expect(afterRows).toEqual(beforeRows);
+    expect(db.prepare('PRAGMA integrity_check').pluck().get()).toBe('ok');
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 
@@ -4436,6 +5465,7 @@ describe('CLI main command parser', () => {
         {
           sourceType: 'user_command',
           sourceId: 'cli-enable-durable-audit-source',
+          external: true,
         },
       ],
     });
@@ -4536,6 +5566,7 @@ describe('CLI main command parser', () => {
         {
           sourceType: 'user_command',
           sourceId: 'cli-approve-durable-audit-source',
+          external: true,
         },
       ],
     });
@@ -4557,6 +5588,7 @@ describe('CLI main command parser', () => {
         {
           sourceType: 'user_command',
           sourceId: 'cli-reject-durable-audit-source',
+          external: true,
         },
       ],
     });
@@ -4673,6 +5705,7 @@ describe('CLI main command parser', () => {
         {
           sourceType: 'user_command',
           sourceId: 'cli-disable-durable-audit-source',
+          external: true,
         },
       ],
     });
@@ -4771,6 +5804,7 @@ describe('CLI main command parser', () => {
         {
           sourceType: 'user_command',
           sourceId: 'cli-restore-durable-audit-source',
+          external: true,
         },
       ],
     });
@@ -4873,6 +5907,7 @@ describe('CLI main command parser', () => {
         {
           sourceType: 'user_command',
           sourceId: 'cli-supersede-durable-audit-old-source',
+          external: true,
         },
       ],
     });
@@ -4894,6 +5929,7 @@ describe('CLI main command parser', () => {
         {
           sourceType: 'user_command',
           sourceId: 'cli-supersede-durable-audit-replacement-source',
+          external: true,
         },
       ],
     });
@@ -8998,6 +10034,98 @@ describe('CLI main command parser', () => {
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 
+  it('accepts the delayed Attention persistence failure stage for operator inspection', () => {
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO raw_events (id, type, timestamp, source, platform, conversation_id, payload, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'evt-cli-delayed-attention-failure',
+      'chat.message.received',
+      now,
+      'gateway',
+      'qq',
+      'group:synthetic-delayed-attention',
+      '{}',
+      now,
+    );
+    db.prepare(
+      `INSERT INTO event_processing_failures (
+        id, raw_event_id, occurred_at, stage, conversation_type,
+        error_name, error_message_hash, details
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'failure-cli-delayed-attention',
+      'evt-cli-delayed-attention-failure',
+      now,
+      'delayed_attention_persist',
+      'group',
+      'Error',
+      'a'.repeat(64),
+      JSON.stringify({ redaction: 'hashes_only_no_message_text_no_platform_ids_no_raw_error' }),
+    );
+
+    const rows = JSON.parse(expectSuccessfulCli([
+      'list-event-failures',
+      '--stage',
+      'delayed_attention_persist',
+    ])) as Array<{ id: string; stage: string }>;
+
+    expect(rows).toEqual([
+      expect.objectContaining({
+        id: 'failure-cli-delayed-attention',
+        stage: 'delayed_attention_persist',
+      }),
+    ]);
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('accepts the governance command failure stage for operator inspection', () => {
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO raw_events (id, type, timestamp, source, platform, conversation_id, payload, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'evt-cli-governance-command-failure',
+      'chat.message.received',
+      now,
+      'gateway',
+      'qq',
+      'group:synthetic-governance-command',
+      '{}',
+      now,
+    );
+    db.prepare(
+      `INSERT INTO event_processing_failures (
+        id, raw_event_id, occurred_at, stage, conversation_type,
+        error_name, error_message_hash, details
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'failure-cli-governance-command',
+      'evt-cli-governance-command-failure',
+      now,
+      'governance_command',
+      'group',
+      'Error',
+      'b'.repeat(64),
+      JSON.stringify({ redaction: 'hashes_only_no_message_text_no_platform_ids_no_raw_error' }),
+    );
+
+    const rows = JSON.parse(expectSuccessfulCli([
+      'list-event-failures',
+      '--stage',
+      'governance_command',
+    ])) as Array<{ id: string; stage: string }>;
+
+    expect(rows).toEqual([
+      expect.objectContaining({
+        id: 'failure-cli-governance-command',
+        stage: 'governance_command',
+      }),
+    ]);
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
   it('spawns event failure filter variants without cross-returning diagnostics or mutating data', () => {
     const now = Date.now();
     const secret = 'sk-defghijklmnopqrstuvwxyz123456789';
@@ -10935,6 +12063,290 @@ describe('CLI main command parser', () => {
       failures: db.prepare('SELECT * FROM event_processing_failures ORDER BY id').all(),
       jobs: db.prepare('SELECT * FROM jobs ORDER BY id').all(),
       workerHeartbeats: db.prepare('SELECT * FROM worker_heartbeats ORDER BY worker_id').all(),
+      audit: db.prepare('SELECT * FROM audit_log ORDER BY id').all(),
+    };
+    expect(afterRows).toEqual(beforeRows);
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('spawns compact governance health with aggregate-only triage evidence', () => {
+    const now = Date.now();
+    const secret = 'sk-cli-health-compact-secret-should-not-leak';
+    const platformId = 'qq-987654321';
+    const rawPayloadText = `operator payload ${secret} ${platformId}`;
+
+    db.prepare(
+      `INSERT INTO raw_events (id, type, timestamp, source, platform, conversation_id, payload, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'evt-cli-health-compact',
+      'chat.message.received',
+      now,
+      'gateway',
+      'qq',
+      'private:qq-health-compact',
+      JSON.stringify({ text: rawPayloadText }),
+      now
+    );
+    db.prepare(
+      `INSERT INTO agent_turns (
+        id, conversation_id, trigger_event_id, context_pack_id,
+        pi_model, pi_provider, response_text, status, started_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'turn-cli-health-compact',
+      'private:qq-health-compact',
+      'evt-cli-health-compact',
+      'ctx-cli-health-compact',
+      'mock',
+      'mock',
+      rawPayloadText,
+      'failed',
+      now,
+      now
+    );
+    db.prepare(
+      `INSERT INTO action_decisions (
+        id, turn_id, decided_by, risk_level, confidence,
+        evaluator_required, evaluator_passed, actions, reasons, suppressors, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'decision-cli-health-compact',
+      'turn-cli-health-compact',
+      'pi',
+      'high',
+      0.75,
+      1,
+      0,
+      JSON.stringify([{ type: 'reply_short', payload: { text: rawPayloadText } }]),
+      JSON.stringify([rawPayloadText]),
+      JSON.stringify([rawPayloadText]),
+      now
+    );
+    db.prepare(
+      `INSERT INTO action_executions (
+        id, action_decision_id, action_type, status,
+        error_message, audit_level, audit_entry, executed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'execution-cli-health-compact',
+      'decision-cli-health-compact',
+      'reply_short',
+      'failed',
+      rawPayloadText,
+      'summary',
+      JSON.stringify({ payload: rawPayloadText }),
+      now
+    );
+    db.prepare(
+      `INSERT INTO tool_calls (
+        id, turn_id, tool_name, input, output,
+        requested_by, actor_user_id, actor_class, invocation_context,
+        status, error_message, execution_time_ms, secrets_redacted, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'tool-cli-health-compact',
+      'turn-cli-health-compact',
+      'compact_secret_tool',
+      JSON.stringify({ input: rawPayloadText }),
+      JSON.stringify({ output: rawPayloadText }),
+      'pi',
+      'user-cli',
+      'user',
+      'private_chat',
+      'error',
+      rawPayloadText,
+      12,
+      1,
+      now
+    );
+    db.prepare(
+      `INSERT INTO jobs (
+        id, type, payload, status, attempts, max_attempts,
+        lease_owner, lease_expires_at, created_at, updated_at, scheduled_at,
+        error, result
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'job-cli-health-compact-failed',
+      'summary',
+      JSON.stringify({ payload: rawPayloadText }),
+      'failed',
+      1,
+      3,
+      null,
+      null,
+      now,
+      now,
+      now,
+      rawPayloadText,
+      JSON.stringify({ result: rawPayloadText }),
+      'job-cli-health-compact-expired',
+      'extraction',
+      JSON.stringify({ payload: rawPayloadText }),
+      'running',
+      1,
+      3,
+      'worker-cli-health-compact',
+      now - 1000,
+      now,
+      now,
+      now,
+      null,
+      null
+    );
+    db.prepare(
+      `INSERT INTO worker_heartbeats (
+        worker_id, worker_type, status, current_job_id, heartbeat_at, details
+      ) VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(
+      'worker-cli-health-compact',
+      'durable',
+      'error',
+      'job-cli-health-compact-expired',
+      now,
+      JSON.stringify({ diagnostic: rawPayloadText })
+    );
+    db.prepare(
+      `INSERT INTO event_processing_failures (
+        id, raw_event_id, turn_id, occurred_at, stage, conversation_type,
+        error_name, error_message_hash, message_id_hash, sender_id_hash,
+        conversation_id_hash, details
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'failure-cli-health-compact',
+      'evt-cli-health-compact',
+      'turn-cli-health-compact',
+      now,
+      'pi_inference',
+      'private',
+      'ProviderError',
+      'a'.repeat(64),
+      'b'.repeat(64),
+      'c'.repeat(64),
+      'd'.repeat(64),
+      JSON.stringify({ diagnostic: rawPayloadText })
+    );
+    db.prepare(
+      `INSERT INTO audit_log (
+        id, timestamp, category, level, event_type, event_id,
+        actor_class, invocation_context, summary, details, redacted, risk_level
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'audit-cli-health-compact-review',
+      now,
+      'memory',
+      'redacted_full',
+      'memory.conflict.detected',
+      'job-cli-health-compact-review',
+      'system_worker',
+      'background_worker',
+      rawPayloadText,
+      JSON.stringify({ groups: [{ memoryIds: ['mem-compact-a', 'mem-compact-b'] }] }),
+      1,
+      'medium',
+      'audit-cli-health-compact-risk',
+      now + 1,
+      'system',
+      'summary',
+      `system.health.${secret}.${platformId}`,
+      'event-cli-health-compact-risk',
+      'system',
+      'admin_cli',
+      rawPayloadText,
+      JSON.stringify({ detail: rawPayloadText }),
+      1,
+      'prohibited'
+    );
+
+    const beforeRows = {
+      rawEvents: db.prepare('SELECT * FROM raw_events ORDER BY id').all(),
+      turns: db.prepare('SELECT * FROM agent_turns ORDER BY id').all(),
+      actionDecisions: db.prepare('SELECT * FROM action_decisions ORDER BY id').all(),
+      actionExecutions: db.prepare('SELECT * FROM action_executions ORDER BY id').all(),
+      toolCalls: db.prepare('SELECT * FROM tool_calls ORDER BY id').all(),
+      jobs: db.prepare('SELECT * FROM jobs ORDER BY id').all(),
+      workerHeartbeats: db.prepare('SELECT * FROM worker_heartbeats ORDER BY worker_id').all(),
+      eventFailures: db.prepare('SELECT * FROM event_processing_failures ORDER BY id').all(),
+      audit: db.prepare('SELECT * FROM audit_log ORDER BY id').all(),
+    };
+
+    const stdout = expectSuccessfulCli(['summarize-governance-health', '--compact']);
+    const compact = JSON.parse(stdout) as {
+      overall: string;
+      attention: {
+        unresolvedMemoryReviews: number;
+        failedJobs: number;
+        expiredRunningLeases: number;
+        errorWorkerHeartbeats: number;
+        failedOrRejectedActions: number;
+        failedOrRejectedToolCalls: number;
+        eventProcessingFailures: number;
+        highOrProhibitedRiskAuditEvents: number;
+      };
+      totals: {
+        memoryReviews: number;
+        eventProcessingFailures: number;
+        actionDecisions: number;
+        actionExecutions: number;
+        toolCalls: number;
+        jobs: number;
+        workerHeartbeats: number;
+        auditEvents: number;
+      };
+      latest: {
+        eventFailureAt?: string;
+        workerHeartbeatAt?: string;
+      };
+    };
+
+    expect(compact).toMatchObject({
+      overall: 'attention_required',
+      attention: {
+        unresolvedMemoryReviews: 1,
+        failedJobs: 1,
+        expiredRunningLeases: 1,
+        errorWorkerHeartbeats: 1,
+        failedOrRejectedActions: 1,
+        failedOrRejectedToolCalls: 1,
+        eventProcessingFailures: 1,
+        highOrProhibitedRiskAuditEvents: 1,
+      },
+      totals: {
+        memoryReviews: 1,
+        eventProcessingFailures: 1,
+        actionDecisions: 1,
+        actionExecutions: 1,
+        toolCalls: 1,
+        jobs: 2,
+        workerHeartbeats: 1,
+        auditEvents: 2,
+      },
+    });
+    expect(compact.latest.eventFailureAt).toBeDefined();
+    expect(compact.latest.workerHeartbeatAt).toBeDefined();
+
+    expect(stdout).not.toContain(secret);
+    expect(stdout).not.toContain(platformId);
+    expect(stdout).not.toContain('987654321');
+    expect(stdout).not.toContain(rawPayloadText);
+    expect(stdout).not.toContain('compact_secret_tool');
+    expect(stdout).not.toContain('memory.conflict.detected');
+    expect(stdout).not.toContain('system.health');
+    expect(stdout).not.toContain('pi_inference');
+    expect(stdout).not.toContain('summary');
+    expect(stdout).not.toContain('extraction');
+    expect(stdout).not.toContain('durable');
+
+    reopenDb();
+    const afterRows = {
+      rawEvents: db.prepare('SELECT * FROM raw_events ORDER BY id').all(),
+      turns: db.prepare('SELECT * FROM agent_turns ORDER BY id').all(),
+      actionDecisions: db.prepare('SELECT * FROM action_decisions ORDER BY id').all(),
+      actionExecutions: db.prepare('SELECT * FROM action_executions ORDER BY id').all(),
+      toolCalls: db.prepare('SELECT * FROM tool_calls ORDER BY id').all(),
+      jobs: db.prepare('SELECT * FROM jobs ORDER BY id').all(),
+      workerHeartbeats: db.prepare('SELECT * FROM worker_heartbeats ORDER BY worker_id').all(),
+      eventFailures: db.prepare('SELECT * FROM event_processing_failures ORDER BY id').all(),
       audit: db.prepare('SELECT * FROM audit_log ORDER BY id').all(),
     };
     expect(afterRows).toEqual(beforeRows);
@@ -14756,6 +16168,135 @@ describe('CLI main command parser', () => {
       audit: db.prepare('SELECT * FROM audit_log ORDER BY id').all(),
       memories: db.prepare('SELECT * FROM memory_records ORDER BY id').all(),
       revisions: db.prepare('SELECT * FROM memory_revisions ORDER BY id').all(),
+    };
+    expect(afterRows).toEqual(beforeRows);
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('spawns platform account unlink with one redacted identity audit and inactive no-op failures', () => {
+    const now = Date.now();
+    const secret = 'sk-cli-unlink-platform-secret-abcdefghijklmnopqrstuvwxyz';
+    const platformAccountId = `api_key=${secret}-qq-246813579`;
+    const inactivePlatformAccountId = '975318642';
+    db.prepare(
+      `INSERT INTO platform_accounts (
+        platform, platform_account_id, canonical_user_id, account_type,
+        verified_level, status, first_seen_at, last_seen_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'qq', platformAccountId, 'user-cli', 'private', 'owner_verified', 'active', now, now,
+      'qq', inactivePlatformAccountId, 'user-cli', 'group_member', 'observed', 'disabled', now, now,
+    );
+
+    const stdout = expectSuccessfulCli(['unlink-platform-account', 'qq', platformAccountId]);
+    expect(stdout).toBe('✅ Platform account mapping disabled');
+    expect(stdout).not.toContain(secret);
+    expect(stdout).not.toContain('246813579');
+
+    const repeated = runCli(['unlink-platform-account', 'qq', platformAccountId]);
+    expect(repeated.status).toBe(1);
+    expect(repeated.stdout).toBe('');
+    expect(repeated.stderr).toBe('❌ Platform account mapping not found or not active');
+    expect(repeated.stderr).not.toContain(secret);
+    expect(repeated.stderr).not.toContain('246813579');
+
+    const inactive = runCli(['unlink-platform-account', 'qq', inactivePlatformAccountId]);
+    expect(inactive.status).toBe(1);
+    expect(inactive.stdout).toBe('');
+    expect(inactive.stderr).toBe('❌ Platform account mapping not found or not active');
+    expect(inactive.stderr).not.toContain(inactivePlatformAccountId);
+
+    const unknownPlatformAccountId = `token=${secret}-qq-135792468`;
+    const unknown = runCli(['unlink-platform-account', 'qq', unknownPlatformAccountId]);
+    expect(unknown.status).toBe(1);
+    expect(unknown.stdout).toBe('');
+    expect(unknown.stderr).toBe('❌ Platform account mapping not found or not active');
+    expect(unknown.stderr).not.toContain(secret);
+    expect(unknown.stderr).not.toContain('135792468');
+
+    reopenDb();
+    expect(
+      db.prepare(
+        'SELECT status FROM platform_accounts WHERE platform = ? AND platform_account_id = ?'
+      ).get('qq', platformAccountId)
+    ).toEqual({ status: 'disabled' });
+    expect(
+      db.prepare(
+        'SELECT status FROM platform_accounts WHERE platform = ? AND platform_account_id = ?'
+      ).get('qq', inactivePlatformAccountId)
+    ).toEqual({ status: 'disabled' });
+
+    const auditRows = db
+      .prepare(
+        `SELECT * FROM audit_log
+         WHERE category = 'system' AND event_type = 'identity.platform_account.unlinked'`
+      )
+      .all() as Array<{
+      level: string;
+      event_id: string;
+      actor_class: string;
+      invocation_context: string;
+      summary: string;
+      details: string;
+      redacted: number;
+    }>;
+    expect(auditRows).toHaveLength(1);
+    expect(auditRows[0]).toMatchObject({
+      level: 'summary',
+      actor_class: 'admin',
+      invocation_context: 'admin_cli',
+      summary: 'Governance CLI disabled one platform account mapping',
+      redacted: 1,
+    });
+    expect(auditRows[0]?.event_id).toMatch(/^identity-unlink-/);
+    const auditDetails = JSON.parse(auditRows[0]?.details ?? '{}') as Record<string, unknown>;
+    expect(auditDetails).toMatchObject({
+      platform: 'qq',
+      canonicalUserId: 'user-cli',
+      previousStatus: 'active',
+      newStatus: 'disabled',
+      redaction: 'no_raw_platform_account_id',
+    });
+    expect(auditDetails).not.toHaveProperty('platformAccountId');
+
+    const listedAudit = expectSuccessfulCli([
+      'list-audit',
+      '--event-type',
+      'identity.platform_account.unlinked',
+      '--include-details',
+    ]);
+    const serializedEvidence = JSON.stringify({ auditRows, auditDetails, listedAudit });
+    expect(serializedEvidence).not.toContain(secret);
+    expect(serializedEvidence).not.toContain('246813579');
+    expect(serializedEvidence).not.toContain(inactivePlatformAccountId);
+    expect(serializedEvidence).not.toContain('135792468');
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('rejects unsupported unlink platforms without exposing the account ID or mutating data', () => {
+    const secret = 'sk-cli-unlink-invalid-platform-abcdefghijklmnopqrstuvwxyz';
+    const invalidPlatform = `discord-${secret}-qq-112233445`;
+    const platformAccountId = `api_key=${secret}-qq-556677889`;
+    const beforeRows = {
+      mappings: db.prepare('SELECT * FROM platform_accounts ORDER BY platform, platform_account_id').all(),
+      audit: db.prepare('SELECT * FROM audit_log ORDER BY id').all(),
+    };
+
+    const result = runCli(['unlink-platform-account', invalidPlatform, platformAccountId]);
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe('❌ Invalid identity platform; expected qq');
+    expect(result.stderr).not.toContain(secret);
+    expect(result.stderr).not.toContain('112233445');
+    expect(result.stderr).not.toContain('556677889');
+    expect(result.stderr).not.toContain('src/cli');
+    expect(result.stderr).not.toContain('\n    at ');
+
+    reopenDb();
+    const afterRows = {
+      mappings: db.prepare('SELECT * FROM platform_accounts ORDER BY platform, platform_account_id').all(),
+      audit: db.prepare('SELECT * FROM audit_log ORDER BY id').all(),
     };
     expect(afterRows).toEqual(beforeRows);
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);

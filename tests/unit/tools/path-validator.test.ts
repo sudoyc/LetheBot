@@ -35,6 +35,7 @@ describe('PathValidator', () => {
     context = {
       toolCallId: 'test-call-id',
       turnId: 'test-turn-id',
+      signal: new AbortController().signal,
       workspaceRoot: tempDir,
       sandboxPolicy,
     };
@@ -45,6 +46,25 @@ describe('PathValidator', () => {
   });
 
   describe('Path Traversal Detection', () => {
+    it('should fail with a stable error when cancellation is already requested', async () => {
+      const controller = new AbortController();
+      const leakedReason = 'sk-path-abort-reason-must-not-leak';
+      controller.abort(leakedReason);
+      context.signal = controller.signal;
+
+      const error = await validator.validate('file.txt', context).then(
+        () => undefined,
+        (reason: unknown) => reason as NodeJS.ErrnoException
+      );
+
+      expect(error).toMatchObject({
+        name: 'AbortError',
+        code: 'ABORT_ERR',
+        message: 'File operation aborted',
+      });
+      expect(String(error)).not.toContain(leakedReason);
+    });
+
     it('should reject paths with ../', async () => {
       const result = await validator.validate('../etc/passwd', context);
       expect(result.allowed).toBe(false);

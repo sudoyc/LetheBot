@@ -28,11 +28,13 @@ describe('Action Decision & Execution', () => {
       const target: ActionTarget = {
         conversationId: 'conv-private-001',
         conversationType: 'private',
-        userId: 'user-001',
+        userId: 'qq-10001',
+        canonicalUserId: 'user-001',
       };
 
       expect(target.conversationType).toBe('private');
-      expect(target.userId).toBe('user-001');
+      expect(target.userId).toBe('qq-10001');
+      expect(target.canonicalUserId).toBe('user-001');
     });
   });
 
@@ -124,9 +126,10 @@ describe('Action Decision & Execution', () => {
         type: 'dm_user',
         priority: 1,
         target: {
-          conversationId: 'private:user-001',
+          conversationId: 'private:qq-10001',
           conversationType: 'private',
-          userId: 'user-001',
+          userId: 'qq-10001',
+          canonicalUserId: 'user-001',
         },
         payload: {
           text: 'Reminder',

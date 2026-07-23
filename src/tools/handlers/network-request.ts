@@ -4,8 +4,8 @@
  * HTTP/HTTPS 网络请求工具实现
  */
 
-import { redactSecretsInText } from '../../memory/secret-scan';
-import type { ToolRegistryEntry } from '../../types/tool';
+import { redactSecretsInText } from '../../memory/secret-scan.js';
+import type { ToolRegistryEntry } from '../../types/tool.js';
 
 /**
  * HTTP 请求方法
@@ -98,7 +98,7 @@ export const networkRequestPiSchema = {
  * 网络请求处理器接口
  */
 export interface NetworkRequestHandler {
-  execute(input: NetworkRequestInput): Promise<NetworkRequestOutput>;
+  execute(input: NetworkRequestInput, signal?: AbortSignal): Promise<NetworkRequestOutput>;
   validateUrl(url: string): boolean;
   isAllowedDomain(url: string, allowedDomains: string[]): boolean;
 }
@@ -215,8 +215,12 @@ export class NetworkRequestHandlerImpl implements NetworkRequestHandler {
   /**
    * 执行网络请求
    */
-  async execute(input: NetworkRequestInput): Promise<NetworkRequestOutput> {
+  async execute(
+    input: NetworkRequestInput,
+    signal: AbortSignal = new AbortController().signal
+  ): Promise<NetworkRequestOutput> {
     const startTime = Date.now();
+    let abortCause: 'upstream' | 'timeout' | undefined;
 
     try {
       // 验证 URL
@@ -239,53 +243,100 @@ export class NetworkRequestHandlerImpl implements NetworkRequestHandler {
 
       // 准备请求选项
       const method = input.method || 'GET';
-      const options: RequestInit = {
-        method,
-        headers: {
-          'User-Agent': 'LetheBot/1.0',
-          ...input.headers,
-        },
-        signal: AbortSignal.timeout(input.timeout || 5000),
+      const requestController = new AbortController();
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      let listeningForUpstreamAbort = false;
+
+      const cleanupCancellation = (): void => {
+        if (timeoutHandle !== undefined) {
+          clearTimeout(timeoutHandle);
+          timeoutHandle = undefined;
+        }
+        if (listeningForUpstreamAbort) {
+          signal.removeEventListener('abort', abortFromUpstream);
+          listeningForUpstreamAbort = false;
+        }
+      };
+      const abortRequest = (cause: 'upstream' | 'timeout'): void => {
+        if (abortCause !== undefined) {
+          return;
+        }
+        abortCause = cause;
+        cleanupCancellation();
+        requestController.abort();
+      };
+      const abortFromUpstream = (): void => {
+        abortRequest('upstream');
       };
 
-      // 处理请求体
-      if (input.body && ['POST', 'PUT', 'PATCH'].includes(method)) {
-        if (typeof input.body === 'string') {
-          options.body = input.body;
-        } else {
-          options.body = JSON.stringify(input.body);
-          options.headers = {
-            ...options.headers,
-            'Content-Type': 'application/json',
-          };
-        }
+      timeoutHandle = setTimeout(
+        () => abortRequest('timeout'),
+        input.timeout || 5000
+      );
+      if (signal.aborted) {
+        abortFromUpstream();
+      } else {
+        listeningForUpstreamAbort = true;
+        signal.addEventListener('abort', abortFromUpstream, { once: true });
       }
 
-      // 执行请求
-      const response = await fetch(input.url, options);
+      try {
+        const options: RequestInit = {
+          method,
+          headers: {
+            'User-Agent': 'LetheBot/1.0',
+            ...input.headers,
+          },
+          signal: requestController.signal,
+        };
 
-      // 读取响应体（限制大小）
-      const maxBodySize = 1048576; // 1MB
-      const bodyText = await response.text();
-      const redactedBodyText = redactNetworkDiagnosticText(bodyText);
-      const truncated = redactedBodyText.length > maxBodySize
-        ? redactedBodyText.slice(0, maxBodySize) + '\n[truncated]'
-        : redactedBodyText;
+        // 处理请求体
+        if (input.body && ['POST', 'PUT', 'PATCH'].includes(method)) {
+          if (typeof input.body === 'string') {
+            options.body = input.body;
+          } else {
+            options.body = JSON.stringify(input.body);
+            options.headers = {
+              ...options.headers,
+              'Content-Type': 'application/json',
+            };
+          }
+        }
 
-      // 构建响应头字典
-      const headers: Record<string, string> = {};
-      response.headers.forEach((value, key) => {
-        headers[key] = redactNetworkDiagnosticText(value);
-      });
+        if (requestController.signal.aborted) {
+          const error = new Error('Request aborted');
+          error.name = 'AbortError';
+          throw error;
+        }
 
-      return {
-        success: response.ok,
-        status: response.status,
-        statusText: redactNetworkDiagnosticText(response.statusText),
-        headers,
-        body: truncated,
-        executionTimeMs: Date.now() - startTime,
-      };
+        // 执行请求
+        const response = await fetch(input.url, options);
+
+        // 读取响应体（限制大小）
+        const maxBodySize = 1048576; // 1MB
+        const bodyText = await response.text();
+        const redactedBodyText = redactNetworkDiagnosticText(bodyText);
+        const truncated = redactedBodyText.length > maxBodySize
+          ? redactedBodyText.slice(0, maxBodySize) + '\n[truncated]'
+          : redactedBodyText;
+
+        // 构建响应头字典
+        const headers: Record<string, string> = {};
+        response.headers.forEach((value, key) => {
+          headers[key] = redactNetworkDiagnosticText(value);
+        });
+
+        return {
+          success: response.ok,
+          status: response.status,
+          statusText: redactNetworkDiagnosticText(response.statusText),
+          headers,
+          body: truncated,
+          executionTimeMs: Date.now() - startTime,
+        };
+      } finally {
+        cleanupCancellation();
+      }
 
     } catch (error: unknown) {
       const err = error as Error;
@@ -294,9 +345,11 @@ export class NetworkRequestHandlerImpl implements NetworkRequestHandler {
 
       return {
         success: false,
-        error: err.name === 'TimeoutError'
+        error: abortCause === 'timeout' || err.name === 'TimeoutError'
           ? 'Request timeout'
-          : redactedMessage,
+          : abortCause === 'upstream'
+            ? 'Request aborted'
+            : redactedMessage,
         executionTimeMs: Date.now() - startTime,
       };
     }
@@ -339,7 +392,7 @@ export const networkRequestToolEntry: ToolRegistryEntry = {
     const handler = new NetworkRequestHandlerImpl(
       networkRequestToolEntry.sandboxPolicy.allowedDomains ?? []
     );
-    return handler.execute(request.input as NetworkRequestInput);
+    return handler.execute(request.input as NetworkRequestInput, request.signal);
   },
 };
 

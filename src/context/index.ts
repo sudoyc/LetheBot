@@ -4,4 +4,4 @@
  * 统一导出上下文模块
  */
 
-export * from './builder';
+export * from './builder.js';

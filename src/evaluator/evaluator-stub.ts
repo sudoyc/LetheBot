@@ -14,7 +14,7 @@ import type {
   MemoryEvaluationResult,
   SocialEvaluationRequest,
   SocialEvaluationResult,
-} from '../types/evaluator';
+} from '../types/evaluator.js';
 
 export class EvaluatorStub implements IEvaluator {
   private readonly version = 'stub-v1';

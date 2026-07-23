@@ -4,7 +4,7 @@
  * 网关适配器统一接口（供 OneBotAdapter 和 FakeOneBot 实现）
  */
 
-import type { ChatMessageReceived, GatewayCapabilities } from '../types/events';
+import type { ChatMessageReceived, GatewayCapabilities } from '../types/events.js';
 
 export interface MessageTarget {
   conversationId: string;

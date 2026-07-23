@@ -6,12 +6,13 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import type { ToolCallResult } from '../../../types/tool';
+import type { ToolCallResult } from '../../../types/tool.js';
 import {
   PathValidator,
+  throwIfFileOperationAborted,
   type FileOperationContext,
-} from '../path-validator';
-import { redactFileOperationText } from '../redaction';
+} from '../path-validator.js';
+import { redactFileOperationText } from '../redaction.js';
 
 interface WriteFileInput {
   path: string;
@@ -49,6 +50,8 @@ export class WriteFileHandler {
     const pathSecretsRedacted = redactedPathResult.redacted;
 
     try {
+      throwIfFileOperationAborted(context.signal);
+
       // 1. 检查是否为 readonly 模式
       if (context.sandboxPolicy.filesystem === 'readonly') {
         return {
@@ -95,6 +98,7 @@ export class WriteFileHandler {
       } catch {
         // 文件不存在
       }
+      throwIfFileOperationAborted(context.signal);
 
       if (fileExists && !input.overwrite) {
         return {
@@ -112,7 +116,9 @@ export class WriteFileHandler {
 
       // 4. 确保父目录存在
       const parentDir = path.dirname(normalizedPath);
+      throwIfFileOperationAborted(context.signal);
       await fs.promises.mkdir(parentDir, { recursive: true });
+      throwIfFileOperationAborted(context.signal);
 
       // 5. 写入文件
       const encoding = input.encoding || 'utf8';
@@ -124,10 +130,15 @@ export class WriteFileHandler {
         buffer = Buffer.from(input.content, 'utf8');
       }
 
-      await fs.promises.writeFile(normalizedPath, buffer);
+      throwIfFileOperationAborted(context.signal);
+      await fs.promises.writeFile(normalizedPath, buffer, {
+        signal: context.signal,
+      });
+      throwIfFileOperationAborted(context.signal);
 
       // 6. 获取文件大小
       const stats = await fs.promises.stat(normalizedPath);
+      throwIfFileOperationAborted(context.signal);
 
       const output: WriteFileOutput = {
         path: redactedInputPath,

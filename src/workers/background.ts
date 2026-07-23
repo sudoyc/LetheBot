@@ -11,6 +11,7 @@ import type { JobRepository, JobRecord } from '../storage/job-repository.js';
 export type TaskType =
   | 'summary'
   | 'extraction'
+  | 'attention_recheck'
   | 'consolidation'
   | 'decay'
   | 'conflict'
@@ -49,13 +50,31 @@ export interface TaskResult {
   error?: string;
 }
 
-export type BackgroundTaskHandler = (task: BackgroundTask) => Promise<unknown>;
+export interface BackgroundTaskExecutionContext {
+  jobId: string;
+  jobAttemptId: string;
+  attemptNumber: number;
+  now: number;
+}
+
+export type BackgroundTaskHandler = (
+  task: BackgroundTask,
+  executionContext?: BackgroundTaskExecutionContext,
+) => Promise<unknown>;
 
 export interface BackgroundWorkerOptions {
   jobRepository?: JobRepository;
   workerId?: string;
   leaseMs?: number;
+  clock?: () => number;
   handlers?: Partial<Record<TaskType, BackgroundTaskHandler>>;
+}
+
+export class NonRetryableBackgroundTaskError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NonRetryableBackgroundTaskError';
+  }
 }
 
 export class BackgroundWorker {
@@ -63,6 +82,7 @@ export class BackgroundWorker {
   private taskCounter = 0;
   private readonly workerId: string;
   private readonly leaseMs: number;
+  private readonly clock: () => number;
   private readonly handlers: Partial<Record<TaskType, BackgroundTaskHandler>>;
   private readonly jobRepository?: JobRepository;
 
@@ -70,6 +90,7 @@ export class BackgroundWorker {
     this.jobRepository = options.jobRepository;
     this.workerId = options.workerId ?? 'background-worker-local';
     this.leaseMs = options.leaseMs ?? 60_000;
+    this.clock = options.clock ?? Date.now;
     this.handlers = options.handlers ?? {};
   }
 
@@ -128,9 +149,9 @@ export class BackgroundWorker {
   /**
    * 处理下一个待处理任务
    */
-  async processNext(): Promise<TaskResult | null> {
+  async processNext(now?: number, types?: TaskType[]): Promise<TaskResult | null> {
     if (this.jobRepository) {
-      return this.processNextDurable();
+      return this.processNextDurable(now, types);
     }
 
     const pending = Array.from(this.tasks.values()).find((t) => t.status === 'pending');
@@ -142,7 +163,7 @@ export class BackgroundWorker {
     pending.status = 'processing';
 
     try {
-      const output = redactWorkerDiagnosticValue(await this.processTask(pending));
+      const output = redactWorkerDiagnosticValue(await this.processTask(pending, undefined));
 
       pending.status = 'completed';
       pending.completedAt = new Date();
@@ -167,22 +188,29 @@ export class BackgroundWorker {
     }
   }
 
-  private async processNextDurable(): Promise<TaskResult | null> {
+  private async processNextDurable(
+    nowOverride?: number,
+    types?: TaskType[],
+  ): Promise<TaskResult | null> {
     if (!this.jobRepository) {
       return null;
     }
 
+    const claimNow = nowOverride ?? this.clock();
     if (this.jobRepository.getWorkerHeartbeatStatus(this.workerId) !== 'error') {
       this.jobRepository.heartbeat({
         workerId: this.workerId,
         workerType: 'background',
         status: 'idle',
+        now: claimNow,
       });
     }
 
     const claimed = this.jobRepository.claimNext({
       workerId: this.workerId,
       leaseMs: this.leaseMs,
+      now: claimNow,
+      types,
     });
 
     if (!claimed) {
@@ -198,6 +226,7 @@ export class BackgroundWorker {
         attemptId: claimed.attemptId,
         error: message,
         terminal: true,
+        now: nowOverride ?? this.clock(),
       });
       this.jobRepository.heartbeat({
         workerId: this.workerId,
@@ -205,6 +234,7 @@ export class BackgroundWorker {
         status: 'error',
         currentJobId: claimed.job.id,
         details: { jobId: claimed.job.id, error: message, type: claimed.job.type },
+        now: nowOverride ?? this.clock(),
       });
 
       return {
@@ -227,21 +257,38 @@ export class BackgroundWorker {
         attemptNumber: claimed.attemptNumber,
         type: claimed.job.type,
       },
+      now: claimNow,
     });
 
-    const stopLeaseHeartbeat = this.startDurableLeaseHeartbeat(claimed);
+    const stopLeaseHeartbeat = this.startDurableLeaseHeartbeat(claimed, nowOverride);
+    const executionNow = this.createExecutionNow(nowOverride);
 
     try {
-      const output = redactWorkerDiagnosticValue(await this.processTask(task));
-      this.jobRepository.complete({
+      const output = redactWorkerDiagnosticValue(
+        await this.processTask(task, {
+          jobId: claimed.job.id,
+          jobAttemptId: claimed.attemptId,
+          attemptNumber: claimed.attemptNumber,
+          get now() {
+            return executionNow();
+          },
+        }),
+      );
+      const completedAt = nowOverride ?? this.clock();
+      const completed = this.jobRepository.complete({
         jobId: claimed.job.id,
         attemptId: claimed.attemptId,
         result: output,
+        now: completedAt,
       });
+      if (!completed) {
+        throw new Error('Background job attempt lost lease authority before completion');
+      }
       this.jobRepository.heartbeat({
         workerId: this.workerId,
         workerType: 'background',
         status: 'idle',
+        now: completedAt,
       });
 
       return {
@@ -253,10 +300,13 @@ export class BackgroundWorker {
       const message = redactWorkerDiagnosticText(
         error instanceof Error ? error.message : 'Unknown error',
       );
+      const failedAt = nowOverride ?? this.clock();
       this.jobRepository.fail({
         jobId: claimed.job.id,
         attemptId: claimed.attemptId,
         error: message,
+        terminal: error instanceof NonRetryableBackgroundTaskError,
+        now: failedAt,
       });
       this.jobRepository.heartbeat({
         workerId: this.workerId,
@@ -264,6 +314,7 @@ export class BackgroundWorker {
         status: 'error',
         currentJobId: claimed.job.id,
         details: { jobId: claimed.job.id, error: message },
+        now: failedAt,
       });
 
       return {
@@ -276,25 +327,38 @@ export class BackgroundWorker {
     }
   }
 
+  private createExecutionNow(nowOverride?: number): () => number {
+    if (nowOverride === undefined) {
+      return () => this.clock();
+    }
+
+    return () => nowOverride;
+  }
+
   private startDurableLeaseHeartbeat(claimed: {
     job: JobRecord;
     attemptId: string;
     attemptNumber: number;
-  }): () => void {
-    if (!this.jobRepository) {
+  }, nowOverride?: number): () => void {
+    if (!this.jobRepository || nowOverride !== undefined) {
       return () => undefined;
     }
 
+    const jobRepository = this.jobRepository;
     const intervalMs = Math.max(1, Math.floor(this.leaseMs / 2));
     const timer = setInterval(() => {
       try {
-        this.jobRepository?.extendLease({
+        const extended = jobRepository.extendLease({
           jobId: claimed.job.id,
           attemptId: claimed.attemptId,
           workerId: this.workerId,
           leaseMs: this.leaseMs,
         });
-        this.jobRepository?.heartbeat({
+        if (!extended) {
+          clearInterval(timer);
+          return;
+        }
+        jobRepository.heartbeat({
           workerId: this.workerId,
           workerType: 'background',
           status: 'running',
@@ -316,10 +380,19 @@ export class BackgroundWorker {
   /**
    * 处理任务。未注册专用 handler 时使用安全桩输出。
    */
-  private async processTask(task: BackgroundTask): Promise<unknown> {
+  private async processTask(
+    task: BackgroundTask,
+    executionContext?: BackgroundTaskExecutionContext,
+  ): Promise<unknown> {
     const handler = isKnownTaskType(task.type) ? this.handlers[task.type] : undefined;
     if (handler) {
-      return handler(task);
+      return handler(task, executionContext);
+    }
+
+    if (task.type === 'attention_recheck') {
+      throw new NonRetryableBackgroundTaskError(
+        'Background task attention_recheck requires a registered handler',
+      );
     }
 
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -379,6 +452,7 @@ function isKnownTaskType(value: string): value is TaskType {
   return (
     value === 'summary' ||
     value === 'extraction' ||
+    value === 'attention_recheck' ||
     value === 'consolidation' ||
     value === 'decay' ||
     value === 'conflict' ||

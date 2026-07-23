@@ -8,7 +8,7 @@
  * 记忆记录
  */
 export interface MemoryRecord {
-  id: string; // ULID
+  id: string; // Stable opaque ID; durable worker effects may use a versioned hash.
 
   // 所有权
   scope: 'global' | 'user' | 'group' | 'conversation' | 'tool' | 'system';
@@ -51,7 +51,7 @@ export interface MemorySource {
   sourceType: 'raw_event' | 'chat_message' | 'tool_output' | 'worker_extraction' | 'user_command';
   sourceId: string;
   sourceTimestamp: Date;
-  extractedBy?: 'user' | 'evaluator' | 'worker';
+  extractedBy?: 'user' | 'evaluator' | 'tool' | 'worker';
 }
 
 /**

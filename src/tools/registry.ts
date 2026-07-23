@@ -9,11 +9,15 @@ import type {
   InvocationContext,
   ActorClass,
   ToolHandler,
-} from '../types/tool';
+} from '../types/tool.js';
+import { MIN_TOOL_OUTPUT_BYTES } from './output-limit.js';
+import { MAX_TOOL_RUNTIME_MS } from './runtime-limit.js';
+import { assertKnownToolExecution } from './sandbox-policy.js';
 
 export interface ActorContext {
   actorClass: ActorClass;
   canonicalUserId?: string;
+  groupId?: string;
 }
 
 export class ToolRegistry {
@@ -29,6 +33,18 @@ export class ToolRegistry {
 
     if (typeof entry.handler !== 'function') {
       throw new Error(`Tool "${entry.name}" must be registered with a resolved function handler`);
+    }
+
+    assertKnownToolExecution(entry.name, entry.sandboxPolicy?.execution);
+    validateSandboxLimit('maxRuntimeMs', entry.sandboxPolicy.maxRuntimeMs);
+    validateSandboxLimit('maxOutputBytes', entry.sandboxPolicy.maxOutputBytes);
+    if (
+      entry.sandboxPolicy.maxOutputBytes !== undefined
+      && entry.sandboxPolicy.maxOutputBytes < MIN_TOOL_OUTPUT_BYTES
+    ) {
+      throw new Error(
+        `Tool "${entry.name}" maxOutputBytes must be at least ${MIN_TOOL_OUTPUT_BYTES}`
+      );
     }
 
     this.tools.set(entry.name, entry);
@@ -90,6 +106,30 @@ export class ToolRegistry {
       return false;
     }
 
+    if (permissions.deniedUserIds?.includes(actor.canonicalUserId ?? '')) {
+      return false;
+    }
+
+    if (
+      permissions.allowedUserIds &&
+      permissions.allowedUserIds.length > 0 &&
+      (!actor.canonicalUserId || !permissions.allowedUserIds.includes(actor.canonicalUserId))
+    ) {
+      return false;
+    }
+
+    if (permissions.deniedGroupIds?.includes(actor.groupId ?? '')) {
+      return false;
+    }
+
+    if (
+      permissions.allowedGroupIds &&
+      permissions.allowedGroupIds.length > 0 &&
+      (!actor.groupId || !permissions.allowedGroupIds.includes(actor.groupId))
+    ) {
+      return false;
+    }
+
     return true;
   }
 
@@ -99,5 +139,21 @@ export class ToolRegistry {
   requiresEvaluator(toolName: string): boolean {
     const tool = this.tools.get(toolName);
     return tool?.evaluatorPolicy === 'required';
+  }
+}
+
+function validateSandboxLimit(
+  field: 'maxRuntimeMs' | 'maxOutputBytes',
+  value: number | undefined,
+): void {
+  if (
+    value !== undefined
+    && (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0)
+  ) {
+    throw new Error(`${field} must be a positive safe integer`);
+  }
+
+  if (field === 'maxRuntimeMs' && value !== undefined && value > MAX_TOOL_RUNTIME_MS) {
+    throw new Error(`${field} must not exceed ${MAX_TOOL_RUNTIME_MS}`);
   }
 }

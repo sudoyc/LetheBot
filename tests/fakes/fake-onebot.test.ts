@@ -218,6 +218,38 @@ describe('FakeOneBot', () => {
     });
   });
 
+  describe('sendReaction', () => {
+    it('should record sent reactions for assertions', async () => {
+      await gateway.sendReaction('source-msg-1', '👍');
+      await gateway.sendReaction('source-msg-2', '✅');
+
+      const reactions = gateway.getSentReactions();
+      expect(reactions).toHaveLength(2);
+      expect(reactions[0]).toMatchObject({
+        messageId: 'source-msg-1',
+        emoji: '👍',
+      });
+      expect(reactions[1]).toMatchObject({
+        messageId: 'source-msg-2',
+        emoji: '✅',
+      });
+      expect(reactions[0]?.sentAt).toBeInstanceOf(Date);
+      expect(gateway.getLastSentReaction()).toMatchObject({
+        messageId: 'source-msg-2',
+        emoji: '✅',
+      });
+    });
+
+    it('should support reaction assertions without recording fake messages', async () => {
+      await gateway.sendReaction('source-msg-1', '👍');
+
+      expect(() => gateway.assertReactionSent('source-msg-1', '👍')).not.toThrow();
+      expect(() => gateway.assertReactionSent('missing-msg', '👍')).toThrow(/Expected reaction/);
+      expect(() => gateway.assertReactionSent('source-msg-1', '👎')).toThrow(/Expected reaction/);
+      expect(gateway.getSentMessages()).toHaveLength(0);
+    });
+  });
+
   describe('getLastSentMessage', () => {
     it('should return undefined when no messages sent', () => {
       expect(gateway.getLastSentMessage()).toBeUndefined();
@@ -297,6 +329,15 @@ describe('FakeOneBot', () => {
 
       gateway.reset();
       expect(gateway.getSentMessages()).toHaveLength(0);
+    });
+
+    it('should clear sent reactions', async () => {
+      await gateway.sendReaction('source-msg-1', '👍');
+      expect(gateway.getSentReactions()).toHaveLength(1);
+
+      gateway.reset();
+      expect(gateway.getSentReactions()).toHaveLength(0);
+      expect(gateway.getLastSentReaction()).toBeUndefined();
     });
 
     it('should reset counters', async () => {

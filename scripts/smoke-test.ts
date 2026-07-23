@@ -5,7 +5,7 @@
  * 快速验证 LetheBot 核心功能
  */
 
-import { initDatabase, runMigration, closeDatabase } from '../src/storage/database';
+import { initDatabase, runMigrations, closeDatabase } from '../src/storage/database';
 import { MemoryRepository } from '../src/storage/memory-repository';
 import { IdentityRepository } from '../src/storage/identity-repository';
 import { AttentionEngine } from '../src/attention/engine';
@@ -74,7 +74,7 @@ export async function smokeTest(): Promise<void> {
     // 1. Database
     console.log('1️⃣  Database initialization...');
     const db = initDatabase({ path: dbPath });
-    runMigration(db, join(__dirname, '../migrations/001_initial_schema.sql'));
+    runMigrations(db, join(__dirname, '../migrations'));
     console.log('   ✅ Database initialized\n');
 
     // 2. Repositories
@@ -86,6 +86,51 @@ export async function smokeTest(): Promise<void> {
       'smoke-user',
       Date.now(),
       Date.now()
+    );
+    const sourceTimestamp = Date.now();
+    db.prepare(
+      `INSERT INTO platform_accounts (
+        platform, platform_account_id, canonical_user_id, account_type,
+        verified_level, status, first_seen_at, last_seen_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'qq',
+      'smoke-account',
+      'smoke-user',
+      'private',
+      'observed',
+      'active',
+      sourceTimestamp,
+      sourceTimestamp,
+    );
+    db.prepare(
+      `INSERT INTO raw_events (
+        id, type, timestamp, source, platform, conversation_id, payload, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'smoke-memory-source',
+      'chat.message.received',
+      sourceTimestamp,
+      'gateway',
+      'qq',
+      'private:smoke-user',
+      '{}',
+      sourceTimestamp,
+    );
+    db.prepare(
+      `INSERT INTO chat_messages (
+        id, raw_event_id, message_id, conversation_id, conversation_type,
+        sender_id, text, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'smoke-memory-message',
+      'smoke-memory-source',
+      'smoke-memory-message',
+      'private:smoke-user',
+      'private',
+      'smoke-account',
+      'Smoke test memory',
+      sourceTimestamp,
     );
 
     const memoryId = await memoryRepo.create({
@@ -101,6 +146,14 @@ export async function smokeTest(): Promise<void> {
       confidence: 0.9,
       importance: 0.5,
       sourceContext: 'smoke_test',
+      sources: [
+        {
+          sourceType: 'raw_event',
+          sourceId: 'smoke-memory-source',
+          sourceTimestamp,
+          extractedBy: 'user',
+        },
+      ],
     });
 
     const memory = await memoryRepo.findById(memoryId);
@@ -121,8 +174,8 @@ export async function smokeTest(): Promise<void> {
       replyToBot: false,
     });
 
-    if (signals.classification !== 'needs_evaluation') {
-      console.log(`   ⚠️  Expected 'needs_evaluation', got '${signals.classification}'`);
+    if (signals.classification !== 'needs_response') {
+      console.log(`   ⚠️  Expected 'needs_response', got '${signals.classification}'`);
       console.log(`   Trigger score: ${signals.triggerScore}`);
       throw new Error('Attention engine classification failed');
     }

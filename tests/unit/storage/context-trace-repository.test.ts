@@ -82,6 +82,14 @@ describe('ContextTraceRepository', () => {
             reason: 'reject api_key=sk-context-trace-rejected-secret-should-not-persist qq-1234567894',
           },
         ],
+        memorySelections: [{
+          memoryId: 'mem-qq-10004',
+          querySources: ['current_message'],
+          retrievalMethods: ['scoped_rank', 'fts'],
+          scopeAffinity: 'same_user',
+          retrievalRank: 1,
+          selectionReason: 'query_match',
+        }],
         filtersApplied: [
           'state=active',
           'filter sk-context-trace-filter-secret-should-not-persist legacy_qq-1234567895',
@@ -168,10 +176,183 @@ describe('ContextTraceRepository', () => {
     const stored = await repo.findByTurnId('turn-context-trace-repo');
     expect(stored?.memories[0]?.memoryId).toBe('mem-qq-10004');
     expect(stored?.memories[0]?.title).toContain('[REDACTED:openai_like_api_key]');
+    expect(stored?.memories[0]?.selection).toEqual({
+      memoryId: 'mem-qq-10004',
+      querySources: ['current_message'],
+      retrievalMethods: ['scoped_rank', 'fts'],
+      scopeAffinity: 'same_user',
+      retrievalRank: 1,
+      selectionReason: 'query_match',
+    });
+    expect(stored?.memorySelections).toEqual([stored?.memories[0]?.selection]);
     expect(stored?.rejectedMemories[0]?.memoryId).toBe('mem-qq-10005');
     expect(stored?.rejectedMemories[0]?.reason).toContain('[REDACTED:api_key_assignment]');
     expect(stored?.tokenBudget.promptLayers?.[0]?.name).toContain('[REDACTED:openai_like_api_key]');
     expect(stored?.tokenBudget.promptLayers?.[0]?.version).toContain('[REDACTED:platform_id]');
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('rejects non-enum memory selection metadata before durable trace persistence', async () => {
+    const context = {
+      id: 'ctx-invalid-memory-selection',
+      turnId: 'turn-context-trace-repo',
+      createdAt: new Date(1_700_000_000_000),
+      conversation: {
+        conversationId: 'group:qq-group-10001',
+        conversationType: 'group',
+        groupId: 'qq-group-10001',
+      },
+      recentMessages: [],
+      memory: {
+        retrievedFacts: [{
+          memoryId: 'mem-invalid-selection',
+          scope: 'user',
+          kind: 'fact',
+          title: 'Synthetic selected memory',
+          content: 'Synthetic selected memory content',
+          confidence: 0.9,
+        }],
+        selectedMemoryIds: ['mem-invalid-selection'],
+      },
+      participants: [],
+      injectedIdentityFields: [],
+      trace: {
+        candidateMemoryIds: ['mem-invalid-selection'],
+        selectedMemoryIds: ['mem-invalid-selection'],
+        rejectedMemories: [],
+        memorySelections: [{
+          memoryId: 'mem-invalid-selection',
+          querySources: ['api_key=sk-selection-metadata-must-not-persist qq-1234567890'],
+          retrievalMethods: ['fts'],
+          scopeAffinity: 'same_user',
+          retrievalRank: 1,
+          selectionReason: 'query_match',
+        }],
+        filtersApplied: [],
+      },
+      tokenBudget: {
+        max: 8_000,
+        used: 300,
+        breakdown: { recentMessages: 0, memory: 0, identity: 0, system: 300 },
+      },
+    } as unknown as ContextPack;
+
+    await expect(repo.createFromContext(context)).rejects.toThrow(
+      'Context memory selection evidence has an invalid query source',
+    );
+    expect(db.prepare(
+      'SELECT COUNT(*) AS count FROM context_traces WHERE id = ?',
+    ).get(context.id)).toEqual({ count: 0 });
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('REL-CTX-01/REL-QUOTE-01 stores content-free pack-local reference evidence', async () => {
+    const context = {
+      id: 'ctx-context-reference-trace',
+      turnId: 'turn-context-trace-repo',
+      createdAt: new Date(1_700_000_000_000),
+      conversation: {
+        conversationId: 'group:qq-group-10001',
+        conversationType: 'group',
+        groupId: 'qq-group-10001',
+      },
+      currentMessageRef: 'message_2',
+      replyReference: {
+        status: 'resolved',
+        sourceMessageRef: 'message_2',
+        targetMessageRef: 'message_1',
+        targetSpeakerRef: 'speaker_1',
+        targetRole: 'human',
+        targetInRollingWindow: true,
+      },
+      recentMessages: [
+        {
+          messageId: 'internal-message-reference-target',
+          messageRef: 'message_1',
+          senderId: 'qq-10002',
+          speakerRef: 'speaker_1',
+          senderDisplayName: 'Duplicate Label',
+          text: 'target content must not enter trace metadata',
+          timestamp: new Date(1_700_000_000_000),
+          isFromBot: false,
+          isCurrent: false,
+        },
+        {
+          messageId: 'internal-message-reference-current',
+          messageRef: 'message_2',
+          senderId: 'qq-10003',
+          speakerRef: 'speaker_2',
+          senderDisplayName: 'Duplicate Label',
+          text: 'current content must not enter trace metadata',
+          timestamp: new Date(1_700_000_001_000),
+          isFromBot: false,
+          isCurrent: true,
+        },
+      ],
+      memory: {
+        retrievedFacts: [],
+        selectedMemoryIds: [],
+      },
+      participants: [],
+      injectedIdentityFields: [],
+      trace: {
+        candidateMemoryIds: [],
+        selectedMemoryIds: [],
+        rejectedMemories: [],
+        filtersApplied: [],
+      },
+      tokenBudget: {
+        max: 8_000,
+        used: 320,
+        breakdown: {
+          recentMessages: 20,
+          memory: 0,
+          identity: 0,
+          system: 300,
+        },
+      },
+    } as unknown as ContextPack;
+
+    await repo.createFromContext(context);
+
+    const row = db.prepare(
+      'SELECT recent_message_ids, token_budget FROM context_traces WHERE id = ?',
+    ).get(context.id) as { recent_message_ids: string; token_budget: string };
+    const storedBudget = JSON.parse(row.token_budget) as {
+      referenceTrace?: Record<string, unknown>;
+    };
+    const serialized = JSON.stringify(row);
+
+    expect(JSON.parse(row.recent_message_ids)).toEqual([
+      'internal-message-reference-target',
+      'internal-message-reference-current',
+    ]);
+    expect(storedBudget.referenceTrace).toEqual({
+      currentMessageRef: 'message_2',
+      messages: [
+        { messageRef: 'message_1', speakerRef: 'speaker_1', isCurrent: false },
+        { messageRef: 'message_2', speakerRef: 'speaker_2', isCurrent: true },
+      ],
+      replyReference: {
+        status: 'resolved',
+        sourceMessageRef: 'message_2',
+        targetMessageRef: 'message_1',
+        targetSpeakerRef: 'speaker_1',
+        targetRole: 'human',
+        targetInRollingWindow: true,
+      },
+    });
+    expect(serialized).not.toContain('Duplicate Label');
+    expect(serialized).not.toContain('target content');
+    expect(serialized).not.toContain('current content');
+    expect(serialized).not.toContain('qq-10002');
+    expect(serialized).not.toContain('qq-10003');
+
+    const stored = await repo.findByTurnId('turn-context-trace-repo');
+    const storedReferenceTrace = (stored as unknown as {
+      referenceTrace?: Record<string, unknown>;
+    } | null)?.referenceTrace;
+    expect(storedReferenceTrace).toEqual(storedBudget.referenceTrace);
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 

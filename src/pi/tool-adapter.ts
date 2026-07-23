@@ -10,13 +10,16 @@
 
 import type { AgentTool } from '@earendil-works/pi-agent-core';
 import type { ImageContent, TextContent } from '@earendil-works/pi-ai';
+import { createHash } from 'node:crypto';
 import type {
   ToolRegistryEntry,
   ToolHandler,
   ActorClass,
   InvocationContext,
-} from '../types/tool';
+} from '../types/tool.js';
 import { redactSecretsInText } from '../memory/secret-scan.js';
+import { startToolRuntimeGuard } from '../tools/runtime-limit.js';
+import { assertSupportedToolExecution } from '../tools/sandbox-policy.js';
 
 type LetheBotToolMetadata = Pick<
   ToolRegistryEntry,
@@ -29,8 +32,44 @@ type LetheBotToolMetadata = Pick<
   | 'permissions'
 >;
 
+const PROVIDER_TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const PROVIDER_TOOL_ALIAS_PREFIX = 'lb_';
+const PROVIDER_TOOL_ALIAS_HASH_LENGTH = 48;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
+}
+
+export function toProviderToolName(canonicalName: string): string {
+  if (typeof canonicalName !== 'string' || canonicalName.length === 0) {
+    throw new Error('Canonical tool name must be a non-empty string');
+  }
+
+  if (PROVIDER_TOOL_NAME_PATTERN.test(canonicalName)) {
+    return canonicalName;
+  }
+
+  const digest = createHash('sha256')
+    .update(canonicalName, 'utf8')
+    .digest('hex')
+    .slice(0, PROVIDER_TOOL_ALIAS_HASH_LENGTH);
+  return `${PROVIDER_TOOL_ALIAS_PREFIX}${digest}`;
+}
+
+export function createProviderToolNameMap(
+  canonicalNames: Iterable<string>,
+): Map<string, string> {
+  const providerToCanonical = new Map<string, string>();
+
+  for (const canonicalName of canonicalNames) {
+    const providerName = toProviderToolName(canonicalName);
+    if (providerToCanonical.has(providerName)) {
+      throw new Error('Provider tool name collision');
+    }
+    providerToCanonical.set(providerName, canonicalName);
+  }
+
+  return providerToCanonical;
 }
 
 
@@ -114,22 +153,39 @@ export function convertToolToPiFormat(
   handler: ToolHandler,
   context: ToolAdapterContext
 ): AgentTool {
+  const canonicalName = entry.name;
+  assertSupportedToolExecution(canonicalName, entry.sandboxPolicy.execution);
+
   return {
-    name: entry.name,
+    name: toProviderToolName(canonicalName),
     description: entry.description,
-    label: formatToolLabel(entry.name),
+    label: formatToolLabel(canonicalName),
     parameters: convertJsonSchemaToTypeBox(entry.piSchema.input),
 
-    execute: async (toolCallId: string, params: unknown, _signal, _onUpdate) => {
-      // Execute tool with LetheBot-specific context
-      const result = await handler({
-        toolCallId,
-        turnId: context.turnId,
-        toolName: entry.name,
-        input: params,
-        actor: context.actor,
-        context: context.invocationContext,
-      });
+    execute: async (toolCallId: string, params: unknown, signal, _onUpdate) => {
+      assertSupportedToolExecution(canonicalName, entry.sandboxPolicy.execution);
+      const runtimeGuard = startToolRuntimeGuard(signal, entry.sandboxPolicy.maxRuntimeMs);
+      let result: unknown;
+      try {
+        runtimeGuard.throwIfAbortedOrExpired();
+        try {
+          result = await handler({
+            toolCallId,
+            turnId: context.turnId,
+            toolName: canonicalName,
+            signal: runtimeGuard.signal,
+            input: params,
+            actor: context.actor,
+            context: context.invocationContext,
+          });
+        } catch (error) {
+          runtimeGuard.throwIfAbortedOrExpired();
+          throw error;
+        }
+        runtimeGuard.throwIfAbortedOrExpired();
+      } finally {
+        runtimeGuard.dispose();
+      }
 
       // Convert result to Pi AgentToolResult
       return formatToolResultForPi(result, entry);
@@ -150,7 +206,7 @@ export function convertToolsToPiFormat(
   getHandler: (toolName: string) => ToolHandler | undefined,
   context: ToolAdapterContext
 ): AgentTool[] {
-  const piTools: AgentTool[] = [];
+  const convertedTools: Array<{ canonicalName: string; tool: AgentTool }> = [];
 
   for (const entry of entries) {
     const handler = getHandler(entry.name);
@@ -161,7 +217,7 @@ export function convertToolsToPiFormat(
 
     try {
       const piTool = convertToolToPiFormat(entry, handler, context);
-      piTools.push(piTool);
+      convertedTools.push({ canonicalName: entry.name, tool: piTool });
     } catch (error) {
       console.error(
         `[tool-adapter] Failed to convert tool ${redactToolDiagnosticText(String(entry.name))}:`,
@@ -171,7 +227,8 @@ export function convertToolsToPiFormat(
     }
   }
 
-  return piTools;
+  createProviderToolNameMap(convertedTools.map(({ canonicalName }) => canonicalName));
+  return convertedTools.map(({ tool }) => tool);
 }
 
 /**
@@ -445,7 +502,7 @@ export function createMockPiTool(
   handler: (params: unknown) => Promise<string> | string
 ): AgentTool {
   return {
-    name,
+    name: toProviderToolName(name),
     description,
     label: formatToolLabel(name),
     parameters: {

@@ -4,7 +4,7 @@
  * 行动决策和执行结果
  */
 
-import type { ToolCallRequest } from './tool';
+import type { ToolCallRequest } from './tool.js';
 
 /**
  * 行动类型
@@ -29,7 +29,8 @@ export type ActionType =
 export interface ActionTarget {
   conversationId: string;
   conversationType: 'private' | 'group';
-  userId?: string; // 用于 dm_user
+  userId?: string; // platform delivery user id for dm_user
+  canonicalUserId?: string; // canonical user id for privacy/governance checks
   groupId?: string;
 }
 
@@ -47,6 +48,23 @@ export interface MemoryProposalRequest {
   sourceContext: string;
 }
 
+export type BackgroundTaskActionType =
+  | 'summary'
+  | 'extraction'
+  | 'consolidation'
+  | 'decay'
+  | 'conflict'
+  | 'admin_digest'
+  | 'retention';
+
+export interface BackgroundTaskActionRequest {
+  type: BackgroundTaskActionType;
+  payload?: Record<string, unknown>;
+  idempotencyKey?: string;
+  scheduledAt?: number | Date;
+  maxAttempts?: number;
+}
+
 /**
  * 行动载荷
  */
@@ -54,7 +72,9 @@ export interface ActionPayload {
   text?: string;
   toolCall?: ToolCallRequest;
   memoryProposal?: MemoryProposalRequest;
+  backgroundTask?: BackgroundTaskActionRequest;
   reaction?: string;
+  messageId?: string; // react_only 的目标消息 ID
 }
 
 /**
@@ -101,6 +121,7 @@ export interface ActionDecision {
   // 评估器元数据（如果适用）
   evaluatorRequired: boolean;
   evaluatorPassed?: boolean;
+  evaluatorDecisionId?: string;
   evaluatorPromptId?: string;
 }
 

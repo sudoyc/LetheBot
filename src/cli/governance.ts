@@ -6,22 +6,26 @@
 
 import type Database from 'better-sqlite3';
 import { ulid } from 'ulidx';
-import type { ContextBuilder } from '../context/builder';
-import { redactSecretsInText } from '../memory/secret-scan';
-import { ContextTraceRepository } from '../storage/context-trace-repository';
-import type { JobAttemptStatus, JobStatus, WorkerHeartbeatStatus } from '../storage/job-repository';
-import type { MemoryRepository } from '../storage/memory-repository';
+import type { ContextBuilder } from '../context/builder.js';
+import {
+  formatGovernanceMemoryIdForDisplay,
+  GovernanceService,
+} from '../governance/service.js';
+import { redactSecretsInText } from '../memory/secret-scan.js';
+import { ContextTraceRepository } from '../storage/context-trace-repository.js';
+import type { JobAttemptStatus, JobStatus, WorkerHeartbeatStatus } from '../storage/job-repository.js';
+import type { MemoryRepository } from '../storage/memory-repository.js';
 import {
   PrivacyPreferenceRepository,
   type PrivacyPreferenceRecord,
   type PrivacyPreferenceState,
   type PrivacyPreferenceType,
-} from '../storage/privacy-preference-repository';
-import type { AuditEntry } from '../types/audit';
-import type { ActionDecision, ActionExecutionResult, ActionPlan, ActionType } from '../types/action';
-import type { ContextPack } from '../types/context';
-import type { MemoryRecord, MemorySource } from '../types/memory';
-import type { ToolCallResult } from '../types/tool';
+} from '../storage/privacy-preference-repository.js';
+import type { AuditEntry } from '../types/audit.js';
+import type { ActionDecision, ActionExecutionResult, ActionPlan, ActionType } from '../types/action.js';
+import type { ContextPack, MemorySelectionEvidence } from '../types/context.js';
+import type { MemoryRecord, MemorySource } from '../types/memory.js';
+import type { ToolCallResult } from '../types/tool.js';
 
 export interface ListMemoryOptions {
   userId?: string;
@@ -40,6 +44,11 @@ export interface CommandResult {
   success: boolean;
   message?: string;
   error?: string;
+}
+
+export interface UnlinkPlatformAccountOptions {
+  platform: 'qq';
+  platformAccountId: string;
 }
 
 export interface SupersedeMemoryOptions {
@@ -83,14 +92,27 @@ export interface ContextExplanation {
   injectedIdentityFields: string[];
   recentMessageIds: string[];
   tokenBudget: ContextPack['tokenBudget'];
+  memorySelections?: MemorySelectionEvidence[];
   memories: Array<{
     memoryId: string;
     scope: string;
     kind?: MemoryRecord['kind'];
     title: string;
     sourceContext?: string;
+    selection?: MemorySelectionEvidence;
   }>;
   actionDecision?: ActionDecisionExplanation;
+  toolCalls?: ToolCallExplanation[];
+}
+
+export interface ToolCallExplanation {
+  id: string;
+  toolName: string;
+  requestedBy: string;
+  status: string;
+  errorCode?: string;
+  errorMessage?: string;
+  executionTimeMs?: number;
 }
 
 export interface ActionDecisionExplanation {
@@ -107,7 +129,10 @@ export interface ActionExecutionExplanation {
   id: string;
   actionType: string;
   status: string;
+  effect?: string;
   executedMessageId?: string;
+  executedMemoryId?: string;
+  executedJobId?: string;
   downgradedFrom?: string;
   downgradedReason?: string;
   errorCode?: string;
@@ -427,6 +452,8 @@ export interface ActionExecutionInspectionRecord {
   actionType: string;
   status: string;
   executedMessageId?: string;
+  executedMemoryId?: string;
+  executedJobId?: string;
   downgradedFrom?: string;
   downgradedReason?: string;
   errorCode?: string;
@@ -614,6 +641,8 @@ interface ActionExecutionRow {
   action_type: ActionType;
   status: string;
   executed_message_id: string | null;
+  executed_memory_id: string | null;
+  executed_job_id: string | null;
   downgraded_from: ActionType | null;
   downgraded_reason: string | null;
   error_code: string | null;
@@ -1207,33 +1236,90 @@ export class GovernanceCLI {
     ));
   }
 
+  async unlinkPlatformAccount(options: UnlinkPlatformAccountOptions): Promise<CommandResult> {
+    const db = this.requireDatabase('platform account unlink');
+
+    try {
+      const unlink = db.transaction((): CommandResult => {
+        const mapping = db
+          .prepare(
+            `SELECT canonical_user_id, status
+             FROM platform_accounts
+             WHERE platform = ? AND platform_account_id = ?`
+          )
+          .get(options.platform, options.platformAccountId) as
+          | { canonical_user_id: string; status: string }
+          | undefined;
+
+        if (!mapping || mapping.status !== 'active') {
+          return {
+            success: false,
+            error: 'Platform account mapping not found or not active',
+          };
+        }
+
+        const update = db
+          .prepare(
+            `UPDATE platform_accounts
+             SET status = 'disabled'
+             WHERE platform = ? AND platform_account_id = ? AND status = 'active'`
+          )
+          .run(options.platform, options.platformAccountId);
+
+        if (update.changes !== 1) {
+          return {
+            success: false,
+            error: 'Platform account mapping not found or not active',
+          };
+        }
+
+        this.insertSystemAudit({
+          eventType: 'identity.platform_account.unlinked',
+          eventId: `identity-unlink-${ulid()}`,
+          summary: 'Governance CLI disabled one platform account mapping',
+          details: {
+            platform: options.platform,
+            canonicalUserId: mapping.canonical_user_id,
+            previousStatus: 'active',
+            newStatus: 'disabled',
+            redaction: 'no_raw_platform_account_id',
+          },
+        });
+
+        return {
+          success: true,
+          message: 'Platform account mapping disabled',
+        };
+      });
+
+      return unlink();
+    } catch {
+      return {
+        success: false,
+        error: 'Platform account unlink failed',
+      };
+    }
+  }
+
   /**
    * 删除记忆记录
    */
   async deleteMemory(memoryId: string): Promise<CommandResult> {
     try {
-      const existing = await this.memoryRepo.findById(memoryId);
-
-      if (!existing) {
+      const result = new GovernanceService(
+        this.requireDatabase('memory deletion'),
+        this.memoryRepo,
+      ).forgetMemoryAsLocalAdmin(memoryId);
+      if (result.outcome === 'not_found') {
         return {
           success: false,
-          error: `Memory ${memoryId} not found`,
+          error: `Memory ${formatGovernanceMemoryIdForDisplay(memoryId)} not found`,
         };
       }
 
-      await this.memoryRepo.updateState(memoryId, 'deleted', {
-        actor: {
-          canonicalUserId: 'admin',
-          actorClass: 'admin',
-          context: 'admin_cli',
-        },
-        reason: 'Governance CLI delete memory',
-        auditSummary: `Governance CLI deleted memory ${memoryId}`,
-      });
-
       return {
         success: true,
-        message: `Memory ${memoryId} deleted`,
+        message: `Memory ${formatGovernanceMemoryIdForDisplay(memoryId)} deleted`,
       };
     } catch (error) {
       return {
@@ -1675,9 +1761,10 @@ export class GovernanceCLI {
 
     const resolved = this.resolveExplainContextOptions(options);
     const actionDecision = this.findActionDecisionExplanation(resolved.turnId);
+    const toolCalls = this.findToolCallExplanations(resolved.turnId);
     const stored = await this.findStoredContextExplanation(resolved.turnId);
     if (stored) {
-      return { ...stored, actionDecision };
+      return { ...stored, actionDecision, toolCalls };
     }
 
     const context = await this.options.contextBuilder.build({
@@ -1688,6 +1775,10 @@ export class GovernanceCLI {
       canonicalUserId: resolved.canonicalUserId,
       messageLimit: options.messageLimit,
     });
+    const memorySelections = context.trace?.memorySelections;
+    const selectionByMemoryId = new Map(
+      (memorySelections ?? []).map((selection) => [selection.memoryId, selection]),
+    );
 
     return {
       turnId: resolved.turnId,
@@ -1701,15 +1792,49 @@ export class GovernanceCLI {
       injectedIdentityFields: context.injectedIdentityFields,
       recentMessageIds: context.recentMessages.map((message) => message.messageId),
       tokenBudget: context.tokenBudget,
+      ...(memorySelections === undefined ? {} : { memorySelections }),
       memories: context.memory.retrievedFacts.map((memory) => ({
         memoryId: memory.memoryId,
         scope: memory.scope,
         kind: memory.kind,
         title: memory.title,
         sourceContext: memory.sourceContext,
+        ...(selectionByMemoryId.has(memory.memoryId)
+          ? { selection: selectionByMemoryId.get(memory.memoryId) }
+          : {}),
       })),
       actionDecision,
+      toolCalls,
     };
+  }
+
+  private findToolCallExplanations(turnId: string): ToolCallExplanation[] {
+    const db = this.options.db;
+    if (!db) {
+      return [];
+    }
+
+    const rows = db
+      .prepare(
+        `SELECT *
+         FROM tool_calls
+         WHERE turn_id = ?
+         ORDER BY created_at ASC, id ASC`
+      )
+      .all(turnId) as ToolCallRow[];
+
+    return rows.map((row) => {
+      const inspection = this.toolCallRowToInspection(row, false);
+      return {
+        id: inspection.id,
+        toolName: inspection.toolName,
+        requestedBy: inspection.requestedBy,
+        status: inspection.status,
+        errorCode: inspection.errorCode,
+        errorMessage: inspection.errorMessage,
+        executionTimeMs: inspection.executionTimeMs,
+      };
+    });
   }
 
   private findActionDecisionExplanation(turnId: string): ActionDecisionExplanation | undefined {
@@ -1769,13 +1894,34 @@ export class GovernanceCLI {
         id: inspection.id,
         actionType: inspection.actionType,
         status: inspection.status,
+        effect: this.describeActionExecutionEffect(inspection),
         executedMessageId: inspection.executedMessageId,
+        executedMemoryId: inspection.executedMemoryId,
+        executedJobId: inspection.executedJobId,
         downgradedFrom: inspection.downgradedFrom,
         downgradedReason: inspection.downgradedReason,
         errorCode: inspection.errorCode,
         errorMessage: inspection.errorMessage,
       };
     });
+  }
+
+  private describeActionExecutionEffect(
+    execution: Pick<ActionExecutionInspectionRecord, 'actionType' | 'status' | 'executedMessageId'>
+  ): string | undefined {
+    if (execution.actionType !== 'react_only') {
+      return undefined;
+    }
+
+    if (execution.status === 'success' && !execution.executedMessageId) {
+      return 'true_reaction';
+    }
+
+    if (execution.status === 'downgraded') {
+      return execution.executedMessageId ? 'face_message_fallback' : 'silent_reaction_fallback';
+    }
+
+    return undefined;
   }
 
   private async findStoredContextExplanation(turnId: string): Promise<ContextExplanation | null> {
@@ -1800,6 +1946,9 @@ export class GovernanceCLI {
       injectedIdentityFields: stored.injectedIdentityFields,
       recentMessageIds: stored.recentMessageIds,
       tokenBudget: stored.tokenBudget,
+      ...(stored.memorySelections === undefined
+        ? {}
+        : { memorySelections: stored.memorySelections }),
       memories: stored.memories,
     };
   }
@@ -2248,6 +2397,8 @@ export class GovernanceCLI {
       executedMessageId: row.executed_message_id
         ? this.redactString(row.executed_message_id).text
         : undefined,
+      executedMemoryId: row.executed_memory_id ? this.redactString(row.executed_memory_id).text : undefined,
+      executedJobId: row.executed_job_id ? this.redactString(row.executed_job_id).text : undefined,
       downgradedFrom: row.downgraded_from ? this.redactString(row.downgraded_from).text : undefined,
       downgradedReason: row.downgraded_reason ? this.redactString(row.downgraded_reason).text : undefined,
       errorCode: row.error_code ? this.redactString(row.error_code).text : undefined,
@@ -2478,8 +2629,8 @@ export class GovernanceCLI {
 
   private redactPlatformIdentifiers(text: string): string {
     return text
-      .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
-      .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
+      .replace(/(?<![A-Za-z0-9])qq-(?:group-)?[1-9][0-9]{4,11}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
+      .replace(/(?<![A-Za-z0-9])[1-9][0-9]{4,11}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
   }
 
   private redactStructuredValue(value: unknown, path: string[] = []): { value: unknown; redacted: boolean } {
@@ -2523,7 +2674,7 @@ export class GovernanceCLI {
   private shouldRedactNumericPlatformId(path: string[], value: number): boolean {
     return Number.isInteger(value)
       && this.isPlatformIdField(path)
-      && /^\d{8,12}$/.test(String(Math.abs(value)));
+      && /^[1-9][0-9]{4,11}$/.test(String(Math.abs(value)));
   }
 
   private isPlatformIdField(path: string[]): boolean {

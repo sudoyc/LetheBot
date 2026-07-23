@@ -3,8 +3,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type Database from 'better-sqlite3';
-import { initDatabase, runMigration, closeDatabase } from '../../../src/storage/database';
-import { ActionRepository } from '../../../src/actions/action-repository';
+import { initDatabase, runMigrations, closeDatabase } from '../../../src/storage/database';
+import {
+  ActionRepository,
+  type CreateActionDecisionInput,
+  type SocialEvaluatorEvidence,
+} from '../../../src/actions/action-repository';
 
 describe('ActionRepository', () => {
   let testDir: string;
@@ -14,7 +18,7 @@ describe('ActionRepository', () => {
   beforeEach(() => {
     testDir = mkdtempSync(join(tmpdir(), 'lethebot-action-repository-'));
     db = initDatabase({ path: join(testDir, 'test.db') });
-    runMigration(db, join(__dirname, '../../../migrations/001_initial_schema.sql'));
+    runMigrations(db, join(__dirname, '../../../migrations'));
     repo = new ActionRepository(db);
 
     const now = Date.now();
@@ -32,6 +36,33 @@ describe('ActionRepository', () => {
     closeDatabase(db);
     rmSync(testDir, { recursive: true, force: true });
   });
+
+  function insertCompletedSocialInvocation(input: {
+    id: string;
+    requestId: string;
+    sourceEventIds: string[];
+    startedAt: number;
+    completedAt: number;
+  }): void {
+    db.prepare(
+      `INSERT INTO model_invocations (
+        id, turn_id, job_attempt_id, context_id, purpose, evaluator_request_id,
+        evaluator_domain, prompt_version, call_number, provider, model, status,
+        started_at, completed_at, tokens_input, tokens_output, tokens_total,
+        response_sha256, response_bytes
+      ) VALUES (?, 'turn-action-repo', NULL, NULL, 'evaluator', ?, 'social',
+                'social-prompt-v1', 1, 'openai', 'gpt-4', 'completed',
+                ?, ?, 12, 6, 18, ?, 48)`
+    ).run(input.id, input.requestId, input.startedAt, input.completedAt, 'b'.repeat(64));
+    const insertSource = db.prepare(
+      `INSERT INTO model_invocation_sources (
+        model_invocation_id, raw_event_id, source_ordinal
+      ) VALUES (?, ?, ?)`
+    );
+    input.sourceEventIds.forEach((sourceEventId, ordinal) => {
+      insertSource.run(input.id, sourceEventId, ordinal);
+    });
+  }
 
   it('redacts sensitive action decision and execution narrative fields before durable persistence', async () => {
     const decision = await repo.createDecision({
@@ -57,6 +88,7 @@ describe('ActionRepository', () => {
             conversationId: 'private:qq-10001',
             conversationType: 'private',
             userId: 'qq-10001',
+            canonicalUserId: 'user-action-repo-legacy_qq-5566778899',
           },
           payload: {
             text: 'reply sk-action-repository-payload-secret-should-not-persist to qq-1234567890',
@@ -94,8 +126,13 @@ describe('ActionRepository', () => {
     });
 
     const decisionRow = db
-      .prepare('SELECT actions, reasons, suppressors FROM action_decisions WHERE id = ?')
-      .get(decision.id) as { actions: string; reasons: string; suppressors: string };
+      .prepare('SELECT actions, reasons, suppressors, execution_binding FROM action_decisions WHERE id = ?')
+      .get(decision.id) as {
+        actions: string;
+        reasons: string;
+        suppressors: string;
+        execution_binding: string;
+      };
     const executionRow = db
       .prepare(
         `SELECT executed_message_id, downgraded_reason, error_code, error_message, audit_entry
@@ -109,6 +146,7 @@ describe('ActionRepository', () => {
         audit_entry: string;
       };
     const serializedRows = JSON.stringify({ decisionRow, executionRow });
+    const serializedExecutionResult = JSON.stringify(execution);
 
     expect(serializedRows).not.toContain('sk-action-repository-reason-secret-should-not-persist');
     expect(serializedRows).not.toContain('sk-action-repository-payload-secret-should-not-persist');
@@ -131,9 +169,19 @@ describe('ActionRepository', () => {
     expect(serializedRows).toContain('[REDACTED:api_key_assignment]');
     expect(serializedRows).toContain('[REDACTED:token_assignment]');
     expect(serializedRows).toContain('[REDACTED:platform_id]');
+    expect(serializedExecutionResult).not.toContain('sk-action-repository-downgrade-secret-should-not-persist');
+    expect(serializedExecutionResult).not.toContain('sk-action-repository-error-secret-should-not-persist');
+    expect(serializedExecutionResult).not.toContain('sk-action-repository-audit-secret-should-not-persist');
+    expect(serializedExecutionResult).not.toContain('1234567896');
+    expect(serializedExecutionResult).not.toContain('1234567897');
+    expect(execution.downgradedReason).toBe(executionRow.downgraded_reason);
+    expect(execution.error?.code).toBe(executionRow.error_code);
+    expect(execution.error?.message).toBe(executionRow.error_message);
+    expect(execution.auditEntry).toBe(executionRow.audit_entry);
+    expect(decisionRow.execution_binding).toMatch(/^v1:[a-f0-9]{64}$/);
 
     const storedActions = JSON.parse(decisionRow.actions) as Array<{
-      target: { conversationId: string; userId: string };
+      target: { conversationId: string; userId: string; canonicalUserId: string };
       payload: {
         text: string;
         metadata: {
@@ -149,6 +197,7 @@ describe('ActionRepository', () => {
     expect(storedActions[0]?.target).toMatchObject({
       conversationId: 'private:qq-10001',
       userId: 'qq-10001',
+      canonicalUserId: 'user-action-repo-legacy_qq-5566778899',
     });
     expect(storedActions[0]?.payload.text).toContain('[REDACTED:openai_like_api_key]');
     expect(storedActions[0]?.payload.metadata.senderIds).toEqual(['[REDACTED:platform_id]', 42]);
@@ -384,6 +433,563 @@ describe('ActionRepository', () => {
     expect(serializedRows).not.toContain('22334455673');
     expect(serializedRows).not.toContain('22334455674');
     expect(serializedRows).not.toContain('22334455675');
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('keeps non-evaluated action decisions valid with a null evaluator link', async () => {
+    const decision = await repo.createDecision({
+      id: 'decision-without-evaluator',
+      turnId: 'turn-action-repo',
+      decidedBy: 'pi',
+      riskLevel: 'low',
+      confidence: 0.9,
+      evaluatorRequired: false,
+      reasons: ['ordinary reply'],
+      suppressors: [],
+      actions: [
+        {
+          type: 'reply_short',
+          priority: 100,
+          constraints: {},
+          reason: 'ordinary reply',
+        },
+      ],
+    });
+
+    expect(decision.evaluatorDecisionId).toBeUndefined();
+    expect(
+      db.prepare('SELECT evaluator_decision_id FROM action_decisions WHERE id = ?').get(decision.id)
+    ).toEqual({ evaluator_decision_id: null });
+    expect(db.prepare('SELECT COUNT(*) AS count FROM evaluator_decisions').get()).toEqual({ count: 0 });
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('atomically links exact completed Provider evidence to a social action decision', async () => {
+    const turnStartedAt = db.prepare(
+      'SELECT started_at FROM agent_turns WHERE id = ?'
+    ).pluck().get('turn-action-repo') as number;
+    const requestCreatedAt = new Date(turnStartedAt + 1);
+    const decidedAt = new Date(turnStartedAt + 4);
+    const action = {
+      type: 'reply_full' as const,
+      priority: 100,
+      constraints: { evaluatorRequired: true },
+      reason: 'evaluated reply',
+    };
+    insertCompletedSocialInvocation({
+      id: 'invocation-social-provider-link',
+      requestId: 'request-social-provider-link',
+      sourceEventIds: ['evt-action-repo'],
+      startedAt: turnStartedAt + 2,
+      completedAt: turnStartedAt + 3,
+    });
+
+    const decision = await repo.createDecision({
+      id: 'decision-social-provider-link',
+      turnId: 'turn-action-repo',
+      decidedBy: 'evaluator',
+      riskLevel: 'medium',
+      confidence: 0.86,
+      evaluatorRequired: true,
+      evaluatorPassed: true,
+      reasons: ['evaluated reply'],
+      suppressors: [],
+      actions: [action],
+      evaluatorEvidence: {
+        request: {
+          requestId: 'request-social-provider-link',
+          domain: 'social',
+          turnId: 'turn-action-repo',
+          actor: { canonicalUserId: 'user-social-provider-link', actorClass: 'user' },
+          context: 'private_chat',
+          sourceEventIds: ['evt-action-repo'],
+          contextSummary: 'bounded context',
+          createdAt: requestCreatedAt,
+          proposedAction: action,
+          attentionSignals: {
+            classification: 'needs_evaluation',
+            triggerScore: 0.8,
+            triggerReasons: ['direct_question'],
+            suppressors: [],
+            recommendedPath: 'risk_path',
+          },
+          isProactive: false,
+        },
+        result: {
+          decisionId: 'evaluator-social-provider-link',
+          requestId: 'request-social-provider-link',
+          domain: 'social',
+          decision: 'approve',
+          reason: 'approved',
+          confidence: 0.86,
+          riskLevel: 'medium',
+          decidedAt,
+          evaluatorVersion: 'openai/gpt-4/social-prompt-v1',
+          modelInvocationId: 'invocation-social-provider-link',
+        },
+      },
+    });
+
+    expect(db.prepare(
+      'SELECT model_invocation_id FROM evaluator_decisions WHERE id = ?'
+    ).get(decision.evaluatorDecisionId)).toEqual({
+      model_invocation_id: 'invocation-social-provider-link',
+    });
+    expect(repo.assertExecutionBinding(decision)).toMatchObject({
+      turnId: 'turn-action-repo',
+      triggerEventId: 'evt-action-repo',
+    });
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it.each([
+    {
+      label: 'evaluator decision source',
+      input: { decidedBy: 'evaluator' },
+    },
+    {
+      label: 'passing evaluator flag',
+      input: { evaluatorPassed: true },
+    },
+    {
+      label: 'complete bare approval state',
+      input: {
+        decidedBy: 'evaluator',
+        evaluatorRequired: true,
+        evaluatorPassed: true,
+        actionEvaluatorRequired: true,
+      },
+    },
+  ] as const)('rejects evidence-free $label before persistence', async ({ label, input }) => {
+    const id = `decision-missing-evidence-${label.replaceAll(' ', '-')}`;
+    const createInput: CreateActionDecisionInput = {
+      id,
+      turnId: 'turn-action-repo',
+      decidedBy: input.decidedBy ?? 'pi',
+      riskLevel: 'medium',
+      confidence: 0.8,
+      evaluatorRequired: input.evaluatorRequired ?? false,
+      evaluatorPassed: input.evaluatorPassed,
+      reasons: ['authority must be traceable'],
+      suppressors: [],
+      actions: [
+        {
+          type: 'reply_full',
+          priority: 100,
+          constraints: {
+            evaluatorRequired: input.actionEvaluatorRequired,
+          },
+          reason: 'attempted evidence-free authority',
+        },
+      ],
+    };
+
+    await expect(repo.createDecision(createInput)).rejects.toThrow('evaluator evidence');
+
+    expect(
+      db.prepare('SELECT COUNT(*) AS count FROM action_decisions WHERE id = ?').get(id),
+    ).toEqual({ count: 0 });
+    expect(db.prepare('SELECT COUNT(*) AS count FROM evaluator_decisions').get()).toEqual({ count: 0 });
+    expect(
+      db.prepare('SELECT action_decision_id FROM agent_turns WHERE id = ?').get('turn-action-repo'),
+    ).toEqual({ action_decision_id: null });
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('rolls back evaluator evidence when the linked action decision insert fails', async () => {
+    const requestCreatedAt = new Date('2026-07-10T02:03:04.000Z');
+    const decidedAt = new Date('2026-07-10T02:03:05.000Z');
+    const action = {
+      type: 'reply_full' as const,
+      priority: 100,
+      constraints: { evaluatorRequired: true },
+      reason: 'evaluated reply',
+    };
+    db.exec(`
+      CREATE TRIGGER fail_evaluated_action_insert
+      BEFORE INSERT ON action_decisions
+      WHEN NEW.id = 'decision-evaluator-rollback'
+      BEGIN
+        SELECT RAISE(ABORT, 'induced action decision failure');
+      END;
+    `);
+
+    await expect(repo.createDecision({
+      id: 'decision-evaluator-rollback',
+      turnId: 'turn-action-repo',
+      decidedBy: 'evaluator',
+      riskLevel: 'medium',
+      confidence: 0.81,
+      evaluatorRequired: true,
+      evaluatorPassed: true,
+      reasons: ['evaluated reply'],
+      suppressors: [],
+      actions: [action],
+      evaluatorEvidence: {
+        request: {
+          requestId: 'request-evaluator-rollback',
+          domain: 'social',
+          turnId: 'turn-action-repo',
+          actor: {
+            canonicalUserId: 'user-evaluator-rollback',
+            actorClass: 'user',
+          },
+          context: 'private_chat',
+          sourceEventIds: ['evt-action-repo'],
+          contextSummary: 'bounded context',
+          createdAt: requestCreatedAt,
+          proposedAction: action,
+          attentionSignals: {
+            classification: 'needs_evaluation',
+            triggerScore: 0.8,
+            triggerReasons: ['direct_question'],
+            suppressors: [],
+            recommendedPath: 'risk_path',
+          },
+          isProactive: false,
+        },
+        result: {
+          decisionId: 'eval-evaluator-rollback',
+          requestId: 'request-evaluator-rollback',
+          domain: 'social',
+          decision: 'approve',
+          reason: 'approved',
+          confidence: 0.81,
+          riskLevel: 'medium',
+          decidedAt,
+          evaluatorVersion: 'test-evaluator-v1',
+        },
+      },
+    })).rejects.toThrow('induced action decision failure');
+
+    expect(
+      db.prepare('SELECT COUNT(*) AS count FROM evaluator_decisions WHERE id = ?')
+        .get('eval-evaluator-rollback')
+    ).toEqual({ count: 0 });
+    expect(
+      db.prepare('SELECT COUNT(*) AS count FROM action_decisions WHERE id = ?')
+        .get('decision-evaluator-rollback')
+    ).toEqual({ count: 0 });
+    expect(
+      db.prepare('SELECT action_decision_id FROM agent_turns WHERE id = ?').get('turn-action-repo')
+    ).toEqual({ action_decision_id: null });
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('rejects incoherent or untraceable evaluator evidence before persistence', async () => {
+    const action = {
+      type: 'reply_full' as const,
+      priority: 100,
+      constraints: { evaluatorRequired: true },
+      reason: 'evaluated reply',
+    };
+    const makeEvidence = (suffix: string): SocialEvaluatorEvidence => ({
+      request: {
+        requestId: `request-invalid-evidence-${suffix}`,
+        domain: 'social',
+        turnId: 'turn-action-repo',
+        actor: {
+          canonicalUserId: 'user-invalid-evidence',
+          actorClass: 'user',
+        },
+        context: 'private_chat',
+        sourceEventIds: ['evt-action-repo'],
+        contextSummary: 'bounded context',
+        createdAt: new Date('2026-07-10T02:04:05.000Z'),
+        proposedAction: action,
+        attentionSignals: {
+          classification: 'needs_evaluation',
+          triggerScore: 0.8,
+          triggerReasons: ['direct_question'],
+          suppressors: [],
+          recommendedPath: 'risk_path',
+        },
+        isProactive: false,
+      },
+      result: {
+        decisionId: `eval-invalid-evidence-${suffix}`,
+        requestId: `request-invalid-evidence-${suffix}`,
+        domain: 'social',
+        decision: 'approve',
+        reason: 'approved',
+        confidence: 0.81,
+        riskLevel: 'medium',
+        decidedAt: new Date('2026-07-10T02:04:06.000Z'),
+        evaluatorVersion: 'test-evaluator-v1',
+      },
+    });
+    const cases: Array<{
+      suffix: string;
+      expected: string;
+      changeEvidence?: (evidence: SocialEvaluatorEvidence) => SocialEvaluatorEvidence;
+      input?: Partial<Parameters<ActionRepository['createDecision']>[0]>;
+    }> = [
+      {
+        suffix: 'request-domain',
+        expected: 'domain',
+        changeEvidence: (evidence) => ({
+          ...evidence,
+          request: {
+            ...evidence.request,
+            domain: 'tool',
+          } as unknown as SocialEvaluatorEvidence['request'],
+        }),
+      },
+      {
+        suffix: 'result-domain',
+        expected: 'domain',
+        changeEvidence: (evidence) => ({
+          ...evidence,
+          result: {
+            ...evidence.result,
+            domain: 'memory',
+          } as unknown as SocialEvaluatorEvidence['result'],
+        }),
+      },
+      { suffix: 'decided-by', expected: 'decidedBy', input: { decidedBy: 'pi' } },
+      { suffix: 'required', expected: 'evaluatorRequired', input: { evaluatorRequired: false } },
+      { suffix: 'passed', expected: 'evaluatorPassed', input: { evaluatorPassed: false } },
+      { suffix: 'risk', expected: 'riskLevel', input: { riskLevel: 'high' } },
+      { suffix: 'confidence', expected: 'confidence', input: { confidence: 0.7 } },
+      {
+        suffix: 'action-substitution',
+        expected: 'evaluator-authorized action',
+        input: {
+          actions: [
+            {
+              ...action,
+              type: 'reply_short',
+              reason: 'substituted after evaluator approval',
+            },
+          ],
+        },
+      },
+      {
+        suffix: 'passing-prohibited',
+        expected: 'prohibited risk',
+        changeEvidence: (evidence) => ({
+          ...evidence,
+          result: { ...evidence.result, riskLevel: 'prohibited' },
+        }),
+        input: { riskLevel: 'prohibited' },
+      },
+      {
+        suffix: 'fabricated-silent-store',
+        expected: 'evaluator-authorized action',
+        input: {
+          actions: [
+            {
+              type: 'silent_store',
+              priority: 0,
+              constraints: {},
+              reason: 'fabricated no-op evidence',
+            },
+          ],
+        },
+      },
+      {
+        suffix: 'retargeted-cooldown-suppression',
+        expected: 'evaluator-authorized action',
+        changeEvidence: (evidence) => ({
+          ...evidence,
+          request: {
+            ...evidence.request,
+            proposedAction: {
+              ...action,
+              target: {
+                conversationId: 'private:qq-10001',
+                conversationType: 'private',
+                userId: 'qq-10001',
+              },
+              constraints: {
+                evaluatorRequired: true,
+                cooldownKey: 'private:qq-10001:reply_full',
+                cooldownSeconds: 60,
+              },
+            },
+          },
+        }),
+        input: {
+          suppressors: ['cooldown:private:qq-10001:reply_full'],
+          actions: [
+            {
+              type: 'silent_store',
+              priority: 100,
+              target: {
+                conversationId: 'private:qq-99999',
+                conversationType: 'private',
+                userId: 'qq-99999',
+              },
+              constraints: {
+                evaluatorRequired: true,
+                cooldownKey: 'private:qq-10001:reply_full',
+                cooldownSeconds: 60,
+              },
+              reason: 'Downgraded from reply_full; cooldown active for reply_full',
+            },
+          ],
+        },
+      },
+      {
+        suffix: 'missing-downgrade-action',
+        expected: 'requires a downgrade action',
+        changeEvidence: (evidence) => ({
+          ...evidence,
+          result: { ...evidence.result, decision: 'downgrade' },
+        }),
+        input: {
+          actions: [{ type: 'silent_store', priority: 0, constraints: {}, reason: 'cooldown' }],
+        },
+      },
+      {
+        suffix: 'unmatched-downgrade-action',
+        expected: 'does not match the proposed action',
+        changeEvidence: (evidence) => ({
+          ...evidence,
+          result: {
+            ...evidence.result,
+            decision: 'downgrade',
+            downgradeAction: {
+              from: 'reply_short',
+              to: 'silent_store',
+              reason: 'mismatched downgrade',
+            },
+          },
+        }),
+        input: {
+          actions: [{ type: 'silent_store', priority: 0, constraints: {}, reason: 'cooldown' }],
+        },
+      },
+      {
+        suffix: 'missing-trigger',
+        expected: 'trigger event',
+        changeEvidence: (evidence) => ({
+          ...evidence,
+          request: { ...evidence.request, sourceEventIds: [] },
+        }),
+      },
+      {
+        suffix: 'missing-source',
+        expected: 'source event',
+        changeEvidence: (evidence) => ({
+          ...evidence,
+          request: {
+            ...evidence.request,
+            sourceEventIds: ['evt-action-repo', 'evt-does-not-exist'],
+          },
+        }),
+      },
+    ];
+
+    for (const testCase of cases) {
+      const initialEvidence = makeEvidence(testCase.suffix);
+      const evaluatorEvidence = testCase.changeEvidence?.(initialEvidence) ?? initialEvidence;
+      await expect(repo.createDecision({
+        id: `decision-invalid-evidence-${testCase.suffix}`,
+        turnId: 'turn-action-repo',
+        decidedBy: 'evaluator',
+        riskLevel: 'medium',
+        confidence: 0.81,
+        evaluatorRequired: true,
+        evaluatorPassed: true,
+        reasons: ['evaluated reply'],
+        suppressors: [],
+        actions: [action],
+        evaluatorEvidence,
+        ...testCase.input,
+      })).rejects.toThrow(testCase.expected);
+
+      expect(
+        db.prepare('SELECT COUNT(*) AS count FROM evaluator_decisions WHERE id = ?')
+          .get(evaluatorEvidence.result.decisionId)
+      ).toEqual({ count: 0 });
+      expect(
+        db.prepare('SELECT COUNT(*) AS count FROM action_decisions WHERE id = ?')
+          .get(`decision-invalid-evidence-${testCase.suffix}`)
+      ).toEqual({ count: 0 });
+    }
+
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('persists executed memory linkage in action execution rows and returned results', async () => {
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO memory_records (
+        id, scope, visibility, sensitivity, authority, kind, title, content,
+        state, confidence, importance, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'mem-action-repo-link',
+      'global',
+      'owner_admin_only',
+      'normal',
+      'inferred',
+      'fact',
+      'Action memory link',
+      'Action execution created a proposed memory',
+      'proposed',
+      0.8,
+      0.5,
+      now,
+      now
+    );
+
+    const decision = await repo.createDecision({
+      id: 'decision-memory-link',
+      turnId: 'turn-action-repo',
+      decidedBy: 'pi',
+      riskLevel: 'low',
+      confidence: 0.9,
+      evaluatorRequired: false,
+      reasons: ['memory proposal'],
+      suppressors: [],
+      actions: [
+        {
+          type: 'propose_memory',
+          priority: 100,
+          payload: {
+            memoryProposal: {
+              scope: 'global',
+              kind: 'fact',
+              title: 'Action memory link',
+              content: 'Action execution created a proposed memory',
+              confidence: 0.8,
+              sourceContext: 'action_repository_test',
+            },
+          },
+          constraints: {},
+          reason: 'Create proposed memory',
+        },
+      ],
+    });
+
+    const execution = await repo.createExecution({
+      id: 'execution-memory-link',
+      actionDecisionId: decision.id,
+      actionType: 'propose_memory',
+      status: 'success',
+      executedMemoryId: 'mem-action-repo-link',
+      auditLevel: 'summary',
+      auditEntry: 'memory_proposal_created=true',
+    });
+
+    expect(execution.executed).toEqual({
+      memoryId: 'mem-action-repo-link',
+    });
+
+    const row = db
+      .prepare('SELECT executed_message_id, executed_memory_id, executed_job_id FROM action_executions WHERE id = ?')
+      .get(execution.id) as {
+        executed_message_id: string | null;
+        executed_memory_id: string;
+        executed_job_id: string | null;
+      };
+    expect(row).toMatchObject({
+      executed_message_id: null,
+      executed_memory_id: 'mem-action-repo-link',
+      executed_job_id: null,
+    });
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 });

@@ -7,14 +7,14 @@
 import { EventEmitter } from 'node:events';
 import type { IncomingHttpHeaders } from 'node:http';
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { redactSecretsInText } from '../memory/secret-scan';
-import type { MessageContent, MessageTarget } from './adapter';
+import { redactSecretsInText } from '../memory/secret-scan.js';
+import type { MessageContent, MessageTarget } from './adapter.js';
 import type {
   ChatMessageReceived,
   GatewayCapabilities,
   MediaAttachment,
   QuotedMessage,
-} from '../types/events';
+} from '../types/events.js';
 
 interface OneBotApiResponse {
   status?: unknown;
@@ -26,6 +26,10 @@ interface OneBotApiResponse {
 }
 
 export type OneBotTransport = 'http' | 'ws';
+export type OneBotIngressDisposition = 'accepted' | 'duplicate' | 'ignored' | 'failed';
+type OneBotIngressHandler = (
+  event: ChatMessageReceived,
+) => Exclude<OneBotIngressDisposition, 'ignored'>;
 
 export interface OneBotWebSocketEvent {
   data?: unknown;
@@ -120,6 +124,7 @@ export class OneBotAdapter extends EventEmitter {
   private manuallyClosed = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly pendingWsRequests = new Map<string, PendingWsRequest>();
+  private ingressHandler: OneBotIngressHandler | undefined;
 
   constructor(config: OneBotConfig) {
     super();
@@ -142,6 +147,8 @@ export class OneBotAdapter extends EventEmitter {
     this.manuallyClosed = false;
     if (this.transport === 'ws') {
       this.openWebSocket();
+    } else {
+      this.emit('ready');
     }
     console.log(`OneBot adapter started (${this.transport.toUpperCase()} mode)`);
   }
@@ -210,32 +217,47 @@ export class OneBotAdapter extends EventEmitter {
    * 处理来自 OneBot runtime 的事件。
    */
   handleHttpEvent(body: unknown): boolean {
+    const disposition = this.dispatchInboundEvent(body, 'http');
+    return disposition === 'accepted' || disposition === 'duplicate';
+  }
+
+  dispatchInboundEvent(
+    body: unknown,
+    transport: OneBotTransport,
+  ): OneBotIngressDisposition {
     try {
       if (!this.isRecord(body)) {
-        return false;
+        return 'ignored';
       }
 
-      const internalEvent = this.convertToInternalEvent(body as unknown as OneBotMessage);
+      const internalEvent = this.convertToInternalEvent(body as unknown as OneBotMessage, transport);
       if (!internalEvent) {
-        return false;
+        return 'ignored';
       }
 
-      this.emit('event', internalEvent);
-      this.emit('message', internalEvent);
-      return true;
+      const disposition = this.ingressHandler?.(internalEvent) ?? 'accepted';
+      if (disposition === 'accepted') {
+        this.emit('event', internalEvent);
+        this.emit('message', internalEvent);
+      }
+      this.lastError = undefined;
+      return disposition;
     } catch (error) {
       const redactedMessage = this.toRedactedDiagnosticMessage(error, 'Unknown OneBot event error');
       this.lastError = redactedMessage;
       console.error('Failed to handle OneBot event:', this.formatRedactedConsoleDiagnostic(error, 'Unknown OneBot event error'));
       this.emitError(error);
-      return false;
+      return 'failed';
     }
   }
 
   /**
    * 转换为内部事件格式。
    */
-  private convertToInternalEvent(msg: OneBotMessage): ChatMessageReceived | null {
+  private convertToInternalEvent(
+    msg: OneBotMessage,
+    transport: OneBotTransport,
+  ): ChatMessageReceived | null {
     if (msg.post_type !== 'message') {
       return null;
     }
@@ -248,9 +270,11 @@ export class OneBotAdapter extends EventEmitter {
       return null;
     }
 
-    const platformMessageId = this.normalizeMessageId(
-      this.normalizeTopLevelId(msg.message_id) ?? this.createLocalMessageId()
-    );
+    const normalizedPlatformMessageId = this.normalizeTopLevelMessageId(msg.message_id);
+    const platformEventId = normalizedPlatformMessageId
+      ? this.normalizeMessageId(normalizedPlatformMessageId)
+      : undefined;
+    const platformMessageId = platformEventId ?? this.normalizeMessageId(this.createLocalMessageId());
     const senderPlatformId = this.normalizeTopLevelId(msg.user_id)
       ?? this.normalizeTopLevelId(msg.sender?.user_id)
       ?? 'unknown';
@@ -267,6 +291,10 @@ export class OneBotAdapter extends EventEmitter {
         source: 'gateway',
         platform: 'qq',
         conversationId,
+        ingress: {
+          transport,
+          ...(platformEventId ? { platformEventId } : {}),
+        },
         message: {
           messageId: platformMessageId,
           conversationId,
@@ -296,6 +324,10 @@ export class OneBotAdapter extends EventEmitter {
       source: 'gateway',
       platform: 'qq',
       conversationId: groupId,
+      ingress: {
+        transport,
+        ...(platformEventId ? { platformEventId } : {}),
+      },
       message: {
         messageId: platformMessageId,
         conversationId: groupId,
@@ -577,6 +609,19 @@ export class OneBotAdapter extends EventEmitter {
     this.on('event', handler);
   }
 
+  onIngress(handler: OneBotIngressHandler): void {
+    this.ingressHandler = handler;
+  }
+
+  whenReady(handler: () => void): void {
+    if (this.getReadiness().ready) {
+      handler();
+      return;
+    }
+
+    this.once('ready', handler);
+  }
+
   /**
    * 调用 OneBot API。
    */
@@ -704,13 +749,10 @@ export class OneBotAdapter extends EventEmitter {
       this.socket = socket;
       this.wsConnected = false;
 
-      socket.addEventListener('open', () => {
-        this.wsConnected = true;
-        this.lastError = undefined;
-      });
-      socket.addEventListener('message', (event) => this.handleWebSocketMessage(event));
-      socket.addEventListener('error', (event) => this.handleWebSocketError(event));
-      socket.addEventListener('close', (event) => this.handleWebSocketClose(event));
+      socket.addEventListener('open', () => this.handleWebSocketOpen(socket));
+      socket.addEventListener('message', (event) => this.handleWebSocketMessage(socket, event));
+      socket.addEventListener('error', (event) => this.handleWebSocketError(socket, event));
+      socket.addEventListener('close', (event) => this.handleWebSocketClose(socket, event));
     } catch (error) {
       this.lastError = this.toRedactedDiagnosticMessage(error, 'Failed to open OneBot WebSocket');
       this.emitError(error);
@@ -740,7 +782,21 @@ export class OneBotAdapter extends EventEmitter {
     return url.toString();
   }
 
-  private handleWebSocketMessage(event: OneBotWebSocketEvent): void {
+  private handleWebSocketOpen(socket: OneBotWebSocketLike): void {
+    if (!this.isCurrentStartedWebSocket(socket)) {
+      return;
+    }
+
+    this.wsConnected = true;
+    this.lastError = undefined;
+    this.emit('ready');
+  }
+
+  private handleWebSocketMessage(socket: OneBotWebSocketLike, event: OneBotWebSocketEvent): void {
+    if (!this.isCurrentStartedWebSocket(socket)) {
+      return;
+    }
+
     const text = this.websocketPayloadToString(event.data);
     if (!text) {
       return;
@@ -760,7 +816,7 @@ export class OneBotAdapter extends EventEmitter {
     }
 
     if (typeof parsed.post_type === 'string') {
-      this.handleHttpEvent(parsed as unknown as OneBotMessage);
+      this.dispatchInboundEvent(parsed as unknown as OneBotMessage, 'ws');
       return;
     }
 
@@ -782,7 +838,11 @@ export class OneBotAdapter extends EventEmitter {
     return true;
   }
 
-  private handleWebSocketError(event: OneBotWebSocketEvent): void {
+  private handleWebSocketError(socket: OneBotWebSocketLike, event: OneBotWebSocketEvent): void {
+    if (!this.isCurrentStartedWebSocket(socket)) {
+      return;
+    }
+
     const error = event.error instanceof Error
       ? event.error
       : new Error('OneBot WebSocket error');
@@ -790,7 +850,11 @@ export class OneBotAdapter extends EventEmitter {
     this.emitError(error);
   }
 
-  private handleWebSocketClose(event: OneBotWebSocketEvent): void {
+  private handleWebSocketClose(socket: OneBotWebSocketLike, event: OneBotWebSocketEvent): void {
+    if (socket !== this.socket) {
+      return;
+    }
+
     this.wsConnected = false;
     this.socket = null;
     this.rejectAllPendingWsRequests(new Error('OneBot WebSocket closed'));
@@ -802,6 +866,10 @@ export class OneBotAdapter extends EventEmitter {
     if (!this.manuallyClosed && this.ready) {
       this.scheduleReconnect();
     }
+  }
+
+  private isCurrentStartedWebSocket(socket: OneBotWebSocketLike): boolean {
+    return this.ready && !this.manuallyClosed && socket === this.socket;
   }
 
   private scheduleReconnect(): void {
@@ -937,6 +1005,21 @@ export class OneBotAdapter extends EventEmitter {
       }
 
       if (/^\d+$/.test(trimmed) || /^qq-\d+$/.test(trimmed) || /^qq-group-\d+$/.test(trimmed)) {
+        return trimmed;
+      }
+    }
+
+    return undefined;
+  }
+
+  private normalizeTopLevelMessageId(value: unknown): number | string | undefined {
+    if (this.isPositiveIntegerId(value)) {
+      return value;
+    }
+
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (/^\d+$/.test(trimmed) || /^qq-\d+$/.test(trimmed)) {
         return trimmed;
       }
     }
@@ -1091,7 +1174,7 @@ export class OneBotAdapter extends EventEmitter {
     return {
       platform: 'qq',
       reactions: { emojiLike: false, faceMessage: true },
-      foldedForward: { groupForward: true, privateForward: true, customNode: true },
+      foldedForward: { groupForward: false, privateForward: false, customNode: false },
       platformAdmin: { kick: false, mute: false, setGroupCard: false },
     };
   }

@@ -4,4 +4,4 @@
  * 统一导出 CLI 模块
  */
 
-export * from './governance';
+export * from './governance.js';

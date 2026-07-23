@@ -6,41 +6,87 @@
 
 import Database from 'better-sqlite3';
 import { createHash, randomUUID } from 'node:crypto';
-import { createServer } from 'node:http';
-import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { realpathSync } from 'node:fs';
+import { createServer, type ServerResponse } from 'node:http';
 import { loadConfig, type Config } from './config/index.js';
 import { getLogger } from './logger/index.js';
-import { closeDatabase, initDatabase, runMigration } from './storage/database.js';
+import { closeDatabase, initDatabase, runMigrations } from './storage/database.js';
 import { MemoryRepository } from './storage/memory-repository.js';
-import { IdentityRepository } from './storage/identity-repository.js';
+import {
+  IdentityRepository,
+  InactivePlatformAccountError,
+} from './storage/identity-repository.js';
 import { AuditRepository } from './storage/audit-repository.js';
 import { ContextTraceRepository } from './storage/context-trace-repository.js';
 import { TurnRepository } from './storage/turn-repository.js';
 import { ToolCallRepository } from './storage/tool-call-repository.js';
+import { LocalToolEffectCoordinator } from './storage/local-tool-effect-coordinator.js';
+import { EvaluatorDecisionRepository } from './storage/evaluator-decision-repository.js';
+import { ModelInvocationRepository } from './storage/model-invocation-repository.js';
 import { PrivacyPreferenceRepository } from './storage/privacy-preference-repository.js';
 import { JobRepository } from './storage/job-repository.js';
+import {
+  GroupSummaryPolicyError,
+  GroupSummaryPolicyRepository,
+} from './storage/group-summary-policy-repository.js';
 import { ActionRepository } from './actions/action-repository.js';
 import { ActionCooldownManager } from './actions/cooldown.js';
 import { ActionExecutor, type MessageSender } from './actions/executor.js';
 import { SocialDecisionService } from './actions/social-decision-service.js';
-import { OneBotAdapter, type OneBotReadiness } from './gateway/onebot-adapter.js';
+import {
+  OneBotAdapter,
+  type OneBotIngressDisposition,
+  type OneBotReadiness,
+  type OneBotTransport,
+} from './gateway/onebot-adapter.js';
 import { AttentionEngine } from './attention/engine.js';
+import {
+  DelayedAttentionService,
+  parseDelayedAttentionTaskPayload,
+  type DelayedAttentionCandidate,
+  type DelayedAttentionDecision,
+} from './attention/delayed-attention-service.js';
 import { ContextBuilder } from './context/builder.js';
 import { PiAdapter, type PiAdapterInput, type PiAdapterOutput } from './pi/pi-adapter.js';
 import { ToolRegistry } from './tools/registry.js';
+import { registerBuiltInTools } from './tools/builtins/memory-search.js';
 import { PolicyGate } from './policy/gate.js';
-import { EvaluatorStub } from './evaluator/evaluator-stub.js';
+import {
+  createRuntimeEvaluator,
+  resolveEvaluatorConfig,
+} from './evaluator/runtime.js';
 import { buildSystemPrompt } from './context/persona.js';
 import { redactSecretsInText } from './memory/secret-scan.js';
-import { MemoryExtractionWorker } from './workers/memory-extraction.js';
-import { BackgroundWorker, type BackgroundTask, type EnqueueTaskInput, type TaskResult } from './workers/background.js';
+import { MemoryProposalService } from './memory/proposal-service.js';
+import {
+  isAutomaticExtractionCandidate,
+  MemoryExtractionWorker,
+} from './workers/memory-extraction.js';
+import {
+  BackgroundWorker,
+  NonRetryableBackgroundTaskError,
+  type BackgroundTask,
+  type BackgroundTaskExecutionContext,
+  type EnqueueTaskInput,
+  type TaskType,
+  type TaskResult,
+} from './workers/background.js';
 import { WorkerScheduler } from './workers/scheduler.js';
 import { SummaryWorker, type ConversationSummaryInput } from './workers/summary-worker.js';
+import {
+  GroupSummaryJobService,
+  GroupSummaryWindowError,
+} from './workers/group-summary-job-service.js';
 import { AdminDigestWorker } from './workers/admin-digest.js';
 import { MemoryConsolidationWorker } from './workers/memory-consolidation.js';
 import { MemoryConflictWorker } from './workers/memory-conflict.js';
 import { MemoryDecayWorker } from './workers/memory-decay.js';
+import {
+  parseStoredChatMessageReceived,
+  type StoredChatEventRow,
+} from './ingestion/stored-chat-event.js';
+import { parseQqGovernanceCommand } from './governance/qq-command.js';
+import { GovernanceService } from './governance/service.js';
 import {
   applyRetentionPolicy,
   collectOperationsMetrics,
@@ -48,10 +94,11 @@ import {
   type RetentionPolicy,
 } from './operations/sqlite-maintenance.js';
 import type { ChatMessageReceived } from './types/events.js';
-import type { ActionExecutionResult } from './types/action.js';
+import type { ActionDecision, ActionExecutionResult } from './types/action.js';
+import type { AttentionSignals } from './types/attention.js';
 import type { IEvaluator } from './types/evaluator.js';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname } from 'node:path';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -61,10 +108,23 @@ const logger = getLogger();
 
 export const VERSION = '0.1.0';
 
+export function resolvePiApiKey(
+  env: NodeJS.ProcessEnv = process.env,
+  required = false,
+): string {
+  const apiKey = env.PI_API_KEY?.trim() ?? '';
+  if (required && !apiKey) {
+    throw new Error('PI_API_KEY is required for a non-mock Pi provider');
+  }
+  return apiKey;
+}
+
 type PublicAdapterStatus = Pick<
   OneBotReadiness,
   'ready' | 'mode' | 'wsConnected' | 'pendingWsRequests' | 'hasToken' | 'botIdConfigured'
 >;
+
+type EventHandlingOutcome = 'completed' | 'failed';
 
 /**
  * 测试导出函数
@@ -189,9 +249,13 @@ class LetheBotApp {
   private toolCallRepo: ToolCallRepository;
   private privacyPreferenceRepo: PrivacyPreferenceRepository;
   private jobRepo: JobRepository;
+  private groupSummaryPolicyRepo: GroupSummaryPolicyRepository;
+  private governance: GovernanceService;
+  private groupSummaryJobService: GroupSummaryJobService;
   private actionRepo: ActionRepository;
   private adapter: OneBotAdapter;
   private attention: AttentionEngine;
+  private delayedAttention: DelayedAttentionService;
   private contextBuilder: ContextBuilder;
   private toolRegistry: ToolRegistry;
   private policyGate: PolicyGate;
@@ -206,6 +270,8 @@ class LetheBotApp {
   private backgroundWorker: BackgroundWorker;
   private workerScheduler: WorkerScheduler;
   private server: ReturnType<typeof createServer> | null = null;
+  private acceptingIngress = false;
+  private stopPromise: Promise<void> | null = null;
   private pendingEventTasks = new Set<Promise<void>>();
   private eventProcessingFailures: Array<{
     eventId: string;
@@ -220,7 +286,7 @@ class LetheBotApp {
     // 初始化数据库
     logger.info('Initializing database...');
     this.db = initDatabase({ path: this.config.dbPath });
-    runMigration(this.db, join(__dirname, '../migrations/001_initial_schema.sql'));
+    runMigrations(this.db, join(__dirname, '../migrations'));
 
     // 初始化存储层
     this.memoryRepo = new MemoryRepository(this.db);
@@ -231,29 +297,31 @@ class LetheBotApp {
     this.toolCallRepo = new ToolCallRepository(this.db);
     this.privacyPreferenceRepo = new PrivacyPreferenceRepository(this.db);
     this.jobRepo = new JobRepository(this.db);
-    this.actionRepo = new ActionRepository(this.db);
-    this.socialEvaluator = new EvaluatorStub();
-    this.cooldowns = new ActionCooldownManager();
-    this.socialDecisionService = new SocialDecisionService(
-      this.actionRepo,
-      this.socialEvaluator,
-      this.cooldowns,
+    this.groupSummaryPolicyRepo = new GroupSummaryPolicyRepository(this.db);
+    this.governance = new GovernanceService(
+      this.db,
+      this.memoryRepo,
+      this.groupSummaryPolicyRepo,
     );
+    this.actionRepo = new ActionRepository(this.db);
+    this.cooldowns = new ActionCooldownManager();
 
     // 初始化工具注册表和策略门
     this.toolRegistry = new ToolRegistry();
+    registerBuiltInTools(this.toolRegistry, { memoryRepository: this.memoryRepo, database: this.db });
     this.policyGate = new PolicyGate(this.toolRegistry);
 
     // 初始化核心模块
     this.attention = new AttentionEngine();
+    this.delayedAttention = new DelayedAttentionService(this.db, this.jobRepo);
     this.contextBuilder = new ContextBuilder(this.memoryRepo, this.identityRepo, this.db);
-    this.memoryExtractor = new MemoryExtractionWorker(this.db, this.memoryRepo);
     this.backgroundWorker = new BackgroundWorker({
       jobRepository: this.jobRepo,
       workerId: 'lethebot-background-main',
       handlers: {
-        summary: (task) => this.handleSummaryBackgroundTask(task),
-        extraction: (task) => this.handleExtractionBackgroundTask(task),
+        summary: (task, execution) => this.handleSummaryBackgroundTask(task, execution),
+        extraction: (task, execution) => this.handleExtractionBackgroundTask(task, execution),
+        attention_recheck: (task, execution) => this.handleAttentionRecheckBackgroundTask(task, execution),
         consolidation: (task) => this.handleConsolidationBackgroundTask(task),
         conflict: (task) => this.handleConflictBackgroundTask(task),
         decay: (task) => this.handleDecayBackgroundTask(task),
@@ -268,17 +336,35 @@ class LetheBotApp {
     this.piModel = process.env.PI_MODEL || 'deepseek-v4-flash';
     const baseUrl = process.env.PI_BASE_URL || 'https://api.deepseek.com/v1';
 
-    // 读取 API Key
-    let apiKey = process.env.PI_API_KEY || '';
-    if (!apiKey) {
-      try {
-        const keyPath = join(homedir(), 'deepseek');
-        apiKey = readFileSync(keyPath, 'utf-8').trim();
-        logger.info({ keyPath }, 'Loaded API key from file');
-      } catch {
-        logger.warn('No API key found, Pi Agent may not work');
-      }
-    }
+    const apiKey = resolvePiApiKey(
+      process.env,
+      !this.config.test && this.piProvider !== 'mock',
+    );
+    const evaluatorConfig = resolveEvaluatorConfig({
+      provider: this.piProvider,
+      model: this.piModel,
+      baseUrl,
+      apiKey,
+    }, {
+      provider: this.config.evaluatorProvider,
+      model: this.config.evaluatorModel,
+      baseUrl: this.config.evaluatorBaseUrl,
+      apiKey: this.config.evaluatorApiKey,
+      timeoutMs: this.config.evaluatorTimeoutMs,
+      maxRetries: this.config.evaluatorMaxRetries,
+      temperature: this.config.evaluatorTemperature,
+      promptVersion: this.config.evaluatorPromptVersion,
+    });
+    this.socialEvaluator = createRuntimeEvaluator(evaluatorConfig, {
+      test: this.config.test,
+      invocationLedger: new ModelInvocationRepository(this.db),
+    });
+    this.socialDecisionService = new SocialDecisionService(
+      this.actionRepo,
+      this.socialEvaluator,
+      this.cooldowns,
+    );
+    this.memoryExtractor = this.createMemoryExtractionWorker(this.socialEvaluator);
 
     this.pi = this.config.test || this.piProvider === 'mock'
       ? this.createTestPiRuntime()
@@ -289,11 +375,31 @@ class LetheBotApp {
           model: this.piModel,
           apiKey,
           baseUrl,
+          turnTimeoutMs: this.config.piTurnTimeoutMs,
           auditRepository: this.auditRepo,
           toolCallRepository: this.toolCallRepo,
+          evaluator: this.socialEvaluator,
+          evaluatorDecisionWriter: new EvaluatorDecisionRepository(this.db),
+          localToolEffectCoordinator: new LocalToolEffectCoordinator(
+            this.db,
+            this.toolCallRepo,
+            this.auditRepo,
+          ),
         });
 
+    this.groupSummaryJobService = new GroupSummaryJobService(this.db, {
+      jobRepository: this.jobRepo,
+      policyRepository: this.groupSummaryPolicyRepo,
+      planGroupSummaryWindow: (input) => (
+        this.createSummaryWorker().planGroupSummaryWindow(input)
+      ),
+    });
+
     logger.info({ provider: this.piProvider, model: this.piModel, baseUrl }, 'Pi Agent initialized');
+    logger.info({
+      provider: evaluatorConfig.provider,
+      model: evaluatorConfig.model,
+    }, 'Evaluator initialized');
 
     // 初始化网关适配器
     this.adapter = new OneBotAdapter({
@@ -305,10 +411,13 @@ class LetheBotApp {
     });
     this.actionExecutor = new ActionExecutor(this.actionRepo, this.adapter, {
       privacyPreferences: this.privacyPreferenceRepo,
+      jobRepository: this.jobRepo,
+      summaryJobService: this.groupSummaryJobService,
+      memoryRepository: this.memoryRepo,
     });
 
-    // 注册事件处理器
-    this.adapter.onEvent((event) => this.enqueueEvent(event));
+    // Register the durable ingress claim before any downstream event work.
+    this.adapter.onIngress((event) => this.claimAndEnqueueEvent(event));
 
     logger.info({ version: VERSION }, 'LetheBot initialized');
   }
@@ -317,7 +426,15 @@ class LetheBotApp {
    * 启动应用
    */
   async start(): Promise<void> {
+    const acceptedEvents = this.prepareAdmissionRecovery();
     await this.adapter.start();
+
+    this.adapter.whenReady(() => {
+      for (const acceptedEvent of acceptedEvents) {
+        this.enqueueEvent(acceptedEvent.event, acceptedEvent.rawEventId);
+      }
+      this.acceptingIngress = true;
+    });
 
     this.registerBackgroundWorkerJobs();
     if (!this.config.test) {
@@ -365,6 +482,11 @@ class LetheBotApp {
 
       // OneBot 事件 endpoint
       if (requestPath === this.config.lethebotEventPath && req.method === 'POST') {
+        if (!this.acceptingIngress) {
+          this.respondIngressUnavailable(res);
+          return;
+        }
+
         let body = '';
         req.on('data', (chunk) => {
           body += chunk.toString();
@@ -372,6 +494,11 @@ class LetheBotApp {
 
         req.on('end', () => {
           try {
+            if (!this.acceptingIngress) {
+              this.respondIngressUnavailable(res);
+              return;
+            }
+
             if (!this.adapter.validateHttpEventAuth(req.headers, body)) {
               res.writeHead(401, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ error: 'Unauthorized' }));
@@ -389,7 +516,12 @@ class LetheBotApp {
             }
 
             logger.debug({ event }, 'Received OneBot event');
-            this.adapter.handleHttpEvent(event);
+            const disposition = this.adapter.dispatchInboundEvent(event, 'http');
+            if (disposition === 'failed') {
+              res.writeHead(503, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'event_unavailable' }));
+              return;
+            }
 
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'ok' }));
@@ -407,33 +539,76 @@ class LetheBotApp {
       res.end('Not Found');
     });
 
-    this.server.listen(port, this.config.lethebotHost, () => {
-    logger.info(`LetheBot listening on ${this.config.lethebotHost}:${port}`);
-    logger.info(`Health check: http://localhost:${port}${this.config.lethebotHealthPath}`);
-    logger.info(`Readiness check: http://localhost:${port}${this.config.lethebotReadinessPath}`);
-    logger.info(`Metrics snapshot: http://localhost:${port}${this.config.lethebotMetricsPath}`);
-    logger.info(`OneBot endpoint: http://localhost:${port}${this.config.lethebotEventPath}`);
+    await new Promise<void>((resolve, reject) => {
+      const server = this.server;
+      if (!server) {
+        reject(new Error('HTTP server was not initialized'));
+        return;
+      }
+
+      const handleListenError = (error: Error) => reject(error);
+      server.once('error', handleListenError);
+      server.listen(port, this.config.lethebotHost, () => {
+        server.off('error', handleListenError);
+        logger.info(`LetheBot listening on ${this.config.lethebotHost}:${port}`);
+        logger.info(`Health check: http://localhost:${port}${this.config.lethebotHealthPath}`);
+        logger.info(`Readiness check: http://localhost:${port}${this.config.lethebotReadinessPath}`);
+        logger.info(`Metrics snapshot: http://localhost:${port}${this.config.lethebotMetricsPath}`);
+        logger.info(`OneBot endpoint: http://localhost:${port}${this.config.lethebotEventPath}`);
+        resolve();
+      });
     });
   }
 
   /**
    * 停止应用
    */
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    this.stopPromise ??= this.performStop();
+    return this.stopPromise;
+  }
+
+  private async performStop(): Promise<void> {
     logger.info('Stopping LetheBot...');
+    this.acceptingIngress = false;
 
-    // 停止 Worker Scheduler
-    this.workerScheduler.stop();
+    const schedulerDrain = this.workerScheduler.stopAndDrain();
+    const serverClose = this.closeHttpServer();
 
-    if (this.server) {
-      this.server.close();
-    }
+    await Promise.all([
+      schedulerDrain,
+      serverClose,
+      this.waitForIdle(),
+    ]);
 
     await this.adapter.stop();
     if (this.db.open) {
       closeDatabase(this.db);
     }
     logger.info('LetheBot stopped');
+  }
+
+  private closeHttpServer(): Promise<void> {
+    const server = this.server;
+    this.server = null;
+    if (!server) {
+      return Promise.resolve();
+    }
+
+    return new Promise((resolve, reject) => {
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+  }
+
+  private respondIngressUnavailable(res: ServerResponse): void {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'event_unavailable' }));
   }
 
   /**
@@ -485,6 +660,9 @@ class LetheBotApp {
   setMessageSenderForTesting(sender: MessageSender): void {
     this.actionExecutor = new ActionExecutor(this.actionRepo, sender, {
       privacyPreferences: this.privacyPreferenceRepo,
+      jobRepository: this.jobRepo,
+      summaryJobService: this.groupSummaryJobService,
+      memoryRepository: this.memoryRepo,
     });
   }
 
@@ -503,6 +681,13 @@ class LetheBotApp {
     await this.adapter.start();
   }
 
+  dispatchOneBotEventForTesting(
+    event: unknown,
+    transport: OneBotTransport,
+  ): OneBotIngressDisposition {
+    return this.adapter.dispatchInboundEvent(event, transport);
+  }
+
   /**
    * Enqueue a durable background task through the same worker used by runtime
    * scheduling. This is intentionally test-only so integration tests can assert
@@ -515,12 +700,15 @@ class LetheBotApp {
   /**
    * Process one durable background job through the runtime worker.
    */
-  async processNextBackgroundJobForTesting(): Promise<TaskResult | null> {
-    return this.backgroundWorker.processNext();
+  async processNextBackgroundJobForTesting(
+    now?: number,
+    types?: TaskType[],
+  ): Promise<TaskResult | null> {
+    return this.backgroundWorker.processNext(now, types);
   }
 
   /**
-   * Replace the social evaluator for integration tests.
+   * Replace the configured evaluator for integration tests.
    */
   setSocialEvaluatorForTesting(evaluator: IEvaluator): void {
     this.socialEvaluator = evaluator;
@@ -528,6 +716,21 @@ class LetheBotApp {
       this.actionRepo,
       this.socialEvaluator,
       this.cooldowns,
+    );
+    this.memoryExtractor = this.createMemoryExtractionWorker(this.socialEvaluator);
+  }
+
+  private createMemoryExtractionWorker(evaluator: IEvaluator): MemoryExtractionWorker {
+    return new MemoryExtractionWorker(
+      this.db,
+      this.memoryRepo,
+      undefined,
+      new MemoryProposalService(this.memoryRepo, {
+        evaluator,
+        evaluatorDecisionWriter: new EvaluatorDecisionRepository(this.db),
+        auditRepository: this.auditRepo,
+        privacyPreferences: this.privacyPreferenceRepo,
+      }),
     );
   }
 
@@ -547,13 +750,15 @@ class LetheBotApp {
       },
     });
 
-    this.workerScheduler.register({
-      name: 'summary-discovery',
-      intervalMs: 5 * 60_000,
-      handler: async () => {
-        await this.enqueueSummaryJobs();
-      },
-    });
+    if (this.config.backgroundSummaryEnabled) {
+      this.workerScheduler.register({
+        name: 'summary-discovery',
+        intervalMs: 5 * 60_000,
+        handler: async () => {
+          await this.enqueueSummaryJobs();
+        },
+      });
+    }
 
     this.workerScheduler.register({
       name: 'retention-maintenance',
@@ -601,57 +806,394 @@ class LetheBotApp {
     const candidates = await summaryWorker.findConversationsNeedingSummary(60);
 
     for (const candidate of candidates) {
-      this.backgroundWorker.enqueue({
-        type: 'summary',
-        payload: {
+      try {
+        await this.groupSummaryJobService.enqueueSummary({
           conversationId: candidate.conversationId,
           conversationType: candidate.conversationType,
           groupId: candidate.groupId,
-          timeRange: candidate.timeRange,
-          messageRange: candidate.messageRange,
-        },
-        idempotencyKey: this.buildSummaryJobKey(candidate),
-      });
+          payload: candidate.conversationType === 'group'
+            ? { source: 'summary_discovery' }
+            : {
+                timeRange: candidate.timeRange,
+                messageRange: candidate.messageRange,
+              },
+          baseIdempotencyKey: this.buildSummaryJobKey(candidate),
+        });
+      } catch (error) {
+        if (error instanceof GroupSummaryPolicyError && error.code === 'policy_disabled') {
+          continue;
+        }
+        if (error instanceof GroupSummaryWindowError && error.code === 'window_unavailable') {
+          continue;
+        }
+        throw error;
+      }
     }
   }
 
   private buildSummaryJobKey(candidate: ConversationSummaryInput): string {
-    const range = candidate.timeRange
-      ? `${candidate.timeRange.startTime}-${candidate.timeRange.endTime}`
-      : `${candidate.messageRange?.start ?? 'all'}-${candidate.messageRange?.end ?? 'all'}`;
-    return `summary:${candidate.conversationType}:${candidate.conversationId}:${range}`;
+    const digest = createHash('sha256')
+      .update(JSON.stringify({
+        version: 1,
+        conversationId: candidate.conversationId,
+        conversationType: candidate.conversationType,
+        groupId: candidate.groupId ?? null,
+        messageRange: candidate.messageRange ?? null,
+        timeRange: candidate.timeRange ?? null,
+      }))
+      .digest('hex')
+      .slice(0, 32);
+    return `summary:v1:${digest}`;
   }
 
   private createSummaryWorker(): SummaryWorker {
-    return new SummaryWorker(this.db, this.pi, this.memoryRepo);
+    if (!this.config.test && !this.config.backgroundSummaryEnabled) {
+      throw new Error(
+        'Background summary Provider processing is disabled; set LETHEBOT_BACKGROUND_SUMMARY_ENABLED=true to opt in',
+      );
+    }
+
+    return new SummaryWorker(
+      this.db,
+      this.pi,
+      this.memoryRepo,
+      new ContextBuilder(this.memoryRepo, this.identityRepo),
+      {
+        piProvider: this.piProvider,
+        piModel: this.piModel,
+        requireDurableExecution: true,
+      },
+    );
   }
 
-  private async handleSummaryBackgroundTask(task: BackgroundTask): Promise<unknown> {
-    const payload = task.payload;
-    const summaryInput: ConversationSummaryInput = {
-      conversationId: this.requireString(payload.conversationId, 'conversationId', task.type),
-      conversationType: payload.conversationType === 'group' ? 'group' : 'private',
-      groupId: this.optionalString(payload.groupId),
-      messageRange: this.parseMessageRange(payload.messageRange),
-      timeRange: this.parseTimeRange(payload.timeRange),
-    };
+  private async handleSummaryBackgroundTask(
+    task: BackgroundTask,
+    execution?: BackgroundTaskExecutionContext,
+  ): Promise<unknown> {
+    if (!execution) {
+      throw new Error('Summary background task requires durable execution context');
+    }
+    try {
+      const payload = task.payload;
+      const conversationType = this.requireConversationType(
+        payload.conversationType,
+        task.type,
+      );
+      const summaryInput: ConversationSummaryInput = {
+        conversationId: this.requireString(payload.conversationId, 'conversationId', task.type),
+        conversationType,
+        groupId: this.optionalString(payload.groupId),
+        ...(conversationType === 'group'
+          ? { sourceChatMessageIds: this.requireSummarySourceIds(payload.sourceChatMessageIds) }
+          : {
+              messageRange: this.parseMessageRange(payload.messageRange),
+              timeRange: this.parseTimeRange(payload.timeRange),
+            }),
+      };
+      const binding = this.groupSummaryPolicyRepo.getBinding(task.id);
+      if (
+        binding
+        && (
+          summaryInput.conversationType !== 'group'
+          || summaryInput.groupId !== binding.groupId
+          || summaryInput.conversationId !== binding.conversationId
+        )
+      ) {
+        throw new GroupSummaryPolicyError(
+          'job_binding_mismatch',
+          'Group summary job binding does not match the task payload.',
+        );
+      }
 
-    return this.createSummaryWorker().generateSummary(summaryInput);
+      const result = await this.createSummaryWorker().generateSummary(summaryInput, execution);
+      if (!result) {
+        return null;
+      }
+
+      return {
+        summaryId: result.summaryId,
+        messageCount: result.messageCount,
+        timeRange: result.timeRange,
+        confidence: result.confidence,
+      };
+    } catch (error) {
+      if (error instanceof GroupSummaryPolicyError) {
+        throw new NonRetryableBackgroundTaskError(error.message);
+      }
+      throw error;
+    }
   }
 
-  private async handleExtractionBackgroundTask(task: BackgroundTask): Promise<unknown> {
+  private async handleExtractionBackgroundTask(
+    task: BackgroundTask,
+    execution?: BackgroundTaskExecutionContext,
+  ): Promise<unknown> {
+    if (!execution) {
+      throw new Error('Extraction background task requires durable execution context');
+    }
     const payload = task.payload;
 
-    return this.memoryExtractor.extractFromTurn({
-      conversationId: this.requireString(payload.conversationId, 'conversationId', task.type),
-      userId: this.requireString(payload.targetUserId, 'targetUserId', task.type),
-      userMessage: this.requireString(payload.userMessage, 'userMessage', task.type),
-      botResponse: this.optionalString(payload.botResponse) ?? '',
-      messageId: this.optionalString(payload.messageId),
-      timestamp: this.optionalNumber(payload.timestamp),
-      conversationType: payload.conversationType === 'group' ? 'group' : 'private',
-      groupId: this.optionalString(payload.groupId),
+    return this.memoryExtractor.extractFromChatMessage({
+      sourceChatMessageId: this.requireString(payload.sourceChatMessageId, 'sourceChatMessageId', task.type),
+      targetUserId: this.requireString(payload.targetUserId, 'targetUserId', task.type),
+      jobAttemptId: execution.jobAttemptId,
     });
+  }
+
+  private async handleAttentionRecheckBackgroundTask(
+    task: BackgroundTask,
+    execution?: BackgroundTaskExecutionContext,
+  ): Promise<unknown> {
+    if (!execution) {
+      throw new Error('Delayed Attention background task requires durable execution context');
+    }
+
+    const { candidateId } = parseDelayedAttentionTaskPayload(task.payload);
+    const candidate = this.delayedAttention.findCandidate(candidateId);
+    if (
+      !candidate
+      || candidate.jobId !== task.id
+      || candidate.jobId !== execution.jobId
+    ) {
+      throw new Error('Delayed Attention candidate/job binding is invalid');
+    }
+
+    const event = this.readDelayedAttentionSourceEvent(candidate);
+    const signals = this.buildDelayedAttentionSignals(event);
+    const decision = this.delayedAttention.decide({
+      candidateId,
+      jobId: execution.jobId,
+      jobAttemptId: execution.jobAttemptId,
+      now: execution.now,
+    });
+
+    if (decision.outcome === 'suppress') {
+      return {
+        candidateId,
+        decisionId: decision.id,
+        outcome: decision.outcome,
+        suppressors: decision.suppressors.map((suppressor) => ({
+          id: suppressor.id,
+          code: suppressor.code,
+        })),
+      };
+    }
+
+    const existing = this.findDelayedAttentionTerminalTurn(candidate.sourceRawEventId);
+    if (existing) {
+      return this.buildDelayedAttentionRespondResult(candidateId, decision, existing);
+    }
+
+    const outcome = await this.handleEvent(event, candidate.sourceRawEventId, {
+      sourceAlreadyPersisted: true,
+      signals,
+    });
+    if (outcome !== 'completed') {
+      throw new Error('Delayed Attention response processing failed');
+    }
+
+    const completed = this.findDelayedAttentionTerminalTurn(candidate.sourceRawEventId);
+    if (!completed) {
+      throw new Error('Delayed Attention response completed without terminal turn evidence');
+    }
+    return this.buildDelayedAttentionRespondResult(candidateId, decision, completed);
+  }
+
+  private readDelayedAttentionSourceEvent(
+    candidate: DelayedAttentionCandidate,
+  ): ChatMessageReceived {
+    const row = this.db.prepare(
+      `SELECT raw.id,
+              raw.type,
+              raw.timestamp,
+              raw.source,
+              raw.platform,
+              raw.conversation_id,
+              raw.correlation_id,
+              raw.platform_event_id,
+              raw.payload,
+              raw.created_at AS raw_created_at,
+              message.id AS chat_message_id,
+              message.raw_event_id AS chat_raw_event_id,
+              message.message_id AS chat_platform_message_id,
+              message.conversation_id AS chat_conversation_id,
+              message.conversation_type AS chat_conversation_type,
+              message.group_id AS chat_group_id,
+              message.sender_id AS chat_sender_id,
+              message.sender_role AS chat_sender_role,
+              message.text AS chat_text,
+              message.mentions_bot AS chat_mentions_bot,
+              message.reply_to_message_id AS chat_reply_to_message_id
+         FROM raw_events AS raw
+         JOIN chat_messages AS message ON message.id = ?
+        WHERE raw.id = ?
+          AND message.raw_event_id = raw.id`,
+    ).get(candidate.sourceChatMessageId, candidate.sourceRawEventId) as (StoredChatEventRow & {
+      raw_created_at: number;
+      chat_message_id: string;
+      chat_raw_event_id: string;
+      chat_platform_message_id: string;
+      chat_conversation_id: string;
+      chat_conversation_type: string;
+      chat_group_id: string | null;
+      chat_sender_id: string;
+      chat_sender_role: string | null;
+      chat_text: string | null;
+      chat_mentions_bot: number;
+      chat_reply_to_message_id: string | null;
+    }) | undefined;
+    if (!row) {
+      throw new Error('Delayed Attention source event is unavailable');
+    }
+
+    const parsed = parseStoredChatMessageReceived(row);
+    if (!parsed.ok) {
+      throw new Error('Delayed Attention source event is invalid');
+    }
+    const event = parsed.event;
+    if (
+      row.raw_created_at !== candidate.observedAt
+      || row.chat_message_id !== candidate.sourceChatMessageId
+      || row.chat_raw_event_id !== candidate.sourceRawEventId
+      || row.chat_platform_message_id !== event.message.messageId
+      || row.chat_conversation_id !== candidate.conversationId
+      || row.chat_conversation_id !== event.message.conversationId
+      || row.chat_conversation_type !== candidate.conversationType
+      || event.message.conversationType !== candidate.conversationType
+      || row.chat_group_id !== candidate.groupId
+      || event.message.groupId !== candidate.groupId
+      || row.chat_sender_id !== event.message.senderId
+      || row.chat_sender_role !== (event.message.senderRole ?? null)
+      || (row.chat_text ?? '') !== (event.message.content.text ?? '')
+      || row.chat_mentions_bot !== (event.message.mentionsBot ? 1 : 0)
+      || row.chat_reply_to_message_id !== (event.message.replyToMessageId ?? null)
+    ) {
+      throw new Error('Delayed Attention source event no longer matches its chat evidence');
+    }
+
+    return event;
+  }
+
+  private buildDelayedAttentionSignals(event: ChatMessageReceived): AttentionSignals {
+    const original = this.attention.analyze({
+      conversationType: event.message.conversationType,
+      mentionsBot: event.message.mentionsBot,
+      text: event.message.content.text ?? '',
+      senderId: event.message.senderId,
+      senderRole: event.message.senderRole,
+      replyToBot: false,
+    });
+    if (
+      original.classification !== 'defer'
+      || original.recommendedPath !== 'delayed_recheck'
+    ) {
+      throw new Error('Delayed Attention source no longer matches the deferred policy');
+    }
+
+    return {
+      ...original,
+      classification: 'needs_response',
+      recommendedPath: 'reply_fast_path',
+      triggerReasons: [...new Set([...original.triggerReasons, 'delayed_recheck'])],
+    };
+  }
+
+  private findDelayedAttentionTerminalTurn(sourceRawEventId: string): {
+    turnId: string;
+    actionDecisionId?: string;
+    actionExecutionId?: string;
+    deliveryRecorded: boolean;
+  } | null {
+    const rows = this.db.prepare(
+      `SELECT turn.id AS turn_id,
+              turn.status,
+              turn.action_decision_id,
+              delivery.id AS delivery_execution_id
+         FROM agent_turns AS turn
+         LEFT JOIN action_executions AS delivery
+           ON delivery.id = (
+             SELECT execution.id
+               FROM action_executions AS execution
+              WHERE execution.action_decision_id = turn.action_decision_id
+                AND execution.executed_message_id IS NOT NULL
+                AND (
+                  (execution.status = 'success' AND execution.action_type IN (
+                    'reply_short', 'reply_full', 'reply_with_tool', 'ask_clarification'
+                  ))
+                  OR (execution.status = 'downgraded' AND execution.action_type IN (
+                    'send_folded_forward', 'react_only'
+                  ))
+                )
+              ORDER BY execution.executed_at DESC, execution.id DESC
+              LIMIT 1
+           )
+        WHERE turn.trigger_event_id = ?
+        ORDER BY turn.started_at DESC, turn.id DESC`,
+    ).all(sourceRawEventId) as Array<{
+      turn_id: string;
+      status: string;
+      action_decision_id: string | null;
+      delivery_execution_id: string | null;
+    }>;
+
+    const delivered = rows.find((row) => row.delivery_execution_id !== null);
+    if (delivered) {
+      return {
+        turnId: delivered.turn_id,
+        ...(delivered.action_decision_id
+          ? { actionDecisionId: delivered.action_decision_id }
+          : {}),
+        actionExecutionId: delivered.delivery_execution_id as string,
+        deliveryRecorded: true,
+      };
+    }
+
+    const completed = rows.find((row) => row.status === 'completed');
+    if (completed) {
+      return {
+        turnId: completed.turn_id,
+        ...(completed.action_decision_id
+          ? { actionDecisionId: completed.action_decision_id }
+          : {}),
+        deliveryRecorded: false,
+      };
+    }
+
+    const indeterminate = rows.find((row) => {
+      return row.status === 'pending'
+        || row.status === 'running'
+        || row.action_decision_id !== null;
+    });
+    if (indeterminate) {
+      throw new Error('Delayed Attention prior turn has indeterminate delivery state');
+    }
+
+    return null;
+  }
+
+  private buildDelayedAttentionRespondResult(
+    candidateId: string,
+    decision: DelayedAttentionDecision,
+    terminal: {
+      turnId: string;
+      actionDecisionId?: string;
+      actionExecutionId?: string;
+      deliveryRecorded: boolean;
+    },
+  ): object {
+    return {
+      candidateId,
+      decisionId: decision.id,
+      outcome: decision.outcome,
+      turnId: terminal.turnId,
+      ...(terminal.actionDecisionId
+        ? { actionDecisionId: terminal.actionDecisionId }
+        : {}),
+      ...(terminal.actionExecutionId
+        ? { actionExecutionId: terminal.actionExecutionId }
+        : {}),
+      deliveryRecorded: terminal.deliveryRecorded,
+    };
   }
 
   private enqueueConsolidationJob(): string {
@@ -839,6 +1381,17 @@ class LetheBotApp {
     return typeof value === 'string' && value.length > 0 ? value : undefined;
   }
 
+  private requireConversationType(
+    value: unknown,
+    taskType: string,
+  ): 'private' | 'group' {
+    if (value === 'private' || value === 'group') {
+      return value;
+    }
+
+    throw new Error(`Background task ${taskType} requires payload.conversationType`);
+  }
+
   private optionalNumber(value: unknown): number | undefined {
     return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
   }
@@ -873,6 +1426,35 @@ class LetheBotApp {
     return undefined;
   }
 
+  private requireSummarySourceIds(value: unknown): string[] {
+    if (!Array.isArray(value) || value.length === 0 || value.length > 50) {
+      throw new GroupSummaryPolicyError(
+        'job_binding_mismatch',
+        'Group summary job requires a bounded frozen source window.',
+      );
+    }
+    const sourceIds = value.map((sourceId) => {
+      if (
+        typeof sourceId !== 'string'
+        || sourceId.length === 0
+        || sourceId.trim() !== sourceId
+      ) {
+        throw new GroupSummaryPolicyError(
+          'job_binding_mismatch',
+          'Group summary job frozen source IDs are invalid.',
+        );
+      }
+      return sourceId;
+    });
+    if (new Set(sourceIds).size !== sourceIds.length) {
+      throw new GroupSummaryPolicyError(
+        'job_binding_mismatch',
+        'Group summary job frozen source IDs must be unique.',
+      );
+    }
+    return sourceIds;
+  }
+
   private getRequestPath(url: string | undefined): string {
     return new URL(url ?? '/', 'http://localhost').pathname;
   }
@@ -887,21 +1469,20 @@ class LetheBotApp {
     status: 'ok' | 'degraded';
     version: string;
     checks: {
-      database: { ok: boolean; open: boolean; error?: string };
+      database: { ok: boolean; open: boolean };
       adapter: PublicAdapterStatus;
       eventProcessing: { pending: number; failures: number };
     };
   } {
     let databaseOk = false;
-    let databaseError: string | undefined;
 
     try {
       if (this.db.open) {
         this.db.prepare('SELECT 1').get();
         databaseOk = true;
       }
-    } catch (error) {
-      databaseError = error instanceof Error ? error.message : 'Unknown database health error';
+    } catch {
+      databaseOk = false;
     }
 
     const adapter = this.buildPublicAdapterStatus(this.adapter.getReadiness());
@@ -914,7 +1495,6 @@ class LetheBotApp {
         database: {
           ok: databaseOk,
           open: this.db.open,
-          error: databaseError,
         },
         adapter,
         eventProcessing: {
@@ -975,12 +1555,310 @@ class LetheBotApp {
     };
   }
 
-  private enqueueEvent(event: ChatMessageReceived): void {
-    const task = this.handleEvent(event);
+  private claimAndEnqueueEvent(
+    event: ChatMessageReceived,
+  ): 'accepted' | 'duplicate' | 'failed' {
+    if (!this.acceptingIngress) {
+      return 'failed';
+    }
+
+    const claim = this.claimRawEvent(event);
+    if (claim.disposition === 'accepted') {
+      this.enqueueEvent(event, claim.rawEventId);
+    }
+    return claim.disposition;
+  }
+
+  private enqueueEvent(event: ChatMessageReceived, rawEventId: string): void {
+    const task = this.processAdmittedEvent(event, rawEventId);
     this.pendingEventTasks.add(task);
-    task.finally(() => {
-      this.pendingEventTasks.delete(task);
+    void task.then(
+      () => {
+        this.pendingEventTasks.delete(task);
+      },
+      (error: unknown) => {
+        this.pendingEventTasks.delete(task);
+        logger.error({ error: this.redactErrorForLog(error) }, 'Admission processing transition failed');
+      },
+    );
+  }
+
+  private prepareAdmissionRecovery(): Array<{
+    event: ChatMessageReceived;
+    rawEventId: string;
+  }> {
+    const rows = this.db.prepare(
+      `SELECT
+         a.raw_event_id,
+         a.state,
+         a.accepted_at,
+         re.id,
+         re.type,
+         re.timestamp,
+         re.source,
+         re.platform,
+         re.conversation_id,
+         re.correlation_id,
+         re.platform_event_id,
+         re.payload,
+         EXISTS(SELECT 1 FROM chat_messages cm WHERE cm.raw_event_id = a.raw_event_id) AS has_chat,
+         EXISTS(SELECT 1 FROM agent_turns at WHERE at.trigger_event_id = a.raw_event_id) AS has_turn,
+         EXISTS(SELECT 1 FROM event_processing_failures epf WHERE epf.raw_event_id = a.raw_event_id) AS has_failure,
+         (SELECT COUNT(*)
+             FROM event_ingress_receipts receipt
+            WHERE receipt.raw_event_id = a.raw_event_id
+              AND receipt.disposition = 'accepted') AS accepted_receipt_count,
+         (SELECT receipt.transport
+             FROM event_ingress_receipts receipt
+            WHERE receipt.raw_event_id = a.raw_event_id
+              AND receipt.disposition = 'accepted'
+            ORDER BY receipt.received_at, receipt.id
+            LIMIT 1) AS accepted_transport,
+         (SELECT receipt.received_at
+             FROM event_ingress_receipts receipt
+            WHERE receipt.raw_event_id = a.raw_event_id
+              AND receipt.disposition = 'accepted'
+            ORDER BY receipt.received_at, receipt.id
+            LIMIT 1) AS accepted_received_at
+       FROM event_processing_admissions a
+       JOIN raw_events re ON re.id = a.raw_event_id
+       WHERE a.state IN ('accepted', 'processing')
+       ORDER BY a.accepted_at, a.raw_event_id`
+    ).all() as Array<StoredChatEventRow & {
+      raw_event_id: string;
+      state: 'accepted' | 'processing';
+      accepted_at: number;
+      has_chat: number;
+      has_turn: number;
+      has_failure: number;
+      accepted_receipt_count: number;
+      accepted_transport: string | null;
+      accepted_received_at: number | null;
+    }>;
+
+    const acceptedEvents: Array<{ event: ChatMessageReceived; rawEventId: string }> = [];
+    let resetProcessing = 0;
+    let staleProcessing = 0;
+    let startedEvidence = 0;
+    let invalidStoredEvents = 0;
+
+    for (const row of rows) {
+      if (row.state === 'processing') {
+        const recoveredEvent = this.resetEvidenceEmptyProcessingAdmission(row.raw_event_id);
+        if (recoveredEvent) {
+          acceptedEvents.push({ event: recoveredEvent, rawEventId: row.raw_event_id });
+          resetProcessing += 1;
+        } else {
+          staleProcessing += this.interruptAdmission(
+            row.raw_event_id,
+            'processing',
+            'stale_processing',
+          );
+        }
+        continue;
+      }
+
+      if (row.has_chat === 1 || row.has_turn === 1 || row.has_failure === 1) {
+        startedEvidence += this.interruptAdmission(row.raw_event_id, 'accepted', 'started_evidence');
+        continue;
+      }
+
+      const parsed = parseStoredChatMessageReceived(row);
+      if (
+        !parsed.ok
+        || row.accepted_receipt_count !== 1
+        || row.accepted_transport !== parsed.event.ingress.transport
+        || row.accepted_received_at !== row.accepted_at
+      ) {
+        invalidStoredEvents += this.interruptAdmission(
+          row.raw_event_id,
+          'accepted',
+          'invalid_stored_event',
+        );
+        continue;
+      }
+
+      acceptedEvents.push({ event: parsed.event, rawEventId: row.raw_event_id });
+    }
+
+    if (rows.length > 0) {
+      logger.info({
+        acceptedForRecovery: acceptedEvents.length,
+        resetProcessing,
+        staleProcessing,
+        startedEvidence,
+        invalidStoredEvents,
+      }, 'Event admission recovery reconciled');
+    }
+
+    return acceptedEvents;
+  }
+
+  private resetEvidenceEmptyProcessingAdmission(
+    rawEventId: string,
+  ): ChatMessageReceived | undefined {
+    const resetAdmission = this.db.transaction(() => {
+      const row = this.db.prepare(
+        `SELECT
+           a.raw_event_id,
+           a.accepted_at,
+           a.processing_started_at,
+           re.id,
+           re.type,
+           re.timestamp,
+           re.source,
+           re.platform,
+           re.conversation_id,
+           re.correlation_id,
+           re.platform_event_id,
+           re.payload,
+           EXISTS(SELECT 1 FROM chat_messages cm WHERE cm.raw_event_id = a.raw_event_id) AS has_chat,
+           EXISTS(SELECT 1 FROM agent_turns at WHERE at.trigger_event_id = a.raw_event_id) AS has_turn,
+           EXISTS(SELECT 1 FROM event_processing_failures epf WHERE epf.raw_event_id = a.raw_event_id) AS has_failure,
+           (SELECT COUNT(*)
+              FROM event_ingress_receipts receipt
+             WHERE receipt.raw_event_id = a.raw_event_id
+               AND receipt.disposition = 'accepted') AS accepted_receipt_count,
+           (SELECT receipt.transport
+              FROM event_ingress_receipts receipt
+             WHERE receipt.raw_event_id = a.raw_event_id
+               AND receipt.disposition = 'accepted'
+             ORDER BY receipt.received_at, receipt.id
+             LIMIT 1) AS accepted_transport,
+           (SELECT receipt.received_at
+              FROM event_ingress_receipts receipt
+             WHERE receipt.raw_event_id = a.raw_event_id
+               AND receipt.disposition = 'accepted'
+             ORDER BY receipt.received_at, receipt.id
+             LIMIT 1) AS accepted_received_at
+         FROM event_processing_admissions a
+         JOIN raw_events re ON re.id = a.raw_event_id
+         WHERE a.raw_event_id = ? AND a.state = 'processing'`
+      ).get(rawEventId) as (StoredChatEventRow & {
+        raw_event_id: string;
+        accepted_at: number;
+        processing_started_at: number;
+        has_chat: number;
+        has_turn: number;
+        has_failure: number;
+        accepted_receipt_count: number;
+        accepted_transport: string | null;
+        accepted_received_at: number | null;
+      }) | undefined;
+
+      if (!row || row.has_chat === 1 || row.has_turn === 1 || row.has_failure === 1) {
+        return undefined;
+      }
+
+      const parsed = parseStoredChatMessageReceived(row);
+      if (
+        !parsed.ok
+        || row.accepted_receipt_count !== 1
+        || row.accepted_transport !== parsed.event.ingress.transport
+        || row.accepted_received_at !== row.accepted_at
+      ) {
+        return undefined;
+      }
+
+      const changed = this.db.prepare(
+        `UPDATE event_processing_admissions
+         SET state = 'accepted',
+             processing_started_at = NULL,
+             finished_at = NULL,
+             reason_code = NULL
+         WHERE raw_event_id = ?
+           AND state = 'processing'
+           AND accepted_at = ?
+           AND processing_started_at = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM chat_messages cm
+              WHERE cm.raw_event_id = event_processing_admissions.raw_event_id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM agent_turns at
+              WHERE at.trigger_event_id = event_processing_admissions.raw_event_id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM event_processing_failures epf
+              WHERE epf.raw_event_id = event_processing_admissions.raw_event_id
+           )
+           AND (
+             SELECT COUNT(*)
+               FROM event_ingress_receipts receipt
+              WHERE receipt.raw_event_id = event_processing_admissions.raw_event_id
+                AND receipt.disposition = 'accepted'
+           ) = 1
+           AND EXISTS (
+             SELECT 1
+               FROM event_ingress_receipts receipt
+              WHERE receipt.raw_event_id = event_processing_admissions.raw_event_id
+                AND receipt.disposition = 'accepted'
+                AND receipt.transport = ?
+                AND receipt.received_at = event_processing_admissions.accepted_at
+           )`
+      ).run(
+        rawEventId,
+        row.accepted_at,
+        row.processing_started_at,
+        parsed.event.ingress.transport,
+      ).changes;
+
+      return changed === 1 ? parsed.event : undefined;
     });
+
+    // The write lock keeps the strict read and guarded reset on one evidence snapshot.
+    return resetAdmission.immediate();
+  }
+
+  private interruptAdmission(
+    rawEventId: string,
+    expectedState: 'accepted' | 'processing',
+    reasonCode: 'stale_processing' | 'started_evidence' | 'invalid_stored_event',
+  ): number {
+    const completedAt = new Date();
+    return this.db.transaction(() => {
+      const changed = this.db.prepare(
+        `UPDATE event_processing_admissions
+         SET state = 'interrupted_review', finished_at = ?, reason_code = ?
+         WHERE raw_event_id = ? AND state = ?`
+      ).run(completedAt.getTime(), reasonCode, rawEventId, expectedState).changes;
+
+      if (changed === 1) {
+        this.turnRepo.markAbortedByTriggerEvent(
+          rawEventId,
+          'Startup admission recovery interrupted this turn',
+          completedAt,
+        );
+      }
+
+      return changed;
+    })();
+  }
+
+  private async processAdmittedEvent(
+    event: ChatMessageReceived,
+    rawEventId: string,
+  ): Promise<void> {
+    const processingStartedAt = Date.now();
+    const started = this.db.prepare(
+      `UPDATE event_processing_admissions
+       SET state = 'processing', processing_started_at = ?
+       WHERE raw_event_id = ? AND state = 'accepted'`
+    ).run(processingStartedAt, rawEventId).changes;
+    if (started !== 1) {
+      return;
+    }
+
+    const outcome = await this.handleEvent(event, rawEventId);
+    const reasonCode = outcome === 'failed' ? 'handler_failed' : null;
+    const terminalized = this.db.prepare(
+      `UPDATE event_processing_admissions
+       SET state = ?, finished_at = ?, reason_code = ?
+       WHERE raw_event_id = ? AND state = 'processing'`
+    ).run(outcome, Date.now(), reasonCode, rawEventId).changes;
+    if (terminalized !== 1) {
+      throw new Error('Unable to terminalize event processing admission');
+    }
   }
 
   private createTestPiRuntime(): { runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> } {
@@ -1001,34 +1879,23 @@ class LetheBotApp {
   /**
    * 解析用户身份（canonical_user_id）
    */
-  private async resolveIdentity(platformUserId: string): Promise<string> {
+  private async resolveIdentity(platformUserId: string): Promise<string | null> {
     try {
-      // 1. 查找现有映射
-      const existingUserId = await this.identityRepo.findCanonicalUserId('qq', platformUserId);
-
-      if (existingUserId) {
-        // 更新最后见到时间
-        await this.identityRepo.ensureCanonicalUser(existingUserId);
-        return existingUserId;
-      }
-
-      // 2. 创建新用户
-      const canonicalUserId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
-
-      await this.identityRepo.ensureCanonicalUser(canonicalUserId);
-
-      await this.identityRepo.upsertPlatformAccount({
-        canonicalUserId,
-        platform: 'qq',
-        platformAccountId: platformUserId,
-        accountType: 'private',
-        verifiedLevel: 'observed',
-        status: 'active',
-      });
-
-      logger.debug({ canonicalUserId, platformUserId }, 'Created new user identity');
+      const canonicalUserId = await this.identityRepo.getOrCreateCanonicalUser(
+        'qq',
+        platformUserId,
+      );
+      logger.debug({ canonicalUserId }, 'Resolved user identity');
       return canonicalUserId;
     } catch (error) {
+      if (error instanceof InactivePlatformAccountError) {
+        logger.info({
+          platform: 'qq',
+          accountStatus: error.status,
+        }, 'Inactive platform account denied');
+        return null;
+      }
+
       logger.error({ error, platformUserId }, 'Failed to resolve identity');
       throw error;
     }
@@ -1037,38 +1904,92 @@ class LetheBotApp {
   /**
    * 存储原始事件到数据库
    */
-  private async storeRawEvent(event: ChatMessageReceived): Promise<string> {
-    const eventId = event.id;
-    await this.db.prepare(`
-      INSERT INTO raw_events (
-        id, type, timestamp, source, platform,
-        conversation_id, correlation_id, payload, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      eventId,
-      event.type,
-      new Date(event.timestamp).getTime(),
-      event.source,
-      event.platform,
-      event.conversationId,
-      event.correlationId ?? null,
-      JSON.stringify(event),
-      Date.now(),
-    );
+  private claimRawEvent(event: ChatMessageReceived): {
+    disposition: 'accepted' | 'duplicate';
+    rawEventId: string;
+  } {
+    return this.db.transaction(() => {
+      const conversationId = event.conversationId ?? event.message.conversationId;
+      const platformEventId = event.ingress.platformEventId ?? null;
+      const receivedAt = Date.now();
+      const insert = this.db.prepare(`
+        INSERT INTO raw_events (
+          id, type, timestamp, source, platform,
+          conversation_id, correlation_id, platform_event_id, payload, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT DO NOTHING
+      `).run(
+        event.id,
+        event.type,
+        new Date(event.timestamp).getTime(),
+        event.source,
+        event.platform,
+        conversationId,
+        event.correlationId ?? null,
+        platformEventId,
+        JSON.stringify(event),
+        receivedAt,
+      );
 
-    logger.debug({ eventId }, 'Raw event stored');
-    return eventId;
+      let disposition: 'accepted' | 'duplicate';
+      let rawEventId: string;
+      if (insert.changes === 1) {
+        disposition = 'accepted';
+        rawEventId = event.id;
+      } else {
+        if (!platformEventId) {
+          throw new Error('Unable to claim OneBot event without a stable platform event id');
+        }
+        const canonical = this.db.prepare(
+          `SELECT id
+             FROM raw_events
+            WHERE source = 'gateway'
+              AND platform = ?
+              AND type = ?
+              AND conversation_id = ?
+              AND platform_event_id = ?`
+        ).get(event.platform, event.type, conversationId, platformEventId) as { id: string } | undefined;
+        if (!canonical) {
+          throw new Error('Unable to resolve canonical OneBot event after claim conflict');
+        }
+        disposition = 'duplicate';
+        rawEventId = canonical.id;
+      }
+
+      this.db.prepare(
+        `INSERT INTO event_ingress_receipts (
+          id, raw_event_id, transport, disposition, received_at
+        ) VALUES (?, ?, ?, ?, ?)`
+      ).run(
+        `ingress-receipt-${randomUUID()}`,
+        rawEventId,
+        event.ingress.transport,
+        disposition,
+        receivedAt,
+      );
+
+      if (disposition === 'accepted') {
+        this.db.prepare(
+          `INSERT INTO event_processing_admissions (
+            raw_event_id, state, accepted_at, processing_started_at, finished_at, reason_code
+          ) VALUES (?, 'accepted', ?, NULL, NULL, NULL)`
+        ).run(rawEventId, receivedAt);
+      }
+
+      logger.debug({ rawEventId, disposition }, 'OneBot ingress claimed');
+      return { disposition, rawEventId };
+    })();
   }
 
   /**
    * 存储聊天消息到数据库
    */
-  private async storeChatMessage(
+  private storeChatMessage(
     event: ChatMessageReceived,
     rawEventId: string,
     isFromBot: boolean = false,
-  ): Promise<void> {
-    await this.db.prepare(`
+  ): void {
+    this.db.prepare(`
       INSERT INTO chat_messages (
         id, raw_event_id, message_id, conversation_id,
         conversation_type, group_id, sender_id, sender_role,
@@ -1129,67 +2050,96 @@ class LetheBotApp {
   /**
    * 存储 Bot 回复到数据库
    */
-  private async storeBotResponse(
+  private storeBotResponse(
     conversationId: string,
     conversationType: 'private' | 'group',
     text: string,
     groupId?: string,
     sentMessageId?: string,
-  ): Promise<void> {
+  ): void {
     const rawEventId = `evt-bot-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
     const messageId = sentMessageId ?? `msg-bot-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 
-    await this.db.prepare(`
-      INSERT INTO raw_events (
-        id, type, timestamp, source, platform,
-        conversation_id, payload, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      rawEventId,
-      'bot.response',
-      Date.now(),
-      'agent',
-      'qq',
-      conversationId,
-      JSON.stringify({ messageId, conversationId, conversationType, groupId, text }),
-      Date.now(),
-    );
+    this.db.transaction(() => {
+      this.db.prepare(`
+        INSERT INTO raw_events (
+          id, type, timestamp, source, platform,
+          conversation_id, payload, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        rawEventId,
+        'bot.response',
+        Date.now(),
+        'agent',
+        'qq',
+        conversationId,
+        JSON.stringify({ messageId, conversationId, conversationType, groupId, text }),
+        Date.now(),
+      );
 
-    // 创建一个简化的 Bot 消息记录
-    await this.db.prepare(`
-      INSERT INTO chat_messages (
-        id, raw_event_id, message_id, conversation_id,
-        conversation_type, group_id, sender_id, text,
-        has_media, has_quote, mentions_bot, timestamp
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      messageId,
-      rawEventId,
-      messageId, // Bot 消息使用内部 ID
-      conversationId,
-      conversationType,
-      groupId ?? null,
-      'bot-self',
-      text,
-      0,
-      0,
-      0,
-      Date.now(),
-    );
+      // 创建一个简化的 Bot 消息记录
+      this.db.prepare(`
+        INSERT INTO chat_messages (
+          id, raw_event_id, message_id, conversation_id,
+          conversation_type, group_id, sender_id, text,
+          has_media, has_quote, mentions_bot, timestamp
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        messageId,
+        rawEventId,
+        messageId, // Bot 消息使用内部 ID
+        conversationId,
+        conversationType,
+        groupId ?? null,
+        'bot-self',
+        text,
+        0,
+        0,
+        0,
+        Date.now(),
+      );
+    })();
 
     logger.debug({ messageId, rawEventId }, 'Bot response stored');
   }
 
   private findSuccessfulReplyExecution(results: ActionExecutionResult[]): ActionExecutionResult | undefined {
     return results.find((result) => {
-      return (
+      if (!result.executed?.messageId) {
+        return false;
+      }
+
+      if (
         result.status === 'success' &&
         (result.actionType === 'reply_short' ||
           result.actionType === 'reply_full' ||
-          result.actionType === 'ask_clarification') &&
-        Boolean(result.executed?.messageId)
+          result.actionType === 'reply_with_tool' ||
+          result.actionType === 'ask_clarification')
+      ) {
+        return true;
+      }
+
+      return result.status === 'downgraded' && (
+        result.actionType === 'send_folded_forward' ||
+        result.actionType === 'react_only'
       );
     });
+  }
+
+  private getDeliveredReplyText(
+    decision: ActionDecision,
+    execution: ActionExecutionResult,
+    fallbackText: string,
+  ): string {
+    const actionText = decision.actions.find((action) => {
+      return action.type === execution.actionType && action.payload?.text?.trim();
+    })?.payload?.text?.trim();
+    const reactionText = execution.actionType === 'react_only'
+      ? decision.actions.find((action) => action.type === 'react_only' && action.payload?.reaction?.trim())
+        ?.payload?.reaction?.trim()
+      : undefined;
+
+    return actionText ?? reactionText ?? fallbackText;
   }
 
   private isReplyToStoredBotMessage(event: ChatMessageReceived): boolean {
@@ -1219,11 +2169,17 @@ class LetheBotApp {
   /**
    * 处理内部事件
    */
-  private async handleEvent(event: ChatMessageReceived): Promise<void> {
+  private async handleEvent(
+    event: ChatMessageReceived,
+    rawEventId: string,
+    options: {
+      sourceAlreadyPersisted?: boolean;
+      signals?: AttentionSignals;
+    } = {},
+  ): Promise<EventHandlingOutcome> {
     let turnId: string | undefined;
     let turnFinalized = false;
-    let rawEventId: string | undefined;
-    let currentStage = 'raw_event_store';
+    let currentStage = 'identity_resolution';
 
     try {
       logger.info({
@@ -1232,53 +2188,218 @@ class LetheBotApp {
         senderId: event.message.senderId,
       }, 'Processing event');
 
-      // 0. 存储原始事件（最优先）
-      currentStage = 'raw_event_store';
-      rawEventId = await this.storeRawEvent(event);
-
       // 0.1 解析用户身份
       currentStage = 'identity_resolution';
       const senderId = event.message.senderId.replace('qq-', '');
       const canonicalUserId = await this.resolveIdentity(senderId);
+      if (!canonicalUserId) {
+        return 'completed';
+      }
 
-      currentStage = 'display_metadata';
-      await this.recordDisplayMetadata(event, canonicalUserId);
+      if (!options.sourceAlreadyPersisted) {
+        currentStage = 'display_metadata';
+        await this.recordDisplayMetadata(event, canonicalUserId);
+      }
 
-      // 0.2 存储聊天消息
-      currentStage = 'chat_message_store';
-      await this.storeChatMessage(event, rawEventId, false);
+      const parsedGovernanceCommand = parseQqGovernanceCommand(
+        event.message.content.text ?? '',
+      );
+      if (parsedGovernanceCommand.status !== 'not_command') {
+        if (options.sourceAlreadyPersisted) {
+          logger.debug('Stored governance command is not replayed through delayed Attention');
+          return 'completed';
+        }
 
-      // 1. 注意力分析
-      let signals;
-      try {
-        currentStage = 'attention_analysis';
-        signals = this.attention.analyze({
-          conversationType: event.message.conversationType,
-          mentionsBot: event.message.mentionsBot,
-          text: event.message.content.text ?? '',
-          senderId: event.message.senderId,
-          replyToBot: this.isReplyToStoredBotMessage(event),
+        currentStage = 'chat_message_store';
+        this.storeChatMessage(event, rawEventId, false);
+
+        currentStage = 'turn_create';
+        const conversationId = event.conversationId ?? event.message.conversationId;
+        turnId = await this.turnRepo.createPending({
+          conversationId,
+          triggerEventId: rawEventId,
+          piModel: 'qq-governance-v1',
+          piProvider: 'local',
         });
+        const governanceTurnId = turnId;
 
-        logger.debug({ signals }, 'Attention analysis');
-      } catch (error) {
-        logger.error({
-          error: error instanceof Error ? {
-            message: error.message,
-            stack: error.stack,
-            name: error.name,
-          } : error,
-          step: 'attention_analysis',
-          eventType: event.type,
-          conversationId: event.conversationId,
-        }, 'Attention analysis failed');
-        throw error;
+        currentStage = 'governance_command';
+        const actionType = event.message.conversationType === 'group'
+          ? 'reply_short'
+          : 'reply_full';
+        const persistGovernanceEffectAndDecision = this.db.transaction(() => {
+          const governanceResult = this.governance.handleQqCommandSync({
+            sourceEventId: rawEventId,
+            ...(this.config.botOwnerQqId === undefined
+              ? {}
+              : { botOwnerQqId: this.config.botOwnerQqId }),
+          });
+          if (!governanceResult) {
+            throw new Error('Governance command verification mismatch');
+          }
+
+          const actionDecision = this.actionRepo.createDecisionSync({
+            turnId: governanceTurnId,
+            decidedBy: 'attention',
+            actions: [
+              {
+                type: actionType,
+                priority: 100,
+                target: {
+                  conversationId,
+                  conversationType: event.message.conversationType,
+                  ...(event.message.conversationType === 'group'
+                    ? { groupId: event.message.groupId }
+                    : {
+                        userId: event.message.senderId,
+                        canonicalUserId,
+                      }),
+                },
+                payload: { text: governanceResult.responseText },
+                constraints: {
+                  evaluatorRequired: false,
+                  redactionLevel: 'strict',
+                  proactive: false,
+                },
+                reason: 'Deterministic QQ governance command',
+              },
+            ],
+            riskLevel: 'low',
+            confidence: 1,
+            reasons: ['Deterministic QQ governance command'],
+            suppressors: [],
+            evaluatorRequired: false,
+            claimActor: { canonicalUserId },
+          });
+          return { governanceResult, actionDecision };
+        });
+        const {
+          governanceResult,
+          actionDecision,
+        } = persistGovernanceEffectAndDecision.immediate();
+
+        currentStage = 'action_execution';
+        const actionResults = await this.actionExecutor.execute(actionDecision);
+        const successfulReply = this.findSuccessfulReplyExecution(actionResults);
+        const deliveredReplyText = successfulReply
+          ? this.getDeliveredReplyText(
+              actionDecision,
+              successfulReply,
+              governanceResult.responseText,
+            )
+          : undefined;
+
+        if (successfulReply && deliveredReplyText && deliveredReplyText.trim().length > 0) {
+          const completedTurnId = turnId;
+          this.db.transaction(() => {
+            currentStage = 'bot_response_persist';
+            this.storeBotResponse(
+              conversationId,
+              event.message.conversationType,
+              deliveredReplyText,
+              event.message.groupId,
+              successfulReply.executed?.messageId,
+            );
+
+            currentStage = 'turn_complete';
+            this.turnRepo.markCompleted(completedTurnId, {
+              responseText: deliveredReplyText,
+              tokensUsed: { input: 0, output: 0, total: 0 },
+            });
+          })();
+          turnFinalized = true;
+        } else {
+          currentStage = 'turn_complete';
+          this.turnRepo.markCompleted(turnId, {
+            responseText: governanceResult.responseText,
+            tokensUsed: { input: 0, output: 0, total: 0 },
+          });
+          turnFinalized = true;
+        }
+
+        return 'completed';
+      }
+
+      const hasNormalizedContent = Boolean(event.message.content.text?.trim())
+        || (event.message.content.media?.length ?? 0) > 0
+        || event.message.content.quote !== undefined
+        || (event.message.mentions?.length ?? 0) > 0
+        || event.message.mentionsBot
+        || event.message.replyToMessageId !== undefined;
+      let signals = options.signals;
+      if (hasNormalizedContent && !signals) {
+        try {
+          currentStage = 'attention_analysis';
+          signals = this.attention.analyze({
+            conversationType: event.message.conversationType,
+            mentionsBot: event.message.mentionsBot,
+            text: event.message.content.text ?? '',
+            senderId: event.message.senderId,
+            senderRole: event.message.senderRole,
+            replyToBot: this.isReplyToStoredBotMessage(event),
+          });
+
+          logger.debug({ signals }, 'Attention analysis');
+        } catch (error) {
+          logger.error({
+            error: error instanceof Error ? {
+              message: error.message,
+              stack: error.stack,
+              name: error.name,
+            } : error,
+            step: 'attention_analysis',
+            eventType: event.type,
+            conversationId: event.conversationId,
+          }, 'Attention analysis failed');
+          throw error;
+        }
+      }
+
+      if (!options.sourceAlreadyPersisted) {
+        const shouldEnqueueExtraction = isAutomaticExtractionCandidate({
+          text: event.message.content.text ?? '',
+          conversationType: event.message.conversationType,
+        });
+        currentStage = signals?.classification === 'defer'
+          ? 'delayed_attention_persist'
+          : 'chat_message_store';
+        this.db.transaction(() => {
+          this.storeChatMessage(event, rawEventId, false);
+          if (shouldEnqueueExtraction) {
+            currentStage = 'memory_extraction_enqueue';
+            this.backgroundWorker.enqueue({
+              type: 'extraction',
+              payload: {
+                sourceChatMessageId: rawEventId,
+                targetUserId: canonicalUserId,
+              },
+              idempotencyKey: `extraction:auto:${rawEventId}`,
+              maxAttempts: 3,
+            });
+          }
+          if (signals?.classification === 'defer') {
+            currentStage = 'delayed_attention_persist';
+            this.delayedAttention.enqueueCandidate({ sourceRawEventId: rawEventId });
+          }
+        }).immediate();
+      }
+
+      if (!hasNormalizedContent) {
+        logger.debug('Event has no normalized message content, skipping');
+        return 'completed';
+      }
+      if (!signals) {
+        throw new Error('Attention signals are required for normalized message content');
+      }
+      if (signals.classification === 'defer') {
+        logger.debug('Event deferred for delayed Attention recheck');
+        return 'completed';
       }
 
       // 如果不需要响应，直接返回
       if (signals.classification === 'silent') {
         logger.debug('Event classified as silent, skipping');
-        return;
+        return 'completed';
       }
 
       currentStage = 'turn_create';
@@ -1290,7 +2411,7 @@ class LetheBotApp {
       });
 
       // 2. 构建上下文
-      const groupId = event.message.groupId?.replace('qq-group-', '');
+      const groupId = event.message.groupId;
 
       let context;
       try {
@@ -1301,14 +2422,19 @@ class LetheBotApp {
           conversationType: event.message.conversationType,
           recentMessages: [
             {
-              messageId: event.message.messageId,
+              messageId: rawEventId,
               senderId: event.message.senderId,
               text: event.message.content.text ?? '',
               timestamp: event.timestamp,
               senderDisplayName: event.message.senderDisplayName ?? event.message.senderId,
               isFromBot: false,
+              ...(event.message.senderRole ? { senderRole: event.message.senderRole } : {}),
             },
           ],
+          currentMessageId: rawEventId,
+          ...(event.message.replyToMessageId
+            ? { replyToMessageId: event.message.replyToMessageId }
+            : {}),
           targetUserId: canonicalUserId,
           groupId,
         });
@@ -1351,9 +2477,11 @@ class LetheBotApp {
           actor: {
             canonicalUserId,
             actorClass: 'user',
+            ...(groupId ? { groupId } : {}),
           },
           invocationContext: event.message.conversationType === 'private' ? 'private_chat' : 'group_chat',
           turnId,
+          sourceEventIds: [rawEventId],
         });
 
         logger.debug({
@@ -1377,7 +2505,7 @@ class LetheBotApp {
           piResult.errorMessage ?? `Pi turn ended with status: ${piResult.status}`
         );
         turnFinalized = true;
-        return;
+        return 'failed';
       }
 
       // 4. 将 Pi 输出转换为结构化行动并通过执行器处理
@@ -1391,47 +2519,49 @@ class LetheBotApp {
         signals,
         actor: {
           canonicalUserId,
-          actorClass: 'user',
+          actorClass: event.message.conversationType === 'group'
+            && (event.message.senderRole === 'owner' || event.message.senderRole === 'admin')
+            ? 'group_admin'
+            : 'user',
         },
       });
       currentStage = 'action_execution';
       const actionResults = await this.actionExecutor.execute(actionDecision);
       const successfulReply = this.findSuccessfulReplyExecution(actionResults);
+      const deliveredReplyText = successfulReply
+        ? this.getDeliveredReplyText(actionDecision, successfulReply, responseText)
+        : undefined;
 
-      if (successfulReply && responseText.trim().length > 0) {
+      if (successfulReply && deliveredReplyText && deliveredReplyText.trim().length > 0) {
         try {
-          currentStage = 'bot_response_persist';
           logger.info({
             conversationId: event.conversationId,
-            responseLength: responseText.length,
+            responseLength: deliveredReplyText.length,
             actionDecisionId: actionDecision.id,
             actionExecutionId: successfulReply.id,
           }, 'Response action executed');
 
-          await this.storeBotResponse(
-            event.conversationId ?? event.message.conversationId,
-            event.message.conversationType,
-            responseText,
-            event.message.groupId,
-            successfulReply.executed?.messageId,
-          );
-
-          try {
-            currentStage = 'memory_extraction';
-            await this.memoryExtractor.extractFromTurn({
-              conversationId: event.conversationId ?? event.message.conversationId,
-              userId: canonicalUserId,
-              userMessage: event.message.content.text || '',
-              botResponse: responseText,
-              messageId: event.message.messageId,
-              timestamp: event.timestamp.getTime(),
-              conversationType: event.message.conversationType,
-              groupId: event.message.groupId,
-            });
-          } catch (error) {
-            // 记忆提取失败不应阻塞流程
-            logger.warn({ error }, 'Memory extraction failed, continuing');
+          if (!turnId) {
+            throw new Error('Turn identity is required before post-action persistence');
           }
+          const completedTurnId = turnId;
+          this.db.transaction(() => {
+            currentStage = 'bot_response_persist';
+            this.storeBotResponse(
+              event.conversationId ?? event.message.conversationId,
+              event.message.conversationType,
+              deliveredReplyText,
+              event.message.groupId,
+              successfulReply.executed?.messageId,
+            );
+
+            currentStage = 'turn_complete';
+            this.turnRepo.markCompleted(completedTurnId, {
+              responseText,
+              tokensUsed: piResult.tokensUsed,
+            });
+          })();
+          turnFinalized = true;
         } catch (error) {
           logger.error({
             error: error instanceof Error ? {
@@ -1439,7 +2569,7 @@ class LetheBotApp {
               stack: error.stack,
               name: error.name,
             } : error,
-            step: 'send_message',
+            step: currentStage,
             conversationType: event.message.conversationType,
             conversationId: event.conversationId,
             senderId: event.message.senderId,
@@ -1450,12 +2580,15 @@ class LetheBotApp {
         }
       }
 
-      currentStage = 'turn_complete';
-      await this.turnRepo.markCompleted(turnId, {
-        responseText,
-        tokensUsed: piResult.tokensUsed,
-      });
-      turnFinalized = true;
+      if (!turnFinalized) {
+        currentStage = 'turn_complete';
+        await this.turnRepo.markCompleted(turnId, {
+          responseText,
+          tokensUsed: piResult.tokensUsed,
+        });
+        turnFinalized = true;
+      }
+      return 'completed';
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       const redactedErrorMessage = this.redactSensitiveText(errorMessage);
@@ -1498,6 +2631,7 @@ class LetheBotApp {
           timestamp: event.timestamp,
         },
       }, 'Failed to handle event');
+      return 'failed';
     }
   }
 
@@ -1609,8 +2743,22 @@ async function main() {
   await app.start();
 }
 
+export function isMainModuleInvocation(
+  moduleUrl: string,
+  invokedPath: string | undefined,
+): boolean {
+  if (!invokedPath) {
+    return false;
+  }
+  try {
+    return realpathSync(fileURLToPath(moduleUrl)) === realpathSync(invokedPath);
+  } catch {
+    return moduleUrl === pathToFileURL(invokedPath).href;
+  }
+}
+
 // 运行
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModuleInvocation(import.meta.url, process.argv[1])) {
   main().catch((error) => {
     console.error('Fatal error:', formatFatalErrorForConsole(error));
     process.exit(1);

@@ -151,4 +151,98 @@ describe('TurnRepository', () => {
     expect(row.response_text).not.toContain('12345678911');
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
+
+  it('aborts only nonterminal turns linked to one trigger event and remains idempotent', async () => {
+    db.prepare(
+      `INSERT INTO raw_events (id, type, timestamp, source, platform, conversation_id, payload, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'evt-turn-other',
+      'message',
+      1000,
+      'gateway',
+      'qq',
+      'private:other',
+      '{}',
+      1000,
+    );
+
+    const linkedTurnIds = [
+      'turn-pending',
+      'turn-running',
+      'turn-completed',
+      'turn-failed',
+      'turn-aborted',
+    ];
+    for (const id of linkedTurnIds) {
+      await repo.createPending({
+        id,
+        conversationId: 'private:test',
+        triggerEventId: 'evt-turn-redaction',
+        piModel: 'mock',
+        piProvider: 'mock',
+        startedAt: new Date(1000),
+      });
+    }
+    await repo.createPending({
+      id: 'turn-other-trigger',
+      conversationId: 'private:other',
+      triggerEventId: 'evt-turn-other',
+      piModel: 'mock',
+      piProvider: 'mock',
+      startedAt: new Date(1000),
+    });
+
+    db.prepare('UPDATE agent_turns SET status = ? WHERE id = ?').run('running', 'turn-running');
+    for (const status of ['completed', 'failed', 'aborted'] as const) {
+      db.prepare(
+        `UPDATE agent_turns
+            SET status = ?, response_text = ?, completed_at = ?
+          WHERE id = ?`,
+      ).run(status, `preserve-${status}`, 1500, `turn-${status}`);
+    }
+
+    const reason = 'startup recovery api_key=sk-turn-abort-secret-qq-12345678911';
+    expect(repo.markAbortedByTriggerEvent('evt-turn-redaction', reason, new Date(2000))).toBe(2);
+
+    const rows = db.prepare(
+      `SELECT id, status, response_text, completed_at
+         FROM agent_turns
+        ORDER BY id`,
+    ).all() as Array<{
+      id: string;
+      status: string;
+      response_text: string | null;
+      completed_at: number | null;
+    }>;
+    const byId = new Map(rows.map((row) => [row.id, row]));
+
+    for (const id of ['turn-pending', 'turn-running']) {
+      expect(byId.get(id)).toMatchObject({ status: 'aborted', completed_at: 2000 });
+      expect(byId.get(id)?.response_text).toContain('[REDACTED:api_key_assignment]');
+      expect(byId.get(id)?.response_text).toContain('[REDACTED:platform_id]');
+      expect(byId.get(id)?.response_text).not.toContain('sk-turn-abort-secret');
+      expect(byId.get(id)?.response_text).not.toContain('12345678911');
+    }
+    for (const status of ['completed', 'failed', 'aborted'] as const) {
+      expect(byId.get(`turn-${status}`)).toEqual({
+        id: `turn-${status}`,
+        status,
+        response_text: `preserve-${status}`,
+        completed_at: 1500,
+      });
+    }
+    expect(byId.get('turn-other-trigger')).toEqual({
+      id: 'turn-other-trigger',
+      status: 'pending',
+      response_text: null,
+      completed_at: null,
+    });
+
+    expect(repo.markAbortedByTriggerEvent('evt-turn-redaction', 'second pass', new Date(3000))).toBe(0);
+    expect(db.prepare(
+      'SELECT completed_at FROM agent_turns WHERE id = ?'
+    ).get('turn-running')).toEqual({ completed_at: 2000 });
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
 });

@@ -79,6 +79,32 @@ describe('WorkerScheduler', () => {
     expect(handler).toHaveBeenCalledTimes(2);
   });
 
+  it('should skip ticks while the same job is still running', async () => {
+    let releaseHandler: (() => void) | undefined;
+    const pending = new Promise<void>((resolve) => {
+      releaseHandler = resolve;
+    });
+    const handler = vi.fn(() => pending);
+
+    scheduler.register({
+      name: 'single-flight-job',
+      intervalMs: 1000,
+      handler,
+    });
+    scheduler.start();
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(handler).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(handler).toHaveBeenCalledTimes(1);
+
+    releaseHandler?.();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(handler).toHaveBeenCalledTimes(2);
+  });
+
   it('should not execute job when not started', async () => {
     const handler = vi.fn().mockResolvedValue(undefined);
 
@@ -135,6 +161,52 @@ describe('WorkerScheduler', () => {
     scheduler.stop();
 
     expect(scheduler.jobCount).toBe(0);
+  });
+
+  it('should stop new ticks and drain every active handler', async () => {
+    let resolveFirst: (() => void) | undefined;
+    let resolveSecond: (() => void) | undefined;
+    const firstHandler = vi.fn(() => new Promise<void>((resolve) => {
+      resolveFirst = resolve;
+    }));
+    const secondHandler = vi.fn(() => new Promise<void>((resolve) => {
+      resolveSecond = resolve;
+    }));
+
+    scheduler.register({
+      name: 'first-job',
+      intervalMs: 1000,
+      handler: firstHandler,
+    });
+    scheduler.register({
+      name: 'second-job',
+      intervalMs: 1000,
+      handler: secondHandler,
+    });
+    scheduler.start();
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(firstHandler).toHaveBeenCalledTimes(1);
+    expect(secondHandler).toHaveBeenCalledTimes(1);
+
+    let drained = false;
+    const drainPromise = scheduler.stopAndDrain().then(() => {
+      drained = true;
+    });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(firstHandler).toHaveBeenCalledTimes(1);
+    expect(secondHandler).toHaveBeenCalledTimes(1);
+
+    resolveFirst?.();
+    await Promise.resolve();
+    expect(drained).toBe(false);
+
+    resolveSecond?.();
+    await drainPromise;
+    expect(drained).toBe(true);
   });
 
   it('should handle job errors gracefully', async () => {

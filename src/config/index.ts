@@ -1,24 +1,32 @@
 /**
  * Configuration loader
  *
- * Loads and validates configuration from environment variables.
+ * Loads and validates configuration from the supplied process environment.
+ * Environment files must be loaded explicitly by the process launcher.
  */
 
-import { config as dotenvConfig } from 'dotenv';
 import { z } from 'zod';
-
-// Load .env file
-dotenvConfig();
 
 const ConfigSchema = z.object({
   logLevel: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
   test: z.boolean().default(false),
+  backgroundSummaryEnabled: z.boolean().default(false),
+  botOwnerQqId: z.string().regex(/^[1-9][0-9]{4,11}$/).optional(),
   dbPath: z.string().default('./data/lethebot.db'),
   rawEventRetentionDays: z.number().int().min(0).default(90),
   chatMessageRetentionDays: z.number().int().min(0).default(0),
   auditLogRetentionDays: z.number().int().min(0).default(0),
   disabledDeletedMemoryRetentionDays: z.number().int().min(0).default(0),
   eventProcessingFailureRetentionDays: z.number().int().min(0).default(0),
+  piTurnTimeoutMs: z.number().finite().int().min(1).max(2_147_483_647).default(120_000),
+  evaluatorProvider: z.string().min(1).optional(),
+  evaluatorModel: z.string().min(1).optional(),
+  evaluatorBaseUrl: z.string().url().optional(),
+  evaluatorApiKey: z.string().optional(),
+  evaluatorTimeoutMs: z.number().finite().int().min(1).max(2_147_483_647).default(30_000),
+  evaluatorMaxRetries: z.number().finite().int().min(0).max(10).default(1),
+  evaluatorTemperature: z.number().finite().min(0).max(1).default(0),
+  evaluatorPromptVersion: z.string().min(1).default('lethebot-governance-v1'),
 
   // OneBot runtime configuration (SnowLuma / NapCat compatible)
   onebotTransport: z.enum(['http', 'ws']).default('ws'),
@@ -87,6 +95,14 @@ export function loadConfig(): Config {
   const raw = {
     logLevel: process.env.LOG_LEVEL,
     test: process.env.LETHEBOT_TEST === 'true',
+    backgroundSummaryEnabled: process.env.LETHEBOT_BACKGROUND_SUMMARY_ENABLED === undefined
+      ? undefined
+      : process.env.LETHEBOT_BACKGROUND_SUMMARY_ENABLED === 'true'
+        ? true
+        : process.env.LETHEBOT_BACKGROUND_SUMMARY_ENABLED === 'false'
+          ? false
+          : process.env.LETHEBOT_BACKGROUND_SUMMARY_ENABLED,
+    botOwnerQqId: process.env.LETHEBOT_BOT_OWNER_QQ_ID,
     dbPath: process.env.LETHEBOT_DB_PATH,
     rawEventRetentionDays: process.env.LETHEBOT_RAW_EVENT_RETENTION_DAYS
       ? parseInt(process.env.LETHEBOT_RAW_EVENT_RETENTION_DAYS, 10)
@@ -103,6 +119,23 @@ export function loadConfig(): Config {
     eventProcessingFailureRetentionDays: process.env.LETHEBOT_EVENT_PROCESSING_FAILURE_RETENTION_DAYS
       ? parseInt(process.env.LETHEBOT_EVENT_PROCESSING_FAILURE_RETENTION_DAYS, 10)
       : undefined,
+    piTurnTimeoutMs: process.env.PI_TURN_TIMEOUT_MS === undefined
+      ? undefined
+      : Number(process.env.PI_TURN_TIMEOUT_MS),
+    evaluatorProvider: process.env.EVALUATOR_PROVIDER,
+    evaluatorModel: process.env.EVALUATOR_MODEL,
+    evaluatorBaseUrl: process.env.EVALUATOR_BASE_URL,
+    evaluatorApiKey: process.env.EVALUATOR_API_KEY,
+    evaluatorTimeoutMs: process.env.EVALUATOR_TIMEOUT_MS === undefined
+      ? undefined
+      : Number(process.env.EVALUATOR_TIMEOUT_MS),
+    evaluatorMaxRetries: process.env.EVALUATOR_MAX_RETRIES === undefined
+      ? undefined
+      : Number(process.env.EVALUATOR_MAX_RETRIES),
+    evaluatorTemperature: process.env.EVALUATOR_TEMPERATURE === undefined
+      ? undefined
+      : Number(process.env.EVALUATOR_TEMPERATURE),
+    evaluatorPromptVersion: process.env.EVALUATOR_PROMPT_VERSION,
 
     // OneBot runtime configuration
     onebotTransport: process.env.ONEBOT_TRANSPORT,

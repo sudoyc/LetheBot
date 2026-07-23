@@ -28,6 +28,7 @@ export interface WorkerJob {
  */
 export class WorkerScheduler {
   private jobs: Map<string, NodeJS.Timeout> = new Map();
+  private readonly activeHandlers = new Map<string, Promise<void>>();
   private running = false;
   private readonly logger: SchedulerLogger;
 
@@ -55,9 +56,19 @@ export class WorkerScheduler {
     // 设置定期执行
     const timer = setInterval(() => {
       if (!this.running) return;
+      if (this.activeHandlers.has(job.name)) {
+        this.logger.debug({ jobName: job.name }, 'Scheduled job is still running, skipping tick');
+        return;
+      }
 
       this.logger.debug({ jobName: job.name }, 'Running scheduled job');
-      job.handler().catch((error) => {
+      let handlerResult: Promise<void>;
+      try {
+        handlerResult = job.handler();
+      } catch (error) {
+        handlerResult = Promise.reject(error);
+      }
+      const activeHandler = handlerResult.catch((error) => {
         this.logger.error({
           error: error instanceof Error ? {
             message: error.message,
@@ -66,6 +77,12 @@ export class WorkerScheduler {
           } : error,
           jobName: job.name,
         }, 'Job execution failed');
+      });
+      this.activeHandlers.set(job.name, activeHandler);
+      void activeHandler.then(() => {
+        if (this.activeHandlers.get(job.name) === activeHandler) {
+          this.activeHandlers.delete(job.name);
+        }
       });
     }, job.intervalMs);
 
@@ -94,6 +111,11 @@ export class WorkerScheduler {
     }
 
     this.jobs.clear();
+  }
+
+  async stopAndDrain(): Promise<void> {
+    this.stop();
+    await Promise.allSettled([...this.activeHandlers.values()]);
   }
 
   /**

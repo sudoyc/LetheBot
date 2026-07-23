@@ -8,6 +8,7 @@
 
 import type Database from 'better-sqlite3';
 import type { AuditRepository } from '../storage/audit-repository.js';
+import { redactSecretsInText } from '../memory/secret-scan.js';
 
 export interface AdminDigestInput {
   jobId: string;
@@ -226,8 +227,8 @@ export class AdminDigestWorker {
       .all(sinceMs, untilMs, limit) as FailedJobSampleRow[];
 
     return rows.map((row) => ({
-      id: row.id,
-      type: row.type,
+      id: redactAdminDigestText(row.id),
+      type: redactAdminDigestText(row.type),
       updatedAt: row.updated_at,
     }));
   }
@@ -250,9 +251,9 @@ export class AdminDigestWorker {
       .all(sinceMs, untilMs, limit) as ActionExecutionSampleRow[];
 
     return rows.map((row) => ({
-      id: row.id,
-      actionType: row.action_type,
-      status: row.status,
+      id: redactAdminDigestText(row.id),
+      actionType: redactAdminDigestText(row.action_type),
+      status: redactAdminDigestText(row.status),
       executedAt: row.executed_at,
     }));
   }
@@ -275,9 +276,9 @@ export class AdminDigestWorker {
       .all(sinceMs, untilMs, limit) as ToolCallSampleRow[];
 
     return rows.map((row) => ({
-      id: row.id,
-      toolName: row.tool_name,
-      status: row.status,
+      id: redactAdminDigestText(row.id),
+      toolName: redactAdminDigestText(row.tool_name),
+      status: redactAdminDigestText(row.status),
       createdAt: row.created_at,
     }));
   }
@@ -300,9 +301,26 @@ export class AdminDigestWorker {
       .all(sinceMs, untilMs, limit) as AuditSampleRow[];
 
     return rows.map((row) => ({
-      id: row.id,
-      eventType: row.event_type,
+      id: redactAdminDigestText(row.id),
+      eventType: redactAdminDigestText(row.event_type),
       timestamp: row.timestamp,
     }));
   }
+}
+
+function redactAdminDigestText(text: string): string {
+  const platformRedacted = redactPlatformIdentifiers(text);
+  const secretRedacted = redactSecretsInText(platformRedacted).text;
+  const redacted = redactPlatformIdentifiers(secretRedacted);
+  const platformMarkerLost =
+    platformRedacted.includes('[REDACTED:platform_id]')
+    && !redacted.includes('[REDACTED:platform_id]');
+
+  return platformMarkerLost ? `${redacted} [REDACTED:platform_id]` : redacted;
+}
+
+function redactPlatformIdentifiers(text: string): string {
+  return text
+    .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
+    .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
 }

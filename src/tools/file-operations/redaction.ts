@@ -1,4 +1,4 @@
-import { redactSecretsInText } from '../../memory/secret-scan';
+import { redactSecretsInText } from '../../memory/secret-scan.js';
 
 export interface FileOperationRedactionResult {
   text: string;

@@ -75,6 +75,35 @@ describe('AuditRepository', () => {
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 
+  it('creates one durable audit effect for concurrent event retries', async () => {
+    const entry = {
+      timestamp: new Date(1334),
+      category: 'memory' as const,
+      level: 'summary' as const,
+      eventType: 'memory.candidate_rejected',
+      eventId: 'memory-candidate-v1-concurrent',
+      actor: {
+        actorClass: 'system_worker' as const,
+        context: 'background_worker' as const,
+      },
+      summary: 'Candidate rejected once',
+      redacted: true,
+      riskLevel: 'high' as const,
+    };
+
+    const [firstId, secondId] = await Promise.all([
+      repo.createOnceForEvent(entry),
+      repo.createOnceForEvent(entry),
+    ]);
+
+    expect(secondId).toBe(firstId);
+    expect(
+      db.prepare('SELECT COUNT(*) AS count FROM audit_log WHERE event_type = ? AND event_id = ?')
+        .get(entry.eventType, entry.eventId)
+    ).toEqual({ count: 1 });
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
   it('preserves platform markers for adjacent secret/platform durable audit text', async () => {
     const adjacentSecretPlatform = 'sk-audit-repo-adjacent-secret-qq-12345678901';
     const auditId = await repo.create({

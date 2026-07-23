@@ -1,5 +1,57 @@
 import { describe, it, expect } from 'vitest';
-import { formatFatalErrorForConsole } from '../../src/index';
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import {
+  formatFatalErrorForConsole,
+  isMainModuleInvocation,
+  resolvePiApiKey,
+} from '../../src/index';
+
+describe('main module invocation', () => {
+  it('recognizes an entrypoint invoked through a managed release symlink', () => {
+    const root = mkdtempSync(join(tmpdir(), 'lethebot-main-module-'));
+    try {
+      const releaseDir = join(root, 'releases', 'A', 'dist');
+      mkdirSync(releaseDir, { recursive: true });
+      const realEntrypoint = join(releaseDir, 'index.js');
+      writeFileSync(realEntrypoint, 'export {};\n', 'utf8');
+      symlinkSync('releases/A', join(root, 'current'));
+
+      expect(isMainModuleInvocation(
+        pathToFileURL(realEntrypoint).href,
+        join(root, 'current', 'dist', 'index.js'),
+      )).toBe(true);
+      expect(isMainModuleInvocation(
+        pathToFileURL(realEntrypoint).href,
+        join(root, 'missing', 'index.js'),
+      )).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('provider credential configuration', () => {
+  it('uses only an explicitly provided PI_API_KEY', () => {
+    expect(resolvePiApiKey({ PI_API_KEY: 'explicit-test-key' })).toBe('explicit-test-key');
+    expect(resolvePiApiKey({})).toBe('');
+    expect(resolvePiApiKey({ HOME: '/tmp/home-with-implicit-key-file' })).toBe('');
+    expect(() => resolvePiApiKey({}, true)).toThrow(
+      'PI_API_KEY is required for a non-mock Pi provider',
+    );
+    expect(() => resolvePiApiKey({ PI_API_KEY: '  ' }, true)).toThrow(
+      'PI_API_KEY is required for a non-mock Pi provider',
+    );
+  });
+});
 
 describe('top-level fatal diagnostics', () => {
   it('redacts Error messages and suppresses stacks before direct console output', () => {

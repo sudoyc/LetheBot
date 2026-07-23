@@ -5,9 +5,11 @@
  */
 
 import type Database from 'better-sqlite3';
-import type { AuditEntry, AuditQueryOptions, AuditStatsResult } from '../types/audit';
+import type { AuditEntry, AuditQueryOptions, AuditStatsResult } from '../types/audit.js';
 import { redactSecretsInText } from '../memory/secret-scan.js';
 import { ulid } from 'ulidx';
+
+type CreateAuditEntryInput = Omit<AuditEntry, 'id'>;
 
 /**
  * 审计日志仓储
@@ -22,7 +24,24 @@ export class AuditRepository {
   /**
    * 创建审计日志条目
    */
-  async create(entry: Omit<AuditEntry, 'id'>): Promise<string> {
+  async create(entry: CreateAuditEntryInput): Promise<string> {
+    return this.createSync(entry);
+  }
+
+  createSync(entry: CreateAuditEntryInput): string {
+    return this.insert(entry);
+  }
+
+  async createOnceForEvent(entry: CreateAuditEntryInput): Promise<string> {
+    return this.db.transaction(() => {
+      const existing = this.db
+        .prepare('SELECT id FROM audit_log WHERE event_type = ? AND event_id = ? LIMIT 1')
+        .get(entry.eventType, entry.eventId) as { id: string } | undefined;
+      return existing?.id ?? this.insert(entry);
+    }).immediate();
+  }
+
+  private insert(entry: CreateAuditEntryInput): string {
     const id = ulid();
     const summary = this.redactAuditText(entry.summary);
     const details = entry.details ? this.redactStructuredValue(entry.details) : undefined;

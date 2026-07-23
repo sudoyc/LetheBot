@@ -46,6 +46,19 @@ describe('Persona Builder', () => {
     expect(prompt).toContain('长期存储');
   });
 
+  it('should route explicit safe remember requests through reviewable proposal semantics', () => {
+    const prompt = buildSystemPrompt({
+      conversationType: 'private',
+      hasMemorySystem: true,
+    });
+
+    expect(prompt).toContain('明确要求');
+    expect(prompt).toContain('稳定、非敏感');
+    expect(prompt).toContain('记忆提议工具');
+    expect(prompt).toContain('待审核');
+    expect(prompt).toContain('不得声称已写入或已经成为长期记忆');
+  });
+
   it('should include conversation principles', () => {
     const prompt = buildSystemPrompt({
       conversationType: 'group',

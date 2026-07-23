@@ -5,7 +5,7 @@
  * outward actions into a recorded silent action.
  */
 
-import type { ActionPlan, ActionType } from '../types/action';
+import type { ActionPlan, ActionType } from '../types/action.js';
 
 export interface CooldownResult {
   actions: ActionPlan[];

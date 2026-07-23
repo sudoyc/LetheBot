@@ -22,6 +22,7 @@ describe('Memory Retrieval', () => {
   let db: Database;
   let contextBuilder: ContextBuilder;
   let memoryRepo: MemoryRepository;
+  let createMemory: MemoryRepository['create'];
   let identityRepo: IdentityRepository;
   const testDbPath = join(__dirname, '../../data/test-memory-retrieval.db');
 
@@ -50,8 +51,39 @@ describe('Memory Retrieval', () => {
     identityRepo = new IdentityRepository(db);
     contextBuilder = new ContextBuilder(memoryRepo, identityRepo, db);
 
+    const now = Date.now();
+    createMemory = (input) => memoryRepo.create({
+      ...input,
+      sources: input.sources ?? [
+        {
+          sourceType: 'raw_event',
+          sourceId: 'raw-memory-retrieval-source',
+          sourceTimestamp: now,
+          extractedBy: 'user',
+        },
+      ],
+    });
+
     // 创建测试用户
     await identityRepo.ensureCanonicalUser('user-123');
+    seedActiveQqAccount(db, 'user-123', 'qq-user-123', now);
+    seedMemoryEvidence(db, {
+      rawEventId: 'raw-memory-retrieval-source',
+      chatMessageId: 'msg-memory-retrieval-source',
+      conversationId: 'private:user-123',
+      conversationType: 'private',
+      senderId: 'qq-user-123',
+      timestamp: now,
+    });
+    seedMemoryEvidence(db, {
+      rawEventId: 'raw-memory-retrieval-group-source',
+      chatMessageId: 'msg-memory-retrieval-group-source',
+      conversationId: 'conv-group-456',
+      conversationType: 'group',
+      groupId: 'group-456',
+      senderId: 'qq-user-123',
+      timestamp: now + 1,
+    });
   });
 
   afterEach(() => {
@@ -63,7 +95,7 @@ describe('Memory Retrieval', () => {
 
   it('should retrieve user memories in private chat', async () => {
     // 创建用户记忆
-    await memoryRepo.create({
+    await createMemory({
       id: 'mem-1',
       scope: 'user',
       canonicalUserId: 'user-123',
@@ -94,7 +126,7 @@ describe('Memory Retrieval', () => {
 
   it('should not retrieve private_only memories in group chat', async () => {
     // 创建 private_only 记忆
-    await memoryRepo.create({
+    await createMemory({
       id: 'mem-1',
       scope: 'user',
       canonicalUserId: 'user-123',
@@ -125,7 +157,7 @@ describe('Memory Retrieval', () => {
   });
 
   it('should retrieve same_user_any_context memories in both private and group', async () => {
-    await memoryRepo.create({
+    await createMemory({
       id: 'mem-1',
       scope: 'user',
       canonicalUserId: 'user-123',
@@ -166,7 +198,7 @@ describe('Memory Retrieval', () => {
   });
 
   it('should only retrieve same_group_only memories in the same group', async () => {
-    await memoryRepo.create({
+    await createMemory({
       id: 'mem-1',
       scope: 'user',
       canonicalUserId: 'user-123',
@@ -181,6 +213,10 @@ describe('Memory Retrieval', () => {
       confidence: 0.9,
       importance: 0.7,
       sourceContext: 'group_chat',
+      sources: [{
+        sourceType: 'raw_event',
+        sourceId: 'raw-memory-retrieval-group-source',
+      }],
     });
 
     // 相同群组
@@ -210,7 +246,7 @@ describe('Memory Retrieval', () => {
 
   it('should not retrieve disabled or deleted memories', async () => {
     // Active 记忆
-    await memoryRepo.create({
+    await createMemory({
       id: 'mem-active',
       scope: 'user',
       canonicalUserId: 'user-123',
@@ -227,7 +263,7 @@ describe('Memory Retrieval', () => {
     });
 
     // Disabled 记忆
-    await memoryRepo.create({
+    await createMemory({
       id: 'mem-disabled',
       scope: 'user',
       canonicalUserId: 'user-123',
@@ -258,7 +294,7 @@ describe('Memory Retrieval', () => {
   it('should retrieve public memories for any user', async () => {
     await identityRepo.ensureCanonicalUser('user-456');
 
-    await memoryRepo.create({
+    await createMemory({
       id: 'mem-1',
       scope: 'global',
       visibility: 'public',
@@ -297,7 +333,7 @@ describe('Memory Retrieval', () => {
   });
 
   it('should include memory IDs in selectedMemoryIds', async () => {
-    const memoryId = await memoryRepo.create({
+    const memoryId = await createMemory({
       id: 'mem-1',
       scope: 'user',
       canonicalUserId: 'user-123',
@@ -324,3 +360,67 @@ describe('Memory Retrieval', () => {
     expect(context.memory.selectedMemoryIds).toContain(memoryId);
   });
 });
+
+function seedActiveQqAccount(
+  db: Database,
+  canonicalUserId: string,
+  platformAccountId: string,
+  timestamp: number,
+): void {
+  db.prepare(
+    `INSERT INTO platform_accounts (
+      platform, platform_account_id, canonical_user_id, account_type,
+      verified_level, status, first_seen_at, last_seen_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    'qq',
+    platformAccountId,
+    canonicalUserId,
+    'private',
+    'observed',
+    'active',
+    timestamp,
+    timestamp,
+  );
+}
+
+function seedMemoryEvidence(db: Database, input: {
+  rawEventId: string;
+  chatMessageId: string;
+  conversationId: string;
+  conversationType: 'private' | 'group';
+  groupId?: string;
+  senderId: string;
+  timestamp: number;
+}): void {
+  db.prepare(
+    `INSERT INTO raw_events (
+      id, type, timestamp, source, platform, conversation_id, payload, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    input.rawEventId,
+    'chat.message.received',
+    input.timestamp,
+    'gateway',
+    'qq',
+    input.conversationId,
+    '{}',
+    input.timestamp,
+  );
+  db.prepare(
+    `INSERT INTO chat_messages (
+      id, raw_event_id, message_id, conversation_id, conversation_type,
+      group_id, sender_id, text, timestamp
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    input.chatMessageId,
+    input.rawEventId,
+    `platform-${input.chatMessageId}`,
+    input.conversationId,
+    input.conversationType,
+    input.groupId ?? null,
+    input.senderId,
+    'Synthetic memory provenance',
+    input.timestamp,
+  );
+}

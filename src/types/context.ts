@@ -7,6 +7,9 @@
 /**
  * 最近消息
  */
+export type MessageRef = `message_${number}`;
+export type SpeakerRef = `speaker_${number}`;
+
 export interface RecentMessage {
   messageId: string;
   senderId: string;
@@ -14,6 +17,12 @@ export interface RecentMessage {
   text?: string;
   timestamp: Date;
   isFromBot: boolean;
+  senderRole?: 'member' | 'admin' | 'owner';
+
+  // ContextBuilder assigns prompt-local references after budget selection.
+  messageRef?: MessageRef;
+  speakerRef?: SpeakerRef;
+  isCurrent?: boolean;
 }
 
 /**
@@ -30,6 +39,20 @@ export interface MemoryBlock {
   sourceContext?: string;
 }
 
+export type MemoryQuerySource = 'current_message' | 'quoted_message' | 'recent_thread';
+export type MemoryRetrievalMethod = 'scoped_rank' | 'fts';
+export type MemoryScopeAffinity = 'exact_conversation' | 'exact_group' | 'same_user' | 'global';
+export type MemorySelectionReason = 'profile_priority' | 'query_match' | 'ranked_fallback';
+
+export interface MemorySelectionEvidence {
+  memoryId: string;
+  querySources: MemoryQuerySource[];
+  retrievalMethods: MemoryRetrievalMethod[];
+  scopeAffinity: MemoryScopeAffinity;
+  retrievalRank: number;
+  selectionReason: MemorySelectionReason;
+}
+
 /**
  * Context retrieval trace
  */
@@ -40,6 +63,7 @@ export interface ContextTrace {
     memoryId: string;
     reason: string;
   }>;
+  memorySelections?: MemorySelectionEvidence[];
   filtersApplied: string[];
 }
 
@@ -70,7 +94,8 @@ export interface InjectedIdentityDataField {
  * 参与者上下文
  */
 export interface ParticipantContext {
-  canonicalUserId: string;
+  canonicalUserId?: string;
+  speakerRef?: SpeakerRef;
 
   // 显示（不可信的用户提供数据）
   displayName: string;
@@ -84,6 +109,15 @@ export interface ParticipantContext {
 
   // 平台 ID 注入（目的绑定）
   platformAccountId?: string; // 仅在需要身份消歧/调试时
+}
+
+export interface ReplyReference {
+  status: 'resolved' | 'unresolved';
+  sourceMessageRef: MessageRef;
+  targetMessageRef?: MessageRef;
+  targetSpeakerRef?: SpeakerRef;
+  targetRole?: 'human' | 'bot';
+  targetInRollingWindow?: boolean;
 }
 
 /**
@@ -102,6 +136,8 @@ export interface ContextPack {
 
   // 最近消息（token 预算内）
   recentMessages: RecentMessage[];
+  currentMessageRef?: MessageRef;
+  replyReference?: ReplyReference;
 
   // 记忆（可见性过滤后）
   memory: {

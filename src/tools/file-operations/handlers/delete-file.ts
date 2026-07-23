@@ -5,12 +5,13 @@
  */
 
 import * as fs from 'fs';
-import type { ToolCallResult } from '../../../types/tool';
+import type { ToolCallResult } from '../../../types/tool.js';
 import {
   PathValidator,
+  throwIfFileOperationAborted,
   type FileOperationContext,
-} from '../path-validator';
-import { redactFileOperationText } from '../redaction';
+} from '../path-validator.js';
+import { redactFileOperationText } from '../redaction.js';
 
 interface DeleteFileInput {
   path: string;
@@ -45,6 +46,8 @@ export class DeleteFileHandler {
     const pathSecretsRedacted = redactedPathResult.redacted;
 
     try {
+      throwIfFileOperationAborted(context.signal);
+
       // 1. 检查是否为 readonly 模式
       if (context.sandboxPolicy.filesystem === 'readonly') {
         return {
@@ -86,8 +89,11 @@ export class DeleteFileHandler {
       // 3. 检查文件/目录是否存在
       let stats: fs.Stats;
       try {
+        throwIfFileOperationAborted(context.signal);
         stats = await fs.promises.stat(normalizedPath);
+        throwIfFileOperationAborted(context.signal);
       } catch (err: unknown) {
+        throwIfFileOperationAborted(context.signal);
         const error = err as NodeJS.ErrnoException;
         if (error.code === 'ENOENT') {
           return {
@@ -121,11 +127,13 @@ export class DeleteFileHandler {
       }
 
       // 5. 执行删除
+      throwIfFileOperationAborted(context.signal);
       if (stats.isDirectory()) {
         await fs.promises.rm(normalizedPath, { recursive: true, force: true });
       } else {
         await fs.promises.unlink(normalizedPath);
       }
+      throwIfFileOperationAborted(context.signal);
 
       const output: DeleteFileOutput = {
         deleted: true,

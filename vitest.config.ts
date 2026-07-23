@@ -1,10 +1,7 @@
 import { defineConfig } from 'vitest/config';
-import { config } from 'dotenv';
-
-// Load .env file for tests
-config();
 
 export default defineConfig({
+  envDir: 'tests/fixtures/vitest-no-env',
   test: {
     globals: true,
     environment: 'node',

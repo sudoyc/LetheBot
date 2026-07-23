@@ -58,7 +58,7 @@ describe('Identity Resolution', () => {
 
     // 创建用户
     await identityRepo.ensureCanonicalUser(canonicalUserId);
-    await identityRepo.upsertPlatformAccount({
+    await identityRepo.createPlatformAccount({
       canonicalUserId,
       platform: 'qq',
       platformAccountId: platformUserId,
@@ -82,7 +82,7 @@ describe('Identity Resolution', () => {
 
     // 创建用户
     await identityRepo.ensureCanonicalUser(canonicalUserId);
-    await identityRepo.upsertPlatformAccount({
+    await identityRepo.createPlatformAccount({
       canonicalUserId,
       platform: 'qq',
       platformAccountId: platformUserId,
@@ -107,7 +107,7 @@ describe('Identity Resolution', () => {
     await identityRepo.ensureCanonicalUser(canonicalUserId);
 
     // 链接第一个账号
-    await identityRepo.upsertPlatformAccount({
+    await identityRepo.createPlatformAccount({
       canonicalUserId,
       platform: 'qq',
       platformAccountId: '123456',
@@ -117,7 +117,7 @@ describe('Identity Resolution', () => {
     });
 
     // 链接第二个账号（假设未来支持多平台）
-    await identityRepo.upsertPlatformAccount({
+    await identityRepo.createPlatformAccount({
       canonicalUserId,
       platform: 'qq',
       platformAccountId: '789012',

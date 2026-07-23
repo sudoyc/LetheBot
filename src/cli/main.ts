@@ -6,31 +6,36 @@
  */
 
 import { Command } from 'commander';
-import { initDatabase, closeDatabase } from '../storage/database';
-import { MemoryRepository } from '../storage/memory-repository';
-import { IdentityRepository } from '../storage/identity-repository';
-import { ContextBuilder } from '../context/builder';
+import {
+  formatGovernanceMemoryIdForDisplay,
+  GovernanceService,
+} from '../governance/service.js';
+import { initDatabase, closeDatabase } from '../storage/database.js';
+import { MemoryRepository } from '../storage/memory-repository.js';
+import { IdentityRepository } from '../storage/identity-repository.js';
+import { ContextBuilder } from '../context/builder.js';
 import {
   GovernanceCLI,
   type CommandResult,
+  type GovernanceHealthSummaryInspectionRecord,
   type MemoryReviewAuditEventType,
   type MemoryReviewResolutionStatus,
-} from './governance';
-import { loadConfig } from '../config';
-import { redactSecretsInText } from '../memory/secret-scan';
+} from './governance.js';
+import { loadConfig } from '../config/index.js';
+import { redactSecretsInText } from '../memory/secret-scan.js';
 import type {
   PrivacyPreferenceState,
   PrivacyPreferenceType,
-} from '../storage/privacy-preference-repository';
+} from '../storage/privacy-preference-repository.js';
 import type {
   JobAttemptStatus,
   JobStatus,
   WorkerHeartbeatStatus,
-} from '../storage/job-repository';
-import type { ActionDecision, ActionExecutionResult, ActionType } from '../types/action';
-import type { AuditEntry } from '../types/audit';
-import type { MemoryRecord, MemorySource } from '../types/memory';
-import type { ToolCallResult } from '../types/tool';
+} from '../storage/job-repository.js';
+import type { ActionDecision, ActionExecutionResult, ActionType } from '../types/action.js';
+import type { AuditEntry } from '../types/audit.js';
+import type { MemoryRecord, MemorySource } from '../types/memory.js';
+import type { ToolCallResult } from '../types/tool.js';
 
 const program = new Command();
 
@@ -39,7 +44,9 @@ const EVENT_PROCESSING_FAILURE_STAGES = [
   'identity_resolution',
   'display_metadata',
   'chat_message_store',
+  'governance_command',
   'attention_analysis',
+  'delayed_attention_persist',
   'turn_create',
   'context_building',
   'pi_inference',
@@ -51,6 +58,9 @@ const EVENT_PROCESSING_FAILURE_STAGES = [
 ] as const;
 
 type EventProcessingFailureStage = typeof EVENT_PROCESSING_FAILURE_STAGES[number];
+type MemorySummaryAction = 'status' | 'enable' | 'disable';
+const MAX_CLI_ERROR_LENGTH = 2_048;
+const CLI_ERROR_PREFIX = '❌ ';
 
 function getDbPath(): string {
   return loadConfig().dbPath;
@@ -74,7 +84,12 @@ function printCommandResult(result: CommandResult): void {
     return;
   }
 
-  console.error(`❌ ${redactForDisplay(result.error ?? 'Command failed')}`);
+  console.error(
+    `${CLI_ERROR_PREFIX}${projectCliErrorForDisplay(
+      result.error ?? 'Command failed',
+      MAX_CLI_ERROR_LENGTH - CLI_ERROR_PREFIX.length,
+    )}`,
+  );
   process.exitCode = 1;
 }
 
@@ -82,10 +97,77 @@ function printJson(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
 }
 
+function compactGovernanceHealth(summary: GovernanceHealthSummaryInspectionRecord): {
+  generatedAt: Date;
+  overall: 'ok' | 'attention_required';
+  attention: GovernanceHealthSummaryInspectionRecord['attention'];
+  totals: {
+    memoryReviews: number;
+    eventProcessingFailures: number;
+    actionDecisions: number;
+    actionExecutions: number;
+    toolCalls: number;
+    jobs: number;
+    workerHeartbeats: number;
+    auditEvents: number;
+  };
+  latest: {
+    eventFailureAt?: Date;
+    workerHeartbeatAt?: Date;
+  };
+} {
+  const attentionTotal = Object.values(summary.attention)
+    .reduce((total, count) => total + count, 0);
+
+  return {
+    generatedAt: summary.generatedAt,
+    overall: attentionTotal === 0 ? 'ok' : 'attention_required',
+    attention: summary.attention,
+    totals: {
+      memoryReviews: summary.memoryReviews.total,
+      eventProcessingFailures: summary.eventProcessing.failuresTotal,
+      actionDecisions: summary.actions.decisions.total,
+      actionExecutions: summary.actions.executions.total,
+      toolCalls: summary.tools.total,
+      jobs: summary.jobs.total,
+      workerHeartbeats: summary.workerHeartbeats.total,
+      auditEvents: summary.audit.total,
+    },
+    latest: {
+      eventFailureAt: summary.eventProcessing.latestFailureAt,
+      workerHeartbeatAt: summary.workerHeartbeats.latestHeartbeatAt,
+    },
+  };
+}
+
 function printError(error: unknown): void {
   const message = error instanceof Error ? error.message : 'Unknown error';
-  console.error(`❌ ${redactForDisplay(message)}`);
+  console.error(
+    `${CLI_ERROR_PREFIX}${projectCliErrorForDisplay(
+      message,
+      MAX_CLI_ERROR_LENGTH - CLI_ERROR_PREFIX.length,
+    )}`,
+  );
   process.exitCode = 1;
+}
+
+function projectCliErrorForDisplay(
+  value: string,
+  maxLength = MAX_CLI_ERROR_LENGTH,
+): string {
+  const withoutControls = [...value].map((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)
+      ? ' '
+      : character;
+  }).join('');
+  const singleLine = withoutControls
+    .replace(/\s+/gu, ' ')
+    .trim();
+  const redacted = redactForDisplay(singleLine);
+  return redacted.length <= maxLength
+    ? redacted
+    : `${redacted.slice(0, maxLength - 3)}...`;
 }
 
 function redactForDisplay(value: string): string {
@@ -104,8 +186,48 @@ function redactNullableForDisplay(value: string | null | undefined): string {
 
 function redactPlatformIdentifiers(value: string): string {
   return value
-    .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
-    .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
+    .replace(/(?<![A-Za-z0-9])qq-(?:group-)?[1-9][0-9]{4,11}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
+    .replace(/(?<![A-Za-z0-9])[1-9][0-9]{4,11}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
+}
+
+function parseIdentityPlatform(value: string): 'qq' {
+  if (value === 'qq') {
+    return value;
+  }
+
+  throw new Error('Invalid identity platform; expected qq');
+}
+
+function parseMemorySummaryAction(value: string): MemorySummaryAction {
+  switch (value) {
+    case 'status':
+    case 'enable':
+    case 'disable':
+      return value;
+    default:
+      throw new Error('Invalid memory summary action; expected status, enable, or disable');
+  }
+}
+
+function parseMemorySummaryGroupId(value: string): string {
+  if (value.length === 0 || value.trim() !== value) {
+    throw new Error('Group ID must be a non-empty trimmed value');
+  }
+  if (!/^qq-group-[1-9][0-9]{4,11}$/.test(value)) {
+    throw new Error('Group ID must use qq-group-<5-12 digit QQ id>');
+  }
+  return value;
+}
+
+function printMemorySummaryPolicy(input: {
+  state: 'enabled' | 'disabled';
+  changed: boolean;
+  canceledJobCount: number;
+}): void {
+  console.log(redactForDisplay(
+    `Group summary policy: state=${input.state}`
+    + ` changed=${input.changed} canceled_jobs=${input.canceledJobCount}`
+  ));
 }
 
 function parseMemoryReviewEventType(value: string | undefined): MemoryReviewAuditEventType | undefined {
@@ -498,7 +620,7 @@ function parseLimit(value: string | undefined, label = 'limit', max = 1000): num
 program
   .configureOutput({
     outputError: (str, write) => {
-      write(redactForDisplay(str));
+      write(`${projectCliErrorForDisplay(str)}\n`);
     },
   })
   .name('lethebot-cli')
@@ -569,8 +691,7 @@ program
     await withGovernanceCli(async (cli) => {
       const result = await cli.showMemory(memoryId);
       if (!result) {
-        console.error(`❌ Memory ${redactForDisplay(memoryId)} not found`);
-        process.exitCode = 1;
+        printCommandResult({ success: false, error: `Memory ${memoryId} not found` });
         return;
       }
       printJson(result);
@@ -616,19 +737,66 @@ program
   .command('delete-memory')
   .description('Delete a memory record')
   .argument('<memoryId>', 'Memory ID to delete')
-  .action(async (memoryId) => {
+  .action((memoryId: string) => {
     const db = initDatabase({ path: getDbPath() });
     const memoryRepo = new MemoryRepository(db);
-    const cli = new GovernanceCLI(memoryRepo, { db });
+    const governance = new GovernanceService(db, memoryRepo);
 
     try {
-      const result = await cli.deleteMemory(memoryId);
-      if (result.success) {
-        console.log(`✅ ${redactForDisplay(result.message ?? 'Command completed')}`);
+      const result = governance.forgetMemoryAsLocalAdmin(memoryId);
+      const displayId = formatGovernanceMemoryIdForDisplay(memoryId);
+      if (result.outcome === 'forgotten') {
+        console.log(`✅ Memory ${displayId} deleted`);
       } else {
-        console.error(`❌ ${redactForDisplay(result.error ?? 'Command failed')}`);
-        process.exit(1);
+        console.error(`❌ Memory ${displayId} not found`);
+        process.exitCode = 1;
       }
+    } catch (error) {
+      printError(error);
+    } finally {
+      closeDatabase(db);
+    }
+  });
+
+program
+  .command('memory-summary')
+  .description('Inspect or change the exact group summary policy')
+  .argument(
+    '<action>',
+    'Summary policy action (status, enable, or disable)',
+    parseMemorySummaryAction,
+  )
+  .requiredOption(
+    '--group <groupId>',
+    'Exact group ID',
+    parseMemorySummaryGroupId,
+  )
+  .action((action: MemorySummaryAction, options: { group: string }) => {
+    const db = initDatabase({ path: getDbPath() });
+    const governance = new GovernanceService(db);
+
+    try {
+      if (action === 'status') {
+        const policy = governance.getGroupSummaryPolicyAsLocalAdmin(options.group);
+        printMemorySummaryPolicy({
+          state: policy?.state ?? 'disabled',
+          changed: false,
+          canceledJobCount: 0,
+        });
+        return;
+      }
+
+      const result = governance.setGroupSummaryPolicyAsLocalAdmin({
+        groupId: options.group,
+        enabled: action === 'enable',
+      });
+      printMemorySummaryPolicy({
+        state: result.policy?.state ?? 'disabled',
+        changed: result.changed,
+        canceledJobCount: result.canceledJobCount,
+      });
+    } catch (error) {
+      printError(error);
     } finally {
       closeDatabase(db);
     }
@@ -648,12 +816,7 @@ program
       const result = await cli.disableMemory(memoryId, {
         decayReviewAuditId: options.decayReviewAudit,
       });
-      if (result.success) {
-        console.log(`✅ ${redactForDisplay(result.message ?? 'Command completed')}`);
-      } else {
-        console.error(`❌ ${redactForDisplay(result.error ?? 'Command failed')}`);
-        process.exit(1);
-      }
+      printCommandResult(result);
     } finally {
       closeDatabase(db);
     }
@@ -670,12 +833,7 @@ program
 
     try {
       const result = await cli.enableMemory(memoryId);
-      if (result.success) {
-        console.log(`✅ ${redactForDisplay(result.message ?? 'Command completed')}`);
-      } else {
-        console.error(`❌ ${redactForDisplay(result.error ?? 'Command failed')}`);
-        process.exit(1);
-      }
+      printCommandResult(result);
     } finally {
       closeDatabase(db);
     }
@@ -761,6 +919,16 @@ program
         console.log(`Group: ${redactForDisplay(explanation.conversation.groupId)}`);
       }
       console.log(`Selected memories: ${redactForDisplay(explanation.selectedMemoryIds.join(', ') || 'none')}`);
+      if (explanation.memorySelections && explanation.memorySelections.length > 0) {
+        const selectionSummary = explanation.memorySelections.map((selection) => (
+          `${selection.memoryId}:${selection.selectionReason}`
+          + `:${selection.querySources.join('+') || 'none'}`
+          + `:${selection.scopeAffinity}`
+          + `:via=${selection.retrievalMethods.join('+')}`
+          + `:rank=${selection.retrievalRank}`
+        )).join(', ');
+        console.log(`Memory selection evidence: ${redactForDisplay(selectionSummary)}`);
+      }
       console.log(`Candidate memories: ${redactForDisplay(explanation.candidateMemoryIds.join(', ') || 'none')}`);
       console.log(`Rejected memories: ${redactForDisplay(JSON.stringify(explanation.rejectedMemories))}`);
       console.log(`Filters: ${redactForDisplay(explanation.filtersApplied.join(', '))}`);
@@ -796,7 +964,10 @@ program
             .map((execution) => {
               const parts = [
                 `${execution.id}:${execution.actionType}:${execution.status}`,
+                execution.effect ? `effect=${execution.effect}` : undefined,
                 execution.executedMessageId ? `message=${execution.executedMessageId}` : undefined,
+                execution.executedMemoryId ? `memory=${execution.executedMemoryId}` : undefined,
+                execution.executedJobId ? `job=${execution.executedJobId}` : undefined,
                 execution.downgradedFrom ? `downgraded_from=${execution.downgradedFrom}` : undefined,
                 execution.downgradedReason ? `downgraded_reason=${execution.downgradedReason}` : undefined,
                 execution.errorCode ? `error_code=${execution.errorCode}` : undefined,
@@ -809,11 +980,25 @@ program
           console.log(`Action executions: ${redactForDisplay(executionSummary)}`);
         }
       }
+      if (explanation.toolCalls && explanation.toolCalls.length > 0) {
+        const toolCallSummary = explanation.toolCalls
+          .map((toolCall) => {
+            const parts = [
+              `${toolCall.id}:${toolCall.toolName}:${toolCall.status}`,
+              `requested_by=${toolCall.requestedBy}`,
+              toolCall.executionTimeMs !== undefined ? `duration_ms=${toolCall.executionTimeMs}` : undefined,
+              toolCall.errorCode ? `error_code=${toolCall.errorCode}` : undefined,
+              toolCall.errorMessage ? `error=${toolCall.errorMessage}` : undefined,
+            ].filter((part): part is string => Boolean(part));
+
+            return parts.join(' ');
+          })
+          .join(' | ');
+        console.log(`Tool calls: ${redactForDisplay(toolCallSummary)}`);
+      }
       console.log(`Recent messages: ${redactForDisplay(explanation.recentMessageIds.join(', ') || 'none')}`);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
-      console.error(`❌ ${redactForDisplay(message)}`);
-      process.exitCode = 1;
+      printError(error);
     } finally {
       closeDatabase(db);
     }
@@ -905,10 +1090,11 @@ program
 program
   .command('summarize-governance-health')
   .description('Summarize redacted governance health counts for reviews, actions, tools, jobs, workers, and audit')
-  .action(async () => {
+  .option('--compact', 'Print only overall status, attention counters, totals, and latest timestamps')
+  .action(async (options: { compact?: boolean }) => {
     await withGovernanceCli(async (cli) => {
       const summary = await cli.summarizeGovernanceHealth();
-      printJson(summary);
+      printJson(options.compact ? compactGovernanceHealth(summary) : summary);
     });
   });
 
@@ -1149,6 +1335,24 @@ program
   });
 
 program
+  .command('unlink-platform-account')
+  .description('Disable an active platform account mapping')
+  .argument('<platform>', 'Platform name (qq)')
+  .argument('<platformAccountId>', 'Platform account ID to unlink')
+  .action(async (platform, platformAccountId) => {
+    await withGovernanceCli(async (cli) => {
+      try {
+        printCommandResult(await cli.unlinkPlatformAccount({
+          platform: parseIdentityPlatform(platform),
+          platformAccountId,
+        }));
+      } catch (error) {
+        printError(error);
+      }
+    });
+  });
+
+program
   .command('redact-display-profile')
   .description('Redact display profile and nickname history for a user')
   .argument('<canonicalUserId>', 'Canonical user ID')
@@ -1164,12 +1368,7 @@ program
         groupId: options.group,
       });
 
-      if (result.success) {
-        console.log(`✅ ${redactForDisplay(result.message ?? 'Command completed')}`);
-      } else {
-        console.error(`❌ ${redactForDisplay(result.error ?? 'Command failed')}`);
-        process.exit(1);
-      }
+      printCommandResult(result);
     } finally {
       closeDatabase(db);
     }

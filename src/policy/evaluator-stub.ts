@@ -4,7 +4,7 @@
  * 评估器桩实现（Phase J 最小实现）
  */
 
-import type { ActionDecision } from '../types/action';
+import type { ActionDecision } from '../types/action.js';
 
 export interface EvaluatorRequest {
   actionDecision: ActionDecision;

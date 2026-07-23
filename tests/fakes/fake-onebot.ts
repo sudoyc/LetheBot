@@ -46,18 +46,21 @@ export interface SentMessage {
   sentAt: Date;
 }
 
+export interface SentReaction {
+  messageId: string;
+  emoji: string;
+  sentAt: Date;
+}
+
 export interface FakeOneBotConfig {
   botId?: string;
   capabilities?: Partial<GatewayCapabilities>;
-  autoIncrement?: {
-    messageIds?: boolean;
-    userIds?: boolean;
-  };
 }
 
 export class FakeOneBot implements GatewayAdapter {
   private emitter = new EventEmitter();
   private sentMessages: SentMessage[] = [];
+  private sentReactions: SentReaction[] = [];
   private capabilities: GatewayCapabilities;
   private botId: string;
   private messageCounter = 0;
@@ -106,9 +109,12 @@ export class FakeOneBot implements GatewayAdapter {
     return messageId;
   }
 
-  async sendReaction(_messageId: string, _emoji: string): Promise<void> {
-    // Store reactions if needed for assertions
-    // For now, just a no-op
+  async sendReaction(messageId: string, emoji: string): Promise<void> {
+    this.sentReactions.push({
+      messageId,
+      emoji,
+      sentAt: new Date(),
+    });
   }
 
   getCapabilities(): GatewayCapabilities {
@@ -239,6 +245,38 @@ export class FakeOneBot implements GatewayAdapter {
   }
 
   /**
+   * 获取所有已发送的 reaction
+   */
+  getSentReactions(): SentReaction[] {
+    return [...this.sentReactions];
+  }
+
+  /**
+   * 获取最后一条已发送的 reaction
+   */
+  getLastSentReaction(): SentReaction | undefined {
+    return this.sentReactions[this.sentReactions.length - 1];
+  }
+
+  /**
+   * 断言 reaction 已发送
+   */
+  assertReactionSent(messageId: string, emoji?: string): void {
+    const found = this.sentReactions.some((reaction) => {
+      if (reaction.messageId !== messageId) {
+        return false;
+      }
+      return emoji === undefined || reaction.emoji === emoji;
+    });
+
+    if (!found) {
+      throw new Error(
+        `Expected reaction ${emoji ?? '*'} for message ${messageId} but found: ${JSON.stringify(this.sentReactions)}`,
+      );
+    }
+  }
+
+  /**
    * 断言消息已发送
    */
   assertMessageSent(matcher?: string | RegExp | { text?: string | RegExp; conversationId?: string }): void {
@@ -301,6 +339,7 @@ export class FakeOneBot implements GatewayAdapter {
    */
   reset(): void {
     this.sentMessages = [];
+    this.sentReactions = [];
     this.messageCounter = 0;
     this.userCounter = 0;
   }

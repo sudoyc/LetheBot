@@ -83,15 +83,93 @@ describe('AttentionEngine', () => {
       expect(signals.triggerReasons).toContain('question');
       expect(signals.triggerScore).toBeGreaterThan(0.8);
     });
+
+    it.each([
+      {
+        label: 'mention plus question',
+        mentionsBot: true,
+        replyToBot: false,
+        text: '@bot 现在可以回复吗？',
+        expectedReasons: ['@bot', 'question'],
+      },
+      {
+        label: 'reply-to-bot plus question',
+        mentionsBot: false,
+        replyToBot: true,
+        text: '现在可以回复吗？',
+        expectedReasons: ['reply_to_bot', 'question'],
+      },
+      {
+        label: 'mention plus reply-to-bot plus question',
+        mentionsBot: true,
+        replyToBot: true,
+        text: '@bot 继续说明可以吗？',
+        expectedReasons: ['@bot', 'reply_to_bot', 'question'],
+      },
+    ])('REL-ATT-01 keeps $label on the reply fast path', ({
+      mentionsBot,
+      replyToBot,
+      text,
+      expectedReasons,
+    }) => {
+      const signals = engine.analyze({
+        conversationType: 'group',
+        mentionsBot,
+        replyToBot,
+        text,
+        senderId: 'synthetic-direct-user',
+      });
+
+      expect(signals.classification).toBe('needs_response');
+      expect(signals.recommendedPath).toBe('reply_fast_path');
+      expect(signals.triggerReasons).toEqual(expect.arrayContaining(expectedReasons));
+    });
   });
 
-  describe('Risk path', () => {
-    it('should trigger evaluation on command', () => {
+  describe('Delayed Attention path', () => {
+    it.each([
+      '有谁知道这个问题应该怎么处理？',
+      '谁知道？',
+    ])('REL-ATT-02 defers an unmentioned group question: %s', (text) => {
       const signals = engine.analyze({
         conversationType: 'group',
         mentionsBot: false,
-        text: '/remember 重要信息',
-        senderId: 'user-007',
+        replyToBot: false,
+        text,
+        senderId: 'synthetic-delayed-question-user',
+      });
+
+      expect(signals.classification).toBe('defer');
+      expect(signals.recommendedPath).toBe('delayed_recheck');
+      expect(signals.triggerReasons).toContain('question');
+      expect(signals.suppressors).not.toContain('high_speed_chat');
+    });
+  });
+
+  describe('Risk path', () => {
+    it.each(['/memory list', '/why'])(
+      'REL-ADMIN-01 routes explicit deterministic command %s through governance',
+      (command) => {
+        const signals = engine.analyze({
+          conversationType: 'group',
+          mentionsBot: false,
+          text: command,
+          senderId: 'user-007',
+          senderRole: 'admin',
+        });
+
+        expect(signals.classification).toBe('needs_evaluation');
+        expect(signals.recommendedPath).toBe('risk_path');
+        expect(signals.triggerReasons).toContain('command');
+      },
+    );
+
+    it('routes an exact private governance command through evaluation', () => {
+      const signals = engine.analyze({
+        conversationType: 'private',
+        mentionsBot: false,
+        text: '/why last turn',
+        senderId: 'synthetic-private-command-user',
       });
 
       expect(signals.classification).toBe('needs_evaluation');
@@ -99,20 +177,35 @@ describe('AttentionEngine', () => {
       expect(signals.triggerReasons).toContain('command');
     });
 
-    it('should trigger evaluation on admin instruction', () => {
+    it.each([
+      {
+        label: '管理 narrative from an admin',
+        text: '我们正在讨论管理页面的命名',
+        senderRole: 'admin',
+      },
+      {
+        label: '设置 narrative from an owner',
+        text: '设置页面的文案还在讨论',
+        senderRole: 'owner',
+      },
+    ] as const)('REL-ADMIN-01 keeps $label on the ordinary silent path', ({
+      text,
+      senderRole,
+    }) => {
       const signals = engine.analyze({
         conversationType: 'group',
         mentionsBot: false,
-        text: '管理员设置群规则',
-        senderId: 'admin-001',
-        senderRole: 'admin',
+        text,
+        senderId: 'synthetic-admin-narrative',
+        senderRole,
       });
 
-      expect(signals.classification).toBe('needs_evaluation');
-      expect(signals.triggerReasons).toContain('admin_instruction');
+      expect(signals.classification).toBe('silent');
+      expect(signals.recommendedPath).toBe('silent_fast_path');
+      expect(signals.triggerReasons).not.toContain('admin_instruction');
     });
 
-    it('should handle high-score triggers', () => {
+    it('keeps a high relevance score on the reply path without an independent risk signal', () => {
       const signals = engine.analyze({
         conversationType: 'private',
         mentionsBot: true,
@@ -121,8 +214,32 @@ describe('AttentionEngine', () => {
         senderRole: 'owner',
       });
 
-      expect(signals.classification).toBe('needs_evaluation');
+      expect(signals.classification).toBe('needs_response');
+      expect(signals.recommendedPath).toBe('reply_fast_path');
       expect(signals.triggerScore).toBeGreaterThan(0.9);
+    });
+
+    it.each([
+      { text: '/memoryless', senderRole: 'admin' },
+      { text: '/whyever', senderRole: 'owner' },
+      { text: '!memory list', senderRole: 'admin' },
+      { text: '/memory list', senderRole: 'member' },
+      { text: '/why', senderRole: undefined },
+    ] as const)('does not grant command risk to $text with role $senderRole', ({
+      text,
+      senderRole,
+    }) => {
+      const signals = engine.analyze({
+        conversationType: 'group',
+        mentionsBot: false,
+        text,
+        senderId: 'synthetic-command-boundary-user',
+        ...(senderRole === undefined ? {} : { senderRole }),
+      });
+
+      expect(signals.classification).toBe('silent');
+      expect(signals.recommendedPath).toBe('silent_fast_path');
+      expect(signals.triggerReasons).not.toContain('command');
     });
   });
 

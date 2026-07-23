@@ -71,6 +71,16 @@ describe('E2E: Full Memory Cycle', () => {
     // 1. 用户陈述偏好
     const userMessage = '我喜欢喝咖啡';
     const botResponse = '知道了，你喜欢喝咖啡';
+    const messageId = 'msg-coffee-pref';
+    const timestamp = 1_700_000_000_000;
+
+    insertCanonicalChatSource(db, {
+      messageId,
+      conversationId,
+      userId,
+      text: userMessage,
+      timestamp,
+    });
 
     // 2. 提取记忆
     await memoryExtractor.extractFromTurn({
@@ -78,6 +88,8 @@ describe('E2E: Full Memory Cycle', () => {
       userId,
       userMessage,
       botResponse,
+      messageId,
+      timestamp,
     });
 
     // 3. 验证存储
@@ -128,27 +140,42 @@ describe('E2E: Full Memory Cycle', () => {
       { user: '我需要学习 TypeScript', bot: '好的' },
     ];
 
-    for (const turn of turns) {
+    for (const [index, turn] of turns.entries()) {
+      const messageId = `msg-bob-${index + 1}`;
+      const timestamp = 1_700_000_001_000 + index;
+      insertCanonicalChatSource(db, {
+        messageId,
+        conversationId,
+        userId,
+        text: turn.user,
+        timestamp,
+      });
       await memoryExtractor.extractFromTurn({
         conversationId,
         userId,
         userMessage: turn.user,
         botResponse: turn.bot,
+        messageId,
+        timestamp,
       });
     }
 
-    // 验证所有记忆
-    const memories = await memoryRepo.retrieve({
+    const activeMemories = await memoryRepo.retrieve({
       canonicalUserId: userId,
       state: 'active',
     });
+    const proposedMemories = await memoryRepo.retrieve({
+      canonicalUserId: userId,
+      state: 'proposed',
+    });
 
-    expect(memories.length).toBeGreaterThanOrEqual(3);
+    expect(activeMemories).toHaveLength(2);
+    expect(proposedMemories).toHaveLength(1);
 
-    const contents = memories.map(m => m.content);
-    expect(contents.some(c => c.includes('Bob'))).toBe(true);
-    expect(contents.some(c => c.includes('编程'))).toBe(true);
-    expect(contents.some(c => c.includes('TypeScript'))).toBe(true);
+    const activeContents = activeMemories.map((memory) => memory.content);
+    expect(activeContents.some((content) => content.includes('编程'))).toBe(true);
+    expect(activeContents.some((content) => content.includes('TypeScript'))).toBe(true);
+    expect(proposedMemories[0].content).toContain('Bob');
   });
 
   it('should respect visibility rules in memory retrieval', async () => {
@@ -159,23 +186,32 @@ describe('E2E: Full Memory Cycle', () => {
     await identityRepo.ensureCanonicalUser(userId);
 
     // 在私聊中陈述
+    insertCanonicalChatSource(db, {
+      messageId: 'msg-charlie-birthday',
+      conversationId: privateConvId,
+      userId,
+      text: '我的生日是 1月1日',
+      timestamp: 1_700_000_002_000,
+    });
     await memoryExtractor.extractFromTurn({
       conversationId: privateConvId,
       userId,
       userMessage: '我的生日是 1月1日',
       botResponse: '记住了',
+      messageId: 'msg-charlie-birthday',
+      timestamp: 1_700_000_002_000,
     });
 
-    // 手动设置为 private_only
-    const privateMemory = await memoryRepo.retrieve({
+    const privateProposals = await memoryRepo.retrieve({
       canonicalUserId: userId,
-      state: 'active',
+      state: 'proposed',
     });
-
-    if (privateMemory[0]) {
-      await db.prepare('UPDATE memory_records SET visibility = ? WHERE id = ?')
-        .run('private_only', privateMemory[0].id);
-    }
+    expect(privateProposals).toHaveLength(1);
+    expect(privateProposals[0].visibility).toBe('private_only');
+    await memoryRepo.approve(privateProposals[0].id, {
+      actor: { canonicalUserId: 'admin', actorClass: 'admin', context: 'admin_cli' },
+      reason: 'E2E approval for private visibility check',
+    });
 
     // 在私聊中应该能检索到
     const privateContext = await contextBuilder.buildContext({
@@ -208,6 +244,15 @@ describe('E2E: Full Memory Cycle', () => {
 
     await identityRepo.ensureCanonicalUser(userId);
 
+    insertCanonicalChatSource(db, {
+      messageId: 'msg-rust-pref',
+      conversationId,
+      userId,
+      text: '我喜欢在群里讨论 Rust',
+      timestamp: 123456,
+      conversationType: 'group',
+      groupId,
+    });
     const extraction = await memoryExtractor.extractFromTurn({
       conversationId,
       userId,
@@ -267,6 +312,15 @@ describe('E2E: Full Memory Cycle', () => {
       reason: 'E2E restore disabled memory',
     });
 
+    insertCanonicalChatSource(db, {
+      messageId: 'msg-rust-pref-update',
+      conversationId,
+      userId,
+      text: 'Elena prefers Rust async-runtime discussions in this group',
+      timestamp: 123999,
+      conversationType: 'group',
+      groupId,
+    });
     const replacementId = await memoryRepo.create({
       scope: 'user',
       canonicalUserId: userId,
@@ -421,3 +475,65 @@ describe('E2E: Full Memory Cycle', () => {
     expect(context.recentMessages[2].text).toBe('今天天气怎么样');
   });
 });
+
+function insertCanonicalChatSource(
+  db: Database.Database,
+  input: {
+    messageId: string;
+    conversationId: string;
+    userId: string;
+    text: string;
+    timestamp: number;
+    conversationType?: 'private' | 'group';
+    groupId?: string;
+  },
+): void {
+  const rawEventId = `raw-${input.messageId}`;
+  const conversationType = input.conversationType ?? 'private';
+  db.prepare(
+    `INSERT INTO platform_accounts (
+      platform, platform_account_id, canonical_user_id, account_type,
+      verified_level, status, first_seen_at, last_seen_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(platform, platform_account_id) DO NOTHING`,
+  ).run(
+    'qq',
+    input.userId,
+    input.userId,
+    conversationType === 'group' ? 'group_member' : 'private',
+    'observed',
+    'active',
+    input.timestamp,
+    input.timestamp,
+  );
+  db.prepare(
+    `INSERT INTO raw_events (
+      id, type, timestamp, source, platform, conversation_id, payload, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    rawEventId,
+    'chat.message.received',
+    input.timestamp,
+    'gateway',
+    'qq',
+    input.conversationId,
+    JSON.stringify({ text: input.text }),
+    input.timestamp,
+  );
+  db.prepare(
+    `INSERT INTO chat_messages (
+      id, raw_event_id, message_id, conversation_id, conversation_type,
+      group_id, sender_id, text, timestamp
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    input.messageId,
+    rawEventId,
+    input.messageId,
+    input.conversationId,
+    conversationType,
+    input.groupId ?? null,
+    input.userId,
+    input.text,
+    input.timestamp,
+  );
+}

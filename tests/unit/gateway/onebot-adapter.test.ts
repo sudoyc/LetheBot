@@ -72,9 +72,66 @@ class FakeWebSocket implements OneBotWebSocketLike {
   }
 }
 
+class DeferredCloseFakeWebSocket extends FakeWebSocket {
+  override close(): void {
+    this.readyState = 3;
+  }
+}
+
 describe('OneBotAdapter', () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it('reports only currently implemented OneBot gateway capabilities', () => {
+    const adapter = new OneBotAdapter({ httpUrl: 'http://localhost:3000' });
+
+    expect(adapter.getCapabilities()).toEqual({
+      platform: 'qq',
+      reactions: { emojiLike: false, faceMessage: true },
+      foldedForward: { groupForward: false, privateForward: false, customNode: false },
+      platformAdmin: { kick: false, mute: false, setGroupCard: false },
+    });
+  });
+
+  it('runs readiness callbacks only after the configured transport is ready', async () => {
+    const httpAdapter = new OneBotAdapter({
+      transport: 'http',
+      httpUrl: 'http://localhost:3000',
+    });
+    let httpReadyCalls = 0;
+    httpAdapter.whenReady(() => {
+      httpReadyCalls += 1;
+    });
+    expect(httpReadyCalls).toBe(0);
+    await httpAdapter.start();
+    expect(httpReadyCalls).toBe(1);
+    httpAdapter.whenReady(() => {
+      httpReadyCalls += 1;
+    });
+    expect(httpReadyCalls).toBe(2);
+    await httpAdapter.stop();
+
+    const sockets: FakeWebSocket[] = [];
+    const wsAdapter = new OneBotAdapter({
+      transport: 'ws',
+      httpUrl: 'http://localhost:3000',
+      wsUrl: 'ws://localhost:3001/',
+      webSocketFactory: (url) => {
+        const socket = new FakeWebSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+    });
+    let wsReadyCalls = 0;
+    wsAdapter.whenReady(() => {
+      wsReadyCalls += 1;
+    });
+    await wsAdapter.start();
+    expect(wsReadyCalls).toBe(0);
+    sockets[0]?.simulateOpen();
+    expect(wsReadyCalls).toBe(1);
+    await wsAdapter.stop();
   });
 
   it('validates reverse HTTP events with the configured bearer token', () => {
@@ -217,10 +274,33 @@ describe('OneBotAdapter', () => {
 
     expect(first.message.mentions).toEqual(['qq-111111']);
     expect(first.message.mentionsBot).toBe(false);
+    expect(first.ingress).toEqual({ transport: 'http', platformEventId: 'qq-1' });
+    expect(second.ingress).toEqual({ transport: 'http', platformEventId: 'qq-2' });
     expect(first.message.content.text).toBe('不是叫你');
     expect(second.message.mentions).toEqual(['qq-3889000770']);
     expect(second.message.mentionsBot).toBe(true);
     expect(second.message.content.text).toBe('你好');
+  });
+
+  it('does not treat a group-id namespace as a stable message event id', () => {
+    const adapter = new OneBotAdapter({ httpUrl: 'http://localhost:3000' });
+    const events: ChatMessageReceived[] = [];
+    adapter.onEvent((event) => events.push(event));
+
+    expect(adapter.dispatchInboundEvent({
+      post_type: 'message',
+      message_type: 'private',
+      message_id: 'qq-group-12345',
+      user_id: 12346,
+      message: 'wrong namespace',
+      raw_message: 'wrong namespace',
+      sender: { user_id: 12346, nickname: 'Namespace Test' },
+      time: 1782970000,
+    }, 'http')).toBe('accepted');
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.message.messageId).toMatch(/^qq-local-/);
+    expect(events[0]?.ingress).toEqual({ transport: 'http' });
   });
 
   it('parses sender role, group card, quote, and media from OneBot segments', () => {
@@ -1046,6 +1126,276 @@ describe('OneBotAdapter', () => {
     await adapter.stop();
   });
 
+  it('ignores late WebSocket messages after stop', async () => {
+    const sockets: DeferredCloseFakeWebSocket[] = [];
+    const adapter = new OneBotAdapter({
+      transport: 'ws',
+      httpUrl: 'http://localhost:3000',
+      wsUrl: 'ws://localhost:3001/',
+      webSocketFactory: (url) => {
+        const socket = new DeferredCloseFakeWebSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+    });
+    const events: ChatMessageReceived[] = [];
+    adapter.onEvent((event) => events.push(event));
+
+    await adapter.start();
+    const socket = sockets[0];
+    if (!socket) {
+      throw new Error('Expected fake WebSocket');
+    }
+    socket.simulateOpen();
+
+    await adapter.stop();
+    socket.simulateMessage({
+      post_type: 'message',
+      message_type: 'private',
+      message_id: 701,
+      user_id: 10001,
+      message: 'late after stop',
+      time: 1782970000,
+    });
+
+    expect(events).toHaveLength(0);
+    expect(adapter.getReadiness()).toMatchObject({
+      ready: false,
+      wsConnected: false,
+    });
+  });
+
+  it('ignores stale open and close events after a replacement WebSocket starts', async () => {
+    vi.useFakeTimers();
+    const sockets: DeferredCloseFakeWebSocket[] = [];
+    const errors: Error[] = [];
+    const adapter = new OneBotAdapter({
+      transport: 'ws',
+      httpUrl: 'http://localhost:3000',
+      wsUrl: 'ws://localhost:3001/',
+      wsReconnectIntervalMs: 100,
+      webSocketFactory: (url) => {
+        const socket = new DeferredCloseFakeWebSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+    });
+    adapter.on('error', (error) => {
+      errors.push(error instanceof Error ? error : new Error(String(error)));
+    });
+
+    try {
+      await adapter.start();
+      const staleSocket = sockets[0];
+      if (!staleSocket) {
+        throw new Error('Expected initial fake WebSocket');
+      }
+
+      await adapter.stop();
+      await adapter.start();
+      const replacementSocket = sockets[1];
+      if (!replacementSocket) {
+        throw new Error('Expected replacement fake WebSocket');
+      }
+
+      staleSocket.simulateOpen();
+      expect(adapter.getReadiness().ready).toBe(false);
+
+      replacementSocket.simulateOpen();
+      expect(adapter.getReadiness().ready).toBe(true);
+
+      staleSocket.simulateError(new Error('late stale error'));
+      expect(errors).toHaveLength(0);
+      expect(adapter.getReadiness().lastError).toBeUndefined();
+
+      staleSocket.simulateClose('late stale close');
+      expect(adapter.getReadiness().ready).toBe(true);
+
+      vi.advanceTimersByTime(100);
+      expect(sockets).toHaveLength(2);
+    } finally {
+      await adapter.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps replacement pending requests intact when a stale WebSocket closes', async () => {
+    const sockets: DeferredCloseFakeWebSocket[] = [];
+    const adapter = new OneBotAdapter({
+      transport: 'ws',
+      httpUrl: 'http://localhost:3000',
+      wsUrl: 'ws://localhost:3001/',
+      wsReconnectIntervalMs: 10_000,
+      webSocketFactory: (url) => {
+        const socket = new DeferredCloseFakeWebSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+    });
+
+    await adapter.start();
+    const staleSocket = sockets[0];
+    if (!staleSocket) {
+      throw new Error('Expected initial fake WebSocket');
+    }
+    await adapter.stop();
+    await adapter.start();
+    const replacementSocket = sockets[1];
+    if (!replacementSocket) {
+      throw new Error('Expected replacement fake WebSocket');
+    }
+    replacementSocket.simulateOpen();
+
+    const pending = adapter.sendGroupMessage('qq-group-20001', 'replacement request');
+    const request = JSON.parse(replacementSocket.sent[0] ?? '{}') as Record<string, unknown>;
+    const guardedPending = pending.then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+
+    staleSocket.simulateClose('late stale close');
+    expect(adapter.getReadiness().pendingWsRequests).toBe(1);
+
+    replacementSocket.simulateMessage({
+      status: 'ok',
+      retcode: 0,
+      data: { message_id: 702 },
+      echo: request.echo,
+    });
+
+    await expect(guardedPending).resolves.toEqual({ value: 'qq-702' });
+    expect(adapter.getReadiness()).toMatchObject({
+      ready: true,
+      wsConnected: true,
+      pendingWsRequests: 0,
+    });
+
+    await adapter.stop();
+  });
+
+  it('reconnects exactly once after the current WebSocket closes unexpectedly', async () => {
+    vi.useFakeTimers();
+    const sockets: FakeWebSocket[] = [];
+    const adapter = new OneBotAdapter({
+      transport: 'ws',
+      httpUrl: 'http://localhost:3000',
+      wsUrl: 'ws://localhost:3001/',
+      wsReconnectIntervalMs: 100,
+      webSocketFactory: (url) => {
+        const socket = new FakeWebSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+    });
+
+    try {
+      await adapter.start();
+      const socket = sockets[0];
+      if (!socket) {
+        throw new Error('Expected initial fake WebSocket');
+      }
+      socket.simulateOpen();
+      socket.simulateClose('unexpected close');
+
+      expect(adapter.getReadiness().ready).toBe(false);
+      vi.advanceTimersByTime(99);
+      expect(sockets).toHaveLength(1);
+      vi.advanceTimersByTime(1);
+      expect(sockets).toHaveLength(2);
+
+      const replacementSocket = sockets[1];
+      if (!replacementSocket) {
+        throw new Error('Expected replacement fake WebSocket');
+      }
+      expect(adapter.getReadiness().ready).toBe(false);
+      replacementSocket.simulateOpen();
+      expect(adapter.getReadiness().ready).toBe(true);
+
+      vi.advanceTimersByTime(1_000);
+      expect(sockets).toHaveLength(2);
+    } finally {
+      await adapter.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('retries a synchronous WebSocket factory failure after the reconnect delay', async () => {
+    vi.useFakeTimers();
+    const sockets: FakeWebSocket[] = [];
+    let attempts = 0;
+    const adapter = new OneBotAdapter({
+      transport: 'ws',
+      httpUrl: 'http://localhost:3000',
+      wsUrl: 'ws://localhost:3001/',
+      wsReconnectIntervalMs: 100,
+      webSocketFactory: (url) => {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new Error('synthetic WebSocket factory failure');
+        }
+        const socket = new FakeWebSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+    });
+
+    try {
+      await adapter.start();
+      expect(attempts).toBe(1);
+      expect(adapter.getReadiness().ready).toBe(false);
+
+      vi.advanceTimersByTime(99);
+      expect(attempts).toBe(1);
+      vi.advanceTimersByTime(1);
+      expect(attempts).toBe(2);
+      expect(sockets).toHaveLength(1);
+
+      sockets[0]?.simulateOpen();
+      expect(adapter.getReadiness().ready).toBe(true);
+    } finally {
+      await adapter.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels a scheduled WebSocket reconnect when stopped', async () => {
+    vi.useFakeTimers();
+    const sockets: FakeWebSocket[] = [];
+    const adapter = new OneBotAdapter({
+      transport: 'ws',
+      httpUrl: 'http://localhost:3000',
+      wsUrl: 'ws://localhost:3001/',
+      wsReconnectIntervalMs: 100,
+      webSocketFactory: (url) => {
+        const socket = new FakeWebSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+    });
+
+    try {
+      await adapter.start();
+      const socket = sockets[0];
+      if (!socket) {
+        throw new Error('Expected initial fake WebSocket');
+      }
+      socket.simulateOpen();
+      socket.simulateClose('unexpected close before stop');
+
+      await adapter.stop();
+      vi.advanceTimersByTime(1_000);
+
+      expect(sockets).toHaveLength(1);
+      expect(adapter.getReadiness()).toMatchObject({
+        ready: false,
+        wsConnected: false,
+      });
+    } finally {
+      await adapter.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it('cleans up pending WebSocket OneBot API requests during stop without leaking close failures', async () => {
     const rawSecret = 'sk-onebot-ws-stop-close-failure-secret';
     const rawPlatformId = '123456797';
@@ -1839,6 +2189,7 @@ describe('OneBotAdapter', () => {
       mentionsBot: false,
     });
     expect(groupEvent.message.messageId).toMatch(/^qq-local-/);
+    expect(groupEvent.ingress).toEqual({ transport: 'ws' });
     expect(groupEvent.message.content.text).toBe('ws malformed identifiers should be bounded');
 
     expect(privateEvent.message).toMatchObject({
@@ -1849,6 +2200,7 @@ describe('OneBotAdapter', () => {
       mentionsBot: false,
     });
     expect(privateEvent.message.messageId).toMatch(/^qq-local-/);
+    expect(privateEvent.ingress).toEqual({ transport: 'ws' });
     expect(privateEvent.message.content.text).toBe(
       'ws malformed private identifiers should use sender fallback'
     );
@@ -2482,6 +2834,7 @@ describe('OneBotAdapter', () => {
     expect(events[0]?.message.conversationType).toBe('group');
     expect(events[0]?.message.mentionsBot).toBe(true);
     expect(events[0]?.message.content.text).toBe('ws hello');
+    expect(events[0]?.ingress).toEqual({ transport: 'ws', platformEventId: 'qq-88' });
 
     await adapter.stop();
   });

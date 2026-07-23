@@ -109,6 +109,32 @@ describe('Evaluator Types', () => {
       expect(request.initialRiskLevel).toBe('low');
     });
 
+    it('allows a memory request to be owned by a durable job attempt without a turn', () => {
+      const request: MemoryEvaluationRequest = {
+        requestId: 'req-memory-job-001',
+        domain: 'memory',
+        jobAttemptId: 'attempt-memory-001',
+        actor: { actorClass: 'system_worker' },
+        context: 'background_worker',
+        sourceEventIds: ['event-memory-001'],
+        contextSummary: 'Durable extraction candidate',
+        memoryCandidate: {
+          scope: 'user',
+          canonicalUserId: 'user-003',
+          kind: 'preference',
+          title: 'Language',
+          content: 'Prefers English',
+          confidence: 0.9,
+          sourceContext: 'private_chat',
+        },
+        initialRiskLevel: 'low',
+        createdAt: new Date(),
+      };
+
+      expect(request.jobAttemptId).toBe('attempt-memory-001');
+      expect(request).not.toHaveProperty('turnId');
+    });
+
     it('should support all risk levels', () => {
       const riskLevels: Array<MemoryEvaluationRequest['initialRiskLevel']> = ['low', 'medium', 'high'];
 

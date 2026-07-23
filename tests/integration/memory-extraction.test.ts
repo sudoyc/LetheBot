@@ -32,7 +32,7 @@ describe('MemoryExtractionWorker - Integration Tests', () => {
 
   describe('Database integration', () => {
     it('should create memory records that can be queried from memory_records table', async () => {
-      const result = await worker.extractFromTurn({
+      const result = await extractCanonicalTurn(db, worker, {
         conversationId: 'conv-db-001',
         userId: 'user-alice',
         userMessage: '我叫Alice，我喜欢编程',
@@ -47,13 +47,17 @@ describe('MemoryExtractionWorker - Integration Tests', () => {
         .all('user-alice') as any[];
 
       expect(memories).toHaveLength(2);
-      expect(memories[0].scope).toBe('user');
-      expect(memories[0].visibility).toBe('private_only');
-      expect(memories[0].state).toBe('active');
+      expect(memories.every((memory) => memory.scope === 'user')).toBe(true);
+      expect(memories.every((memory) => memory.visibility === 'private_only')).toBe(true);
+      expect(memories.map((memory) => ({ kind: memory.kind, state: memory.state })))
+        .toEqual(expect.arrayContaining([
+          { kind: 'fact', state: 'proposed' },
+          { kind: 'preference', state: 'active' },
+        ]));
     });
 
-    it('should automatically create canonical_users record', async () => {
-      const result = await worker.extractFromTurn({
+    it('should persist memory through an active canonical QQ source identity', async () => {
+      const result = await extractCanonicalTurn(db, worker, {
         conversationId: 'conv-db-002',
         userId: 'user-newuser',
         userMessage: '我喜欢音乐',
@@ -62,19 +66,25 @@ describe('MemoryExtractionWorker - Integration Tests', () => {
 
       expect(result.matched).toBe(true);
 
-      // 验证用户记录被创建
-      const user = db
-        .prepare('SELECT * FROM canonical_users WHERE id = ?')
-        .get('user-newuser') as any;
+      const provenance = db.prepare(
+        `SELECT mr.canonical_user_id, pa.status, ms.source_type, ms.chat_message_id
+           FROM memory_records mr
+           JOIN platform_accounts pa
+             ON pa.platform = 'qq' AND pa.canonical_user_id = mr.canonical_user_id
+           JOIN memory_sources ms ON ms.memory_id = mr.id
+          WHERE mr.id = ?`
+      ).get(result.memoryIds[0]);
 
-      expect(user).toBeDefined();
-      expect(user.id).toBe('user-newuser');
-      expect(user.created_at).toBeDefined();
-      expect(user.last_seen_at).toBeDefined();
+      expect(provenance).toEqual({
+        canonical_user_id: 'user-newuser',
+        status: 'active',
+        source_type: 'chat_message',
+        chat_message_id: 'chat-source-conv-db-002-user-newuser',
+      });
     });
 
     it('should store sourceContext correctly', async () => {
-      const result = await worker.extractFromTurn({
+      const result = await extractCanonicalTurn(db, worker, {
         conversationId: 'conv-db-003',
         userId: 'user-bob',
         userMessage: '我喜欢阅读',
@@ -91,7 +101,7 @@ describe('MemoryExtractionWorker - Integration Tests', () => {
 
     it('should handle multiple extractions for same user independently', async () => {
       // 第一次提取
-      await worker.extractFromTurn({
+      await extractCanonicalTurn(db, worker, {
         conversationId: 'conv-db-004',
         userId: 'user-charlie',
         userMessage: '我喜欢游泳',
@@ -99,7 +109,7 @@ describe('MemoryExtractionWorker - Integration Tests', () => {
       });
 
       // 第二次提取
-      await worker.extractFromTurn({
+      await extractCanonicalTurn(db, worker, {
         conversationId: 'conv-db-005',
         userId: 'user-charlie',
         userMessage: '我喜欢跑步',
@@ -118,7 +128,7 @@ describe('MemoryExtractionWorker - Integration Tests', () => {
 
   describe('Repository integration', () => {
     it('should use MemoryRepository.create() for memory creation', async () => {
-      const result = await worker.extractFromTurn({
+      const result = await extractCanonicalTurn(db, worker, {
         conversationId: 'conv-repo-001',
         userId: 'user-dave',
         userMessage: '我叫Dave',
@@ -135,7 +145,7 @@ describe('MemoryExtractionWorker - Integration Tests', () => {
     });
 
     it('should return correct memory ID from Repository', async () => {
-      const result = await worker.extractFromTurn({
+      const result = await extractCanonicalTurn(db, worker, {
         conversationId: 'conv-repo-002',
         userId: 'user-eve',
         userMessage: '我喜欢画画',
@@ -144,8 +154,8 @@ describe('MemoryExtractionWorker - Integration Tests', () => {
 
       const memoryId = result.memoryIds[0];
 
-      // 验证ID格式（ULID）
-      expect(memoryId).toMatch(/^[0-9A-Z]{26}$/);
+      // Extraction effects use a deterministic, versioned identity for safe retries.
+      expect(memoryId).toMatch(/^extraction-v1-[a-f0-9]{64}$/);
 
       // 验证可以通过Repository查询
       const memory = await memoryRepo.findById(memoryId);
@@ -171,7 +181,7 @@ describe('MemoryExtractionWorker - Integration Tests', () => {
 
   describe('Batch processing integration', () => {
     it('should create all memories in batch processing', async () => {
-      const result = await worker.extractBatch({
+      const result = await extractCanonicalBatch(db, worker, {
         conversationId: 'conv-batch-int-001',
         turns: [
           {
@@ -201,8 +211,8 @@ describe('MemoryExtractionWorker - Integration Tests', () => {
       }
     });
 
-    it('should create users for all unique userIds in batch', async () => {
-      await worker.extractBatch({
+    it('should preserve active canonical QQ source identities for all unique users in batch', async () => {
+      await extractCanonicalBatch(db, worker, {
         conversationId: 'conv-batch-int-002',
         turns: [
           {
@@ -218,12 +228,19 @@ describe('MemoryExtractionWorker - Integration Tests', () => {
         ],
       });
 
-      // 验证两个用户都被创建
       const users = db
-        .prepare('SELECT * FROM canonical_users WHERE id IN (?, ?)')
+        .prepare(
+          `SELECT canonical_user_id, status
+             FROM platform_accounts
+            WHERE platform = 'qq' AND canonical_user_id IN (?, ?)
+            ORDER BY canonical_user_id`
+        )
         .all('user-henry', 'user-iris') as any[];
 
-      expect(users).toHaveLength(2);
+      expect(users).toEqual([
+        { canonical_user_id: 'user-henry', status: 'active' },
+        { canonical_user_id: 'user-iris', status: 'active' },
+      ]);
     });
   });
 
@@ -239,7 +256,7 @@ describe('MemoryExtractionWorker - Integration Tests', () => {
         },
       ]);
 
-      const result = await customWorker.extractFromTurn({
+      const result = await extractCanonicalTurn(db, customWorker, {
         conversationId: 'conv-custom-001',
         userId: 'user-jack',
         userMessage: '项目名称是LetheBot',
@@ -257,7 +274,7 @@ describe('MemoryExtractionWorker - Integration Tests', () => {
   describe('Memory retrieval integration', () => {
     it('should allow retrieving extracted memories for a user', async () => {
       // 提取多条记忆
-      await worker.extractFromTurn({
+      await extractCanonicalTurn(db, worker, {
         conversationId: 'conv-retrieve-001',
         userId: 'user-kate',
         userMessage: '我叫Kate，我喜欢旅行',
@@ -270,13 +287,21 @@ describe('MemoryExtractionWorker - Integration Tests', () => {
         state: 'active',
       });
 
-      expect(memories.length).toBe(2);
+      expect(memories).toHaveLength(1);
       expect(memories[0].canonicalUserId).toBe('user-kate');
       expect(memories[0].state).toBe('active');
+      expect(memories[0].kind).toBe('preference');
+
+      const proposals = await memoryRepo.retrieve({
+        canonicalUserId: 'user-kate',
+        state: 'proposed',
+      });
+      expect(proposals).toHaveLength(1);
+      expect(proposals[0]).toMatchObject({ kind: 'fact', state: 'proposed' });
     });
 
     it('should filter memories by scope correctly', async () => {
-      await worker.extractFromTurn({
+      await extractCanonicalTurn(db, worker, {
         conversationId: 'conv-retrieve-002',
         userId: 'user-leo',
         userMessage: '我喜欢足球',
@@ -301,11 +326,12 @@ describe('MemoryExtractionWorker - Integration Tests', () => {
 
       // 执行多次提取
       for (let i = 0; i < 5; i++) {
-        await worker.extractFromTurn({
+        await extractCanonicalTurn(db, worker, {
           conversationId,
           userId,
           userMessage: `我喜欢活动${i}`,
           botResponse: '很好',
+          messageId: `msg-consistency-${i}`,
         });
       }
 
@@ -328,36 +354,156 @@ describe('MemoryExtractionWorker - Integration Tests', () => {
 
   describe('Error recovery integration', () => {
     it('should handle partial batch failure gracefully', async () => {
+      const conversationId = 'conv-error-recovery-001';
+      const validMessageId = 'msg-error-recovery-valid';
+      const timestamp = 1_700_000_000_000;
+      insertCanonicalChatSource(db, {
+        rawEventId: 'raw-error-recovery-valid',
+        chatMessageId: validMessageId,
+        conversationId,
+        userId: 'user-nancy',
+        text: '我喜欢绘画',
+        timestamp,
+      });
+
       const result = await worker.extractBatch({
-        conversationId: 'conv-error-recovery-001',
+        conversationId,
         turns: [
           {
             userId: 'user-nancy',
             userMessage: '我喜欢绘画',
             botResponse: '很好',
-          },
-          {
-            userId: 'user-nancy',
-            userMessage: '没有匹配内容',
-            botResponse: '好的',
+            messageId: validMessageId,
+            timestamp,
           },
           {
             userId: 'user-nancy',
             userMessage: '我喜欢摄影',
             botResponse: '很好',
+            messageId: 'msg-error-recovery-missing',
+            timestamp: timestamp + 1,
           },
         ],
       });
 
-      // 应该成功提取2条（第2条无匹配）
-      expect(result.count).toBe(2);
+      expect(result.count).toBe(1);
+      expect(result.errors).toHaveLength(1);
 
       const memories = await memoryRepo.retrieve({
         canonicalUserId: 'user-nancy',
         state: 'active',
       });
 
-      expect(memories).toHaveLength(2);
+      expect(memories).toHaveLength(1);
     });
   });
 });
+
+function insertCanonicalChatSource(
+  db: Database.Database,
+  input: {
+    rawEventId: string;
+    chatMessageId: string;
+    conversationId: string;
+    userId: string;
+    text: string;
+    timestamp: number;
+    conversationType?: 'private' | 'group';
+    groupId?: string;
+  },
+): void {
+  const conversationType = input.conversationType ?? 'private';
+  const senderId = `qq-source-${input.userId}`;
+  const platformAccountId = senderId.replace(/^qq-/, '');
+  db.prepare(
+    'INSERT OR IGNORE INTO canonical_users (id, created_at, last_seen_at) VALUES (?, ?, ?)'
+  ).run(input.userId, input.timestamp, input.timestamp);
+  db.prepare(
+    `INSERT OR REPLACE INTO platform_accounts (
+      platform, platform_account_id, canonical_user_id, account_type,
+      verified_level, status, first_seen_at, last_seen_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    'qq',
+    platformAccountId,
+    input.userId,
+    conversationType === 'group' ? 'group_member' : 'private',
+    'observed',
+    'active',
+    input.timestamp,
+    input.timestamp,
+  );
+  db.prepare(
+    `INSERT INTO raw_events (
+      id, type, timestamp, source, platform, conversation_id, payload, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    input.rawEventId,
+    'chat.message.received',
+    input.timestamp,
+    'gateway',
+    'qq',
+    input.conversationId,
+    '{}',
+    input.timestamp,
+  );
+  db.prepare(
+    `INSERT INTO chat_messages (
+      id, raw_event_id, message_id, conversation_id, conversation_type,
+      group_id, sender_id, text, timestamp
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    input.chatMessageId,
+    input.rawEventId,
+    `platform-${input.chatMessageId}`,
+    input.conversationId,
+    conversationType,
+    input.groupId ?? null,
+    senderId,
+    input.text,
+    input.timestamp,
+  );
+}
+
+async function extractCanonicalTurn(
+  db: Database.Database,
+  worker: MemoryExtractionWorker,
+  input: Parameters<MemoryExtractionWorker['extractFromTurn']>[0],
+) {
+  const messageId = input.messageId ?? `chat-source-${input.conversationId}-${input.userId}`;
+  const timestamp = input.timestamp ?? 1_700_000_000_000;
+  insertCanonicalChatSource(db, {
+    rawEventId: `raw-source-${messageId}`,
+    chatMessageId: messageId,
+    conversationId: input.conversationId,
+    userId: input.userId,
+    text: input.userMessage,
+    timestamp,
+    conversationType: input.conversationType,
+    groupId: input.groupId,
+  });
+  return worker.extractFromTurn({ ...input, messageId, timestamp });
+}
+
+async function extractCanonicalBatch(
+  db: Database.Database,
+  worker: MemoryExtractionWorker,
+  input: Parameters<MemoryExtractionWorker['extractBatch']>[0],
+) {
+  const turns = input.turns.map((turn, index) => {
+    const messageId = turn.messageId ?? `chat-source-${input.conversationId}-${turn.userId}-${index}`;
+    const timestamp = turn.timestamp ?? 1_700_000_000_000 + index;
+    insertCanonicalChatSource(db, {
+      rawEventId: `raw-source-${messageId}`,
+      chatMessageId: messageId,
+      conversationId: input.conversationId,
+      userId: turn.userId,
+      text: turn.userMessage,
+      timestamp,
+      conversationType: turn.conversationType,
+      groupId: turn.groupId,
+    });
+    return { ...turn, messageId, timestamp };
+  });
+  return worker.extractBatch({ ...input, turns });
+}

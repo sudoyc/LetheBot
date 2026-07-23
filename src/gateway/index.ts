@@ -4,5 +4,5 @@
  * 统一导出网关相关模块
  */
 
-export * from './adapter';
-export * from './onebot-adapter';
+export * from './adapter.js';
+export * from './onebot-adapter.js';

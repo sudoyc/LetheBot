@@ -7,7 +7,7 @@
 
 import type Database from 'better-sqlite3';
 import { ulid } from 'ulidx';
-import { redactSecretsInText } from '../memory/secret-scan';
+import { redactSecretsInText } from '../memory/secret-scan.js';
 
 export type JobStatus = 'pending' | 'running' | 'completed' | 'failed';
 export type JobAttemptStatus = 'running' | 'completed' | 'failed';
@@ -104,6 +104,35 @@ interface JobRow {
 interface AttemptNumberRow {
   attempts: number;
   max_attempts: number;
+}
+
+export function hasActiveJobAttemptAuthority(
+  db: Database.Database,
+  options: {
+    jobId: string;
+    attemptId: string;
+    now: number;
+    workerId?: string;
+  },
+): boolean {
+  const row = db.prepare(
+    `SELECT job_attempts.worker_id
+       FROM job_attempts
+       JOIN jobs ON jobs.id = job_attempts.job_id
+      WHERE jobs.id = ?
+        AND job_attempts.id = ?
+        AND jobs.status = 'running'
+        AND job_attempts.status = 'running'
+        AND jobs.attempts = job_attempts.attempt_number
+        AND jobs.lease_owner = job_attempts.worker_id
+        AND jobs.lease_expires_at IS NOT NULL
+        AND jobs.lease_expires_at > ?`
+  ).get(options.jobId, options.attemptId, options.now) as {
+    worker_id: string;
+  } | undefined;
+
+  return row !== undefined
+    && (options.workerId === undefined || row.worker_id === options.workerId);
 }
 
 export class JobRepository {
@@ -286,9 +315,17 @@ export class JobRepository {
       .run(now, now, error, now, now, ...typeFilter.params);
   }
 
-  complete(options: CompleteJobOptions): void {
+  complete(options: CompleteJobOptions): boolean {
     const now = options.now ?? Date.now();
-    const transaction = this.db.transaction(() => {
+    const transaction = this.db.transaction((): boolean => {
+      if (!hasActiveJobAttemptAuthority(this.db, {
+        jobId: options.jobId,
+        attemptId: options.attemptId,
+        now,
+      })) {
+        return false;
+      }
+
       const resultJson =
         options.result === undefined ? null : JSON.stringify(redactStructuredDiagnostics(options.result));
 
@@ -300,11 +337,11 @@ export class JobRepository {
         )
         .run(now, now, resultJson, options.attemptId, options.jobId);
 
-      if (attemptResult.changes === 0) {
-        return;
+      if (attemptResult.changes !== 1) {
+        throw new Error('Active job attempt completion update failed');
       }
 
-      this.db
+      const jobResult = this.db
         .prepare(
           `UPDATE jobs
            SET status = 'completed', completed_at = ?, updated_at = ?, result = ?,
@@ -312,21 +349,35 @@ export class JobRepository {
            WHERE id = ? AND status = 'running'`
         )
         .run(now, now, resultJson, now, options.jobId);
+
+      if (jobResult.changes !== 1) {
+        throw new Error('Active job completion update failed');
+      }
+
+      return true;
     });
 
-    transaction();
+    return transaction.immediate();
   }
 
-  fail(options: FailJobOptions): void {
+  fail(options: FailJobOptions): boolean {
     const now = options.now ?? Date.now();
     const retryDelayMs = options.retryDelayMs ?? 0;
     const redactedError = redactJobDiagnosticText(options.error);
-    const transaction = this.db.transaction(() => {
+    const transaction = this.db.transaction((): boolean => {
+      if (!hasActiveJobAttemptAuthority(this.db, {
+        jobId: options.jobId,
+        attemptId: options.attemptId,
+        now,
+      })) {
+        return false;
+      }
+
       const row = this.db
         .prepare('SELECT attempts, max_attempts FROM jobs WHERE id = ?')
         .get(options.jobId) as AttemptNumberRow | undefined;
       if (!row) {
-        return;
+        throw new Error('Active job attempt disappeared before failure update');
       }
 
       const shouldRetry = !options.terminal && row.attempts < row.max_attempts;
@@ -342,11 +393,11 @@ export class JobRepository {
         )
         .run(now, now, redactedError, options.attemptId, options.jobId);
 
-      if (attemptResult.changes === 0) {
-        return;
+      if (attemptResult.changes !== 1) {
+        throw new Error('Active job attempt failure update failed');
       }
 
-      this.db
+      const jobResult = this.db
         .prepare(
           `UPDATE jobs
            SET status = ?, scheduled_at = ?, completed_at = ?, updated_at = ?, error = ?,
@@ -354,9 +405,15 @@ export class JobRepository {
            WHERE id = ? AND status = 'running'`
         )
         .run(nextStatus, scheduledAt, completedAt, now, redactedError, now, options.jobId);
+
+      if (jobResult.changes !== 1) {
+        throw new Error('Active job failure update failed');
+      }
+
+      return true;
     });
 
-    transaction();
+    return transaction.immediate();
   }
 
   heartbeat(options: HeartbeatOptions): void {
@@ -383,10 +440,19 @@ export class JobRepository {
       );
   }
 
-  extendLease(options: { jobId: string; attemptId: string; workerId: string; leaseMs: number; now?: number }): void {
+  extendLease(options: { jobId: string; attemptId: string; workerId: string; leaseMs: number; now?: number }): boolean {
     const now = options.now ?? Date.now();
     const leaseExpiresAt = now + options.leaseMs;
-    const transaction = this.db.transaction(() => {
+    const transaction = this.db.transaction((): boolean => {
+      if (!hasActiveJobAttemptAuthority(this.db, {
+        jobId: options.jobId,
+        attemptId: options.attemptId,
+        workerId: options.workerId,
+        now,
+      })) {
+        return false;
+      }
+
       const attemptResult = this.db
         .prepare(
           `UPDATE job_attempts
@@ -395,20 +461,26 @@ export class JobRepository {
         )
         .run(now, options.attemptId, options.jobId, options.workerId);
 
-      if (attemptResult.changes === 0) {
-        return;
+      if (attemptResult.changes !== 1) {
+        throw new Error('Active job attempt lease update failed');
       }
 
-      this.db
+      const jobResult = this.db
         .prepare(
           `UPDATE jobs
            SET lease_owner = ?, lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
            WHERE id = ? AND status = 'running' AND lease_owner = ?`
         )
         .run(options.workerId, leaseExpiresAt, now, now, options.jobId, options.workerId);
+
+      if (jobResult.changes !== 1) {
+        throw new Error('Active job lease update failed');
+      }
+
+      return true;
     });
 
-    transaction();
+    return transaction.immediate();
   }
 
   private buildTypeFilter(types: string[] | undefined): { sql: string; params: unknown[] } {

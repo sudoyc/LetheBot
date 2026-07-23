@@ -11,10 +11,12 @@ import type { PiAdapter } from '../../src/pi/pi-adapter.js';
 import { MemoryRepository } from '../../src/storage/memory-repository.js';
 import { ContextBuilder } from '../../src/context/builder.js';
 import { IdentityRepository } from '../../src/storage/identity-repository.js';
-import { initDatabase } from '../../src/storage/database.js';
+import { GroupSummaryPolicyRepository } from '../../src/storage/group-summary-policy-repository.js';
+import { JobRepository } from '../../src/storage/job-repository.js';
+import { initDatabase, runMigrations } from '../../src/storage/database.js';
 import type Database from 'better-sqlite3';
 import { join } from 'node:path';
-import { mkdirSync, rmSync, existsSync, readFileSync } from 'node:fs';
+import { mkdirSync, rmSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 
@@ -25,6 +27,7 @@ describe('SummaryWorker Integration', () => {
   let db: Database.Database;
   let memoryRepo: MemoryRepository;
   let identityRepo: IdentityRepository;
+  let groupSummaryPolicies: GroupSummaryPolicyRepository;
   let contextBuilder: ContextBuilder;
   let summaryWorker: SummaryWorker;
   let backgroundWorker: BackgroundWorker;
@@ -47,13 +50,12 @@ describe('SummaryWorker Integration', () => {
     db = initDatabase({ path: testDbPath });
 
     // 运行迁移
-    const migrationPath = join(__dirname, '../../migrations/001_initial_schema.sql');
-    const sql = readFileSync(migrationPath, 'utf-8');
-    db.exec(sql);
+    runMigrations(db, join(__dirname, '../../migrations'));
 
     // 初始化仓库
     memoryRepo = new MemoryRepository(db);
     identityRepo = new IdentityRepository(db);
+    groupSummaryPolicies = new GroupSummaryPolicyRepository(db);
 
     // 创建 mock PiAdapter
     mockPiAdapter = {
@@ -68,7 +70,12 @@ describe('SummaryWorker Integration', () => {
       }),
     } as any;
 
-    summaryWorker = new SummaryWorker(db, mockPiAdapter, memoryRepo);
+    summaryWorker = new SummaryWorker(
+      db,
+      mockPiAdapter,
+      memoryRepo,
+      new ContextBuilder(memoryRepo, identityRepo),
+    );
     backgroundWorker = new BackgroundWorker();
 
     // 初始化 ContextBuilder
@@ -81,6 +88,31 @@ describe('SummaryWorker Integration', () => {
       rmSync(testDbPath);
     }
   });
+
+  function enableGroupSummary(groupId: string, eligibleAfter = 0): void {
+    db.prepare(
+      `INSERT INTO group_summary_policies (
+         group_id, state, generation, eligible_after, created_at, updated_at
+       ) VALUES (?, 'enabled', 1, ?, ?, ?)`,
+    ).run(groupId, eligibleAfter, eligibleAfter, eligibleAfter);
+  }
+
+  function setGroupSummaryEnabled(
+    groupId: string,
+    enabled: boolean,
+    now: number,
+  ): void {
+    groupSummaryPolicies.setEnabled({
+      groupId,
+      enabled,
+      authority: {
+        kind: 'bot_owner',
+        actorUserId: 'test-bot-owner',
+        invocationContext: 'admin_cli',
+      },
+      now,
+    });
+  }
 
   describe('End-to-End Summary Flow', () => {
     it('should generate and store summary for real conversation', async () => {
@@ -260,6 +292,109 @@ describe('SummaryWorker Integration', () => {
         expect(linkedMessageIds).toContain(msgId);
       }
     });
+
+    it('does not commit a durable group summary when policy is disabled during Provider I/O', async () => {
+      const base = Date.now();
+      const groupId = 'group-disable-during-provider';
+      const conversationId = 'conv-disable-during-provider';
+      const sourceChatMessageIds: string[] = [];
+      enableGroupSummary(groupId, base);
+      for (let index = 0; index < 15; index += 1) {
+        const rawEventId = `evt-disable-during-provider-${index}`;
+        const chatMessageId = `msg-disable-during-provider-${index}`;
+        sourceChatMessageIds.push(chatMessageId);
+        db.prepare(
+          `INSERT INTO raw_events (id, type, timestamp, source, payload, created_at)
+           VALUES (?, 'message.group', ?, 'gateway', '{}', ?)`,
+        ).run(rawEventId, base + index, base + index + 1);
+        db.prepare(
+          `INSERT INTO chat_messages (
+             id, raw_event_id, message_id, conversation_id, conversation_type,
+             group_id, sender_id, text, timestamp
+           ) VALUES (?, ?, ?, ?, 'group', ?, ?, ?, ?)`,
+        ).run(
+          chatMessageId,
+          rawEventId,
+          `platform-disable-during-provider-${index}`,
+          conversationId,
+          groupId,
+          `user-${index % 3}`,
+          `Message ${index}`,
+          base + index,
+        );
+      }
+      const jobs = new JobRepository(db);
+      const jobId = jobs.enqueue({
+        id: 'job-disable-during-provider',
+        type: 'summary',
+        payload: {
+          conversationId,
+          conversationType: 'group',
+          groupId,
+          windowVersion: 1,
+          sourceChatMessageIds,
+          candidateCount: sourceChatMessageIds.length,
+        },
+        now: base + 1,
+      });
+      groupSummaryPolicies.bindSummaryJob({
+        jobId,
+        groupId,
+        conversationId,
+        now: base + 1,
+      });
+      const claimed = jobs.claimNext({
+        workerId: 'summary-worker-provider-race',
+        types: ['summary'],
+        now: base + 2,
+        leaseMs: 60_000,
+      });
+      expect(claimed?.job.id).toBe(jobId);
+      let providerCalls = 0;
+      mockPiAdapter.runTurn = async (input) => {
+        providerCalls += 1;
+        setGroupSummaryEnabled(groupId, false, base + 3);
+        return {
+          turnId: input.turnId,
+          responseText: 'SUMMARY: This result must not be committed',
+          toolCallIds: [],
+          events: [],
+          tokensUsed: { input: 20, output: 10, total: 30 },
+          status: 'completed',
+        };
+      };
+      const durableWorker = new SummaryWorker(
+        db,
+        mockPiAdapter,
+        memoryRepo,
+        new ContextBuilder(memoryRepo, identityRepo),
+        {
+          requireDurableExecution: true,
+          piProvider: 'test-provider',
+          piModel: 'test-model',
+        },
+      );
+
+      await expect(durableWorker.generateSummary({
+        conversationId,
+        conversationType: 'group',
+        groupId,
+        sourceChatMessageIds,
+      }, {
+        jobId,
+        jobAttemptId: claimed?.attemptId ?? '',
+        attemptNumber: claimed?.attemptNumber ?? 0,
+        now: base + 4,
+      })).rejects.toMatchObject({ code: 'policy_disabled' });
+
+      expect(providerCalls).toBe(1);
+      expect(db.prepare('SELECT COUNT(*) AS count FROM memory_records').get()).toEqual({ count: 0 });
+      expect(db.prepare('SELECT status FROM model_invocations').all()).toEqual([
+        { status: 'completed' },
+      ]);
+      expect(db.prepare('PRAGMA integrity_check').get()).toEqual({ integrity_check: 'ok' });
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+    });
   });
 
   describe('BackgroundWorker Integration', () => {
@@ -385,6 +520,7 @@ describe('SummaryWorker Integration', () => {
       const now = Date.now();
       const privateConvId = 'conv-private';
       const groupConvId = 'conv-group';
+      enableGroupSummary('group-1', now);
 
       // 创建私聊摘要
       for (let i = 0; i < 15; i++) {
@@ -447,7 +583,7 @@ describe('SummaryWorker Integration', () => {
 
       // 验证私聊摘要的可见性
       const privateMemory = await memoryRepo.findById(privateResult.summaryId);
-      expect(privateMemory?.visibility).toBe('same_user_any_context');
+      expect(privateMemory?.visibility).toBe('private_only');
 
       // 验证群聊摘要的可见性
       const groupMemory = await memoryRepo.findById(groupResult.summaryId);
@@ -463,6 +599,7 @@ describe('SummaryWorker Integration', () => {
       const groupContextMemories = await memoryRepo.retrieve({
         conversationId: groupConvId,
         contextType: 'group',
+        groupId: 'group-1',
         state: 'active',
       });
 

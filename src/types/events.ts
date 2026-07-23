@@ -69,6 +69,11 @@ export interface ChatMessageReceived extends InternalEvent {
   source: 'gateway';
   platform: 'qq';
 
+  ingress: {
+    transport: 'http' | 'ws';
+    platformEventId?: string;
+  };
+
   message: {
     messageId: string; // 平台消息 ID
     conversationId: string;

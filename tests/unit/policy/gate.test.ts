@@ -1,6 +1,16 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { PolicyGate } from '../../../src/policy/gate';
 import { ToolRegistry } from '../../../src/tools/registry';
+import type { SandboxPolicy } from '../../../src/types/tool';
+
+function createSandboxPolicy(): SandboxPolicy {
+  return {
+    filesystem: 'none',
+    network: 'none',
+    execution: 'in_process',
+    maxRuntimeMs: 1000,
+  };
+}
 
 describe('PolicyGate', () => {
   let registry: ToolRegistry;
@@ -21,7 +31,12 @@ describe('PolicyGate', () => {
       },
       evaluatorPolicy: 'bypass',
       auditLevel: 'summary',
-      sandboxPolicy: { networkAccess: false, filesystemAccess: false, maxExecutionTimeMs: 1000 },
+      sandboxPolicy: {
+        filesystem: 'none',
+        network: 'none',
+        execution: 'in_process',
+        maxRuntimeMs: 1000,
+      },
       outputSensitivity: 'normal',
       piSchema: { input: {}, output: {} },
       handler: async () => ({ ok: true }),
@@ -63,7 +78,7 @@ describe('PolicyGate', () => {
         },
         evaluatorPolicy: 'required',
         auditLevel: 'full',
-        sandboxPolicy: { networkAccess: false, filesystemAccess: false, maxExecutionTimeMs: 1000 },
+        sandboxPolicy: createSandboxPolicy(),
         outputSensitivity: 'sensitive',
         piSchema: { input: {}, output: {} },
         handler: async () => ({ ok: true }),
@@ -89,6 +104,44 @@ describe('PolicyGate', () => {
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain('Permission denied');
     });
+
+    it.each(['none', 'subprocess', 'docker'] as const)(
+      'should deny unsupported %s execution before handler dispatch',
+      (execution) => {
+        const tool = registry.get('test_tool');
+        if (!tool) {
+          throw new Error('Expected registered test tool');
+        }
+        tool.sandboxPolicy.execution = execution;
+
+        const result = gate.checkToolCall({
+          toolName: 'test_tool',
+          actor: { actorClass: 'user', canonicalUserId: 'user-001' },
+          context: 'private_chat',
+        });
+
+        expect(result).toMatchObject({ allowed: false });
+        expect(result.reason).toMatch(/execution backend/i);
+      }
+    );
+
+    it('should deny missing execution metadata after registration', () => {
+      const tool = registry.get('test_tool');
+      if (!tool) {
+        throw new Error('Expected registered test tool');
+      }
+      const mutablePolicy: Partial<SandboxPolicy> = tool.sandboxPolicy;
+      delete mutablePolicy.execution;
+
+      const result = gate.checkToolCall({
+        toolName: 'test_tool',
+        actor: { actorClass: 'user', canonicalUserId: 'user-001' },
+        context: 'private_chat',
+      });
+
+      expect(result).toMatchObject({ allowed: false });
+      expect(result.reason).toMatch(/execution backend/i);
+    });
   });
 
   describe('L0 policy enforcement', () => {
@@ -105,7 +158,7 @@ describe('PolicyGate', () => {
         },
         evaluatorPolicy: 'bypass',
         auditLevel: 'summary',
-        sandboxPolicy: { networkAccess: false, filesystemAccess: false, maxExecutionTimeMs: 1000 },
+        sandboxPolicy: createSandboxPolicy(),
         outputSensitivity: 'normal',
         piSchema: { input: {}, output: {} },
         handler: async () => ({ ok: true }),

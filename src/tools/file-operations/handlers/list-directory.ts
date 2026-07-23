@@ -7,12 +7,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { minimatch } from 'minimatch';
-import type { ToolCallResult } from '../../../types/tool';
+import type { ToolCallResult } from '../../../types/tool.js';
 import {
   PathValidator,
+  throwIfFileOperationAborted,
   type FileOperationContext,
-} from '../path-validator';
-import { redactFileOperationText } from '../redaction';
+} from '../path-validator.js';
+import { redactFileOperationText } from '../redaction.js';
 
 interface ListDirectoryInput {
   path: string;
@@ -55,6 +56,8 @@ export class ListDirectoryHandler {
     const pathSecretsRedacted = redactedPathResult.redacted;
 
     try {
+      throwIfFileOperationAborted(context.signal);
+
       // 1. 路径验证
       const validation = await this.validator.validate(input.path, context);
       if (!validation.allowed) {
@@ -80,6 +83,7 @@ export class ListDirectoryHandler {
 
       // 2. 检查是否为目录
       const stats = await fs.promises.stat(normalizedPath);
+      throwIfFileOperationAborted(context.signal);
       if (!stats.isDirectory()) {
         return {
           toolCallId: context.toolCallId,
@@ -110,9 +114,11 @@ export class ListDirectoryHandler {
           normalizedPath,
           input.path,
           entries,
-          input.pattern
+          input.pattern,
+          context
         );
       }
+      throwIfFileOperationAborted(context.signal);
 
       const redactedEntries = entries.map((entry) => this.redactEntry(entry));
       const output: ListDirectoryOutput = { entries: redactedEntries };
@@ -155,13 +161,17 @@ export class ListDirectoryHandler {
     normalizedPath: string,
     relativePath: string,
     entries: DirectoryEntry[],
-    pattern?: string
+    pattern: string | undefined,
+    context: FileOperationContext
   ): Promise<void> {
+    throwIfFileOperationAborted(context.signal);
     const dirEntries = await fs.promises.readdir(normalizedPath, {
       withFileTypes: true,
     });
+    throwIfFileOperationAborted(context.signal);
 
     for (const dirent of dirEntries) {
+      throwIfFileOperationAborted(context.signal);
       const entryPath = path.join(relativePath, dirent.name);
 
       // 应用 glob 模式过滤
@@ -171,6 +181,7 @@ export class ListDirectoryHandler {
 
       const fullPath = path.join(normalizedPath, dirent.name);
       const stats = await fs.promises.stat(fullPath);
+      throwIfFileOperationAborted(context.signal);
 
       const entry: DirectoryEntry = {
         name: dirent.name,
@@ -194,11 +205,14 @@ export class ListDirectoryHandler {
     pattern: string | undefined,
     context: FileOperationContext
   ): Promise<void> {
+    throwIfFileOperationAborted(context.signal);
     const dirEntries = await fs.promises.readdir(normalizedPath, {
       withFileTypes: true,
     });
+    throwIfFileOperationAborted(context.signal);
 
     for (const dirent of dirEntries) {
+      throwIfFileOperationAborted(context.signal);
       const entryPath = path.join(relativePath, dirent.name);
       const fullPath = path.join(normalizedPath, dirent.name);
 
@@ -209,6 +223,7 @@ export class ListDirectoryHandler {
       }
 
       const stats = await fs.promises.stat(fullPath);
+      throwIfFileOperationAborted(context.signal);
 
       // 应用 glob 模式过滤
       if (!pattern || minimatch(dirent.name, pattern)) {

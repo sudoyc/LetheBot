@@ -4,7 +4,7 @@
  * 审计日志和错误封装
  */
 
-import type { ActorClass, InvocationContext } from './tool';
+import type { ActorClass, InvocationContext } from './tool.js';
 
 /**
  * 审计条目

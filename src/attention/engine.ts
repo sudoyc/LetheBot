@@ -5,11 +5,11 @@
  */
 
 export interface AttentionSignals {
-  classification: 'silent' | 'needs_response' | 'needs_evaluation';
+  classification: 'silent' | 'defer' | 'needs_response' | 'needs_evaluation';
   triggerScore: number; // 0.0 - 1.0
   triggerReasons: string[];
   suppressors: string[];
-  recommendedPath: 'silent_fast_path' | 'reply_fast_path' | 'risk_path';
+  recommendedPath: 'silent_fast_path' | 'delayed_recheck' | 'reply_fast_path' | 'risk_path';
 }
 
 /**
@@ -28,6 +28,12 @@ export interface Suppressor {
   type: string;
   reason: string;
   downgradeAction?: string;
+}
+
+const GOVERNANCE_COMMAND_PATTERN = /^\/(?:memory|why)(?=$|\s)/;
+
+export function hasQuestionSignal(text: string): boolean {
+  return text.includes('？') || text.includes('?') || text.includes('吗');
 }
 
 /**
@@ -57,7 +63,10 @@ export class AttentionEngine {
       triggers.push({ type: 'reply_to_bot', weight: 0.7, reason: 'Reply to bot message' });
     }
 
-    if (event.text.startsWith('/') || event.text.startsWith('!')) {
+    const hasGovernanceCommandAuthority = event.conversationType === 'private'
+      || event.senderRole === 'owner'
+      || event.senderRole === 'admin';
+    if (hasGovernanceCommandAuthority && GOVERNANCE_COMMAND_PATTERN.test(event.text)) {
       triggers.push({ type: 'command', weight: 0.9, reason: 'Command prefix detected' });
     }
 
@@ -66,20 +75,14 @@ export class AttentionEngine {
       triggers.push({ type: 'private_message', weight: 0.6, reason: 'Private conversation' });
     }
 
-    // 管理员指令
-    if (event.senderRole === 'owner' || event.senderRole === 'admin') {
-      if (event.text.includes('管理') || event.text.includes('设置')) {
-        triggers.push({ type: 'admin_instruction', weight: 0.85, reason: 'Admin instruction' });
-      }
-    }
-
     // 软触发器 - 直接问题
-    if (event.text.includes('？') || event.text.includes('?') || event.text.includes('吗')) {
+    const hasQuestion = hasQuestionSignal(event.text);
+    if (hasQuestion) {
       triggers.push({ type: 'question', weight: 0.3, reason: 'Question detected' });
     }
 
-    // 抑制器 - 高速聊天（简化：检测短消息）
-    if (event.conversationType === 'group' && event.text.length < 10 && !event.mentionsBot) {
+    // 短闲聊仍可快速静默；真实流速在延迟重检时根据持久消息窗口判断。
+    if (event.conversationType === 'group' && event.text.length < 10 && !event.mentionsBot && !hasQuestion) {
       suppressors.push({
         type: 'high_speed_chat',
         reason: 'Short casual message in group',
@@ -102,12 +105,15 @@ export class AttentionEngine {
     if (suppressors.length > 0 && triggerScore < 0.7) {
       classification = 'silent';
       recommendedPath = 'silent_fast_path';
-    } else if (triggerScore >= 0.9 || triggers.some((t) => t.type === 'admin_instruction')) {
+    } else if (triggers.some((trigger) => trigger.type === 'command')) {
       classification = 'needs_evaluation';
       recommendedPath = 'risk_path';
     } else if (triggerScore >= 0.5) {
       classification = 'needs_response';
       recommendedPath = 'reply_fast_path';
+    } else if (event.conversationType === 'group' && hasQuestion) {
+      classification = 'defer';
+      recommendedPath = 'delayed_recheck';
     } else {
       classification = 'silent';
       recommendedPath = 'silent_fast_path';

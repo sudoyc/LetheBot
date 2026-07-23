@@ -1,13 +1,25 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LetheBotApp } from '../../src/index.js';
+import { AttentionEngine } from '../../src/attention/engine.js';
 import { resetConfig } from '../../src/config/index.js';
 import type { OneBotMessage } from '../../src/gateway/onebot-adapter.js';
 import type { PiAdapterInput, PiAdapterOutput } from '../../src/pi/pi-adapter.js';
+import type { ChatMessageReceived } from '../../src/types/events.js';
 import { EvaluatorStub } from '../../src/evaluator/evaluator-stub.js';
-import type { SocialEvaluationRequest, SocialEvaluationResult } from '../../src/types/evaluator.js';
+import { GroupSummaryPolicyRepository } from '../../src/storage/group-summary-policy-repository.js';
+import { MemoryRepository } from '../../src/storage/memory-repository.js';
+import { GroupSummaryJobService } from '../../src/workers/group-summary-job-service.js';
+import type {
+  MemoryEvaluationRequest,
+  MemoryEvaluationResult,
+  SocialEvaluationRequest,
+  SocialEvaluationResult,
+} from '../../src/types/evaluator.js';
+import { FakeOneBot } from '../fakes/fake-onebot';
 
 interface PersistedMessageRow {
   id: string;
@@ -50,6 +62,7 @@ interface PersistedActionRow {
   confidence: number;
   evaluator_required: number;
   evaluator_passed: number | null;
+  evaluator_decision_id: string | null;
   actions: string;
   reasons: string | null;
   suppressors: string | null;
@@ -88,6 +101,16 @@ interface SentMessage {
   text: string;
 }
 
+interface PersistedEventProcessingFailureRow {
+  raw_event_id: string | null;
+  turn_id: string | null;
+  stage: string;
+  conversation_type: string | null;
+  error_name: string;
+  error_message_hash: string;
+  details: string;
+}
+
 describe('E2E Conversation Flow', () => {
   const originalEnv = process.env;
   let app: LetheBotApp;
@@ -112,6 +135,7 @@ describe('E2E Conversation Flow', () => {
     process.env.ONEBOT_WS_URL = 'ws://localhost:3001/onebot?token=health-ws-token-should-not-leak-123456';
     process.env.ONEBOT_TOKEN = 'test-onebot-token';
     process.env.LETHEBOT_BOT_QQ_ID = '3889000770';
+    delete process.env.LETHEBOT_BOT_OWNER_QQ_ID;
     process.env.PI_PROVIDER = 'mock';
     process.env.PI_MODEL = 'mock';
     process.env.LOG_LEVEL = 'fatal'; // Suppress logs during tests
@@ -136,10 +160,44 @@ describe('E2E Conversation Flow', () => {
 
   afterEach(async () => {
     await app.waitForIdle();
-    expect(app.getEventProcessingFailures()).toHaveLength(0);
+    try {
+      expect(app.getEventProcessingFailures()).toHaveLength(0);
+    } finally {
+      app.getDatabase()
+        .prepare(
+          `UPDATE worker_heartbeats
+           SET current_job_id = NULL
+           WHERE current_job_id IN (
+             SELECT id FROM jobs
+             WHERE type = 'extraction'
+               AND status = 'pending'
+               AND idempotency_key LIKE 'extraction:auto:%'
+           )`
+        )
+        .run();
+      app.getDatabase()
+        .prepare(
+          `DELETE FROM job_attempts
+           WHERE job_id IN (
+             SELECT id FROM jobs
+             WHERE type = 'extraction'
+               AND status = 'pending'
+               AND idempotency_key LIKE 'extraction:auto:%'
+           )`
+        )
+        .run();
+      app.getDatabase()
+        .prepare(
+          `DELETE FROM jobs
+           WHERE type = 'extraction'
+             AND status = 'pending'
+             AND idempotency_key LIKE 'extraction:auto:%'`
+        )
+        .run();
+    }
   });
 
-  async function postEvent(event: unknown, token: string | null = 'test-onebot-token'): Promise<Response> {
+  async function sendEvent(event: unknown, token: string | null = 'test-onebot-token'): Promise<Response> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
     };
@@ -147,11 +205,15 @@ describe('E2E Conversation Flow', () => {
       headers.Authorization = `Bearer ${token}`;
     }
 
-    const response = await fetch(`${baseUrl}/onebot/event`, {
+    return fetch(`${baseUrl}/onebot/event`, {
       method: 'POST',
       headers,
       body: JSON.stringify(event),
     });
+  }
+
+  async function postEvent(event: unknown, token: string | null = 'test-onebot-token'): Promise<Response> {
+    const response = await sendEvent(event, token);
 
     await app.waitForIdle();
     return response;
@@ -223,6 +285,7 @@ describe('E2E Conversation Flow', () => {
           ad.confidence,
           ad.evaluator_required,
           ad.evaluator_passed,
+          ad.evaluator_decision_id,
           ad.actions,
           ad.reasons,
           ad.suppressors,
@@ -302,6 +365,79 @@ describe('E2E Conversation Flow', () => {
     return row.count;
   }
 
+  function countBotResponseRows(conversationId: string): number {
+    const row = app
+      .getDatabase()
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM chat_messages cm
+         JOIN raw_events re ON re.id = cm.raw_event_id
+         WHERE cm.conversation_id = ?
+           AND cm.sender_id = 'bot-self'
+           AND re.type = 'bot.response'`
+      )
+      .get(conversationId) as { count: number };
+    return row.count;
+  }
+
+  function countBotResponseRawEvents(conversationId: string): number {
+    const row = app
+      .getDatabase()
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM raw_events
+         WHERE conversation_id = ? AND type = 'bot.response'`
+      )
+      .get(conversationId) as { count: number };
+    return row.count;
+  }
+
+  function countNonTerminalTurnsForMessage(platformMessageId: string): number {
+    const row = app
+      .getDatabase()
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM agent_turns at
+         JOIN raw_events re ON re.id = at.trigger_event_id
+         JOIN chat_messages cm ON cm.raw_event_id = re.id
+         WHERE cm.message_id = ? AND at.status IN ('pending', 'running')`
+      )
+      .get(platformMessageId) as { count: number };
+    return row.count;
+  }
+
+  function expectLinkedEventProcessingFailure(
+    turn: PersistedTurnRow,
+    stage: string,
+  ): void {
+    const failure = app
+      .getDatabase()
+      .prepare(
+        `SELECT raw_event_id, turn_id, stage, conversation_type,
+                error_name, error_message_hash, details
+         FROM event_processing_failures
+         WHERE turn_id = ? AND stage = ?
+         ORDER BY occurred_at DESC
+         LIMIT 1`
+      )
+      .get(turn.id, stage) as PersistedEventProcessingFailureRow | undefined;
+
+    expect(failure).toMatchObject({
+      raw_event_id: turn.trigger_event_id,
+      turn_id: turn.id,
+      stage,
+      conversation_type: 'private',
+      error_name: 'SqliteError',
+    });
+    expect(failure?.error_message_hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(JSON.parse(failure?.details ?? '{}')).toMatchObject({
+      rawEventStored: true,
+      turnStarted: true,
+      stage,
+      conversationType: 'private',
+    });
+  }
+
   function setSuccessfulPiRuntime(): void {
     app.setPiRuntimeForTesting({
       async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
@@ -359,6 +495,117 @@ describe('E2E Conversation Flow', () => {
   function expectNoForeignKeyViolations(): void {
     const violations = app.getDatabase().prepare('PRAGMA foreign_key_check').all();
     expect(violations).toHaveLength(0);
+  }
+
+  function makeGroupEvent(input: {
+    messageId: number;
+    userId: number;
+    groupId: number;
+    text: string;
+    role?: 'member' | 'admin' | 'owner';
+  }): OneBotMessage {
+    return {
+      post_type: 'message',
+      message_type: 'group',
+      message_id: input.messageId,
+      user_id: input.userId,
+      group_id: input.groupId,
+      message: input.text,
+      raw_message: input.text,
+      sender: {
+        user_id: input.userId,
+        nickname: `GovernanceUser${input.userId}`,
+        role: input.role ?? 'admin',
+      },
+      time: Math.floor(Date.now() / 1000),
+    };
+  }
+
+  function forceRiskAttentionForTesting() {
+    return vi.spyOn(AttentionEngine.prototype, 'analyze').mockReturnValue({
+      classification: 'needs_evaluation',
+      triggerScore: 1,
+      triggerReasons: ['synthetic_evaluator_test'],
+      suppressors: [],
+      recommendedPath: 'risk_path',
+    });
+  }
+
+  function expectSuccessfulGroupGovernanceCommand(
+    platformMessageId: string,
+    sentMessage: SentMessage | undefined,
+    expectedText: string,
+  ): void {
+    const source = getPersistedMessage(platformMessageId);
+    expect(source).toBeDefined();
+
+    const turn = getTurnForMessage(platformMessageId);
+    expect(turn).toMatchObject({
+      conversation_id: source?.conversation_id,
+      trigger_event_id: source?.raw_event_id,
+      pi_provider: 'local',
+      pi_model: 'qq-governance-v1',
+      response_text: expectedText,
+      status: 'completed',
+      tokens_input: 0,
+      tokens_output: 0,
+      tokens_total: 0,
+    });
+    expect(turn?.action_decision_id).toBeDefined();
+    expect(turn?.completed_at).toBeGreaterThan(0);
+
+    const actionRows = getActionRowsForMessage(platformMessageId);
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      turn_id: turn?.id,
+      decided_by: 'attention',
+      risk_level: 'low',
+      confidence: 1,
+      evaluator_required: 0,
+      evaluator_passed: null,
+      evaluator_decision_id: null,
+      action_type: 'reply_short',
+      status: 'success',
+      executed_message_id: sentMessage?.messageId,
+      error_code: null,
+      error_message: null,
+    });
+    expect(JSON.parse(actionRows[0]?.reasons ?? '[]')).toEqual([
+      'Deterministic QQ governance command',
+    ]);
+    expect(JSON.parse(actionRows[0]?.actions ?? '[]')).toEqual([
+      expect.objectContaining({
+        type: 'reply_short',
+        payload: { text: expectedText },
+        constraints: expect.objectContaining({
+          evaluatorRequired: false,
+          proactive: false,
+        }),
+      }),
+    ]);
+
+    expect(sentMessage).toMatchObject({
+      target: {
+        conversationId: source?.conversation_id,
+        conversationType: 'group',
+        groupId: source?.group_id,
+      },
+      text: expectedText,
+    });
+    expect(getPersistedMessage(sentMessage?.messageId ?? '')).toMatchObject({
+      conversation_id: source?.conversation_id,
+      conversation_type: 'group',
+      group_id: source?.group_id,
+      sender_id: 'bot-self',
+      text: expectedText,
+      raw_type: 'bot.response',
+    });
+    expect(app.getDatabase().prepare(
+      'SELECT COUNT(*) AS count FROM tool_calls WHERE turn_id = ?',
+    ).get(turn?.id)).toEqual({ count: 0 });
+    expect(app.getDatabase().prepare(
+      'SELECT COUNT(*) AS count FROM evaluator_decisions WHERE turn_id = ?',
+    ).get(turn?.id)).toEqual({ count: 0 });
   }
 
   describe('Health check', () => {
@@ -424,6 +671,36 @@ describe('E2E Conversation Flow', () => {
       expect(serializedReadiness).not.toContain('localhost:3001');
       expect(serializedReadiness).not.toContain('qq-');
       expect(serializedReadiness).not.toContain('private:');
+    });
+
+    it('should omit sensitive database query diagnostics from degraded health', async () => {
+      const rawSecret = 'api_key=sk-health-db-secret-qq-1234567890';
+      const rawPath = '/home/operator/private/lethebot.db';
+      const prepare = vi.spyOn(app.getDatabase(), 'prepare');
+      prepare.mockImplementationOnce(() => {
+        throw new Error(`database failed ${rawSecret} path=${rawPath}`);
+      });
+
+      try {
+        const response = await fetch(`${baseUrl}/healthz`);
+        expect(response.status).toBe(503);
+
+        const health = await response.json() as {
+          status: string;
+          checks: { database: Record<string, unknown> };
+        };
+        expect(health.status).toBe('degraded');
+        expect(health.checks.database).toEqual({ ok: false, open: true });
+
+        const serialized = JSON.stringify(health);
+        expect(serialized).not.toContain(rawSecret);
+        expect(serialized).not.toContain('sk-health-db-secret');
+        expect(serialized).not.toContain('qq-1234567890');
+        expect(serialized).not.toContain(rawPath);
+        expect(serialized).not.toContain('database failed');
+      } finally {
+        prepare.mockRestore();
+      }
     });
 
     it('should return non-leaking degraded health and not_ready readiness when the adapter is stopped', async () => {
@@ -613,6 +890,7 @@ describe('E2E Conversation Flow', () => {
         const data = await response.json() as {
           generatedAt: string;
           rawEvents: { total: number };
+          eventIngressReceipts: { total: number; byDisposition: Record<string, number> };
           chatMessages: { total: number };
           agentTurns: { total: number; byStatus: Record<string, number>; tokensTotal: number };
           contextTraces: { total: number };
@@ -637,6 +915,8 @@ describe('E2E Conversation Flow', () => {
 
         expect(data.generatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
         expect(data.rawEvents.total).toBeGreaterThanOrEqual(0);
+        expect(data.eventIngressReceipts.total).toBeGreaterThanOrEqual(0);
+        expect(data.eventIngressReceipts.byDisposition).toBeDefined();
         expect(data.chatMessages.total).toBeGreaterThanOrEqual(0);
         expect(data.agentTurns.byStatus).toBeDefined();
         expect(data.contextTraces.total).toBeGreaterThanOrEqual(0);
@@ -671,6 +951,7 @@ describe('E2E Conversation Flow', () => {
         expect(prometheusResponse.headers.get('content-type')).toContain('text/plain');
         const prometheus = await prometheusResponse.text();
         expect(prometheus).toContain('lethebot_raw_events_total');
+        expect(prometheus).toContain('lethebot_event_ingress_receipts_total');
         expect(prometheus).toContain('lethebot_jobs_type_total{type="summary"}');
         expect(prometheus).toContain('lethebot_jobs_type_total{type="other"}');
         expect(prometheus).toContain('lethebot_worker_heartbeats_type_total{worker_type="other"}');
@@ -871,7 +1152,934 @@ describe('E2E Conversation Flow', () => {
     });
   });
 
+  describe('Turn persistence failure lifecycle', () => {
+    it('terminalizes a pending turn when context trace persistence fails', async () => {
+      const db = app.getDatabase();
+      const conversationId = 'private:qq-618001';
+      let piCalls = 0;
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          piCalls += 1;
+          return {
+            turnId: input.turnId,
+            responseText: '',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 0, output: 0, total: 0 },
+            status: 'completed',
+          };
+        },
+      });
+      db.exec(`
+        CREATE TEMP TRIGGER fail_turn_context_trace_insert
+        BEFORE INSERT ON context_traces
+        WHEN NEW.conversation_id = '${conversationId}'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced context trace insert failure');
+        END
+      `);
+
+      try {
+        const response = await postEvent({
+          post_type: 'message',
+          message_type: 'private',
+          message_id: 918001,
+          user_id: 618001,
+          message: 'trigger context persistence failure',
+          raw_message: 'trigger context persistence failure',
+          sender: { user_id: 618001, nickname: 'ContextFailureUser' },
+          time: Math.floor(Date.now() / 1000),
+        } satisfies OneBotMessage);
+
+        expect(response.status).toBe(200);
+        expect(app.getEventProcessingFailures()).toHaveLength(1);
+        expect(piCalls).toBe(0);
+        expect(getPersistedMessage('qq-918001')).toBeDefined();
+        expect(countTurnsForMessage('qq-918001')).toBe(1);
+
+        const turn = getTurnForMessage('qq-918001');
+        expect(turn).toBeDefined();
+        if (!turn) {
+          throw new Error('Expected context failure turn');
+        }
+        expect(turn).toMatchObject({
+          status: 'failed',
+          context_pack_id: null,
+          action_decision_id: null,
+        });
+        expect(turn.completed_at).toBeGreaterThan(0);
+        expect(turn.response_text).toContain('forced context trace insert failure');
+        expect(getContextTraceForMessage('qq-918001')).toBeUndefined();
+        expect(getActionRowsForMessage('qq-918001')).toEqual([]);
+        expect(countBotResponseRawEvents(conversationId)).toBe(0);
+        expect(countBotResponseRows(conversationId)).toBe(0);
+        expect(countNonTerminalTurnsForMessage('qq-918001')).toBe(0);
+        expectLinkedEventProcessingFailure(turn, 'context_building');
+        expectNoForeignKeyViolations();
+      } finally {
+        db.exec('DROP TRIGGER IF EXISTS fail_turn_context_trace_insert');
+        app.clearEventProcessingFailuresForTesting();
+        setSuccessfulPiRuntime();
+      }
+    });
+
+    it('terminalizes a running turn when action decision persistence fails', async () => {
+      const db = app.getDatabase();
+      const conversationId = 'private:qq-618002';
+      setSuccessfulPiRuntime();
+      db.exec(`
+        CREATE TEMP TRIGGER fail_turn_action_decision_insert
+        BEFORE INSERT ON action_decisions
+        WHEN (
+          SELECT conversation_id FROM agent_turns WHERE id = NEW.turn_id
+        ) = '${conversationId}'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced action decision insert failure');
+        END
+      `);
+
+      try {
+        const response = await postEvent({
+          post_type: 'message',
+          message_type: 'private',
+          message_id: 918002,
+          user_id: 618002,
+          message: 'trigger action decision persistence failure',
+          raw_message: 'trigger action decision persistence failure',
+          sender: { user_id: 618002, nickname: 'DecisionFailureUser' },
+          time: Math.floor(Date.now() / 1000),
+        } satisfies OneBotMessage);
+
+        expect(response.status).toBe(200);
+        expect(app.getEventProcessingFailures()).toHaveLength(1);
+        const turn = getTurnForMessage('qq-918002');
+        expect(turn).toBeDefined();
+        if (!turn) {
+          throw new Error('Expected action decision failure turn');
+        }
+        const contextTrace = getContextTraceForMessage('qq-918002');
+
+        expect(turn.status).toBe('failed');
+        expect(turn.completed_at).toBeGreaterThan(0);
+        expect(turn.context_pack_id).toBe(contextTrace?.id);
+        expect(turn.action_decision_id).toBeNull();
+        expect(turn.response_text).toContain('forced action decision insert failure');
+        expect(contextTrace?.turn_id).toBe(turn.id);
+        expect(getActionRowsForMessage('qq-918002')).toEqual([]);
+        expect(countBotResponseRawEvents(conversationId)).toBe(0);
+        expect(countBotResponseRows(conversationId)).toBe(0);
+        expect(countNonTerminalTurnsForMessage('qq-918002')).toBe(0);
+        expectLinkedEventProcessingFailure(turn, 'social_decision');
+        expectNoForeignKeyViolations();
+      } finally {
+        db.exec('DROP TRIGGER IF EXISTS fail_turn_action_decision_insert');
+        app.clearEventProcessingFailuresForTesting();
+        setSuccessfulPiRuntime();
+      }
+    });
+
+    it('rolls back evaluator evidence and does not send when an evaluated action insert fails', async () => {
+      class ApprovedFailureEvaluator extends EvaluatorStub {
+        async evaluateSocial(request: SocialEvaluationRequest): Promise<SocialEvaluationResult> {
+          return {
+            domain: 'social',
+            decisionId: 'eval-action-insert-rollback',
+            requestId: request.requestId,
+            decision: 'approve',
+            reason: 'approved before induced persistence failure',
+            confidence: 0.84,
+            riskLevel: 'medium',
+            decidedAt: new Date('2026-07-10T04:06:07.890Z'),
+            evaluatorVersion: 'test-action-insert-rollback',
+          };
+        }
+      }
+
+      const db = app.getDatabase();
+      const conversationId = 'private:qq-618006';
+      const sentMessages: SentMessage[] = [];
+      app.setSocialEvaluatorForTesting(new ApprovedFailureEvaluator());
+      setReplyingPiRuntime('This evaluated response must not be sent.');
+      setCapturingMessageSender(sentMessages);
+      const riskAttention = forceRiskAttentionForTesting();
+      db.exec(`
+        CREATE TEMP TRIGGER fail_evaluated_action_decision_insert
+        BEFORE INSERT ON action_decisions
+        WHEN (
+          SELECT conversation_id FROM agent_turns WHERE id = NEW.turn_id
+        ) = '${conversationId}'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced evaluated action decision insert failure');
+        END
+      `);
+
+      try {
+        const response = await postEvent({
+          post_type: 'message',
+          message_type: 'private',
+          message_id: 918006,
+          user_id: 618006,
+          message: 'trigger evaluated action decision persistence failure',
+          raw_message: 'trigger evaluated action decision persistence failure',
+          sender: { user_id: 618006, nickname: 'EvaluatedDecisionFailureUser' },
+          time: Math.floor(Date.now() / 1000),
+        } satisfies OneBotMessage);
+
+        expect(response.status).toBe(200);
+        expect(sentMessages).toEqual([]);
+        expect(getActionRowsForMessage('qq-918006')).toEqual([]);
+        expect(
+          db.prepare('SELECT COUNT(*) AS count FROM evaluator_decisions WHERE id = ?')
+            .get('eval-action-insert-rollback')
+        ).toEqual({ count: 0 });
+
+        const turn = getTurnForMessage('qq-918006');
+        expect(turn).toMatchObject({
+          status: 'failed',
+          action_decision_id: null,
+        });
+        expectNoForeignKeyViolations();
+      } finally {
+        db.exec('DROP TRIGGER IF EXISTS fail_evaluated_action_decision_insert');
+        app.clearEventProcessingFailuresForTesting();
+        riskAttention.mockRestore();
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('rolls back bot response rows and terminalizes the turn when bot chat persistence fails', async () => {
+      const db = app.getDatabase();
+      const conversationId = 'private:qq-618003';
+      const sentMessages: SentMessage[] = [];
+      setReplyingPiRuntime('reply delivered before local bot chat persistence fails');
+      setCapturingMessageSender(sentMessages);
+      db.exec(`
+        CREATE TEMP TRIGGER fail_turn_bot_chat_insert
+        BEFORE INSERT ON chat_messages
+        WHEN NEW.conversation_id = '${conversationId}' AND NEW.sender_id = 'bot-self'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced bot chat insert failure');
+        END
+      `);
+
+      try {
+        const response = await postEvent({
+          post_type: 'message',
+          message_type: 'private',
+          message_id: 918003,
+          user_id: 618003,
+          message: 'trigger bot chat persistence failure',
+          raw_message: 'trigger bot chat persistence failure',
+          sender: { user_id: 618003, nickname: 'BotChatFailureUser' },
+          time: Math.floor(Date.now() / 1000),
+        } satisfies OneBotMessage);
+
+        expect(response.status).toBe(200);
+        expect(app.getEventProcessingFailures()).toHaveLength(1);
+        expect(sentMessages).toHaveLength(1);
+        const turn = getTurnForMessage('qq-918003');
+        expect(turn).toBeDefined();
+        if (!turn) {
+          throw new Error('Expected bot chat failure turn');
+        }
+        const contextTrace = getContextTraceForMessage('qq-918003');
+        const actionRows = getActionRowsForMessage('qq-918003');
+
+        expect(turn.status).toBe('failed');
+        expect(turn.completed_at).toBeGreaterThan(0);
+        expect(turn.context_pack_id).toBe(contextTrace?.id);
+        expect(turn.action_decision_id).toBe(actionRows[0]?.decision_id);
+        expect(turn.response_text).toContain('forced bot chat insert failure');
+        expect(contextTrace?.turn_id).toBe(turn.id);
+        expect(actionRows).toHaveLength(1);
+        expect(actionRows[0]).toMatchObject({
+          turn_id: turn.id,
+          status: 'success',
+          executed_message_id: sentMessages[0]?.messageId,
+        });
+        expect(countBotResponseRawEvents(conversationId)).toBe(0);
+        expect(countBotResponseRows(conversationId)).toBe(0);
+        expect(countNonTerminalTurnsForMessage('qq-918003')).toBe(0);
+        expectLinkedEventProcessingFailure(turn, 'bot_response_persist');
+        expectNoForeignKeyViolations();
+      } finally {
+        db.exec('DROP TRIGGER IF EXISTS fail_turn_bot_chat_insert');
+        app.clearEventProcessingFailuresForTesting();
+        setSuccessfulPiRuntime();
+        setCapturingMessageSender([]);
+      }
+    });
+
+    it('rolls back derived admission when auto-extraction enqueue fails before Pi or send', async () => {
+      const db = app.getDatabase();
+      const conversationId = 'qq-group-718007';
+      const sentMessages: SentMessage[] = [];
+      let piCalls = 0;
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          piCalls += 1;
+          return {
+            turnId: input.turnId,
+            responseText: 'Auto-extraction failure must happen before this reply.',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 1, output: 1, total: 2 },
+            status: 'completed',
+          };
+        },
+      });
+      setCapturingMessageSender(sentMessages);
+      db.exec(`
+        CREATE TEMP TRIGGER fail_auto_extraction_enqueue
+        BEFORE INSERT ON jobs
+        WHEN NEW.type = 'extraction'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced extraction enqueue failure');
+        END
+      `);
+
+      try {
+        const response = await postEvent({
+          post_type: 'message',
+          message_type: 'group',
+          message_id: 918007,
+          user_id: 618007,
+          group_id: 718007,
+          message: '我喜欢 合成事务回滚',
+          raw_message: '我喜欢 合成事务回滚',
+          sender: {
+            user_id: 618007,
+            nickname: 'SyntheticExtractionFailureUser',
+            role: 'member',
+          },
+          time: Math.floor(Date.now() / 1000),
+        } satisfies OneBotMessage);
+
+        expect(response.status).toBe(200);
+        expect(app.getEventProcessingFailures()).toHaveLength(1);
+        const raw = db.prepare(
+          'SELECT id FROM raw_events WHERE platform_event_id = ?',
+        ).get('qq-918007') as { id: string } | undefined;
+        expect(raw).toBeDefined();
+        expect(getPersistedMessage('qq-918007')).toBeUndefined();
+        expect(piCalls).toBe(0);
+        expect(sentMessages).toEqual([]);
+        expect(db.prepare(
+          'SELECT COUNT(*) AS count FROM agent_turns WHERE trigger_event_id = ?',
+        ).get(raw?.id)).toEqual({ count: 0 });
+        expect(db.prepare(
+          'SELECT COUNT(*) AS count FROM attention_candidates WHERE source_raw_event_id = ?',
+        ).get(raw?.id)).toEqual({ count: 0 });
+        expect(countBotResponseRawEvents(conversationId)).toBe(0);
+        expect(countBotResponseRows(conversationId)).toBe(0);
+        expect(db.prepare(
+          "SELECT COUNT(*) AS count FROM jobs WHERE type = 'extraction' AND idempotency_key = ?",
+        ).get(`extraction:auto:${raw?.id}`)).toEqual({ count: 0 });
+        expect(db.prepare(
+          'SELECT state, reason_code FROM event_processing_admissions WHERE raw_event_id = ?',
+        ).get(raw?.id)).toEqual({ state: 'failed', reason_code: 'handler_failed' });
+
+        const failure = db.prepare(
+          `SELECT raw_event_id, turn_id, stage, conversation_type,
+                  error_name, error_message_hash, details
+             FROM event_processing_failures
+            WHERE raw_event_id = ?`,
+        ).get(raw?.id) as PersistedEventProcessingFailureRow | undefined;
+        expect(failure).toMatchObject({
+          raw_event_id: raw?.id,
+          turn_id: null,
+          stage: 'memory_extraction_enqueue',
+          conversation_type: 'group',
+          error_name: 'SqliteError',
+        });
+        expect(failure?.error_message_hash).toMatch(/^[0-9a-f]{64}$/);
+        expect(JSON.parse(failure?.details ?? '{}')).toMatchObject({
+          rawEventStored: true,
+          turnStarted: false,
+          stage: 'memory_extraction_enqueue',
+          conversationType: 'group',
+        });
+        expect(failure?.details).not.toContain('我喜欢 合成事务回滚');
+        expect(failure?.details).not.toContain('forced extraction enqueue failure');
+        expectNoForeignKeyViolations();
+      } finally {
+        db.exec('DROP TRIGGER IF EXISTS fail_auto_extraction_enqueue');
+        app.clearEventProcessingFailuresForTesting();
+        setSuccessfulPiRuntime();
+        setCapturingMessageSender([]);
+      }
+    });
+
+    it('terminalizes the fully linked turn when completion persistence fails', async () => {
+      const db = app.getDatabase();
+      const conversationId = 'private:qq-618004';
+      setSuccessfulPiRuntime();
+      db.exec(`
+        CREATE TEMP TRIGGER fail_turn_completion_update
+        BEFORE UPDATE OF status ON agent_turns
+        WHEN OLD.conversation_id = '${conversationId}' AND NEW.status = 'completed'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced turn completion update failure');
+        END
+      `);
+
+      try {
+        const response = await postEvent({
+          post_type: 'message',
+          message_type: 'private',
+          message_id: 918004,
+          user_id: 618004,
+          message: 'trigger turn completion persistence failure',
+          raw_message: 'trigger turn completion persistence failure',
+          sender: { user_id: 618004, nickname: 'CompletionFailureUser' },
+          time: Math.floor(Date.now() / 1000),
+        } satisfies OneBotMessage);
+
+        expect(response.status).toBe(200);
+        expect(app.getEventProcessingFailures()).toHaveLength(1);
+        const turn = getTurnForMessage('qq-918004');
+        expect(turn).toBeDefined();
+        if (!turn) {
+          throw new Error('Expected completion failure turn');
+        }
+        const contextTrace = getContextTraceForMessage('qq-918004');
+        const actionRows = getActionRowsForMessage('qq-918004');
+
+        expect(turn.status).toBe('failed');
+        expect(turn.completed_at).toBeGreaterThan(0);
+        expect(turn.context_pack_id).toBe(contextTrace?.id);
+        expect(turn.action_decision_id).toBe(actionRows[0]?.decision_id);
+        expect(turn.response_text).toContain('forced turn completion update failure');
+        expect(contextTrace?.turn_id).toBe(turn.id);
+        expect(actionRows).toHaveLength(1);
+        expect(actionRows[0]).toMatchObject({
+          turn_id: turn.id,
+          action_type: 'silent_store',
+          status: 'success',
+        });
+        expect(countBotResponseRawEvents(conversationId)).toBe(0);
+        expect(countBotResponseRows(conversationId)).toBe(0);
+        expect(countNonTerminalTurnsForMessage('qq-918004')).toBe(0);
+        expectLinkedEventProcessingFailure(turn, 'turn_complete');
+        expectNoForeignKeyViolations();
+      } finally {
+        db.exec('DROP TRIGGER IF EXISTS fail_turn_completion_update');
+        app.clearEventProcessingFailuresForTesting();
+        setSuccessfulPiRuntime();
+      }
+    });
+  });
+
+  describe('Ingress replay idempotency', () => {
+    it('claims one canonical raw event and downstream chain for OneBot retries', async () => {
+      const db = app.getDatabase();
+      const replayStartedAt = Date.now();
+      const sentMessages: SentMessage[] = [];
+      setReplyingPiRuntime('deduplicated reply');
+      setCapturingMessageSender(sentMessages);
+
+      const firstEvent: OneBotMessage = {
+        post_type: 'message',
+        message_type: 'private',
+        message_id: 812345001,
+        user_id: 812345101,
+        message: 'first writer payload',
+        raw_message: 'first writer payload',
+        sender: { user_id: 812345101, nickname: 'ReplayOne' },
+        time: Math.floor(Date.now() / 1000),
+      };
+      const otherConversationEvent: OneBotMessage = {
+        ...firstEvent,
+        user_id: 812345102,
+        sender: { user_id: 812345102, nickname: 'ReplayTwo' },
+        message: 'same platform id in another conversation',
+        raw_message: 'same platform id in another conversation',
+      };
+      const concurrentEvent: OneBotMessage = {
+        ...firstEvent,
+        message_id: 812345002,
+        user_id: 812345103,
+        sender: { user_id: 812345103, nickname: 'ReplayThree' },
+        message: 'concurrent first writer',
+        raw_message: 'concurrent first writer',
+      };
+      const crossTransportEvent: OneBotMessage = {
+        ...firstEvent,
+        message_id: 812345003,
+        user_id: 812345104,
+        sender: { user_id: 812345104, nickname: 'ReplayFour' },
+        message: 'http then websocket replay',
+        raw_message: 'http then websocket replay',
+      };
+
+      try {
+        const firstResponse = await postEvent(firstEvent);
+        const changedReplayResponse = await postEvent({
+          ...firstEvent,
+          message: 'changed replay payload must not replace the first',
+          raw_message: 'changed replay payload must not replace the first',
+        });
+        const otherConversationResponse = await postEvent(otherConversationEvent);
+        const concurrentResponses = await Promise.all([
+          sendEvent(concurrentEvent),
+          sendEvent(concurrentEvent),
+          sendEvent(concurrentEvent),
+        ]);
+        await app.waitForIdle();
+        const crossTransportResponse = await postEvent(crossTransportEvent);
+        const crossTransportReplay = app.dispatchOneBotEventForTesting(crossTransportEvent, 'ws');
+        await app.waitForIdle();
+        expect(crossTransportReplay).toBe('duplicate');
+
+        for (const response of [
+          firstResponse,
+          changedReplayResponse,
+          otherConversationResponse,
+          ...concurrentResponses,
+          crossTransportResponse,
+        ]) {
+          expect(response.status).toBe(200);
+          expect(await response.json()).toEqual({ status: 'ok' });
+        }
+
+        const canonicalRows = db.prepare(
+          `SELECT id, conversation_id, payload
+             FROM raw_events
+            WHERE platform = 'qq'
+              AND type = 'chat.message.received'
+              AND platform_event_id = ?
+            ORDER BY conversation_id`
+        ).all('qq-812345001') as Array<{
+          id: string;
+          conversation_id: string;
+          payload: string;
+        }>;
+        expect(canonicalRows).toHaveLength(2);
+        expect(canonicalRows.map((row) => row.conversation_id)).toEqual([
+          'private:qq-812345101',
+          'private:qq-812345102',
+        ]);
+
+        const firstCanonical = canonicalRows.find(
+          (row) => row.conversation_id === 'private:qq-812345101'
+        );
+        expect(firstCanonical).toBeDefined();
+        const firstPayload = JSON.parse(firstCanonical?.payload ?? '{}') as ChatMessageReceived;
+        expect(firstPayload.message.content.text).toBe('first writer payload');
+        expect(firstPayload.message.content.text).not.toContain('changed replay payload');
+
+        const concurrentCanonical = db.prepare(
+          `SELECT id
+             FROM raw_events
+            WHERE platform = 'qq'
+              AND type = 'chat.message.received'
+              AND conversation_id = ?
+              AND platform_event_id = ?`
+        ).get('private:qq-812345103', 'qq-812345002') as { id: string } | undefined;
+        expect(concurrentCanonical).toBeDefined();
+        const crossTransportCanonical = db.prepare(
+          `SELECT id
+             FROM raw_events
+            WHERE platform = 'qq'
+              AND type = 'chat.message.received'
+              AND conversation_id = ?
+              AND platform_event_id = ?`
+        ).get('private:qq-812345104', 'qq-812345003') as { id: string } | undefined;
+        expect(crossTransportCanonical).toBeDefined();
+
+        for (const rawEventId of [
+          firstCanonical?.id,
+          canonicalRows.find((row) => row.conversation_id === 'private:qq-812345102')?.id,
+          concurrentCanonical?.id,
+          crossTransportCanonical?.id,
+        ]) {
+          expect(rawEventId).toBeDefined();
+          expect(
+            db.prepare('SELECT COUNT(*) AS count FROM chat_messages WHERE raw_event_id = ?').get(rawEventId)
+          ).toEqual({ count: 1 });
+          expect(
+            db.prepare('SELECT COUNT(*) AS count FROM agent_turns WHERE trigger_event_id = ?').get(rawEventId)
+          ).toEqual({ count: 1 });
+          expect(
+            db.prepare('SELECT COUNT(*) AS count FROM event_processing_admissions WHERE raw_event_id = ?')
+              .get(rawEventId)
+          ).toEqual({ count: 1 });
+        }
+
+        const firstReceipts = db.prepare(
+          `SELECT disposition, received_at
+             FROM event_ingress_receipts
+            WHERE raw_event_id = ?
+            ORDER BY received_at, id`
+        ).all(firstCanonical?.id) as Array<{ disposition: string; received_at: number }>;
+        expect(firstReceipts.map((row) => row.disposition).sort()).toEqual(['accepted', 'duplicate']);
+        expect(firstReceipts.every((row) => (
+          Number.isSafeInteger(row.received_at)
+          && row.received_at >= replayStartedAt
+          && row.received_at <= Date.now()
+        ))).toBe(true);
+
+        const concurrentReceipts = db.prepare(
+          `SELECT disposition
+             FROM event_ingress_receipts
+            WHERE raw_event_id = ?
+            ORDER BY received_at, id`
+        ).all(concurrentCanonical?.id) as Array<{ disposition: string }>;
+        expect(concurrentReceipts.map((row) => row.disposition).sort()).toEqual([
+          'accepted',
+          'duplicate',
+          'duplicate',
+        ]);
+
+        const crossTransportReceipts = db.prepare(
+          `SELECT transport, disposition
+             FROM event_ingress_receipts
+            WHERE raw_event_id = ?
+            ORDER BY transport`
+        ).all(crossTransportCanonical?.id) as Array<{
+          transport: string;
+          disposition: string;
+        }>;
+        expect(crossTransportReceipts).toEqual([
+          { transport: 'http', disposition: 'accepted' },
+          { transport: 'ws', disposition: 'duplicate' },
+        ]);
+
+        expect(sentMessages).toHaveLength(4);
+        expect(countBotResponseRows('private:qq-812345101')).toBe(1);
+        expect(countBotResponseRows('private:qq-812345102')).toBe(1);
+        expect(countBotResponseRows('private:qq-812345103')).toBe(1);
+        expect(countBotResponseRows('private:qq-812345104')).toBe(1);
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+      }
+    });
+
+    it('accepts missing or malformed message ids without creating a false dedupe key', async () => {
+      const db = app.getDatabase();
+      const sentMessages: SentMessage[] = [];
+      let piCalls = 0;
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          piCalls += 1;
+          return {
+            turnId: input.turnId,
+            responseText: 'should stay silent',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 1, output: 1, total: 2 },
+            status: 'completed',
+          };
+        },
+      });
+      setCapturingMessageSender(sentMessages);
+
+      const baseEvent = {
+        post_type: 'message',
+        message_type: 'group',
+        user_id: 812345210,
+        group_id: 812345209,
+        message: 'no stable message id',
+        raw_message: 'no stable message id',
+        sender: { user_id: 812345210, nickname: 'NoStableId' },
+        time: Math.floor(Date.now() / 1000),
+      };
+
+      try {
+        for (const event of [
+          baseEvent,
+          baseEvent,
+          { ...baseEvent, message_id: 'qq-group-812345211' },
+        ]) {
+          const response = await postEvent(event);
+          expect(response.status).toBe(200);
+          expect(await response.json()).toEqual({ status: 'ok' });
+        }
+
+        const rows = db.prepare(
+          `SELECT re.id, re.platform_event_id, cm.message_id
+             FROM raw_events re
+             JOIN chat_messages cm ON cm.raw_event_id = re.id
+            WHERE re.type = 'chat.message.received'
+              AND re.conversation_id = ?
+            ORDER BY re.created_at, re.id`
+        ).all('qq-group-812345209') as Array<{
+          id: string;
+          platform_event_id: string | null;
+          message_id: string;
+        }>;
+
+        expect(rows).toHaveLength(3);
+        expect(rows.every((row) => row.platform_event_id === null)).toBe(true);
+        expect(rows.every((row) => /^qq-local-/.test(row.message_id))).toBe(true);
+        expect(new Set(rows.map((row) => row.message_id)).size).toBe(3);
+
+        const placeholders = rows.map(() => '?').join(', ');
+        const receipts = db.prepare(
+          `SELECT transport, disposition
+             FROM event_ingress_receipts
+            WHERE raw_event_id IN (${placeholders})
+            ORDER BY received_at, id`
+        ).all(...rows.map((row) => row.id));
+        expect(receipts).toEqual([
+          { transport: 'http', disposition: 'accepted' },
+          { transport: 'http', disposition: 'accepted' },
+          { transport: 'http', disposition: 'accepted' },
+        ]);
+        expect(piCalls).toBe(0);
+        expect(sentMessages).toEqual([]);
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+      }
+    });
+
+    it('returns bounded 503 without partial rows when the canonical claim fails', async () => {
+      const db = app.getDatabase();
+      const rawSecret = 'api_key=sk-ingress-claim-secret-qq-812345199';
+      const event: OneBotMessage = {
+        post_type: 'message',
+        message_type: 'private',
+        message_id: 812345099,
+        user_id: 812345199,
+        message: 'retry after durable claim failure',
+        raw_message: 'retry after durable claim failure',
+        sender: { user_id: 812345199, nickname: 'ClaimRetry' },
+        time: Math.floor(Date.now() / 1000),
+      };
+      setSuccessfulPiRuntime();
+
+      db.exec(`
+        CREATE TEMP TRIGGER fail_ingress_claim
+        BEFORE INSERT ON event_ingress_receipts
+        WHEN EXISTS (
+          SELECT 1
+            FROM raw_events
+           WHERE id = NEW.raw_event_id
+             AND platform_event_id = 'qq-812345099'
+        )
+        BEGIN
+          SELECT RAISE(ABORT, '${rawSecret}');
+        END;
+      `);
+
+      try {
+        const failed = await sendEvent(event);
+        expect(failed.status).toBe(503);
+        const failurePayload = await failed.json();
+        expect(failurePayload).toEqual({ error: 'event_unavailable' });
+        expect(JSON.stringify(failurePayload)).not.toContain(rawSecret);
+        expect(JSON.stringify(failurePayload)).not.toContain('812345199');
+        expect(
+          db.prepare('SELECT COUNT(*) AS count FROM raw_events WHERE platform_event_id = ?')
+            .get('qq-812345099')
+        ).toEqual({ count: 0 });
+        expect(
+          db.prepare(
+            `SELECT COUNT(*) AS count
+               FROM event_ingress_receipts
+              WHERE raw_event_id IN (
+                SELECT id FROM raw_events WHERE platform_event_id = ?
+              )`
+          ).get('qq-812345099')
+        ).toEqual({ count: 0 });
+      } finally {
+        db.exec('DROP TRIGGER IF EXISTS fail_ingress_claim');
+      }
+
+      const retry = await postEvent(event);
+      expect(retry.status).toBe(200);
+      expect(await retry.json()).toEqual({ status: 'ok' });
+      const canonical = db.prepare(
+        'SELECT id FROM raw_events WHERE platform_event_id = ?'
+      ).get('qq-812345099') as { id: string } | undefined;
+      expect(canonical).toBeDefined();
+      expect(
+        db.prepare(
+          'SELECT transport, disposition FROM event_ingress_receipts WHERE raw_event_id = ?'
+        ).all(canonical?.id)
+      ).toEqual([{ transport: 'http', disposition: 'accepted' }]);
+      expectNoForeignKeyViolations();
+    });
+
+    it('rolls back the raw event and receipt when admission insertion fails', async () => {
+      const db = app.getDatabase();
+      const event: OneBotMessage = {
+        post_type: 'message',
+        message_type: 'private',
+        message_id: 812345098,
+        user_id: 812345198,
+        message: 'retry after durable admission failure',
+        raw_message: 'retry after durable admission failure',
+        sender: { user_id: 812345198, nickname: 'AdmissionRetry' },
+        time: Math.floor(Date.now() / 1000),
+      };
+      setSuccessfulPiRuntime();
+
+      db.exec(`
+        CREATE TEMP TRIGGER fail_event_admission
+        BEFORE INSERT ON event_processing_admissions
+        WHEN EXISTS (
+          SELECT 1
+            FROM raw_events
+           WHERE id = NEW.raw_event_id
+             AND platform_event_id = 'qq-812345098'
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'synthetic admission failure');
+        END;
+      `);
+
+      try {
+        const failed = await sendEvent(event);
+        expect(failed.status).toBe(503);
+        expect(await failed.json()).toEqual({ error: 'event_unavailable' });
+        expect(db.prepare(
+          'SELECT COUNT(*) AS count FROM raw_events WHERE platform_event_id = ?'
+        ).get('qq-812345098')).toEqual({ count: 0 });
+        expect(db.prepare(
+          `SELECT COUNT(*) AS count
+             FROM event_ingress_receipts
+            WHERE raw_event_id IN (
+              SELECT id FROM raw_events WHERE platform_event_id = ?
+            )`
+        ).get('qq-812345098')).toEqual({ count: 0 });
+        expect(db.prepare(
+          `SELECT COUNT(*) AS count
+             FROM event_processing_admissions
+            WHERE raw_event_id IN (
+              SELECT id FROM raw_events WHERE platform_event_id = ?
+            )`
+        ).get('qq-812345098')).toEqual({ count: 0 });
+      } finally {
+        db.exec('DROP TRIGGER IF EXISTS fail_event_admission');
+      }
+
+      const retry = await postEvent(event);
+      expect(retry.status).toBe(200);
+      expect(await retry.json()).toEqual({ status: 'ok' });
+      const canonical = db.prepare(
+        'SELECT id FROM raw_events WHERE platform_event_id = ?'
+      ).get('qq-812345098') as { id: string } | undefined;
+      expect(canonical).toBeDefined();
+      expect(db.prepare(
+        'SELECT COUNT(*) AS count FROM event_ingress_receipts WHERE raw_event_id = ?'
+      ).get(canonical?.id)).toEqual({ count: 1 });
+      expect(db.prepare(
+        'SELECT state, reason_code FROM event_processing_admissions WHERE raw_event_id = ?'
+      ).get(canonical?.id)).toEqual({ state: 'completed', reason_code: null });
+      expectNoForeignKeyViolations();
+    });
+  });
+
   describe('Private message flow', () => {
+    it('keeps accepted raw evidence but denies a disabled account before derived processing', async () => {
+      const db = app.getDatabase();
+      const canonicalUserId = 'user-disabled-ingress';
+      const platformAccountId = '813450101';
+      const platformEventId = 'qq-813450001';
+      const seedTimestamp = Date.UTC(2026, 6, 10);
+      let piCalls = 0;
+      const sentMessages: SentMessage[] = [];
+
+      db.prepare(
+        'INSERT INTO canonical_users (id, created_at, last_seen_at) VALUES (?, ?, ?)'
+      ).run(canonicalUserId, seedTimestamp, seedTimestamp);
+      db.prepare(
+        `INSERT INTO platform_accounts (
+          platform, platform_account_id, canonical_user_id, account_type,
+          verified_level, status, first_seen_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        'qq',
+        platformAccountId,
+        canonicalUserId,
+        'private',
+        'observed',
+        'disabled',
+        seedTimestamp,
+        seedTimestamp,
+      );
+
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          piCalls += 1;
+          return {
+            turnId: input.turnId,
+            responseText: 'disabled account must not reach Pi',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 1, output: 1, total: 2 },
+            status: 'completed',
+          };
+        },
+      });
+      setCapturingMessageSender(sentMessages);
+
+      try {
+        const response = await postEvent({
+          post_type: 'message',
+          message_type: 'private',
+          message_id: 813450001,
+          user_id: 813450101,
+          message: 'disabled account must stop after ingress',
+          raw_message: 'disabled account must stop after ingress',
+          sender: {
+            user_id: 813450101,
+            nickname: 'DisabledAccount',
+          },
+          time: Math.floor(Date.now() / 1000),
+        } satisfies OneBotMessage);
+
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({ status: 'ok' });
+
+        const rawEvent = db
+          .prepare('SELECT id FROM raw_events WHERE platform_event_id = ?')
+          .get(platformEventId) as { id: string } | undefined;
+        expect(rawEvent).toBeDefined();
+        expect(
+          db.prepare(
+            'SELECT transport, disposition FROM event_ingress_receipts WHERE raw_event_id = ?'
+          ).all(rawEvent?.id)
+        ).toEqual([{ transport: 'http', disposition: 'accepted' }]);
+        expect(
+          db.prepare('SELECT COUNT(*) AS count FROM chat_messages WHERE raw_event_id = ?')
+            .get(rawEvent?.id)
+        ).toEqual({ count: 0 });
+        expect(
+          db.prepare('SELECT COUNT(*) AS count FROM agent_turns WHERE trigger_event_id = ?')
+            .get(rawEvent?.id)
+        ).toEqual({ count: 0 });
+        expect(
+          db.prepare('SELECT COUNT(*) AS count FROM display_profiles WHERE canonical_user_id = ?')
+            .get(canonicalUserId)
+        ).toEqual({ count: 0 });
+        expect(
+          db.prepare('SELECT COUNT(*) AS count FROM nickname_history WHERE canonical_user_id = ?')
+            .get(canonicalUserId)
+        ).toEqual({ count: 0 });
+        expect(
+          db.prepare('SELECT last_seen_at FROM canonical_users WHERE id = ?').get(canonicalUserId)
+        ).toEqual({ last_seen_at: seedTimestamp });
+        expect(
+          db.prepare(
+            `SELECT status, last_seen_at
+             FROM platform_accounts
+             WHERE platform = ? AND platform_account_id = ?`
+          ).get('qq', platformAccountId)
+        ).toEqual({ status: 'disabled', last_seen_at: seedTimestamp });
+        expect(piCalls).toBe(0);
+        expect(sentMessages).toHaveLength(0);
+        expect(app.getEventProcessingFailures()).toHaveLength(0);
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+      }
+    });
+
     it('should accept and process private message', async () => {
       const onebotEvent: OneBotMessage = {
         post_type: 'message',
@@ -919,7 +2127,10 @@ describe('E2E Conversation Flow', () => {
       expect(contextTrace?.turn_id).toBe(turn?.id);
       expect(contextTrace?.conversation_id).toBe('private:qq-10001');
       expect(contextTrace?.conversation_type).toBe('private');
-      expect(JSON.parse(contextTrace?.recent_message_ids ?? '[]')).toContain(persisted?.id);
+      const recentMessageIds = JSON.parse(contextTrace?.recent_message_ids ?? '[]') as string[];
+      expect(recentMessageIds).toContain(persisted?.id);
+      expect(recentMessageIds.filter((messageId) => messageId === persisted?.id)).toHaveLength(1);
+      expect(recentMessageIds).not.toContain('qq-12345');
       expect(JSON.parse(contextTrace?.filters_applied ?? '[]')).toEqual(
         expect.arrayContaining([
           'state=active',
@@ -1152,9 +2363,38 @@ describe('E2E Conversation Flow', () => {
         expect(actionRows[0]?.action_type).toBe('reply_full');
         expect(actionRows[0]?.status).toBe('success');
         expect(actionRows[0]?.executed_message_id).toBe(sentMessageId);
-        expect(JSON.parse(actionRows[0]?.actions ?? '[]')).toMatchObject([
-          { type: 'reply_full', payload: { text: '收到，我会处理。' } },
+        const storedActions = JSON.parse(actionRows[0]?.actions ?? '[]') as Array<{
+          type?: string;
+          target?: {
+            conversationId?: string;
+            conversationType?: string;
+            userId?: string;
+            canonicalUserId?: string;
+          };
+          payload?: { text?: string };
+        }>;
+        expect(storedActions).toMatchObject([
+          {
+            type: 'reply_full',
+            target: {
+              conversationId: 'private:qq-10008',
+              conversationType: 'private',
+              userId: 'qq-10008',
+            },
+            payload: { text: '收到，我会处理。' },
+          },
         ]);
+        const identityRow = app
+          .getDatabase()
+          .prepare(
+            `SELECT canonical_user_id
+             FROM platform_accounts
+             WHERE platform = ? AND platform_account_id = ?`
+          )
+          .get('qq', '10008') as { canonical_user_id: string } | undefined;
+        expect(identityRow?.canonical_user_id).toBeDefined();
+        expect(storedActions[0]?.target?.canonicalUserId).toBe(identityRow?.canonical_user_id);
+        expect(storedActions[0]?.target?.canonicalUserId).not.toBe('qq-10008');
 
         const botMessage = getPersistedMessage(sentMessageId ?? '');
         expect(botMessage?.raw_type).toBe('bot.response');
@@ -1611,8 +2851,8 @@ describe('E2E Conversation Flow', () => {
           message_type: 'private',
           message_id: 12353,
           user_id: 10009,
-          message: '触发发送失败',
-          raw_message: '触发发送失败',
+          message: '我喜欢 合成发送失败测试',
+          raw_message: '我喜欢 合成发送失败测试',
           sender: {
             user_id: 10009,
             nickname: 'SendFailureUser',
@@ -1638,6 +2878,11 @@ describe('E2E Conversation Flow', () => {
         expect(actionRows[0]?.error_message).not.toContain(rawPlatformId);
         expect(sentMessages).toHaveLength(1);
         expect(getPersistedMessage(sentMessages[0]?.messageId ?? '')).toBeUndefined();
+        const source = getPersistedMessage('qq-12353');
+        expect(source).toBeDefined();
+        expect(app.getDatabase().prepare(
+          "SELECT COUNT(*) AS count FROM jobs WHERE type = 'extraction' AND idempotency_key = ?",
+        ).get(`extraction:auto:${source?.id}`)).toEqual({ count: 1 });
         expectNoForeignKeyViolations();
       } finally {
         setSuccessfulPiRuntime();
@@ -1645,6 +2890,7 @@ describe('E2E Conversation Flow', () => {
     });
 
     it('should persist evaluator downgrade decisions for social actions', async () => {
+      const evaluatorDecidedAt = new Date('2026-07-10T04:05:06.789Z');
       class DowngradeEvaluator extends EvaluatorStub {
         async evaluateSocial(request: SocialEvaluationRequest): Promise<SocialEvaluationResult> {
           return {
@@ -1655,7 +2901,7 @@ describe('E2E Conversation Flow', () => {
             reason: 'Test evaluator downgraded private full reply',
             confidence: 0.77,
             riskLevel: 'medium',
-            decidedAt: new Date(),
+            decidedAt: evaluatorDecidedAt,
             evaluatorVersion: 'test-downgrade',
             downgradeAction: {
               from: 'reply_full',
@@ -1670,6 +2916,7 @@ describe('E2E Conversation Flow', () => {
       app.setSocialEvaluatorForTesting(new DowngradeEvaluator());
       setReplyingPiRuntime('这是一条会被评估器降级的回复。');
       setCapturingMessageSender(sentMessages);
+      const riskAttention = forceRiskAttentionForTesting();
 
       try {
         const onebotEvent: OneBotMessage = {
@@ -1677,8 +2924,8 @@ describe('E2E Conversation Flow', () => {
           message_type: 'private',
           message_id: 12354,
           user_id: 10010,
-          message: '!请评估后回复',
-          raw_message: '!请评估后回复',
+          message: '请评估后回复',
+          raw_message: '请评估后回复',
           sender: {
             user_id: 10010,
             nickname: 'DowngradeUser',
@@ -1697,13 +2944,688 @@ describe('E2E Conversation Flow', () => {
         expect(actionRows[0]?.risk_level).toBe('medium');
         expect(actionRows[0]?.evaluator_required).toBe(1);
         expect(actionRows[0]?.evaluator_passed).toBe(1);
+        expect(actionRows[0]?.evaluator_decision_id).toBe('eval-downgrade-test');
         expect(actionRows[0]?.action_type).toBe('reply_short');
         expect(actionRows[0]?.status).toBe('success');
         expect(JSON.parse(actionRows[0]?.suppressors ?? '[]')).toContain(
           'evaluator_downgrade:reply_full->reply_short'
         );
+
+        const evidence = app.getDatabase().prepare(
+          `SELECT
+             source_raw.id AS source_raw_event_id,
+             source_chat.id AS source_chat_message_id,
+             turn.id AS turn_id,
+             evaluator.id AS evaluator_decision_id,
+             evaluator.request_id AS evaluator_request_id,
+             evaluator.evaluator_version,
+             evaluator.decided_at AS evaluator_decided_at,
+             evaluator.source_event_ids,
+             action.id AS action_decision_id,
+             execution.id AS action_execution_id,
+             response_raw.id AS response_raw_event_id,
+             response_chat.id AS response_chat_row_id,
+             response_chat.raw_event_id AS response_chat_raw_event_id,
+             response_chat.message_id AS response_platform_message_id
+           FROM chat_messages source_chat
+           JOIN raw_events source_raw ON source_raw.id = source_chat.raw_event_id
+           JOIN agent_turns turn ON turn.trigger_event_id = source_raw.id
+           JOIN action_decisions action ON action.id = turn.action_decision_id
+           JOIN evaluator_decisions evaluator ON evaluator.id = action.evaluator_decision_id
+           JOIN action_executions execution ON execution.action_decision_id = action.id
+           JOIN chat_messages response_chat ON response_chat.message_id = execution.executed_message_id
+           JOIN raw_events response_raw ON response_raw.id = response_chat.raw_event_id
+           WHERE source_chat.message_id = ?`
+        ).get('qq-12354') as {
+          source_raw_event_id: string;
+          source_chat_message_id: string;
+          turn_id: string;
+          evaluator_decision_id: string;
+          evaluator_request_id: string;
+          evaluator_version: string;
+          evaluator_decided_at: number;
+          source_event_ids: string;
+          action_decision_id: string;
+          action_execution_id: string;
+          response_raw_event_id: string;
+          response_chat_row_id: string;
+          response_chat_raw_event_id: string;
+          response_platform_message_id: string;
+        };
+
+        expect(evidence).toMatchObject({
+          source_chat_message_id: evidence.source_raw_event_id,
+          turn_id: actionRows[0]?.turn_id,
+          evaluator_decision_id: 'eval-downgrade-test',
+          evaluator_version: 'test-downgrade',
+          evaluator_decided_at: evaluatorDecidedAt.getTime(),
+          action_decision_id: actionRows[0]?.decision_id,
+        });
+        expect(evidence.evaluator_request_id).toBeTruthy();
+        expect(JSON.parse(evidence.source_event_ids)).toEqual([evidence.source_raw_event_id]);
+        expect(evidence.action_execution_id).toBe(actionRows[0]?.execution_id);
+        expect(evidence.response_chat_row_id).toBeTruthy();
+        expect(evidence.response_raw_event_id).toBe(evidence.response_chat_raw_event_id);
+        expect(evidence.response_platform_message_id).toBe(sentMessages[0]?.messageId);
         expectNoForeignKeyViolations();
       } finally {
+        riskAttention.mockRestore();
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('should persist bot response evidence for evaluator-modified reply_with_tool delivery', async () => {
+      class ReplyWithToolEvaluator extends EvaluatorStub {
+        async evaluateSocial(request: SocialEvaluationRequest): Promise<SocialEvaluationResult> {
+          return {
+            domain: 'social',
+            decisionId: 'eval-reply-with-tool-test',
+            requestId: request.requestId,
+            decision: 'approve',
+            reason: 'Test evaluator selected tool-backed reply delivery',
+            confidence: 0.88,
+            riskLevel: 'medium',
+            decidedAt: new Date(),
+            evaluatorVersion: 'test-reply-with-tool',
+            modifiedAction: {
+              ...request.proposedAction,
+              type: 'reply_with_tool',
+              payload: {
+                text: '工具结果摘要回复。',
+                toolCall: {
+                  id: 'tc-e2e-reply-with-tool',
+                  turnId: request.turnId,
+                  toolName: 'group.recent_summary',
+                  input: {},
+                  requestedBy: 'pi',
+                  actor: {
+                    actorClass: 'user',
+                  },
+                  context: request.context,
+                },
+              },
+              reason: 'Tool result is ready for delivery',
+            },
+          };
+        }
+      }
+
+      const sentMessages: SentMessage[] = [];
+      app.setSocialEvaluatorForTesting(new ReplyWithToolEvaluator());
+      setReplyingPiRuntime('工具结果摘要回复。');
+      setCapturingMessageSender(sentMessages);
+      const riskAttention = forceRiskAttentionForTesting();
+
+      try {
+        const onebotEvent: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'private',
+          message_id: 12356,
+          user_id: 10012,
+          message: '请用工具结果回复',
+          raw_message: '请用工具结果回复',
+          sender: {
+            user_id: 10012,
+            nickname: 'ReplyWithToolUser',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+
+        const response = await postEvent(onebotEvent);
+
+        expect(response.status).toBe(200);
+        expect(sentMessages).toHaveLength(1);
+        expect(sentMessages[0]?.text).toBe('工具结果摘要回复。');
+
+        const turn = getTurnForMessage('qq-12356');
+        expect(turn?.status).toBe('completed');
+        expect(turn?.response_text).toBe('工具结果摘要回复。');
+
+        const actionRows = getActionRowsForMessage('qq-12356');
+        expect(actionRows).toHaveLength(1);
+        expect(actionRows[0]).toMatchObject({
+          decided_by: 'evaluator',
+          evaluator_required: 1,
+          evaluator_passed: 1,
+          action_type: 'reply_with_tool',
+          status: 'success',
+          executed_message_id: sentMessages[0]?.messageId,
+        });
+
+        const outboundMessage = getPersistedMessage(sentMessages[0]?.messageId ?? '');
+        expect(outboundMessage).toMatchObject({
+          raw_type: 'bot.response',
+          raw_event_id: expect.any(String),
+          conversation_id: 'private:qq-10012',
+          conversation_type: 'private',
+          sender_id: 'bot-self',
+          text: '工具结果摘要回复。',
+        });
+        expectNoForeignKeyViolations();
+      } finally {
+        riskAttention.mockRestore();
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('should persist the evaluator-modified delivered text as bot response evidence', async () => {
+      class ModifiedTextEvaluator extends EvaluatorStub {
+        async evaluateSocial(request: SocialEvaluationRequest): Promise<SocialEvaluationResult> {
+          return {
+            domain: 'social',
+            decisionId: 'eval-modified-text-test',
+            requestId: request.requestId,
+            decision: 'approve',
+            reason: 'Test evaluator replaced the outbound text',
+            confidence: 0.86,
+            riskLevel: 'medium',
+            decidedAt: new Date(),
+            evaluatorVersion: 'test-modified-text',
+            modifiedAction: {
+              ...request.proposedAction,
+              type: 'reply_with_tool',
+              target: {
+                conversationId: 'private:qq-99999',
+                conversationType: 'private',
+                userId: 'qq-99999',
+                canonicalUserId: 'user-evaluator-spoof',
+              },
+              payload: {
+                text: '评估器改写后的实际发送文本。',
+              },
+              reason: 'Evaluator replaced draft text and attempted to retarget delivery',
+            },
+          };
+        }
+      }
+
+      const sentMessages: SentMessage[] = [];
+      app.setSocialEvaluatorForTesting(new ModifiedTextEvaluator());
+      setReplyingPiRuntime('Pi 原始草稿不应作为已发送 bot.response。');
+      setCapturingMessageSender(sentMessages);
+      const riskAttention = forceRiskAttentionForTesting();
+
+      try {
+        const onebotEvent: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'private',
+          message_id: 12359,
+          user_id: 10015,
+          message: '请让评估器改写',
+          raw_message: '请让评估器改写',
+          sender: {
+            user_id: 10015,
+            nickname: 'ModifiedTextUser',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+
+        const response = await postEvent(onebotEvent);
+
+        expect(response.status).toBe(200);
+        expect(sentMessages).toHaveLength(1);
+        expect(sentMessages[0]?.text).toBe('评估器改写后的实际发送文本。');
+        expect(sentMessages[0]?.target).toMatchObject({
+          conversationId: 'private:qq-10015',
+          conversationType: 'private',
+          userId: 'qq-10015',
+        });
+        expect(sentMessages[0]?.target.conversationId).not.toBe('private:qq-99999');
+        expect(sentMessages[0]?.target.userId).not.toBe('qq-99999');
+
+        const turn = getTurnForMessage('qq-12359');
+        expect(turn?.status).toBe('completed');
+        expect(turn?.response_text).toBe('Pi 原始草稿不应作为已发送 bot.response。');
+
+        const actionRows = getActionRowsForMessage('qq-12359');
+        expect(actionRows).toHaveLength(1);
+        expect(actionRows[0]).toMatchObject({
+          action_type: 'reply_with_tool',
+          status: 'success',
+          executed_message_id: sentMessages[0]?.messageId,
+        });
+        const storedActions = JSON.parse(actionRows[0]?.actions ?? '[]') as Array<{
+          target?: {
+            conversationId?: string;
+            conversationType?: string;
+            userId?: string;
+            canonicalUserId?: string;
+          };
+          payload?: { text?: string };
+        }>;
+        const identityRow = app
+          .getDatabase()
+          .prepare(
+            `SELECT canonical_user_id
+             FROM platform_accounts
+             WHERE platform = ? AND platform_account_id = ?`
+          )
+          .get('qq', '10015') as { canonical_user_id: string } | undefined;
+        expect(identityRow?.canonical_user_id).toBeDefined();
+        expect(storedActions[0]).toMatchObject({
+          target: {
+            conversationId: 'private:qq-10015',
+            conversationType: 'private',
+            userId: 'qq-10015',
+            canonicalUserId: identityRow?.canonical_user_id,
+          },
+          payload: { text: '评估器改写后的实际发送文本。' },
+        });
+        expect(storedActions[0]?.target?.conversationId).not.toBe('private:qq-99999');
+        expect(storedActions[0]?.target?.userId).not.toBe('qq-99999');
+        expect(storedActions[0]?.target?.canonicalUserId).not.toBe('user-evaluator-spoof');
+
+        const outboundMessage = getPersistedMessage(sentMessages[0]?.messageId ?? '');
+        expect(outboundMessage).toMatchObject({
+          raw_type: 'bot.response',
+          conversation_id: 'private:qq-10015',
+          conversation_type: 'private',
+          sender_id: 'bot-self',
+          text: '评估器改写后的实际发送文本。',
+        });
+        expect(outboundMessage?.text).not.toBe('Pi 原始草稿不应作为已发送 bot.response。');
+        expectNoForeignKeyViolations();
+      } finally {
+        riskAttention.mockRestore();
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('REL-MEM-01 should deliver and persist corrected unsupported memory wording', async () => {
+      const rawPiDraft = '已记住：response_style=compact';
+      const correctedText = '收到：response_style=compact';
+      const sentMessages: SentMessage[] = [];
+      setReplyingPiRuntime(rawPiDraft);
+      setCapturingMessageSender(sentMessages);
+
+      try {
+        const onebotEvent: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'private',
+          message_id: 12361,
+          user_id: 10017,
+          message: '请记住 response_style=compact',
+          raw_message: '请记住 response_style=compact',
+          sender: {
+            user_id: 10017,
+            nickname: 'MemoryClaimUser',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+
+        const response = await postEvent(onebotEvent);
+
+        expect(response.status).toBe(200);
+        expect(sentMessages).toHaveLength(1);
+
+        const turn = getTurnForMessage('qq-12361');
+        expect(turn).toMatchObject({
+          status: 'completed',
+          response_text: rawPiDraft,
+        });
+
+        const actionRows = getActionRowsForMessage('qq-12361');
+        expect(actionRows).toHaveLength(1);
+        expect(actionRows[0]).toMatchObject({
+          decided_by: 'pi',
+          evaluator_required: 0,
+          action_type: 'reply_full',
+          status: 'success',
+          executed_message_id: sentMessages[0]?.messageId,
+        });
+        const storedActions = JSON.parse(actionRows[0]?.actions ?? '[]') as Array<{
+          payload?: { text?: string };
+        }>;
+        expect(storedActions[0]?.payload?.text).toBe(correctedText);
+        expect(JSON.parse(actionRows[0]?.suppressors ?? '[]')).toContain(
+          'memory_claim_truthfulness_guard',
+        );
+        expect(sentMessages[0]?.text).toBe(correctedText);
+
+        const outboundMessage = getPersistedMessage(sentMessages[0]?.messageId ?? '');
+        expect(outboundMessage).toMatchObject({
+          raw_type: 'bot.response',
+          conversation_id: 'private:qq-10017',
+          conversation_type: 'private',
+          sender_id: 'bot-self',
+          text: correctedText,
+        });
+        expect(outboundMessage?.text).not.toBe(turn?.response_text);
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('REL-MEM-01 should not echo a sensitive proposition in action or delivery text', async () => {
+      const sensitiveProposition = 'api_key=sk-memory-claim-synthetic-secret-qq-1234567890';
+      const rawPiDraft = `已记住：${sensitiveProposition}`;
+      const correctedText = '收到。';
+      const sentMessages: SentMessage[] = [];
+      setReplyingPiRuntime(rawPiDraft);
+      setCapturingMessageSender(sentMessages);
+
+      try {
+        const onebotEvent: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'private',
+          message_id: 12362,
+          user_id: 10018,
+          message: '请确认收到这段合成敏感格式。',
+          raw_message: '请确认收到这段合成敏感格式。',
+          sender: {
+            user_id: 10018,
+            nickname: 'SensitiveMemoryClaimUser',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+
+        const response = await postEvent(onebotEvent);
+
+        expect(response.status).toBe(200);
+        expect(sentMessages).toHaveLength(1);
+        expect(sentMessages[0]?.text).toBe(correctedText);
+        expect(sentMessages[0]?.text).not.toContain(sensitiveProposition);
+
+        const actionRows = getActionRowsForMessage('qq-12362');
+        expect(actionRows).toHaveLength(1);
+        const storedActions = JSON.parse(actionRows[0]?.actions ?? '[]') as Array<{
+          payload?: { text?: string };
+        }>;
+        expect(storedActions[0]?.payload?.text).toBe(correctedText);
+        expect(actionRows[0]?.actions).not.toContain(sensitiveProposition);
+        expect(JSON.parse(actionRows[0]?.suppressors ?? '[]')).toContain(
+          'memory_claim_truthfulness_guard',
+        );
+
+        const outboundMessage = getPersistedMessage(sentMessages[0]?.messageId ?? '');
+        expect(outboundMessage).toMatchObject({
+          raw_type: 'bot.response',
+          conversation_id: 'private:qq-10018',
+          conversation_type: 'private',
+          sender_id: 'bot-self',
+          text: correctedText,
+        });
+        expect(outboundMessage?.text).not.toContain(sensitiveProposition);
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('should persist bot response evidence for folded-forward text fallback delivery', async () => {
+      class FoldedForwardEvaluator extends EvaluatorStub {
+        async evaluateSocial(request: SocialEvaluationRequest): Promise<SocialEvaluationResult> {
+          return {
+            domain: 'social',
+            decisionId: 'eval-folded-forward-test',
+            requestId: request.requestId,
+            decision: 'approve',
+            reason: 'Test evaluator selected folded-forward fallback delivery',
+            confidence: 0.82,
+            riskLevel: 'medium',
+            decidedAt: new Date(),
+            evaluatorVersion: 'test-folded-forward',
+            modifiedAction: {
+              ...request.proposedAction,
+              type: 'send_folded_forward',
+              payload: {
+                text: '长回复折叠转发的安全摘要。',
+              },
+              reason: 'Long response should use folded-forward fallback',
+            },
+          };
+        }
+      }
+
+      const sentMessages: SentMessage[] = [];
+      app.setSocialEvaluatorForTesting(new FoldedForwardEvaluator());
+      setReplyingPiRuntime('长回复折叠转发的安全摘要。');
+      setCapturingMessageSender(sentMessages);
+      const riskAttention = forceRiskAttentionForTesting();
+
+      try {
+        const onebotEvent: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'private',
+          message_id: 12357,
+          user_id: 10013,
+          message: '请发送长回复',
+          raw_message: '请发送长回复',
+          sender: {
+            user_id: 10013,
+            nickname: 'FoldedForwardUser',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+
+        const response = await postEvent(onebotEvent);
+
+        expect(response.status).toBe(200);
+        expect(sentMessages).toHaveLength(1);
+        expect(sentMessages[0]?.text).toBe('长回复折叠转发的安全摘要。');
+
+        const turn = getTurnForMessage('qq-12357');
+        expect(turn?.status).toBe('completed');
+        expect(turn?.response_text).toBe('长回复折叠转发的安全摘要。');
+
+        const actionRows = getActionRowsForMessage('qq-12357');
+        expect(actionRows).toHaveLength(1);
+        expect(actionRows[0]).toMatchObject({
+          decided_by: 'evaluator',
+          evaluator_required: 1,
+          evaluator_passed: 1,
+          action_type: 'send_folded_forward',
+          status: 'downgraded',
+          executed_message_id: sentMessages[0]?.messageId,
+        });
+
+        const outboundMessage = getPersistedMessage(sentMessages[0]?.messageId ?? '');
+        expect(outboundMessage).toMatchObject({
+          raw_type: 'bot.response',
+          raw_event_id: expect.any(String),
+          conversation_id: 'private:qq-10013',
+          conversation_type: 'private',
+          sender_id: 'bot-self',
+          text: '长回复折叠转发的安全摘要。',
+        });
+        expectNoForeignKeyViolations();
+      } finally {
+        riskAttention.mockRestore();
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('should record true react_only action execution without bot response evidence', async () => {
+      class ReactOnlyEvaluator extends EvaluatorStub {
+        async evaluateSocial(request: SocialEvaluationRequest): Promise<SocialEvaluationResult> {
+          return {
+            domain: 'social',
+            decisionId: 'eval-react-only-test',
+            requestId: request.requestId,
+            decision: 'approve',
+            reason: 'Test evaluator selected true reaction delivery',
+            confidence: 0.84,
+            riskLevel: 'medium',
+            decidedAt: new Date(),
+            evaluatorVersion: 'test-react-only',
+            modifiedAction: {
+              ...request.proposedAction,
+              type: 'react_only',
+              payload: {
+                reaction: '👍',
+                messageId: 'qq-12358',
+              },
+              reason: 'Use a lightweight reaction only',
+            },
+          };
+        }
+      }
+
+      const fakeGateway = new FakeOneBot({
+        capabilities: {
+          reactions: { emojiLike: true, faceMessage: true },
+        },
+      });
+      app.setSocialEvaluatorForTesting(new ReactOnlyEvaluator());
+      setReplyingPiRuntime('👍');
+      app.setMessageSenderForTesting(fakeGateway);
+      const riskAttention = forceRiskAttentionForTesting();
+
+      try {
+        const onebotEvent: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'private',
+          message_id: 12358,
+          user_id: 10014,
+          message: '只用反应即可',
+          raw_message: '只用反应即可',
+          sender: {
+            user_id: 10014,
+            nickname: 'ReactOnlyUser',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+
+        const response = await postEvent(onebotEvent);
+
+        expect(response.status).toBe(200);
+        expect(fakeGateway.getSentMessages()).toHaveLength(0);
+        expect(fakeGateway.getSentReactions()).toMatchObject([
+          {
+            messageId: 'qq-12358',
+            emoji: '👍',
+          },
+        ]);
+        fakeGateway.assertReactionSent('qq-12358', '👍');
+
+        const turn = getTurnForMessage('qq-12358');
+        expect(turn?.status).toBe('completed');
+        expect(turn?.response_text).toBe('👍');
+
+        const actionRows = getActionRowsForMessage('qq-12358');
+        expect(actionRows).toHaveLength(1);
+        expect(actionRows[0]).toMatchObject({
+          decided_by: 'evaluator',
+          evaluator_required: 1,
+          evaluator_passed: 1,
+          action_type: 'react_only',
+          status: 'success',
+          executed_message_id: null,
+        });
+
+        expect(countBotResponseRows('private:qq-10014')).toBe(0);
+        expectNoForeignKeyViolations();
+      } finally {
+        riskAttention.mockRestore();
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('REL-MEM-01 should guard react_only face-message fallback text before delivery', async () => {
+      const unsupportedReactionClaim = '已记住：reaction_fallback=compact';
+      const correctedReactionText = '收到：reaction_fallback=compact';
+      class ReactFallbackEvaluator extends EvaluatorStub {
+        async evaluateSocial(request: SocialEvaluationRequest): Promise<SocialEvaluationResult> {
+          return {
+            domain: 'social',
+            decisionId: 'eval-react-fallback-test',
+            requestId: request.requestId,
+            decision: 'approve',
+            reason: 'Test evaluator selected reaction fallback delivery',
+            confidence: 0.83,
+            riskLevel: 'medium',
+            decidedAt: new Date(),
+            evaluatorVersion: 'test-react-fallback',
+            modifiedAction: {
+              ...request.proposedAction,
+              type: 'react_only',
+              payload: {
+                reaction: unsupportedReactionClaim,
+                messageId: 'qq-12360',
+              },
+              reason: 'Use a reaction fallback message only',
+            },
+          };
+        }
+      }
+
+      const fakeGateway = new FakeOneBot({
+        capabilities: {
+          reactions: { emojiLike: false, faceMessage: true },
+        },
+      });
+      app.setSocialEvaluatorForTesting(new ReactFallbackEvaluator());
+      setReplyingPiRuntime('Pi reaction fallback draft should not be persisted as delivered text.');
+      app.setMessageSenderForTesting(fakeGateway);
+      const riskAttention = forceRiskAttentionForTesting();
+
+      try {
+        const onebotEvent: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'private',
+          message_id: 12360,
+          user_id: 10016,
+          message: '反应用降级消息',
+          raw_message: '反应用降级消息',
+          sender: {
+            user_id: 10016,
+            nickname: 'ReactFallbackUser',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+
+        const response = await postEvent(onebotEvent);
+
+        expect(response.status).toBe(200);
+        expect(fakeGateway.getSentReactions()).toHaveLength(0);
+        expect(fakeGateway.getSentMessages()).toHaveLength(1);
+        expect(fakeGateway.getSentMessages()[0]?.content.text).toBe(correctedReactionText);
+
+        const turn = getTurnForMessage('qq-12360');
+        expect(turn?.status).toBe('completed');
+        expect(turn?.response_text).toBe('Pi reaction fallback draft should not be persisted as delivered text.');
+
+        const actionRows = getActionRowsForMessage('qq-12360');
+        expect(actionRows).toHaveLength(1);
+        expect(actionRows[0]).toMatchObject({
+          decided_by: 'evaluator',
+          evaluator_required: 1,
+          evaluator_passed: 1,
+          action_type: 'react_only',
+          status: 'downgraded',
+          executed_message_id: fakeGateway.getSentMessages()[0]?.messageId,
+        });
+        const storedActions = JSON.parse(actionRows[0]?.actions ?? '[]') as Array<{
+          payload?: { reaction?: string };
+        }>;
+        expect(storedActions[0]?.payload?.reaction).toBe(correctedReactionText);
+        expect(JSON.parse(actionRows[0]?.suppressors ?? '[]')).toContain(
+          'memory_claim_truthfulness_guard',
+        );
+
+        const outboundMessage = getPersistedMessage(fakeGateway.getSentMessages()[0]?.messageId ?? '');
+        expect(outboundMessage).toMatchObject({
+          raw_type: 'bot.response',
+          raw_event_id: expect.any(String),
+          conversation_id: 'private:qq-10016',
+          conversation_type: 'private',
+          sender_id: 'bot-self',
+          text: correctedReactionText,
+        });
+        expect(outboundMessage?.text).not.toBe(
+          'Pi reaction fallback draft should not be persisted as delivered text.',
+        );
+        expectNoForeignKeyViolations();
+      } finally {
+        riskAttention.mockRestore();
         setSuccessfulPiRuntime();
         restoreDecisionDefaults();
       }
@@ -1730,6 +3652,7 @@ describe('E2E Conversation Flow', () => {
       app.setSocialEvaluatorForTesting(new RejectEvaluator());
       setReplyingPiRuntime('这条回复不应该发送。');
       setCapturingMessageSender(sentMessages);
+      const riskAttention = forceRiskAttentionForTesting();
 
       try {
         const onebotEvent: OneBotMessage = {
@@ -1737,8 +3660,8 @@ describe('E2E Conversation Flow', () => {
           message_type: 'private',
           message_id: 12355,
           user_id: 10011,
-          message: '!高风险回复请求',
-          raw_message: '!高风险回复请求',
+          message: '高风险回复请求',
+          raw_message: '高风险回复请求',
           sender: {
             user_id: 10011,
             nickname: 'RejectUser',
@@ -1762,6 +3685,79 @@ describe('E2E Conversation Flow', () => {
         expect(JSON.parse(actionRows[0]?.suppressors ?? '[]')).toContain('evaluator_reject');
         expectNoForeignKeyViolations();
       } finally {
+        riskAttention.mockRestore();
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('REL-EVAL-02 completes governed evaluator failure with durable suppression and no send', async () => {
+      const leakedDiagnostic = 'sk-synthetic-terminal-social-evaluator-diagnostic';
+      class FailingEvaluator extends EvaluatorStub {
+        async evaluateSocial(): Promise<SocialEvaluationResult> {
+          throw new Error(`Invalid structured output: ${leakedDiagnostic}`);
+        }
+      }
+
+      const sentMessages: SentMessage[] = [];
+      app.setSocialEvaluatorForTesting(new FailingEvaluator());
+      setReplyingPiRuntime('This governed response must remain local.');
+      setCapturingMessageSender(sentMessages);
+      const riskAttention = forceRiskAttentionForTesting();
+
+      try {
+        const response = await postEvent({
+          post_type: 'message',
+          message_type: 'private',
+          message_id: 12364,
+          user_id: 10020,
+          message: 'Synthetic governed response request',
+          raw_message: 'Synthetic governed response request',
+          sender: {
+            user_id: 10020,
+            nickname: 'SyntheticEvaluatorFailureUser',
+          },
+          time: Math.floor(Date.now() / 1000),
+        } satisfies OneBotMessage);
+
+        expect(response.status).toBe(200);
+        expect(sentMessages).toHaveLength(0);
+        const persisted = getPersistedMessage('qq-12364');
+        expect(persisted).toBeDefined();
+        expect(app.getDatabase().prepare(
+          'SELECT state, reason_code FROM event_processing_admissions WHERE raw_event_id = ?',
+        ).get(persisted?.raw_event_id)).toEqual({ state: 'completed', reason_code: null });
+        expect(getTurnForMessage('qq-12364')).toMatchObject({
+          status: 'completed',
+          action_decision_id: expect.any(String),
+          response_text: 'This governed response must remain local.',
+        });
+
+        const actionRows = getActionRowsForMessage('qq-12364');
+        expect(actionRows).toHaveLength(1);
+        expect(actionRows[0]).toMatchObject({
+          decided_by: 'pi',
+          risk_level: 'medium',
+          evaluator_required: 1,
+          evaluator_passed: 0,
+          evaluator_decision_id: null,
+          action_type: 'silent_store',
+          status: 'success',
+          executed_message_id: null,
+        });
+        expect(JSON.parse(actionRows[0]?.reasons ?? '[]')).toContain('evaluator_failure');
+        expect(JSON.parse(actionRows[0]?.suppressors ?? '[]')).toContain(
+          'evaluator_terminal_failure',
+        );
+        expect(JSON.stringify(actionRows[0])).not.toContain(leakedDiagnostic);
+        expect(app.getDatabase().prepare(
+          'SELECT COUNT(*) AS count FROM event_processing_failures WHERE raw_event_id = ?',
+        ).get(persisted?.raw_event_id)).toEqual({ count: 0 });
+        expect(countBotResponseRawEvents('private:qq-10020')).toBe(0);
+        expect(countBotResponseRows('private:qq-10020')).toBe(0);
+        expectNoForeignKeyViolations();
+      } finally {
+        riskAttention.mockRestore();
         setSuccessfulPiRuntime();
         restoreDecisionDefaults();
       }
@@ -1769,6 +3765,61 @@ describe('E2E Conversation Flow', () => {
   });
 
   describe('Group message flow', () => {
+    interface DelayedCandidateRow {
+      candidate_id: string;
+      source_raw_event_id: string;
+      job_id: string;
+      not_before_at: number;
+      expires_at: number;
+      job_status: string;
+      admission_state: string;
+    }
+
+    function getDelayedCandidate(platformMessageId: string): DelayedCandidateRow {
+      const row = app.getDatabase().prepare(
+        `SELECT candidate.id AS candidate_id,
+                candidate.source_raw_event_id,
+                candidate.job_id,
+                candidate.not_before_at,
+                candidate.expires_at,
+                job.status AS job_status,
+                admission.state AS admission_state
+           FROM attention_candidates AS candidate
+           JOIN chat_messages AS message ON message.id = candidate.source_chat_message_id
+           JOIN jobs AS job ON job.id = candidate.job_id
+           JOIN event_processing_admissions AS admission
+             ON admission.raw_event_id = candidate.source_raw_event_id
+          WHERE message.message_id = ?`,
+      ).get(platformMessageId) as DelayedCandidateRow | undefined;
+      if (!row) {
+        throw new Error(`Missing delayed Attention candidate for ${platformMessageId}`);
+      }
+      return row;
+    }
+
+    function setApprovingProactiveEvaluator(
+      requests: SocialEvaluationRequest[] = [],
+    ): void {
+      class ApprovingProactiveEvaluator extends EvaluatorStub {
+        async evaluateSocial(request: SocialEvaluationRequest): Promise<SocialEvaluationResult> {
+          requests.push(request);
+          return {
+            domain: 'social',
+            decisionId: `synthetic-delayed-${request.requestId}`,
+            requestId: request.requestId,
+            decision: 'approve',
+            reason: 'Synthetic delayed intervention approved',
+            confidence: 0.9,
+            riskLevel: 'medium',
+            decidedAt: new Date(),
+            evaluatorVersion: 'synthetic-delayed-v1',
+          };
+        }
+      }
+
+      app.setSocialEvaluatorForTesting(new ApprovingProactiveEvaluator());
+    }
+
     it('should accept and process group message with @mention', async () => {
       const onebotEvent: OneBotMessage = {
         post_type: 'message',
@@ -1871,6 +3922,1766 @@ describe('E2E Conversation Flow', () => {
         expect(getContextTraceForMessage('qq-23457')).toBeUndefined();
         expect(getActionRowsForMessage('qq-23457')).toEqual([]);
         expect(sentMessages).toEqual([]);
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('REL-MEM-02 admits and processes a silent group extraction candidate exactly once', async () => {
+      const db = app.getDatabase();
+      const sentMessages: SentMessage[] = [];
+      let piCalls = 0;
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          piCalls += 1;
+          return {
+            turnId: input.turnId,
+            responseText: 'Silent group extraction must not invoke Pi.',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 1, output: 1, total: 2 },
+            status: 'completed',
+          };
+        },
+      });
+      setCapturingMessageSender(sentMessages);
+      app.setSocialEvaluatorForTesting(new EvaluatorStub());
+      const event: OneBotMessage = {
+        post_type: 'message',
+        message_type: 'group',
+        message_id: 24250,
+        user_id: 20250,
+        group_id: 100050,
+        message: '我喜欢 合成测试',
+        raw_message: '我喜欢 合成测试',
+        sender: {
+          user_id: 20250,
+          nickname: 'SyntheticMemoryUser',
+          role: 'member',
+        },
+        time: Math.floor(Date.now() / 1000),
+      };
+
+      try {
+        const response = await postEvent(event);
+        expect(response.status).toBe(200);
+
+        const persisted = getPersistedMessage('qq-24250');
+        expect(persisted).toMatchObject({
+          conversation_id: 'qq-group-100050',
+          conversation_type: 'group',
+          group_id: 'qq-group-100050',
+          text: '我喜欢 合成测试',
+        });
+        if (!persisted) {
+          throw new Error('Expected silent group source message');
+        }
+        const identity = db.prepare(
+          `SELECT canonical_user_id
+             FROM platform_accounts
+            WHERE platform = 'qq' AND platform_account_id = ?`,
+        ).get('20250') as { canonical_user_id: string } | undefined;
+        expect(identity?.canonical_user_id).toBeDefined();
+
+        const idempotencyKey = `extraction:auto:${persisted.id}`;
+        const pendingJob = db.prepare(
+          `SELECT id, status, attempts, payload, idempotency_key
+             FROM jobs
+            WHERE type = 'extraction' AND idempotency_key = ?`,
+        ).get(idempotencyKey) as {
+          id: string;
+          status: string;
+          attempts: number;
+          payload: string;
+          idempotency_key: string;
+        } | undefined;
+        expect(pendingJob).toMatchObject({
+          status: 'pending',
+          attempts: 0,
+          idempotency_key: idempotencyKey,
+        });
+        if (!pendingJob) {
+          throw new Error('Expected silent group extraction job');
+        }
+        expect(JSON.parse(pendingJob.payload)).toEqual({
+          sourceChatMessageId: persisted.id,
+          targetUserId: identity?.canonical_user_id,
+        });
+        expect(Object.keys(JSON.parse(pendingJob.payload) as Record<string, unknown>).sort())
+          .toEqual(['sourceChatMessageId', 'targetUserId']);
+        expect(pendingJob.payload).not.toContain('我喜欢 合成测试');
+        expect(piCalls).toBe(0);
+        expect(countTurnsForMessage('qq-24250')).toBe(0);
+        expect(getActionRowsForMessage('qq-24250')).toEqual([]);
+        expect(sentMessages).toEqual([]);
+
+        const duplicateResponse = await postEvent(event);
+        expect(duplicateResponse.status).toBe(200);
+        expect(db.prepare(
+          "SELECT COUNT(*) AS count FROM jobs WHERE type = 'extraction' AND idempotency_key = ?",
+        ).get(idempotencyKey)).toEqual({ count: 1 });
+        expect(db.prepare(
+          'SELECT COUNT(*) AS count FROM chat_messages WHERE id = ?',
+        ).get(persisted.id)).toEqual({ count: 1 });
+        expect(piCalls).toBe(0);
+        expect(sentMessages).toEqual([]);
+
+        const result = await app.processNextBackgroundJobForTesting(undefined, ['extraction']);
+        expect(result).toMatchObject({
+          taskId: pendingJob.id,
+          status: 'completed',
+          output: { matched: true, count: 1 },
+        });
+        const output = result?.output as { memoryIds?: string[] } | undefined;
+        const memoryId = output?.memoryIds?.[0];
+        expect(memoryId).toMatch(/^extraction-v1-[a-f0-9]{64}$/);
+
+        const memory = db.prepare(
+          `SELECT scope, canonical_user_id, group_id, conversation_id,
+                  visibility, source_context, state, content
+             FROM memory_records
+            WHERE id = ?`,
+        ).get(memoryId) as {
+          scope: string;
+          canonical_user_id: string;
+          group_id: string;
+          conversation_id: string;
+          visibility: string;
+          source_context: string;
+          state: string;
+          content: string;
+        } | undefined;
+        expect(memory).toEqual({
+          scope: 'user',
+          canonical_user_id: identity?.canonical_user_id,
+          group_id: 'qq-group-100050',
+          conversation_id: 'qq-group-100050',
+          visibility: 'same_group_only',
+          source_context: 'group_chat',
+          state: 'proposed',
+          content: '我喜欢 合成测试',
+        });
+        const sources = db.prepare(
+          `SELECT source_type, source_id, extracted_by, resolution_state,
+                  raw_event_id, chat_message_id
+             FROM memory_sources
+            WHERE memory_id = ?`,
+        ).all(memoryId) as Array<{
+          source_type: string;
+          source_id: string;
+          extracted_by: string;
+          resolution_state: string;
+          raw_event_id: string | null;
+          chat_message_id: string;
+        }>;
+        expect(sources).toEqual([{
+          source_type: 'chat_message',
+          source_id: persisted.id,
+          extracted_by: 'worker',
+          resolution_state: 'internal',
+          raw_event_id: null,
+          chat_message_id: persisted.id,
+        }]);
+        expect(db.prepare(
+          'SELECT COUNT(*) AS count FROM memory_records WHERE id = ?',
+        ).get(memoryId)).toEqual({ count: 1 });
+        expect(piCalls).toBe(0);
+        expect(countTurnsForMessage('qq-24250')).toBe(0);
+        expect(getActionRowsForMessage('qq-24250')).toEqual([]);
+        expect(sentMessages).toEqual([]);
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('REL-ATT-02 defers an unmentioned question and reuses delivery evidence after lease loss', async () => {
+      const evaluatorRequests: SocialEvaluationRequest[] = [];
+      const sentMessages: SentMessage[] = [];
+      let piCalls = 0;
+      let candidate: DelayedCandidateRow | undefined;
+
+      setApprovingProactiveEvaluator(evaluatorRequests);
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          piCalls += 1;
+          return {
+            turnId: input.turnId,
+            responseText: 'Synthetic delayed response',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 9, output: 4, total: 13 },
+            status: 'completed',
+          };
+        },
+      });
+      app.setMessageSenderForTesting({
+        async sendMessage(target, content): Promise<string> {
+          if (!candidate) {
+            throw new Error('Delayed candidate must exist before delivery');
+          }
+          const messageId = `qq-bot-${++outboundMessageCounter}`;
+          sentMessages.push({ messageId, target, text: content.text ?? '' });
+          app.getDatabase().prepare(
+            'UPDATE jobs SET lease_expires_at = ? WHERE id = ?',
+          ).run(candidate.not_before_at, candidate.job_id);
+          return messageId;
+        },
+      });
+
+      try {
+        const event: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'group',
+          message_id: 24101,
+          user_id: 20101,
+          group_id: 100041,
+          message: 'Can this synthetic question be answered?',
+          raw_message: 'Can this synthetic question be answered?',
+          sender: {
+            user_id: 20101,
+            nickname: 'DelayedQuestionUser',
+            role: 'member',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+
+        const response = await postEvent(event);
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({ status: 'ok' });
+
+        candidate = getDelayedCandidate('qq-24101');
+        expect(candidate).toMatchObject({
+          job_status: 'pending',
+          admission_state: 'completed',
+        });
+        expect(piCalls).toBe(0);
+        expect(sentMessages).toEqual([]);
+        expect(countTurnsForMessage('qq-24101')).toBe(0);
+        expect(await app.processNextBackgroundJobForTesting(
+          candidate.not_before_at - 1,
+          ['attention_recheck'],
+        )).toBeNull();
+        expect(piCalls).toBe(0);
+
+        const firstAttempt = await app.processNextBackgroundJobForTesting(
+          candidate.not_before_at,
+          ['attention_recheck'],
+        );
+        expect(firstAttempt).toMatchObject({
+          taskId: candidate.job_id,
+          status: 'failed',
+          error: expect.stringContaining('lost lease authority'),
+        });
+        expect(piCalls).toBe(1);
+        expect(sentMessages).toHaveLength(1);
+        expect(countTurnsForMessage('qq-24101')).toBe(1);
+        expect(countBotResponseRows('qq-group-100041')).toBe(1);
+
+        const retry = await app.processNextBackgroundJobForTesting(
+          candidate.not_before_at + 1,
+          ['attention_recheck'],
+        );
+        expect(retry).toMatchObject({
+          taskId: candidate.job_id,
+          status: 'completed',
+          output: {
+            candidateId: candidate.candidate_id,
+            outcome: 'respond',
+            deliveryRecorded: true,
+          },
+        });
+        expect(piCalls).toBe(1);
+        expect(sentMessages).toHaveLength(1);
+        expect(countTurnsForMessage('qq-24101')).toBe(1);
+        expect(countBotResponseRows('qq-group-100041')).toBe(1);
+
+        expect(evaluatorRequests).toHaveLength(1);
+        expect(evaluatorRequests[0]).toMatchObject({
+          isProactive: true,
+          attentionSignals: {
+            classification: 'needs_response',
+            recommendedPath: 'reply_fast_path',
+            triggerReasons: expect.arrayContaining(['question', 'delayed_recheck']),
+          },
+          proposedAction: {
+            constraints: { proactive: true, evaluatorRequired: true },
+          },
+        });
+        const actionRows = getActionRowsForMessage('qq-24101');
+        expect(actionRows).toHaveLength(1);
+        expect(JSON.parse(actionRows[0]?.reasons ?? '[]')).toContain('delayed_recheck');
+        expect(JSON.parse(actionRows[0]?.actions ?? '[]')[0]?.constraints).toMatchObject({
+          proactive: true,
+          evaluatorRequired: true,
+        });
+        expect(app.getDatabase().prepare(
+          'SELECT COUNT(*) AS count FROM attention_decisions WHERE candidate_id = ?',
+        ).get(candidate.candidate_id)).toEqual({ count: 1 });
+        expect(app.getDatabase().prepare(
+          `SELECT status, attempt_number
+             FROM job_attempts
+            WHERE job_id = ?
+            ORDER BY attempt_number`,
+        ).all(candidate.job_id)).toEqual([
+          { status: 'failed', attempt_number: 1 },
+          { status: 'completed', attempt_number: 2 },
+        ]);
+        expect(app.getDatabase().prepare(
+          'SELECT status FROM jobs WHERE id = ?',
+        ).get(candidate.job_id)).toEqual({ status: 'completed' });
+        expect(app.getDatabase().prepare(
+          'SELECT COUNT(*) AS count FROM chat_messages WHERE message_id = ?',
+        ).get('qq-24101')).toEqual({ count: 1 });
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('REL-ATT-02 rejects mismatched source evidence before Pi or delivery', async () => {
+      const evaluatorRequests: SocialEvaluationRequest[] = [];
+      const sentMessages: SentMessage[] = [];
+      const sourceText = 'Can this exact delayed source still be trusted?';
+      let piCalls = 0;
+
+      setApprovingProactiveEvaluator(evaluatorRequests);
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          piCalls += 1;
+          return {
+            turnId: input.turnId,
+            responseText: 'Unexpected delayed response',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 9, output: 4, total: 13 },
+            status: 'completed',
+          };
+        },
+      });
+      setCapturingMessageSender(sentMessages);
+
+      try {
+        const event: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'group',
+          message_id: 24141,
+          user_id: 20141,
+          group_id: 100048,
+          message: sourceText,
+          raw_message: sourceText,
+          sender: {
+            user_id: 20141,
+            nickname: 'DelayedSourceMismatchUser',
+            role: 'member',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+
+        const response = await postEvent(event);
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({ status: 'ok' });
+
+        const candidate = getDelayedCandidate('qq-24141');
+        const persisted = getPersistedMessage('qq-24141');
+        expect(persisted).toBeDefined();
+        app.getDatabase().prepare(
+          'UPDATE chat_messages SET text = ? WHERE id = ?',
+        ).run('Synthetic mismatched chat evidence', persisted?.id);
+        app.getDatabase().prepare(
+          'UPDATE jobs SET max_attempts = 1 WHERE id = ?',
+        ).run(candidate.job_id);
+
+        const sourceMismatchError =
+          'Delayed Attention source event no longer matches its chat evidence';
+        expect(await app.processNextBackgroundJobForTesting(
+          candidate.not_before_at,
+          ['attention_recheck'],
+        )).toEqual({
+          taskId: candidate.job_id,
+          status: 'failed',
+          error: sourceMismatchError,
+        });
+
+        expect(piCalls).toBe(0);
+        expect(evaluatorRequests).toEqual([]);
+        expect(sentMessages).toEqual([]);
+        expect(countTurnsForMessage('qq-24141')).toBe(0);
+        expect(getActionRowsForMessage('qq-24141')).toEqual([]);
+        expect(countBotResponseRows('qq-group-100048')).toBe(0);
+        expect(app.getDatabase().prepare(
+          'SELECT COUNT(*) AS count FROM attention_decisions WHERE candidate_id = ?',
+        ).get(candidate.candidate_id)).toEqual({ count: 0 });
+        expect(app.getDatabase().prepare(
+          `SELECT attempt_number, status, error
+             FROM job_attempts
+            WHERE job_id = ?
+            ORDER BY attempt_number`,
+        ).all(candidate.job_id)).toEqual([
+          { attempt_number: 1, status: 'failed', error: sourceMismatchError },
+        ]);
+        expect(app.getDatabase().prepare(
+          'SELECT status, attempts, max_attempts, error FROM jobs WHERE id = ?',
+        ).get(candidate.job_id)).toEqual({
+          status: 'failed',
+          attempts: 1,
+          max_attempts: 1,
+          error: sourceMismatchError,
+        });
+        expectNoForeignKeyViolations();
+      } finally {
+        app.getDatabase().prepare(
+          'UPDATE chat_messages SET text = ? WHERE message_id = ?',
+        ).run(sourceText, 'qq-24141');
+        setSuccessfulPiRuntime();
+        setCapturingMessageSender([]);
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('REL-ATT-02 fails closed on indeterminate prior delivery without duplicate work', async () => {
+      const evaluatorRequests: SocialEvaluationRequest[] = [];
+      const sentMessages: SentMessage[] = [];
+      const indeterminateTurnId = 'synthetic-delayed-indeterminate-turn-24142';
+      let piCalls = 0;
+
+      setApprovingProactiveEvaluator(evaluatorRequests);
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          piCalls += 1;
+          return {
+            turnId: input.turnId,
+            responseText: 'Unexpected duplicate delayed response',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 9, output: 4, total: 13 },
+            status: 'completed',
+          };
+        },
+      });
+      setCapturingMessageSender(sentMessages);
+
+      try {
+        const event: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'group',
+          message_id: 24142,
+          user_id: 20142,
+          group_id: 100049,
+          message: 'Can an indeterminate delayed turn be retried safely?',
+          raw_message: 'Can an indeterminate delayed turn be retried safely?',
+          sender: {
+            user_id: 20142,
+            nickname: 'DelayedIndeterminateUser',
+            role: 'member',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+
+        const response = await postEvent(event);
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({ status: 'ok' });
+
+        const candidate = getDelayedCandidate('qq-24142');
+        app.getDatabase().prepare(
+          `INSERT INTO agent_turns (
+             id, conversation_id, trigger_event_id, pi_model, pi_provider,
+             status, started_at
+           ) VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+        ).run(
+          indeterminateTurnId,
+          'qq-group-100049',
+          candidate.source_raw_event_id,
+          'synthetic',
+          'synthetic',
+          candidate.not_before_at,
+        );
+
+        const indeterminateError =
+          'Delayed Attention prior turn has indeterminate delivery state';
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          expect(await app.processNextBackgroundJobForTesting(
+            candidate.not_before_at,
+            ['attention_recheck'],
+          )).toEqual({
+            taskId: candidate.job_id,
+            status: 'failed',
+            error: indeterminateError,
+          });
+          expect(piCalls).toBe(0);
+          expect(evaluatorRequests).toEqual([]);
+          expect(sentMessages).toEqual([]);
+          expect(countTurnsForMessage('qq-24142')).toBe(1);
+          expect(getActionRowsForMessage('qq-24142')).toEqual([]);
+          expect(countBotResponseRows('qq-group-100049')).toBe(0);
+          expect(app.getDatabase().prepare(
+            'SELECT outcome FROM attention_decisions WHERE candidate_id = ?',
+          ).all(candidate.candidate_id)).toEqual([{ outcome: 'respond' }]);
+          expect(app.getDatabase().prepare(
+            'SELECT status, attempts FROM jobs WHERE id = ?',
+          ).get(candidate.job_id)).toEqual({
+            status: attempt === 3 ? 'failed' : 'pending',
+            attempts: attempt,
+          });
+        }
+
+        expect(app.getDatabase().prepare(
+          `SELECT attempt_number, status, error
+             FROM job_attempts
+            WHERE job_id = ?
+            ORDER BY attempt_number`,
+        ).all(candidate.job_id)).toEqual([
+          { attempt_number: 1, status: 'failed', error: indeterminateError },
+          { attempt_number: 2, status: 'failed', error: indeterminateError },
+          { attempt_number: 3, status: 'failed', error: indeterminateError },
+        ]);
+        expect(app.getDatabase().prepare(
+          'SELECT status, attempts, max_attempts, error FROM jobs WHERE id = ?',
+        ).get(candidate.job_id)).toEqual({
+          status: 'failed',
+          attempts: 3,
+          max_attempts: 3,
+          error: indeterminateError,
+        });
+        expect(getTurnForMessage('qq-24142')).toMatchObject({
+          id: indeterminateTurnId,
+          status: 'pending',
+          action_decision_id: null,
+        });
+        expectNoForeignKeyViolations();
+      } finally {
+        app.getDatabase().prepare(
+          `UPDATE agent_turns
+              SET status = 'aborted', completed_at = ?
+            WHERE id = ? AND status IN ('pending', 'running')`,
+        ).run(Date.now(), indeterminateTurnId);
+        setSuccessfulPiRuntime();
+        setCapturingMessageSender([]);
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('REL-ATT-02 persists terminal expiry, human-answer, traffic, and exact-group budget suppressors', async () => {
+      let piCalls = 0;
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          piCalls += 1;
+          return {
+            turnId: input.turnId,
+            responseText: '',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 3, output: 0, total: 3 },
+            status: 'completed',
+          };
+        },
+      });
+
+      const submitQuestion = async (
+        messageId: number,
+        userId: number,
+        groupId: number,
+      ): Promise<DelayedCandidateRow> => {
+        const event: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'group',
+          message_id: messageId,
+          user_id: userId,
+          group_id: groupId,
+          message: `Synthetic delayed policy question ${messageId}?`,
+          raw_message: `Synthetic delayed policy question ${messageId}?`,
+          sender: {
+            user_id: userId,
+            nickname: `DelayedPolicyUser${userId}`,
+            role: 'member',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+        const response = await postEvent(event);
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({ status: 'ok' });
+        return getDelayedCandidate(`qq-${messageId}`);
+      };
+
+      const expectSuppressed = async (
+        candidate: DelayedCandidateRow,
+        now: number,
+        code: string,
+      ): Promise<void> => {
+        const result = await app.processNextBackgroundJobForTesting(
+          now,
+          ['attention_recheck'],
+        );
+        expect(result).toMatchObject({
+          taskId: candidate.job_id,
+          status: 'completed',
+          output: {
+            candidateId: candidate.candidate_id,
+            outcome: 'suppress',
+            suppressors: [expect.objectContaining({ code })],
+          },
+        });
+        expect(app.getDatabase().prepare(
+          `SELECT decision.outcome, suppressor.code
+             FROM attention_decisions AS decision
+             JOIN attention_suppressors AS suppressor
+               ON suppressor.decision_id = decision.id
+            WHERE decision.candidate_id = ?`,
+        ).get(candidate.candidate_id)).toEqual({ outcome: 'suppress', code });
+        const job = app.getDatabase().prepare(
+          'SELECT status, result FROM jobs WHERE id = ?',
+        ).get(candidate.job_id) as { status: string; result: string };
+        expect(job.status).toBe('completed');
+        expect(JSON.parse(job.result)).toMatchObject({
+          candidateId: candidate.candidate_id,
+          outcome: 'suppress',
+        });
+        expect(app.getDatabase().prepare(
+          `SELECT attempt_number, status
+             FROM job_attempts
+            WHERE job_id = ?
+            ORDER BY attempt_number`,
+        ).all(candidate.job_id)).toEqual([
+          { attempt_number: 1, status: 'completed' },
+        ]);
+      };
+
+      try {
+        const expired = await submitQuestion(24110, 20110, 100042);
+        await expectSuppressed(expired, expired.expires_at, 'thread_expired');
+
+        const answered = await submitQuestion(24111, 20111, 100043);
+        const answerEvent: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'group',
+          message_id: 24112,
+          user_id: 20112,
+          group_id: 100043,
+          message: '[CQ:reply,id=24111] Synthetic human answer.',
+          raw_message: '[CQ:reply,id=24111] Synthetic human answer.',
+          sender: {
+            user_id: 20112,
+            nickname: 'DelayedAnswerUser',
+            role: 'member',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+        expect((await postEvent(answerEvent)).status).toBe(200);
+        await expectSuppressed(answered, answered.not_before_at, 'human_answer');
+
+        const traffic = await submitQuestion(24120, 20120, 100044);
+        for (let index = 0; index < 6; index += 1) {
+          const messageId = 24121 + index;
+          const activityEvent: OneBotMessage = {
+            post_type: 'message',
+            message_type: 'group',
+            message_id: messageId,
+            user_id: 20121 + index,
+            group_id: 100044,
+            message: `Synthetic activity ${index}`,
+            raw_message: `Synthetic activity ${index}`,
+            sender: {
+              user_id: 20121 + index,
+              nickname: `TrafficUser${index}`,
+              role: 'member',
+            },
+            time: Math.floor(Date.now() / 1000),
+          };
+          expect((await postEvent(activityEvent)).status).toBe(200);
+          const activity = getPersistedMessage(`qq-${messageId}`);
+          expect(activity).toBeDefined();
+          const observedAt = traffic.not_before_at - 9_000 + index * 1_000;
+          app.getDatabase().transaction(() => {
+            app.getDatabase().prepare(
+              'UPDATE raw_events SET created_at = ? WHERE id = ?',
+            ).run(observedAt, activity?.raw_event_id);
+            app.getDatabase().prepare(
+              'UPDATE event_ingress_receipts SET received_at = ? WHERE raw_event_id = ?',
+            ).run(observedAt, activity?.raw_event_id);
+            app.getDatabase().prepare(
+              `UPDATE event_processing_admissions
+                  SET accepted_at = ?, processing_started_at = ?, finished_at = ?
+                WHERE raw_event_id = ?`,
+            ).run(observedAt, observedAt, observedAt, activity?.raw_event_id);
+          })();
+        }
+        await expectSuppressed(traffic, traffic.not_before_at, 'high_traffic');
+
+        const firstGroupReservation = await submitQuestion(24130, 20130, 100045);
+        expect(await app.processNextBackgroundJobForTesting(
+          firstGroupReservation.not_before_at,
+          ['attention_recheck'],
+        )).toMatchObject({
+          taskId: firstGroupReservation.job_id,
+          status: 'completed',
+          output: { candidateId: firstGroupReservation.candidate_id, outcome: 'respond' },
+        });
+
+        const otherGroupReservation = await submitQuestion(24131, 20131, 100046);
+        expect(await app.processNextBackgroundJobForTesting(
+          otherGroupReservation.not_before_at,
+          ['attention_recheck'],
+        )).toMatchObject({
+          taskId: otherGroupReservation.job_id,
+          status: 'completed',
+          output: { candidateId: otherGroupReservation.candidate_id, outcome: 'respond' },
+        });
+
+        const secondGroupReservation = await submitQuestion(24132, 20132, 100045);
+        expect(await app.processNextBackgroundJobForTesting(
+          secondGroupReservation.not_before_at,
+          ['attention_recheck'],
+        )).toMatchObject({
+          taskId: secondGroupReservation.job_id,
+          status: 'completed',
+          output: { candidateId: secondGroupReservation.candidate_id, outcome: 'respond' },
+        });
+
+        const budgetSuppressed = await submitQuestion(24133, 20133, 100045);
+        await expectSuppressed(
+          budgetSuppressed,
+          budgetSuppressed.not_before_at,
+          'group_budget_exhausted',
+        );
+        expect(app.getDatabase().prepare(
+          `SELECT suppressor.observed_count
+             FROM attention_suppressors AS suppressor
+             JOIN attention_decisions AS decision ON decision.id = suppressor.decision_id
+            WHERE decision.candidate_id = ?`,
+        ).get(budgetSuppressed.candidate_id)).toEqual({ observed_count: 2 });
+        expect(piCalls).toBe(3);
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('REL-ATT-02 rolls back chat, candidate, and job together when deferred persistence fails', async () => {
+      const groupId = 'qq-group-100047';
+      const db = app.getDatabase();
+      db.exec(
+        `CREATE TRIGGER fail_synthetic_delayed_candidate
+         BEFORE INSERT ON attention_candidates
+         WHEN NEW.group_id = '${groupId}'
+         BEGIN
+           SELECT RAISE(ABORT, 'synthetic delayed candidate failure');
+         END`,
+      );
+
+      try {
+        const event: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'group',
+          message_id: 24140,
+          user_id: 20140,
+          group_id: 100047,
+          message: 'Should this synthetic candidate fail atomically?',
+          raw_message: 'Should this synthetic candidate fail atomically?',
+          sender: {
+            user_id: 20140,
+            nickname: 'AtomicCandidateUser',
+            role: 'member',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+        const response = await postEvent(event);
+        expect(response.status).toBe(200);
+
+        const raw = db.prepare(
+          'SELECT id FROM raw_events WHERE platform_event_id = ?',
+        ).get('qq-24140') as { id: string } | undefined;
+        expect(raw).toBeDefined();
+        expect(getPersistedMessage('qq-24140')).toBeUndefined();
+        expect(db.prepare(
+          'SELECT COUNT(*) AS count FROM attention_candidates WHERE group_id = ?',
+        ).get(groupId)).toEqual({ count: 0 });
+        expect(db.prepare(
+          `SELECT COUNT(*) AS count
+             FROM jobs
+            WHERE type = 'attention_recheck'
+              AND idempotency_key = ?`,
+        ).get(`attention:deferred:v1:${raw?.id}`)).toEqual({ count: 0 });
+        expect(db.prepare(
+          'SELECT state, reason_code FROM event_processing_admissions WHERE raw_event_id = ?',
+        ).get(raw?.id)).toEqual({ state: 'failed', reason_code: 'handler_failed' });
+        expect(app.getEventProcessingFailures()).toHaveLength(1);
+        expectNoForeignKeyViolations();
+      } finally {
+        db.exec('DROP TRIGGER IF EXISTS fail_synthetic_delayed_candidate');
+        app.clearEventProcessingFailuresForTesting();
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('REL-ADMIN-01 keeps narrative text silent and routes only authorized exact commands', async () => {
+      const evaluatorRequests: SocialEvaluationRequest[] = [];
+      const sentMessages: SentMessage[] = [];
+      let piCalls = 0;
+
+      class CapturingEvaluator extends EvaluatorStub {
+        async evaluateSocial(request: SocialEvaluationRequest): Promise<SocialEvaluationResult> {
+          evaluatorRequests.push(request);
+          return super.evaluateSocial(request);
+        }
+      }
+
+      app.setSocialEvaluatorForTesting(new CapturingEvaluator());
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          piCalls += 1;
+          return {
+            turnId: input.turnId,
+            responseText: 'Synthetic governed command response',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 11, output: 7, total: 18 },
+            status: 'completed',
+          };
+        },
+      });
+      setCapturingMessageSender(sentMessages);
+
+      try {
+        const memberNarrativeEvent: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'group',
+          message_id: 24020,
+          user_id: 20200,
+          group_id: 100020,
+          message: '设置群规则',
+          raw_message: '设置群规则',
+          sender: {
+            user_id: 20200,
+            nickname: 'InstructionMember',
+            role: 'member',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+        const adminNarrativeEvent: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'group',
+          message_id: 24021,
+          user_id: 20201,
+          group_id: 100020,
+          message: '设置群规则',
+          raw_message: '设置群规则',
+          sender: {
+            user_id: 20201,
+            nickname: 'InstructionAdmin',
+            role: 'admin',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+
+        const memberCommandEvent: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'group',
+          message_id: 24022,
+          user_id: 20202,
+          group_id: 100020,
+          message: '/memory',
+          raw_message: '/memory',
+          sender: {
+            user_id: 20202,
+            nickname: 'CommandMember',
+            role: 'member',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+        const adminCommandEvent: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'group',
+          message_id: 24023,
+          user_id: 20203,
+          group_id: 100020,
+          message: '/memory',
+          raw_message: '/memory',
+          sender: {
+            user_id: 20203,
+            nickname: 'CommandAdmin',
+            role: 'admin',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+        const invalidAdminCommandEvent: OneBotMessage = {
+          post_type: 'message',
+          message_type: 'group',
+          message_id: 24024,
+          user_id: 20203,
+          group_id: 100020,
+          message: '/memory list',
+          raw_message: '/memory list',
+          sender: {
+            user_id: 20203,
+            nickname: 'CommandAdmin',
+            role: 'admin',
+          },
+          time: Math.floor(Date.now() / 1000),
+        };
+
+        const memberResponse = await postEvent(memberNarrativeEvent);
+
+        expect(memberResponse.status).toBe(200);
+        await expect(memberResponse.json()).resolves.toEqual({ status: 'ok' });
+        expect(getPersistedMessage('qq-24020')).toMatchObject({
+          sender_role: 'member',
+          text: '设置群规则',
+          mentions_bot: 0,
+        });
+        expect(piCalls).toBe(0);
+        expect(evaluatorRequests).toHaveLength(0);
+        expect(countTurnsForMessage('qq-24020')).toBe(0);
+        expect(getActionRowsForMessage('qq-24020')).toEqual([]);
+        expect(sentMessages).toEqual([]);
+
+        const adminNarrativeResponse = await postEvent(adminNarrativeEvent);
+
+        expect(adminNarrativeResponse.status).toBe(200);
+        await expect(adminNarrativeResponse.json()).resolves.toEqual({ status: 'ok' });
+        expect(getPersistedMessage('qq-24021')).toMatchObject({
+          sender_role: 'admin',
+          text: '设置群规则',
+          mentions_bot: 0,
+        });
+        expect(piCalls).toBe(0);
+        expect(evaluatorRequests).toHaveLength(0);
+        expect(countTurnsForMessage('qq-24021')).toBe(0);
+        expect(getActionRowsForMessage('qq-24021')).toEqual([]);
+
+        const memberCommandResponse = await postEvent(memberCommandEvent);
+
+        expect(memberCommandResponse.status).toBe(200);
+        await expect(memberCommandResponse.json()).resolves.toEqual({ status: 'ok' });
+        expect(piCalls).toBe(0);
+        expect(evaluatorRequests).toHaveLength(0);
+        expect(countTurnsForMessage('qq-24022')).toBe(1);
+        expect(sentMessages).toHaveLength(1);
+        expectSuccessfulGroupGovernanceCommand(
+          'qq-24022',
+          sentMessages[0],
+          'Governance command denied.',
+        );
+
+        const adminCommandResponse = await postEvent(adminCommandEvent);
+
+        expect(adminCommandResponse.status).toBe(200);
+        await expect(adminCommandResponse.json()).resolves.toEqual({ status: 'ok' });
+        expect(piCalls).toBe(0);
+        expect(evaluatorRequests).toHaveLength(0);
+
+        expect(sentMessages).toHaveLength(2);
+        expectSuccessfulGroupGovernanceCommand(
+          'qq-24023',
+          sentMessages[1],
+          'Memory records: none.',
+        );
+
+        const invalidAdminCommandResponse = await postEvent(invalidAdminCommandEvent);
+
+        expect(invalidAdminCommandResponse.status).toBe(200);
+        await expect(invalidAdminCommandResponse.json()).resolves.toEqual({ status: 'ok' });
+        expect(piCalls).toBe(0);
+        expect(evaluatorRequests).toHaveLength(0);
+        expect(sentMessages).toHaveLength(3);
+        expectSuccessfulGroupGovernanceCommand(
+          'qq-24024',
+          sentMessages[2],
+          'Usage: /memory | /memory forget <memory-id> | /memory summary status|enable|disable',
+        );
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('REL-GOV-01 applies group-summary changes once and cancels bound pending work', async () => {
+      const db = app.getDatabase();
+      const sentMessages: SentMessage[] = [];
+      const evaluatorRequests: SocialEvaluationRequest[] = [];
+      const policyRepository = new GroupSummaryPolicyRepository(db);
+      const groupId = 'qq-group-100071';
+      const groupIdHash = createHash('sha256')
+        .update('lethebot:group-summary-policy:v1\0')
+        .update(groupId)
+        .digest('hex');
+      let piCalls = 0;
+
+      class CapturingEvaluator extends EvaluatorStub {
+        async evaluateSocial(request: SocialEvaluationRequest): Promise<SocialEvaluationResult> {
+          evaluatorRequests.push(request);
+          return super.evaluateSocial(request);
+        }
+      }
+
+      app.setSocialEvaluatorForTesting(new CapturingEvaluator());
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          piCalls += 1;
+          return {
+            turnId: input.turnId,
+            responseText: 'Summary governance commands must not reach Pi.',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 1, output: 1, total: 2 },
+            status: 'completed',
+          };
+        },
+      });
+      setCapturingMessageSender(sentMessages);
+
+      const statusEvent = makeGroupEvent({
+        messageId: 24620,
+        userId: 20711,
+        groupId: 100071,
+        text: '/memory summary status',
+      });
+      const enableEvent = makeGroupEvent({
+        messageId: 24621,
+        userId: 20711,
+        groupId: 100071,
+        text: '/memory summary enable',
+      });
+      const idempotentEnableEvent = makeGroupEvent({
+        messageId: 24622,
+        userId: 20711,
+        groupId: 100071,
+        text: '/memory summary enable',
+      });
+      const disableEvent = makeGroupEvent({
+        messageId: 24623,
+        userId: 20711,
+        groupId: 100071,
+        text: '/memory summary disable',
+      });
+      const reenableEvent = makeGroupEvent({
+        messageId: 24624,
+        userId: 20711,
+        groupId: 100071,
+        text: '/memory summary enable',
+      });
+
+      try {
+        const statusResponse = await postEvent(statusEvent);
+        expect(statusResponse.status).toBe(200);
+        expect(policyRepository.get(groupId)).toBeNull();
+        expect(db.prepare(
+          `SELECT COUNT(*) AS count
+             FROM audit_log
+            WHERE event_type = 'group.summary_policy_changed'
+              AND json_extract(details, '$.groupIdHash') = ?`,
+        ).get(groupIdHash)).toEqual({ count: 0 });
+
+        const enableResponse = await postEvent(enableEvent);
+        expect(enableResponse.status).toBe(200);
+        expect(policyRepository.get(groupId)).toMatchObject({
+          state: 'enabled',
+          generation: 1,
+        });
+
+        const idempotentEnableResponse = await postEvent(idempotentEnableEvent);
+        expect(idempotentEnableResponse.status).toBe(200);
+        expect(policyRepository.get(groupId)).toMatchObject({
+          state: 'enabled',
+          generation: 1,
+        });
+        expect(db.prepare(
+          `SELECT COUNT(*) AS count
+             FROM audit_log
+            WHERE event_type = 'group.summary_policy_changed'
+              AND json_extract(details, '$.groupIdHash') = ?`,
+        ).get(groupIdHash)).toEqual({ count: 1 });
+
+        const jobId = 'job-rel-gov-summary-cancel';
+        const jobCreatedAt = Date.now();
+        db.prepare(
+          `INSERT INTO jobs (
+             id, type, payload, idempotency_key, status, attempts, max_attempts,
+             created_at, updated_at, scheduled_at
+           ) VALUES (?, 'summary', ?, ?, 'pending', 0, 3, ?, ?, ?)`,
+        ).run(
+          jobId,
+          JSON.stringify({ conversationId: groupId, conversationType: 'group', groupId }),
+          'rel-gov-summary-cancel',
+          jobCreatedAt,
+          jobCreatedAt,
+          jobCreatedAt,
+        );
+        policyRepository.bindSummaryJob({
+          jobId,
+          groupId,
+          conversationId: groupId,
+          now: jobCreatedAt,
+        });
+
+        const disableResponse = await postEvent(disableEvent);
+        expect(disableResponse.status).toBe(200);
+        expect(policyRepository.get(groupId)).toMatchObject({
+          state: 'disabled',
+          generation: 2,
+        });
+        expect(db.prepare(
+          'SELECT status, error, result FROM jobs WHERE id = ?',
+        ).get(jobId)).toEqual({
+          status: 'failed',
+          error: 'group_summary_policy_disabled',
+          result: JSON.stringify({ code: 'group_summary_policy_disabled' }),
+        });
+        expect(db.prepare(
+          `SELECT cancellation_code, canceled_at
+             FROM group_summary_job_bindings
+            WHERE job_id = ?`,
+        ).get(jobId)).toMatchObject({
+          cancellation_code: 'group_summary_policy_disabled',
+          canceled_at: expect.any(Number),
+        });
+
+        const reenableResponse = await postEvent(reenableEvent);
+        expect(reenableResponse.status).toBe(200);
+        const duplicateResponse = await postEvent(reenableEvent);
+        expect(duplicateResponse.status).toBe(200);
+        expect(policyRepository.get(groupId)).toMatchObject({
+          state: 'enabled',
+          generation: 3,
+        });
+        expect(db.prepare('SELECT status FROM jobs WHERE id = ?').get(jobId)).toEqual({
+          status: 'failed',
+        });
+
+        expect(piCalls).toBe(0);
+        expect(evaluatorRequests).toHaveLength(0);
+        expect(sentMessages).toHaveLength(5);
+        expectSuccessfulGroupGovernanceCommand(
+          'qq-24620',
+          sentMessages[0],
+          'Group summary policy is disabled.',
+        );
+        expectSuccessfulGroupGovernanceCommand(
+          'qq-24621',
+          sentMessages[1],
+          'Group summary policy enabled.',
+        );
+        expectSuccessfulGroupGovernanceCommand(
+          'qq-24622',
+          sentMessages[2],
+          'Group summary policy enabled.',
+        );
+        expectSuccessfulGroupGovernanceCommand(
+          'qq-24623',
+          sentMessages[3],
+          'Group summary policy disabled.',
+        );
+        expectSuccessfulGroupGovernanceCommand(
+          'qq-24624',
+          sentMessages[4],
+          'Group summary policy enabled.',
+        );
+        expect(countTurnsForMessage('qq-24624')).toBe(1);
+        expect(getActionRowsForMessage('qq-24624')).toHaveLength(1);
+        const replayDispositions = db.prepare(
+          `SELECT disposition
+             FROM event_ingress_receipts
+            WHERE raw_event_id = ?`,
+        ).all(getPersistedMessage('qq-24624')?.raw_event_id) as Array<{
+          disposition: string;
+        }>;
+        expect(replayDispositions.map((row) => row.disposition).sort()).toEqual([
+          'accepted',
+          'duplicate',
+        ]);
+
+        const canonicalActor = db.prepare(
+          `SELECT canonical_user_id
+             FROM platform_accounts
+            WHERE platform = 'qq' AND platform_account_id = '20711'`,
+        ).get() as { canonical_user_id: string };
+        const auditRows = db.prepare(
+          `SELECT actor_user_id, actor_class, invocation_context, summary, details
+             FROM audit_log
+            WHERE event_type = 'group.summary_policy_changed'
+              AND json_extract(details, '$.groupIdHash') = ?
+            ORDER BY json_extract(details, '$.generation')`,
+        ).all(groupIdHash) as Array<{
+          actor_user_id: string;
+          actor_class: string;
+          invocation_context: string;
+          summary: string;
+          details: string;
+        }>;
+        expect(auditRows).toHaveLength(3);
+        expect(auditRows.map((row) => ({
+          actor_user_id: row.actor_user_id,
+          actor_class: row.actor_class,
+          invocation_context: row.invocation_context,
+          summary: row.summary,
+          details: JSON.parse(row.details) as Record<string, unknown>,
+        }))).toEqual([
+          {
+            actor_user_id: canonicalActor.canonical_user_id,
+            actor_class: 'group_admin',
+            invocation_context: 'group_chat',
+            summary: 'Group summary policy changed',
+            details: {
+              groupId: '[REDACTED:platform_id]',
+              groupIdHash,
+              oldState: 'disabled',
+              newState: 'enabled',
+              generation: 1,
+              eligibleAfter: expect.any(Number),
+              authority: 'group_admin',
+              sourceEventId: getPersistedMessage('qq-24621')?.raw_event_id,
+              canceledJobCount: 0,
+            },
+          },
+          {
+            actor_user_id: canonicalActor.canonical_user_id,
+            actor_class: 'group_admin',
+            invocation_context: 'group_chat',
+            summary: 'Group summary policy changed',
+            details: {
+              groupId: '[REDACTED:platform_id]',
+              groupIdHash,
+              oldState: 'enabled',
+              newState: 'disabled',
+              generation: 2,
+              eligibleAfter: null,
+              authority: 'group_admin',
+              sourceEventId: getPersistedMessage('qq-24623')?.raw_event_id,
+              canceledJobCount: 1,
+            },
+          },
+          {
+            actor_user_id: canonicalActor.canonical_user_id,
+            actor_class: 'group_admin',
+            invocation_context: 'group_chat',
+            summary: 'Group summary policy changed',
+            details: {
+              groupId: '[REDACTED:platform_id]',
+              groupIdHash,
+              oldState: 'disabled',
+              newState: 'enabled',
+              generation: 3,
+              eligibleAfter: expect.any(Number),
+              authority: 'group_admin',
+              sourceEventId: getPersistedMessage('qq-24624')?.raw_event_id,
+              canceledJobCount: 0,
+            },
+          },
+        ]);
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('REL-GOV-01 rolls back a governance effect when reply decision persistence fails', async () => {
+      const db = app.getDatabase();
+      const sentMessages: SentMessage[] = [];
+      const groupId = 'qq-group-100076';
+      const event = makeGroupEvent({
+        messageId: 24625,
+        userId: 20716,
+        groupId: 100076,
+        text: '/memory summary enable',
+      });
+      const policyAuditCountBefore = db.prepare(
+        `SELECT COUNT(*) AS count FROM audit_log
+          WHERE event_type = 'group.summary_policy_changed'`,
+      ).get() as { count: number };
+      setCapturingMessageSender(sentMessages);
+      db.exec(`
+        CREATE TEMP TRIGGER fail_governance_action_decision_insert
+        BEFORE INSERT ON action_decisions
+        WHEN (
+          SELECT conversation_id FROM agent_turns WHERE id = NEW.turn_id
+        ) = '${groupId}'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced governance action decision insert failure');
+        END
+      `);
+
+      try {
+        const response = await postEvent(event);
+        expect(response.status).toBe(200);
+        expect(sentMessages).toEqual([]);
+        expect(new GroupSummaryPolicyRepository(db).get(groupId)).toBeNull();
+        expect(db.prepare(
+          `SELECT COUNT(*) AS count FROM audit_log
+            WHERE event_type = 'group.summary_policy_changed'`,
+        ).get()).toEqual(policyAuditCountBefore);
+
+        const turn = getTurnForMessage('qq-24625');
+        expect(turn).toMatchObject({
+          conversation_id: groupId,
+          status: 'failed',
+          action_decision_id: null,
+        });
+        expect(turn?.response_text).toContain('forced governance action decision insert failure');
+        expect(getActionRowsForMessage('qq-24625')).toEqual([]);
+        expect(db.prepare(
+          `SELECT stage, conversation_type, turn_id
+             FROM event_processing_failures WHERE turn_id = ?`,
+        ).get(turn?.id)).toEqual({
+          stage: 'governance_command',
+          conversation_type: 'group',
+          turn_id: turn?.id,
+        });
+
+        const duplicateResponse = await postEvent(event);
+        expect(duplicateResponse.status).toBe(200);
+        expect(new GroupSummaryPolicyRepository(db).get(groupId)).toBeNull();
+        expect(countTurnsForMessage('qq-24625')).toBe(1);
+        expect(sentMessages).toEqual([]);
+        expectNoForeignKeyViolations();
+      } finally {
+        db.exec('DROP TRIGGER IF EXISTS fail_governance_action_decision_insert');
+        app.clearEventProcessingFailuresForTesting();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('REL-GOV-01 forgets an in-scope memory and removes it from retrieval immediately', async () => {
+      const db = app.getDatabase();
+      const sentMessages: SentMessage[] = [];
+      const evaluatorRequests: SocialEvaluationRequest[] = [];
+      const memoryRepository = new MemoryRepository(db);
+      const groupId = 'qq-group-100072';
+      const memoryId = 'mem.gov.100072';
+      let piCalls = 0;
+
+      class CapturingEvaluator extends EvaluatorStub {
+        async evaluateSocial(request: SocialEvaluationRequest): Promise<SocialEvaluationResult> {
+          evaluatorRequests.push(request);
+          return super.evaluateSocial(request);
+        }
+      }
+
+      app.setSocialEvaluatorForTesting(new CapturingEvaluator());
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          piCalls += 1;
+          return {
+            turnId: input.turnId,
+            responseText: 'Memory governance commands must not reach Pi.',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 1, output: 1, total: 2 },
+            status: 'completed',
+          };
+        },
+      });
+      setCapturingMessageSender(sentMessages);
+
+      try {
+        const sourceResponse = await postEvent(makeGroupEvent({
+          messageId: 24630,
+          userId: 20712,
+          groupId: 100072,
+          text: 'Governance fixture: govreliabilitytoken is present before deletion.',
+        }));
+        expect(sourceResponse.status).toBe(200);
+        expect(countTurnsForMessage('qq-24630')).toBe(0);
+        expect(getActionRowsForMessage('qq-24630')).toEqual([]);
+        expect(sentMessages).toEqual([]);
+        const source = getPersistedMessage('qq-24630');
+        if (!source) {
+          throw new Error('Expected persisted governance memory source');
+        }
+        const canonicalActor = db.prepare(
+          `SELECT canonical_user_id
+             FROM platform_accounts
+            WHERE platform = 'qq' AND platform_account_id = '20712'`,
+        ).get() as { canonical_user_id: string };
+
+        memoryRepository.createSync({
+          id: memoryId,
+          scope: 'group',
+          groupId,
+          visibility: 'same_group_only',
+          sensitivity: 'normal',
+          authority: 'user_stated',
+          kind: 'fact',
+          title: 'Governance retrieval fixture',
+          content: 'govreliabilitytoken is present before deletion',
+          state: 'active',
+          confidence: 0.9,
+          importance: 0.7,
+          sourceContext: 'group_chat',
+          sources: [{
+            sourceType: 'chat_message',
+            sourceId: source.id,
+            extractedBy: 'user',
+          }],
+          actor: {
+            canonicalUserId: canonicalActor.canonical_user_id,
+            actorClass: 'group_admin',
+            context: 'group_chat',
+          },
+        });
+
+        expect((await memoryRepository.search('govreliabilitytoken', {
+          groupId,
+          contextType: 'group',
+          limit: 8,
+        })).map((memory) => memory.id)).toContain(memoryId);
+
+        const forgetResponse = await postEvent(makeGroupEvent({
+          messageId: 24631,
+          userId: 20712,
+          groupId: 100072,
+          text: `/memory forget ${memoryId}`,
+        }));
+        expect(forgetResponse.status).toBe(200);
+
+        expect(db.prepare(
+          'SELECT state FROM memory_records WHERE id = ?',
+        ).get(memoryId)).toEqual({ state: 'deleted' });
+        expect((await memoryRepository.search('govreliabilitytoken', {
+          groupId,
+          contextType: 'group',
+          limit: 8,
+        })).map((memory) => memory.id)).not.toContain(memoryId);
+        expect((await memoryRepository.retrieve({
+          groupId,
+          contextType: 'group',
+          limit: 8,
+        })).map((memory) => memory.id)).not.toContain(memoryId);
+
+        const revision = db.prepare(
+          `SELECT revision_number, change_type, reason, actor, new_state
+             FROM memory_revisions
+            WHERE memory_id = ?
+            ORDER BY revision_number DESC
+            LIMIT 1`,
+        ).get(memoryId) as {
+          revision_number: number;
+          change_type: string;
+          reason: string;
+          actor: string;
+          new_state: string;
+        };
+        expect(revision).toMatchObject({
+          revision_number: 2,
+          change_type: 'delete',
+          reason: 'QQ governance memory forget',
+          actor: canonicalActor.canonical_user_id,
+        });
+        expect(JSON.parse(revision.new_state)).toMatchObject({ state: 'deleted' });
+
+        const forgetSource = getPersistedMessage('qq-24631');
+        const audit = db.prepare(
+          `SELECT actor_user_id, actor_class, invocation_context,
+                  summary, details, redacted, risk_level
+             FROM audit_log
+            WHERE event_type = 'memory.delete' AND event_id = ?`,
+        ).get(memoryId) as {
+          actor_user_id: string;
+          actor_class: string;
+          invocation_context: string;
+          summary: string;
+          details: string;
+          redacted: number;
+          risk_level: string;
+        };
+        expect(audit).toMatchObject({
+          actor_user_id: canonicalActor.canonical_user_id,
+          actor_class: 'group_admin',
+          invocation_context: 'group_chat',
+          summary: 'QQ governance deleted one memory record',
+          redacted: 1,
+          risk_level: 'low',
+        });
+        expect(JSON.parse(audit.details)).toMatchObject({
+          memoryId: '[redacted-id]',
+          policyDecision: expect.stringMatching(
+            /^policy:l0:deleted:sha256:[0-9a-f]{64}$/,
+          ),
+          previousState: 'active',
+          newState: 'deleted',
+          revisionNumber: 2,
+          sourceEventId: forgetSource?.raw_event_id,
+          governanceCommand: 'memory_forget',
+          authority: 'group_admin',
+        });
+
+        expect(piCalls).toBe(0);
+        expect(evaluatorRequests).toHaveLength(0);
+        expect(sentMessages).toHaveLength(1);
+        expectSuccessfulGroupGovernanceCommand(
+          'qq-24631',
+          sentMessages[0],
+          'Memory record deleted.',
+        );
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('REL-GOV-01 explains the latest prior turn from the exact conversation only', async () => {
+      const db = app.getDatabase();
+      const sentMessages: SentMessage[] = [];
+      const evaluatorRequests: SocialEvaluationRequest[] = [];
+      const tokenTotals = [7, 13, 23, 31];
+      let piCalls = 0;
+
+      class CapturingEvaluator extends EvaluatorStub {
+        async evaluateSocial(request: SocialEvaluationRequest): Promise<SocialEvaluationResult> {
+          evaluatorRequests.push(request);
+          return super.evaluateSocial(request);
+        }
+      }
+
+      app.setSocialEvaluatorForTesting(new CapturingEvaluator());
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          const total = tokenTotals[piCalls] ?? 41;
+          piCalls += 1;
+          return {
+            turnId: input.turnId,
+            responseText: `Synthetic prior turn with ${total} tokens.`,
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: total - 1, output: 1, total },
+            status: 'completed',
+          };
+        },
+      });
+      setCapturingMessageSender(sentMessages);
+
+      try {
+        const priorEvents: OneBotMessage[] = [
+          makeGroupEvent({
+            messageId: 24640,
+            userId: 20713,
+            groupId: 100073,
+            text: '[CQ:at,qq=3889000770] First target-conversation turn.',
+          }),
+          makeGroupEvent({
+            messageId: 24641,
+            userId: 20713,
+            groupId: 100073,
+            text: '[CQ:at,qq=3889000770] Latest target-conversation turn.',
+          }),
+          makeGroupEvent({
+            messageId: 24642,
+            userId: 20713,
+            groupId: 100074,
+            text: '[CQ:at,qq=3889000770] Later turn from another group.',
+          }),
+          {
+            post_type: 'message',
+            message_type: 'private',
+            message_id: 24643,
+            user_id: 20713,
+            message: 'Later turn from a private conversation.',
+            raw_message: 'Later turn from a private conversation.',
+            sender: {
+              user_id: 20713,
+              nickname: 'GovernanceWhyUser',
+            },
+            time: Math.floor(Date.now() / 1000),
+          },
+        ];
+        for (const event of priorEvents) {
+          app.clearCooldownsForTesting();
+          const response = await postEvent(event);
+          expect(response.status).toBe(200);
+        }
+
+        expect(getTurnForMessage('qq-24640')).toMatchObject({
+          status: 'completed',
+          tokens_total: 7,
+        });
+        const latestTargetTurn = getTurnForMessage('qq-24641');
+        expect(latestTargetTurn).toMatchObject({
+          status: 'completed',
+          tokens_total: 13,
+        });
+        expect(getTurnForMessage('qq-24642')).toMatchObject({
+          status: 'completed',
+          tokens_total: 23,
+        });
+        expect(getTurnForMessage('qq-24643')).toMatchObject({
+          status: 'completed',
+          tokens_total: 31,
+        });
+
+        const latestTargetTrace = getContextTraceForMessage('qq-24641');
+        expect(latestTargetTrace).toBeDefined();
+        const selectedCount = (JSON.parse(
+          latestTargetTrace?.selected_memory_ids ?? '[]',
+        ) as unknown[]).length;
+        const rejectedCount = (JSON.parse(
+          latestTargetTrace?.rejected_memories ?? '[]',
+        ) as unknown[]).length;
+        const latestTargetActionCounts = db.prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM action_decisions WHERE turn_id = ?) AS decisions,
+             (SELECT COUNT(*)
+                FROM action_executions
+                JOIN action_decisions
+                  ON action_decisions.id = action_executions.action_decision_id
+               WHERE action_decisions.turn_id = ?) AS executions,
+             (SELECT COUNT(*) FROM tool_calls WHERE turn_id = ?) AS tools`,
+        ).get(
+          latestTargetTurn?.id,
+          latestTargetTurn?.id,
+          latestTargetTurn?.id,
+        ) as { decisions: number; executions: number; tools: number };
+        const expectedWhyResponse = [
+          'Prior turn evidence:',
+          'turn_status=completed',
+          'stored_context=yes',
+          `selected_memories=${selectedCount}`,
+          `rejected_memories=${rejectedCount}`,
+          'tokens_used=13',
+          `action_decisions=${latestTargetActionCounts.decisions}`,
+          `action_executions=${latestTargetActionCounts.executions}`,
+          `tool_calls=${latestTargetActionCounts.tools}`,
+        ].join('\n');
+
+        const piCallsBeforeWhy = piCalls;
+        const evaluatorCallsBeforeWhy = evaluatorRequests.length;
+        const toolCallsBeforeWhy = db.prepare(
+          'SELECT COUNT(*) AS count FROM tool_calls',
+        ).get() as { count: number };
+        const sendsBeforeWhy = sentMessages.length;
+        app.clearCooldownsForTesting();
+        const whyResponse = await postEvent(makeGroupEvent({
+          messageId: 24644,
+          userId: 20713,
+          groupId: 100073,
+          text: '/why',
+        }));
+        expect(whyResponse.status).toBe(200);
+
+        expect(piCalls).toBe(piCallsBeforeWhy);
+        expect(evaluatorRequests).toHaveLength(evaluatorCallsBeforeWhy);
+        expect(db.prepare('SELECT COUNT(*) AS count FROM tool_calls').get()).toEqual(
+          toolCallsBeforeWhy,
+        );
+        expect(sentMessages).toHaveLength(sendsBeforeWhy + 1);
+        expectSuccessfulGroupGovernanceCommand(
+          'qq-24644',
+          sentMessages[sendsBeforeWhy],
+          expectedWhyResponse,
+        );
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('REL-GOV-01 completes the local turn while preserving a failed governance send', async () => {
+      const sentMessages: SentMessage[] = [];
+      const evaluatorRequests: SocialEvaluationRequest[] = [];
+      const rawSecret = 'sk-governance-send-failure-secret-should-not-persist';
+      const rawPlatformId = 'qq-9876543210';
+      const rawFailure = `governance send failed api_key=${rawSecret} target=${rawPlatformId}`;
+      const conversationId = 'qq-group-100075';
+      let piCalls = 0;
+
+      class CapturingEvaluator extends EvaluatorStub {
+        async evaluateSocial(request: SocialEvaluationRequest): Promise<SocialEvaluationResult> {
+          evaluatorRequests.push(request);
+          return super.evaluateSocial(request);
+        }
+      }
+
+      app.setSocialEvaluatorForTesting(new CapturingEvaluator());
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          piCalls += 1;
+          return {
+            turnId: input.turnId,
+            responseText: 'Failed governance sends must not reach Pi.',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 1, output: 1, total: 2 },
+            status: 'completed',
+          };
+        },
+      });
+      setCapturingMessageSender(sentMessages, rawFailure);
+
+      try {
+        const response = await postEvent(makeGroupEvent({
+          messageId: 24650,
+          userId: 20715,
+          groupId: 100075,
+          text: '/memory',
+        }));
+        expect(response.status).toBe(200);
+        expect(piCalls).toBe(0);
+        expect(evaluatorRequests).toHaveLength(0);
+
+        const source = getPersistedMessage('qq-24650');
+        const turn = getTurnForMessage('qq-24650');
+        expect(turn).toMatchObject({
+          conversation_id: conversationId,
+          trigger_event_id: source?.raw_event_id,
+          pi_provider: 'local',
+          pi_model: 'qq-governance-v1',
+          response_text: 'Memory records: none.',
+          status: 'completed',
+          tokens_input: 0,
+          tokens_output: 0,
+          tokens_total: 0,
+        });
+        expect(turn?.action_decision_id).toBeDefined();
+        expect(turn?.completed_at).toBeGreaterThan(0);
+        expect(countNonTerminalTurnsForMessage('qq-24650')).toBe(0);
+
+        const actionRows = getActionRowsForMessage('qq-24650');
+        expect(actionRows).toHaveLength(1);
+        expect(actionRows[0]).toMatchObject({
+          turn_id: turn?.id,
+          decided_by: 'attention',
+          risk_level: 'low',
+          confidence: 1,
+          evaluator_required: 0,
+          evaluator_passed: null,
+          evaluator_decision_id: null,
+          action_type: 'reply_short',
+          status: 'failed',
+          executed_message_id: null,
+          error_code: 'SEND_MESSAGE_FAILED',
+        });
+        expect(JSON.parse(actionRows[0]?.reasons ?? '[]')).toEqual([
+          'Deterministic QQ governance command',
+        ]);
+        expect(JSON.parse(actionRows[0]?.actions ?? '[]')).toEqual([
+          expect.objectContaining({
+            type: 'reply_short',
+            payload: { text: 'Memory records: none.' },
+          }),
+        ]);
+        expect(actionRows[0]?.error_message).toContain('[REDACTED:api_key_assignment]');
+        expect(actionRows[0]?.error_message).toContain('[REDACTED:platform_id]');
+        expect(actionRows[0]?.error_message).not.toContain(rawSecret);
+        expect(actionRows[0]?.error_message).not.toContain(rawPlatformId);
+
+        expect(sentMessages).toHaveLength(1);
+        expect(getPersistedMessage(sentMessages[0]?.messageId ?? '')).toBeUndefined();
+        expect(countBotResponseRawEvents(conversationId)).toBe(0);
+        expect(countBotResponseRows(conversationId)).toBe(0);
+        expect(app.getDatabase().prepare(
+          'SELECT COUNT(*) AS count FROM tool_calls WHERE turn_id = ?',
+        ).get(turn?.id)).toEqual({ count: 0 });
+        expect(app.getDatabase().prepare(
+          'SELECT COUNT(*) AS count FROM evaluator_decisions WHERE turn_id = ?',
+        ).get(turn?.id)).toEqual({ count: 0 });
+        expect(app.getEventProcessingFailures()).toHaveLength(0);
         expectNoForeignKeyViolations();
       } finally {
         setSuccessfulPiRuntime();
@@ -2239,6 +6050,84 @@ describe('E2E Conversation Flow', () => {
         expect(countTurnsForMessage('qq-23990')).toBe(0);
         expect(getContextTraceForMessage('qq-23990')).toBeUndefined();
         expect(getActionRowsForMessage('qq-23990')).toEqual([]);
+        expect(sentMessages).toEqual([]);
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
+    it('should keep malformed private top-level message content out of Pi and action flow', async () => {
+      let piCalls = 0;
+      const sentMessages: SentMessage[] = [];
+      const rawSecret = 'sk-malformed-private-content-e2e-secret-should-not-persist';
+      const rawPlatformFragment = 'qq-8123456796';
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          piCalls += 1;
+          return {
+            turnId: input.turnId,
+            responseText: 'malformed private content should not reach Pi',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 1, output: 1, total: 2 },
+            status: 'completed',
+          };
+        },
+      });
+      setCapturingMessageSender(sentMessages);
+
+      try {
+        const onebotEvent = {
+          post_type: 'message',
+          message_type: 'private',
+          message_id: 23991,
+          user_id: 290921,
+          message: { token: rawSecret, target: rawPlatformFragment },
+          raw_message: { text: `token=${rawSecret} target=${rawPlatformFragment}` },
+          sender: {
+            user_id: 290921,
+            nickname: 'MalformedPrivateContentUser',
+          },
+          time: Math.floor(Date.now() / 1000),
+        } as unknown as OneBotMessage;
+
+        const response = await postEvent(onebotEvent);
+
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({ status: 'ok' });
+
+        const row = app
+          .getDatabase()
+          .prepare(
+            `SELECT cm.*, re.type AS raw_type, re.payload
+             FROM chat_messages cm
+             JOIN raw_events re ON re.id = cm.raw_event_id
+             WHERE cm.message_id = ?
+             LIMIT 1`
+          )
+          .get('qq-23991') as (PersistedMessageRow & { payload: string }) | undefined;
+
+        expect(row).toMatchObject({
+          raw_type: 'chat.message.received',
+          message_id: 'qq-23991',
+          conversation_type: 'private',
+          group_id: null,
+          sender_id: 'qq-290921',
+          text: '',
+          has_quote: 0,
+          has_media: 0,
+          mentions_bot: 0,
+          reply_to_message_id: null,
+        });
+        expect(row?.payload).not.toContain(rawSecret);
+        expect(row?.payload).not.toContain(rawPlatformFragment);
+
+        expect(piCalls).toBe(0);
+        expect(countTurnsForMessage('qq-23991')).toBe(0);
+        expect(getContextTraceForMessage('qq-23991')).toBeUndefined();
+        expect(getActionRowsForMessage('qq-23991')).toEqual([]);
         expect(sentMessages).toEqual([]);
         expectNoForeignKeyViolations();
       } finally {
@@ -3413,7 +7302,20 @@ describe('E2E Conversation Flow', () => {
 
     it('should trigger group reply when a segment-array uses a numeric bot at value', async () => {
       const sentMessages: SentMessage[] = [];
-      setReplyingPiRuntime('numeric segment at reply');
+      let capturedPiInput: PiAdapterInput | undefined;
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          capturedPiInput = input;
+          return {
+            turnId: input.turnId,
+            responseText: 'numeric segment at reply',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 11, output: 7, total: 18 },
+            status: 'completed',
+          };
+        },
+      });
       setCapturingMessageSender(sentMessages);
 
       try {
@@ -3441,6 +7343,8 @@ describe('E2E Conversation Flow', () => {
 
         expect(response.status).toBe(200);
         await expect(response.json()).resolves.toEqual({ status: 'ok' });
+        expect(capturedPiInput?.contextPack.conversation.groupId).toBe('qq-group-190913');
+        expect(capturedPiInput?.actor.groupId).toBe('qq-group-190913');
         expect(sentMessages).toHaveLength(1);
         expect(sentMessages[0]).toMatchObject({
           target: {
@@ -3506,7 +7410,7 @@ describe('E2E Conversation Flow', () => {
           turn_id: turn?.id,
           conversation_id: 'qq-group-190913',
           conversation_type: 'group',
-          group_id: '190913',
+          group_id: 'qq-group-190913',
         });
         expect(JSON.parse(contextTrace?.recent_message_ids ?? '[]')).toContain(inboundMessage?.id);
 
@@ -4099,6 +8003,7 @@ describe('E2E Conversation Flow', () => {
 
     it('should trigger group reply when replying to a stored bot message without @mention', async () => {
       const sentMessages: SentMessage[] = [];
+      let replyContext: PiAdapterInput['contextPack'] | undefined;
       setReplyingPiRuntime('第一条 bot 回复。');
       setCapturingMessageSender(sentMessages);
 
@@ -4106,7 +8011,7 @@ describe('E2E Conversation Flow', () => {
         const seedEvent: OneBotMessage = {
           post_type: 'message',
           message_type: 'group',
-          message_id: 23560,
+          message_id: 24560,
           user_id: 20006,
           group_id: 100001,
           message: '[CQ:at,qq=3889000770] 先说一句',
@@ -4131,13 +8036,24 @@ describe('E2E Conversation Flow', () => {
           text: '第一条 bot 回复。',
         });
 
-        app.clearCooldownsForTesting();
-        setReplyingPiRuntime('回复引用也会触发。');
+        app.setPiRuntimeForTesting({
+          async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+            replyContext = input.contextPack;
+            return {
+              turnId: input.turnId,
+              responseText: '回复引用也会触发。',
+              toolCallIds: [],
+              events: [],
+              tokensUsed: { input: 11, output: 7, total: 18 },
+              status: 'completed',
+            };
+          },
+        });
 
         const replyEvent: OneBotMessage = {
           post_type: 'message',
           message_type: 'group',
-          message_id: 23561,
+          message_id: 24561,
           user_id: 20007,
           group_id: 100001,
           message: `[CQ:reply,id=${botMessageId}] 继续解释一下`,
@@ -4163,7 +8079,7 @@ describe('E2E Conversation Flow', () => {
           text: '回复引用也会触发。',
         });
 
-        const inboundReply = getPersistedMessage('qq-23561');
+        const inboundReply = getPersistedMessage('qq-24561');
         expect(inboundReply).toMatchObject({
           raw_type: 'chat.message.received',
           raw_event_id: inboundReply?.id,
@@ -4175,8 +8091,38 @@ describe('E2E Conversation Flow', () => {
           mentions_bot: 0,
           reply_to_message_id: botMessageId,
         });
+        const currentContextMessage = replyContext?.recentMessages.find(
+          (message) => message.messageId === inboundReply?.id,
+        );
+        const quotedContextMessage = replyContext?.recentMessages.find(
+          (message) => message.messageId === botMessageId,
+        );
+        expect(currentContextMessage).toMatchObject({
+          isCurrent: true,
+          isFromBot: false,
+        });
+        expect(currentContextMessage?.messageRef).toMatch(/^message_\d+$/);
+        expect(currentContextMessage?.speakerRef).toMatch(/^speaker_\d+$/);
+        expect(quotedContextMessage).toMatchObject({ isFromBot: true });
+        expect(replyContext?.currentMessageRef).toBe(currentContextMessage?.messageRef);
+        expect(replyContext?.replyReference).toMatchObject({
+          status: 'resolved',
+          sourceMessageRef: currentContextMessage?.messageRef,
+          targetMessageRef: quotedContextMessage?.messageRef,
+          targetSpeakerRef: quotedContextMessage?.speakerRef,
+          targetRole: 'bot',
+          targetInRollingWindow: true,
+        });
+        expect(replyContext?.tokenBudget.promptLayers).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              name: 'message_references',
+              version: 'pi-prompt-message-reference-v1',
+            }),
+          ]),
+        );
 
-        const turn = getTurnForMessage('qq-23561');
+        const turn = getTurnForMessage('qq-24561');
         expect(turn).toMatchObject({
           conversation_id: 'qq-group-100001',
           trigger_event_id: inboundReply?.raw_event_id,
@@ -4186,14 +8132,14 @@ describe('E2E Conversation Flow', () => {
           status: 'completed',
         });
 
-        const contextTrace = getContextTraceForMessage('qq-23561');
+        const contextTrace = getContextTraceForMessage('qq-24561');
         expect(contextTrace).toMatchObject({
           turn_id: turn?.id,
           conversation_id: 'qq-group-100001',
           conversation_type: 'group',
         });
 
-        const actionRows = getActionRowsForMessage('qq-23561');
+        const actionRows = getActionRowsForMessage('qq-24561');
         expect(actionRows).toHaveLength(1);
         expect(JSON.parse(actionRows[0]?.reasons ?? '[]')).toEqual(
           expect.arrayContaining(['reply_to_bot', 'pi_response_text'])
@@ -4257,7 +8203,6 @@ describe('E2E Conversation Flow', () => {
           text: '第一条 segment array bot 回复。',
         });
 
-        app.clearCooldownsForTesting();
         setReplyingPiRuntime('segment array 引用 bot 也会触发。');
 
         const replyEvent: OneBotMessage = {
@@ -4356,7 +8301,7 @@ describe('E2E Conversation Flow', () => {
           turn_id: turn?.id,
           conversation_id: 'qq-group-190905',
           conversation_type: 'group',
-          group_id: '190905',
+          group_id: 'qq-group-190905',
         });
         expect(JSON.parse(contextTrace?.recent_message_ids ?? '[]')).toContain(inboundReply?.id);
 
@@ -4627,7 +8572,7 @@ describe('E2E Conversation Flow', () => {
       }
     });
 
-    it('should not trigger group reply when quoting a stored bot message from another group', async () => {
+    it('REL-SCOPE-01 keeps a cross-group bot quote out of the turn and action path', async () => {
       const sentMessages: SentMessage[] = [];
       setReplyingPiRuntime('另一个群里的 bot 回复。');
       setCapturingMessageSender(sentMessages);
@@ -4945,7 +8890,7 @@ describe('E2E Conversation Flow', () => {
           turn_id: turn?.id,
           conversation_id: 'qq-group-190901',
           conversation_type: 'group',
-          group_id: '190901',
+          group_id: 'qq-group-190901',
         });
         expect(JSON.parse(contextTrace?.recent_message_ids ?? '[]')).toContain(inboundMessage?.id);
         expect(JSON.parse(contextTrace?.filters_applied ?? '[]')).toEqual(
@@ -5107,7 +9052,7 @@ describe('E2E Conversation Flow', () => {
           turn_id: turn?.id,
           conversation_id: 'qq-group-190902',
           conversation_type: 'group',
-          group_id: '190902',
+          group_id: 'qq-group-190902',
         });
         expect(JSON.parse(contextTrace?.recent_message_ids ?? '[]')).toContain(inboundMessage?.id);
 
@@ -5260,7 +9205,7 @@ describe('E2E Conversation Flow', () => {
           turn_id: turn?.id,
           conversation_id: 'qq-group-190903',
           conversation_type: 'group',
-          group_id: '190903',
+          group_id: 'qq-group-190903',
         });
         expect(JSON.parse(contextTrace?.recent_message_ids ?? '[]')).toContain(inboundMessage?.id);
 
@@ -5847,8 +9792,18 @@ describe('E2E Conversation Flow', () => {
       }
     });
 
-    it('should invoke social evaluator for group risk path', async () => {
+    it('REL-ATT-01 keeps a group mention question off the social evaluator path', async () => {
+      const evaluatorRequests: SocialEvaluationRequest[] = [];
       const sentMessages: SentMessage[] = [];
+
+      class CapturingEvaluator extends EvaluatorStub {
+        async evaluateSocial(request: SocialEvaluationRequest): Promise<SocialEvaluationResult> {
+          evaluatorRequests.push(request);
+          return super.evaluateSocial(request);
+        }
+      }
+
+      app.setSocialEvaluatorForTesting(new CapturingEvaluator());
       setReplyingPiRuntime('这是经过评估后的群回复。');
       setCapturingMessageSender(sentMessages);
 
@@ -5875,71 +9830,15 @@ describe('E2E Conversation Flow', () => {
 
         const actionRows = getActionRowsForMessage('qq-23462');
         expect(actionRows).toHaveLength(1);
-        expect(actionRows[0]?.decided_by).toBe('evaluator');
-        expect(actionRows[0]?.evaluator_required).toBe(1);
-        expect(actionRows[0]?.evaluator_passed).toBe(1);
+        expect(actionRows[0]?.decided_by).toBe('pi');
+        expect(actionRows[0]?.evaluator_required).toBe(0);
+        expect(actionRows[0]?.evaluator_passed).toBeNull();
         expect(actionRows[0]?.action_type).toBe('reply_short');
         expect(actionRows[0]?.status).toBe('success');
-        expect(JSON.parse(actionRows[0]?.reasons ?? '[]').join(' ')).toContain('evaluator:');
-        expectNoForeignKeyViolations();
-      } finally {
-        setSuccessfulPiRuntime();
-        restoreDecisionDefaults();
-      }
-    });
-
-    it('should downgrade repeated group replies through cooldown suppressor', async () => {
-      const sentMessages: SentMessage[] = [];
-      setReplyingPiRuntime('冷却测试回复。');
-      setCapturingMessageSender(sentMessages);
-
-      try {
-        const firstEvent: OneBotMessage = {
-          post_type: 'message',
-          message_type: 'group',
-          message_id: 23463,
-          user_id: 20007,
-          group_id: 100004,
-          message: '[CQ:at,qq=3889000770] 第一次回复',
-          raw_message: '[CQ:at,qq=3889000770] 第一次回复',
-          sender: {
-            user_id: 20007,
-            nickname: 'CooldownUser1',
-          },
-          time: Math.floor(Date.now() / 1000),
-        };
-        const secondEvent: OneBotMessage = {
-          post_type: 'message',
-          message_type: 'group',
-          message_id: 23464,
-          user_id: 20008,
-          group_id: 100004,
-          message: '[CQ:at,qq=3889000770] 第二次回复',
-          raw_message: '[CQ:at,qq=3889000770] 第二次回复',
-          sender: {
-            user_id: 20008,
-            nickname: 'CooldownUser2',
-          },
-          time: Math.floor(Date.now() / 1000),
-        };
-
-        expect((await postEvent(firstEvent)).status).toBe(200);
-        expect((await postEvent(secondEvent)).status).toBe(200);
-
-        expect(sentMessages).toHaveLength(1);
-
-        const firstActions = getActionRowsForMessage('qq-23463');
-        expect(firstActions).toHaveLength(1);
-        expect(firstActions[0]?.action_type).toBe('reply_short');
-        expect(firstActions[0]?.status).toBe('success');
-
-        const secondActions = getActionRowsForMessage('qq-23464');
-        expect(secondActions).toHaveLength(1);
-        expect(secondActions[0]?.action_type).toBe('silent_store');
-        expect(secondActions[0]?.status).toBe('success');
-        expect(JSON.parse(secondActions[0]?.suppressors ?? '[]')).toContain(
-          'cooldown:group:qq-group-100004:reply_short'
+        expect(JSON.parse(actionRows[0]?.reasons ?? '[]')).toEqual(
+          expect.arrayContaining(['@bot', 'question']),
         );
+        expect(evaluatorRequests).toEqual([]);
         expectNoForeignKeyViolations();
       } finally {
         setSuccessfulPiRuntime();
@@ -6632,7 +10531,474 @@ describe('E2E Conversation Flow', () => {
   });
 
   describe('Durable background runtime', () => {
+    it('should reject summary jobs without an explicit conversation type', async () => {
+      let piCalls = 0;
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          piCalls += 1;
+          return {
+            turnId: input.turnId,
+            responseText: 'SUMMARY: Must not run',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 1, output: 1, total: 2 },
+            status: 'completed',
+          };
+        },
+      });
+
+      try {
+        const taskId = app.enqueueBackgroundTaskForTesting({
+          type: 'summary',
+          payload: { conversationId: 'missing-summary-conversation-type' },
+          maxAttempts: 1,
+        });
+
+        const result = await app.processNextBackgroundJobForTesting();
+
+        expect(result).toMatchObject({ taskId, status: 'failed' });
+        expect(piCalls).toBe(0);
+        expect(
+          app.getDatabase().prepare('SELECT status FROM jobs WHERE id = ?').get(taskId),
+        ).toEqual({ status: 'failed' });
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+      }
+    });
+
+    it('should process action-scheduled summary jobs through durable worker with source-linked memory writes', async () => {
+      const providerResponseText =
+        'SUMMARY: Action scheduled summary captured the group discussion.\nFACTS:\n- Action scheduled summary jobs can be processed by the durable worker';
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          return {
+            turnId: input.turnId,
+            responseText: providerResponseText,
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 10, output: 10, total: 20 },
+            status: 'completed',
+          };
+        },
+      });
+
+      try {
+        const db = app.getDatabase();
+        const now = Date.UTC(2026, 6, 4);
+        const conversationId = 'group:action-scheduled-summary';
+        const groupId = 'group-action-scheduled-summary';
+        const messageIds: string[] = [];
+        const rawEventIds: string[] = [];
+
+        new GroupSummaryPolicyRepository(db).setEnabled({
+          groupId,
+          enabled: true,
+          authority: {
+            kind: 'bot_owner',
+            actorUserId: 'test-bot-owner',
+            invocationContext: 'admin_cli',
+          },
+          now,
+        });
+
+        for (let i = 0; i < 10; i++) {
+          const eventId = `evt-action-scheduled-summary-${i}`;
+          const messageId = `msg-action-scheduled-summary-${i}`;
+          rawEventIds.push(eventId);
+          messageIds.push(messageId);
+          db.prepare(
+            `INSERT INTO raw_events (
+              id, type, timestamp, source, platform,
+              conversation_id, payload, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+          ).run(
+            eventId,
+            'chat.message.received',
+            now + i * 1000,
+            'gateway',
+            'qq',
+            conversationId,
+            '{}',
+            now + i * 1000 + 1,
+          );
+          db.prepare(
+            `INSERT INTO chat_messages (
+              id, raw_event_id, message_id, conversation_id,
+              conversation_type, group_id, sender_id, text, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).run(
+            messageId,
+            eventId,
+            `qq-action-summary-${i}`,
+            conversationId,
+            'group',
+            groupId,
+            `user-action-summary-${i % 2}`,
+            `Action scheduled summary message ${i}`,
+            now + i * 1000,
+          );
+        }
+
+        const taskPayload = {
+          conversationId,
+          conversationType: 'group' as const,
+          groupId,
+          messageRange: {
+            start: messageIds[0] ?? '',
+            end: messageIds[messageIds.length - 1] ?? '',
+          },
+        };
+        const summaryJobs = Reflect.get(app, 'groupSummaryJobService') as GroupSummaryJobService;
+        const taskId = await summaryJobs.enqueueSummary({
+          conversationId,
+          conversationType: 'group',
+          groupId,
+          payload: {
+            ...taskPayload,
+            source: 'action_executor',
+            actionDecisionId: 'decision-action-scheduled-summary',
+            actionType: 'schedule_background_task',
+            reasonSummary: 'Scheduled from action executor',
+            taskPayload,
+          },
+          baseIdempotencyKey: 'action:schedule_background_task:decision-action-scheduled-summary:summary',
+          maxAttempts: 2,
+        });
+        db.prepare(
+          `INSERT INTO raw_events (
+            id, type, timestamp, source, platform,
+            conversation_id, payload, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          'evt-action-scheduled-summary-later',
+          'chat.message.received',
+          now + 4_500,
+          'gateway',
+          'qq',
+          conversationId,
+          '{}',
+          now + 20_000,
+        );
+        db.prepare(
+          `INSERT INTO chat_messages (
+            id, raw_event_id, message_id, conversation_id,
+            conversation_type, group_id, sender_id, text, timestamp
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          'msg-action-scheduled-summary-later',
+          'evt-action-scheduled-summary-later',
+          'qq-action-summary-later',
+          conversationId,
+          'group',
+          groupId,
+          'user-action-summary-later',
+          'Later source must not enter the frozen summary window',
+          now + 4_500,
+        );
+
+        const frozenPayload = JSON.parse(String(
+          (db.prepare('SELECT payload FROM jobs WHERE id = ?').get(taskId) as { payload: string }).payload,
+        )) as { sourceChatMessageIds: string[]; windowVersion: number };
+        expect(frozenPayload).toMatchObject({
+          sourceChatMessageIds: messageIds,
+          windowVersion: 1,
+        });
+
+        const result = await app.processNextBackgroundJobForTesting();
+        expect(result?.taskId).toBe(taskId);
+        expect(result?.status).toBe('completed');
+
+        const output = result?.output as
+          | { summaryId: string; messageCount: number }
+          | undefined;
+        expect(output?.messageCount).toBe(messageIds.length);
+        expect(output?.summaryId).toBeDefined();
+        expect(output).not.toHaveProperty('summary');
+        expect(output).not.toHaveProperty('extractedFacts');
+
+        const job = db.prepare('SELECT status, attempts, result FROM jobs WHERE id = ?').get(taskId) as {
+          status: string;
+          attempts: number;
+          result: string;
+        };
+        const attempts = db
+          .prepare('SELECT id, status, worker_id, result FROM job_attempts WHERE job_id = ?')
+          .all(taskId) as Array<{ id: string; status: string; worker_id: string; result: string }>;
+        const memory = db
+          .prepare('SELECT state, scope, group_id, conversation_id, kind, source_context FROM memory_records WHERE id = ?')
+          .get(output?.summaryId) as {
+            state: string;
+            scope: string;
+            group_id: string;
+            conversation_id: string;
+            kind: string;
+            source_context: string;
+          };
+        const sourceCount = (
+          db.prepare('SELECT COUNT(*) AS count FROM memory_sources WHERE memory_id = ?').get(output?.summaryId) as {
+            count: number;
+          }
+        ).count;
+        const memorySources = db.prepare(
+          `SELECT source_id
+             FROM memory_sources
+            WHERE memory_id = ? AND source_type = 'chat_message'
+            ORDER BY source_timestamp ASC, source_id ASC`,
+        ).all(output?.summaryId) as Array<{ source_id: string }>;
+        const modelContext = db.prepare(
+          `SELECT * FROM model_contexts WHERE job_attempt_id = ?`,
+        ).get(attempts[0]?.id) as Record<string, unknown> | undefined;
+        const modelInvocation = db.prepare(
+          `SELECT * FROM model_invocations WHERE job_attempt_id = ?`,
+        ).get(attempts[0]?.id) as Record<string, unknown> | undefined;
+        const invocationSources = db.prepare(
+          `SELECT raw_event_id
+           FROM model_invocation_sources
+           WHERE model_invocation_id = ?
+           ORDER BY source_ordinal ASC`,
+        ).all(modelInvocation?.id) as Array<{ raw_event_id: string }>;
+
+        expect(job.status).toBe('completed');
+        expect(job.attempts).toBe(1);
+        expect(JSON.parse(job.result).summaryId).toBe(output?.summaryId);
+        expect(job.result).not.toContain('Action scheduled summary captured');
+        expect(attempts).toHaveLength(1);
+        expect(attempts[0]).toMatchObject({
+          status: 'completed',
+          worker_id: 'lethebot-background-main',
+        });
+        expect(JSON.parse(attempts[0]?.result ?? '{}').summaryId).toBe(output?.summaryId);
+        expect(attempts[0]?.result).not.toContain('Action scheduled summary captured');
+        expect(memory).toMatchObject({
+          state: 'active',
+          scope: 'group',
+          group_id: groupId,
+          conversation_id: conversationId,
+          kind: 'summary',
+          source_context: 'background_worker:summary',
+        });
+        expect(sourceCount).toBe(messageIds.length);
+        expect(memorySources.map((source) => source.source_id)).toEqual(messageIds);
+        expect(modelContext).toMatchObject({
+          job_attempt_id: attempts[0]?.id,
+          purpose: 'summary',
+          conversation_type: 'group',
+        });
+        expect(modelContext?.conversation_ref).toMatch(/^ctxref-sha256:[0-9a-f]{64}$/);
+        expect(modelContext?.group_ref).toMatch(/^groupref-sha256:[0-9a-f]{64}$/);
+        expect(JSON.parse(String(modelContext?.recent_message_ids))).toEqual(messageIds);
+        expect(JSON.parse(String(modelContext?.filters_applied))).toContain(
+          'memory=excluded_by_caller',
+        );
+        expect(modelInvocation).toMatchObject({
+          job_attempt_id: attempts[0]?.id,
+          context_id: modelContext?.id,
+          purpose: 'summary',
+          call_number: 1,
+          provider: 'mock',
+          model: 'mock',
+          status: 'completed',
+          tokens_input: 10,
+          tokens_output: 10,
+          tokens_total: 20,
+          response_sha256: createHash('sha256').update(providerResponseText).digest('hex'),
+          response_bytes: Buffer.byteLength(providerResponseText, 'utf8'),
+          error_code: null,
+        });
+        expect(invocationSources.map((source) => source.raw_event_id)).toEqual(rawEventIds);
+
+        const serializedLedger = JSON.stringify({ modelContext, modelInvocation });
+        expect(serializedLedger).not.toContain(providerResponseText);
+        expect(serializedLedger).not.toContain(conversationId);
+        expect(serializedLedger).not.toContain(groupId);
+        expect(serializedLedger).not.toContain('Action scheduled summary message');
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+      }
+    });
+
+    it('should ledger each failed summary retry against one exact durable context', async () => {
+      let providerCalls = 0;
+      app.setPiRuntimeForTesting({
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          providerCalls += 1;
+          if (providerCalls === 1) {
+            return {
+              turnId: input.turnId,
+              responseText: '',
+              errorMessage: 'Synthetic provider failure',
+              toolCallIds: [],
+              events: [],
+              tokensUsed: { input: 0, output: 0, total: 0 },
+              status: 'failed',
+            };
+          }
+          return {
+            turnId: input.turnId,
+            responseText: ' \n\t',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 0, output: 0, total: 0 },
+            status: 'completed',
+          };
+        },
+      });
+
+      try {
+        const db = app.getDatabase();
+        const now = Date.UTC(2026, 6, 5);
+        const conversationId = 'private:durable-summary-retry';
+        const rawEventIds: string[] = [];
+        const messageIds: string[] = [];
+        for (let index = 0; index < 10; index += 1) {
+          const rawEventId = `evt-durable-summary-retry-${index}`;
+          const messageId = `msg-durable-summary-retry-${index}`;
+          rawEventIds.push(rawEventId);
+          messageIds.push(messageId);
+          db.prepare(
+            `INSERT INTO raw_events (
+              id, type, timestamp, source, platform,
+              conversation_id, payload, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).run(
+            rawEventId,
+            'chat.message.received',
+            now + index,
+            'gateway',
+            'qq',
+            conversationId,
+            '{}',
+            now + index,
+          );
+          db.prepare(
+            `INSERT INTO chat_messages (
+              id, raw_event_id, message_id, conversation_id,
+              conversation_type, sender_id, text, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).run(
+            messageId,
+            rawEventId,
+            `qq-durable-summary-retry-${index}`,
+            conversationId,
+            'private',
+            'user-durable-summary-retry',
+            `Durable retry message ${index}`,
+            now + index,
+          );
+        }
+
+        const taskId = app.enqueueBackgroundTaskForTesting({
+          type: 'summary',
+          payload: {
+            conversationId,
+            conversationType: 'private',
+            messageRange: {
+              start: messageIds[0] ?? '',
+              end: messageIds[messageIds.length - 1] ?? '',
+            },
+          },
+          maxAttempts: 1,
+        });
+
+        const result = await app.processNextBackgroundJobForTesting();
+        expect(result).toMatchObject({ taskId, status: 'failed' });
+        expect(providerCalls).toBe(2);
+
+        const attempt = db.prepare(
+          'SELECT id, status FROM job_attempts WHERE job_id = ?',
+        ).get(taskId) as { id: string; status: string };
+        const contexts = db.prepare(
+          'SELECT id, recent_message_ids FROM model_contexts WHERE job_attempt_id = ?',
+        ).all(attempt.id) as Array<{ id: string; recent_message_ids: string }>;
+        const invocations = db.prepare(
+          `SELECT id, context_id, call_number, status, error_code,
+                  response_sha256, response_bytes
+           FROM model_invocations
+           WHERE job_attempt_id = ?
+           ORDER BY call_number ASC`,
+        ).all(attempt.id) as Array<{
+          id: string;
+          context_id: string;
+          call_number: number;
+          status: string;
+          error_code: string;
+          response_sha256: string | null;
+          response_bytes: number | null;
+        }>;
+
+        expect(attempt.status).toBe('failed');
+        expect(contexts).toHaveLength(1);
+        expect(JSON.parse(contexts[0]?.recent_message_ids ?? '[]')).toEqual(messageIds);
+        expect(invocations).toHaveLength(2);
+        expect(invocations.map((invocation) => ({
+          contextId: invocation.context_id,
+          callNumber: invocation.call_number,
+          status: invocation.status,
+          errorCode: invocation.error_code,
+          responseSha256: invocation.response_sha256,
+          responseBytes: invocation.response_bytes,
+        }))).toEqual([
+          {
+            contextId: contexts[0]?.id,
+            callNumber: 1,
+            status: 'failed',
+            errorCode: 'provider_failed',
+            responseSha256: null,
+            responseBytes: null,
+          },
+          {
+            contextId: contexts[0]?.id,
+            callNumber: 2,
+            status: 'failed',
+            errorCode: 'empty_response',
+            responseSha256: null,
+            responseBytes: null,
+          },
+        ]);
+
+        for (const invocation of invocations) {
+          const sources = db.prepare(
+            `SELECT raw_event_id
+             FROM model_invocation_sources
+             WHERE model_invocation_id = ?
+             ORDER BY source_ordinal ASC`,
+          ).all(invocation.id) as Array<{ raw_event_id: string }>;
+          expect(sources.map((source) => source.raw_event_id)).toEqual(rawEventIds);
+        }
+        expect(
+          db.prepare("SELECT COUNT(*) AS count FROM model_invocations WHERE status = 'running'").get(),
+        ).toEqual({ count: 0 });
+        expect(
+          db.prepare('SELECT COUNT(*) AS count FROM memory_records WHERE conversation_id = ?')
+            .get(conversationId),
+        ).toEqual({ count: 0 });
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+      }
+    });
+
     it('should process extraction jobs through durable job attempts and source-linked memory writes', async () => {
+      const deliveredText = 'Automatic extraction response must not enter the job payload.';
+      const sentMessages: SentMessage[] = [];
+      const memoryEvaluationRequests: MemoryEvaluationRequest[] = [];
+      const memoryEvaluationDecisionIds: string[] = [];
+      class CountingMemoryEvaluator extends EvaluatorStub {
+        override async evaluateMemory(
+          request: MemoryEvaluationRequest,
+        ): Promise<MemoryEvaluationResult> {
+          memoryEvaluationRequests.push(request);
+          const result = await super.evaluateMemory(request);
+          const decisionId = `eval-durable-extraction-${request.requestId}`;
+          memoryEvaluationDecisionIds.push(decisionId);
+          return { ...result, decisionId };
+        }
+      }
+      setReplyingPiRuntime(deliveredText);
+      setCapturingMessageSender(sentMessages);
+      app.setSocialEvaluatorForTesting(new CountingMemoryEvaluator());
       const onebotEvent: OneBotMessage = {
         post_type: 'message',
         message_type: 'private',
@@ -6647,122 +11013,249 @@ describe('E2E Conversation Flow', () => {
         time: Math.floor(Date.now() / 1000),
       };
 
-      const response = await postEvent(onebotEvent);
-      expect(response.status).toBe(200);
+      try {
+        const response = await postEvent(onebotEvent);
+        expect(response.status).toBe(200);
+        expect(sentMessages).toHaveLength(1);
 
-      const persisted = getPersistedMessage('qq-34567');
-      expect(persisted).toBeDefined();
+        const persisted = getPersistedMessage('qq-34567');
+        const turn = getTurnForMessage('qq-34567');
+        expect(persisted).toBeDefined();
+        expect(turn?.status).toBe('completed');
 
-      const identity = app
-        .getDatabase()
-        .prepare(
-          `SELECT canonical_user_id
-           FROM platform_accounts
-           WHERE platform = 'qq' AND platform_account_id = ?`
-        )
-        .get('34567') as { canonical_user_id: string } | undefined;
-      expect(identity?.canonical_user_id).toBeDefined();
+        const db = app.getDatabase();
+        const identity = db
+          .prepare(
+            `SELECT canonical_user_id
+             FROM platform_accounts
+             WHERE platform = 'qq' AND platform_account_id = ?`
+          )
+          .get('34567') as { canonical_user_id: string } | undefined;
+        expect(identity?.canonical_user_id).toBeDefined();
 
-      const taskId = app.enqueueBackgroundTaskForTesting({
-        type: 'extraction',
-        payload: {
-          conversationId: persisted?.conversation_id ?? 'private:qq-34567',
-          targetUserId: identity?.canonical_user_id,
-          userMessage: '我喜欢 后台任务测试',
-          botResponse: '我记下了。',
-          messageId: persisted?.id,
-          timestamp: Date.now(),
-          conversationType: 'private',
-        },
-        idempotencyKey: 'test:extraction:qq-34567:background',
-        maxAttempts: 2,
-      });
-      const duplicateTaskId = app.enqueueBackgroundTaskForTesting({
-        type: 'extraction',
-        payload: {
-          conversationId: persisted?.conversation_id ?? 'private:qq-34567',
-          targetUserId: identity?.canonical_user_id,
-          userMessage: '重复任务不应重复入队',
-          botResponse: 'duplicate',
-          messageId: persisted?.id,
-          conversationType: 'private',
-        },
-        idempotencyKey: 'test:extraction:qq-34567:background',
-      });
-      expect(duplicateTaskId).toBe(taskId);
-
-      const result = await app.processNextBackgroundJobForTesting();
-      expect(result?.status).toBe('completed');
-      expect(result?.taskId).toBe(taskId);
-
-      const output = result?.output as
-        | { matched: boolean; count: number; memoryIds: string[] }
-        | undefined;
-      expect(output?.matched).toBe(true);
-      expect(output?.count).toBeGreaterThan(0);
-      const memoryId = output?.memoryIds[0];
-      expect(memoryId).toBeDefined();
-
-      const db = app.getDatabase();
-      const job = db.prepare('SELECT status, attempts, result FROM jobs WHERE id = ?').get(taskId) as {
-        status: string;
-        attempts: number;
-        result: string;
-      };
-      const attempts = db
-        .prepare('SELECT status, worker_id, result FROM job_attempts WHERE job_id = ?')
-        .all(taskId) as Array<{ status: string; worker_id: string; result: string }>;
-      const heartbeat = db
-        .prepare('SELECT status, current_job_id FROM worker_heartbeats WHERE worker_id = ?')
-        .get('lethebot-background-main') as { status: string; current_job_id: string | null };
-      const memory = db
-        .prepare('SELECT state, scope, canonical_user_id, content FROM memory_records WHERE id = ?')
-        .get(memoryId) as {
-          state: string;
-          scope: string;
-          canonical_user_id: string;
-          content: string;
+        const idempotencyKey = `extraction:auto:${persisted?.id}`;
+        const pendingJob = db.prepare(
+          `SELECT id, status, attempts, payload, idempotency_key
+           FROM jobs WHERE type = 'extraction' AND idempotency_key = ?`
+        ).get(idempotencyKey) as {
+          id: string;
+          status: string;
+          attempts: number;
+          payload: string;
+          idempotency_key: string;
         };
-      const source = db
-        .prepare('SELECT source_type, source_id FROM memory_sources WHERE memory_id = ?')
-        .get(memoryId) as { source_type: string; source_id: string };
-      const revisionCount = (
-        db.prepare('SELECT COUNT(*) AS count FROM memory_revisions WHERE memory_id = ?').get(memoryId) as {
-          count: number;
-        }
-      ).count;
-      const auditCount = (
-        db.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE event_type = 'memory.create' AND event_id = ?").get(memoryId) as {
-          count: number;
-        }
-      ).count;
+        const payload = JSON.parse(pendingJob.payload) as Record<string, unknown>;
 
-      expect(job.status).toBe('completed');
-      expect(job.attempts).toBe(1);
-      expect(JSON.parse(job.result).memoryIds).toContain(memoryId);
-      expect(attempts).toHaveLength(1);
-      expect(attempts[0]).toMatchObject({
-        status: 'completed',
-        worker_id: 'lethebot-background-main',
-      });
-      expect(JSON.parse(attempts[0]?.result ?? '{}').memoryIds).toContain(memoryId);
-      expect(heartbeat).toEqual({
-        status: 'idle',
-        current_job_id: null,
-      });
-      expect(memory).toMatchObject({
-        state: 'active',
-        scope: 'user',
-        canonical_user_id: identity?.canonical_user_id,
-        content: '我喜欢 后台任务测试',
-      });
-      expect(source).toEqual({
-        source_type: 'chat_message',
-        source_id: persisted?.id,
-      });
-      expect(revisionCount).toBeGreaterThanOrEqual(1);
-      expect(auditCount).toBe(1);
-      expectNoForeignKeyViolations();
+        expect(pendingJob).toMatchObject({
+          status: 'pending',
+          attempts: 0,
+          idempotency_key: idempotencyKey,
+        });
+        expect(payload).toEqual({
+          sourceChatMessageId: persisted?.id,
+          targetUserId: identity?.canonical_user_id,
+        });
+        expect(Object.keys(payload).sort()).toEqual(['sourceChatMessageId', 'targetUserId']);
+        expect(pendingJob.payload).not.toContain('我喜欢 后台任务测试');
+        expect(pendingJob.payload).not.toContain(deliveredText);
+        expect(
+          db.prepare('SELECT COUNT(*) AS count FROM memory_sources WHERE source_type = ? AND source_id = ?')
+            .get('chat_message', persisted?.id)
+        ).toEqual({ count: 0 });
+
+        const duplicateResponse = await postEvent(onebotEvent);
+        expect(duplicateResponse.status).toBe(200);
+        expect(sentMessages).toHaveLength(1);
+        expect(
+          db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE type = 'extraction' AND idempotency_key = ?")
+            .get(idempotencyKey)
+        ).toEqual({ count: 1 });
+
+        db.exec(`
+          CREATE TEMP TRIGGER fail_auto_extraction_memory_create
+          BEFORE INSERT ON memory_records
+          WHEN NEW.id LIKE 'extraction-v1-%'
+          BEGIN
+            SELECT RAISE(ABORT, 'forced extraction candidate persistence failure');
+          END
+        `);
+        const candidateFailure = await app.processNextBackgroundJobForTesting();
+        expect(candidateFailure).toMatchObject({ taskId: pendingJob.id, status: 'failed' });
+        expect(
+          db.prepare('SELECT status, attempts FROM jobs WHERE id = ?').get(pendingJob.id)
+        ).toEqual({ status: 'pending', attempts: 1 });
+        expect(
+          db.prepare('SELECT COUNT(*) AS count FROM memory_sources WHERE source_type = ? AND source_id = ?')
+            .get('chat_message', persisted?.id)
+        ).toEqual({ count: 0 });
+        const firstAttempt = db.prepare(
+          `SELECT id, status, attempt_number
+           FROM job_attempts
+           WHERE job_id = ?
+           ORDER BY attempt_number ASC`,
+        ).get(pendingJob.id) as { id: string; status: string; attempt_number: number };
+        expect(firstAttempt).toMatchObject({ status: 'failed', attempt_number: 1 });
+        expect(memoryEvaluationRequests).toHaveLength(1);
+        expect(memoryEvaluationRequests[0]).toMatchObject({
+          domain: 'memory',
+          jobAttemptId: firstAttempt.id,
+          actor: {
+            canonicalUserId: identity?.canonical_user_id,
+            actorClass: 'system_worker',
+          },
+          context: 'background_worker',
+          sourceEventIds: [persisted?.raw_event_id],
+        });
+        expect(memoryEvaluationRequests[0]).not.toHaveProperty('turnId');
+        expect(
+          db.prepare('SELECT COUNT(*) AS count FROM evaluator_decisions WHERE request_id = ?')
+            .get(memoryEvaluationRequests[0]?.requestId),
+        ).toEqual({ count: 0 });
+        expectNoForeignKeyViolations();
+        db.exec('DROP TRIGGER fail_auto_extraction_memory_create');
+
+        db.exec(`
+          CREATE TEMP TRIGGER fail_auto_extraction_job_completion
+          BEFORE UPDATE OF status ON job_attempts
+          WHEN NEW.job_id = '${pendingJob.id}' AND NEW.status = 'completed'
+          BEGIN
+            SELECT RAISE(ABORT, 'forced extraction job completion failure');
+          END
+        `);
+        const failed = await app.processNextBackgroundJobForTesting();
+        expect(failed).toMatchObject({ taskId: pendingJob.id, status: 'failed' });
+        expect(
+          db.prepare('SELECT status, attempts FROM jobs WHERE id = ?').get(pendingJob.id)
+        ).toEqual({ status: 'pending', attempts: 2 });
+        const committedBeforeRetry = db.prepare(
+          `SELECT memory_id FROM memory_sources
+           WHERE source_type = 'chat_message' AND source_id = ?`
+        ).get(persisted?.id) as { memory_id: string } | undefined;
+        expect(committedBeforeRetry?.memory_id).toMatch(/^extraction-v1-[a-f0-9]{64}$/);
+        const attemptsBeforeRetry = db.prepare(
+          `SELECT id, status, attempt_number
+           FROM job_attempts
+           WHERE job_id = ?
+           ORDER BY attempt_number ASC`,
+        ).all(pendingJob.id) as Array<{ id: string; status: string; attempt_number: number }>;
+        expect(attemptsBeforeRetry).toHaveLength(2);
+        expect(attemptsBeforeRetry.map((attempt) => attempt.status)).toEqual(['failed', 'failed']);
+        expect(memoryEvaluationRequests).toHaveLength(2);
+        expect(memoryEvaluationRequests[1]).toMatchObject({
+          domain: 'memory',
+          jobAttemptId: attemptsBeforeRetry[1]?.id,
+          actor: {
+            canonicalUserId: identity?.canonical_user_id,
+            actorClass: 'system_worker',
+          },
+          context: 'background_worker',
+          sourceEventIds: [persisted?.raw_event_id],
+        });
+        expect(memoryEvaluationRequests[1]).not.toHaveProperty('turnId');
+        const committedDecision = db.prepare(
+          `SELECT id, request_id, turn_id, job_attempt_id, domain, actor_user_id,
+                  actor_class, invocation_context, source_event_ids
+           FROM evaluator_decisions
+           WHERE request_id = ?`,
+        ).get(memoryEvaluationRequests[1]?.requestId) as {
+          id: string;
+          request_id: string;
+          turn_id: string | null;
+          job_attempt_id: string | null;
+          domain: string;
+          actor_user_id: string | null;
+          actor_class: string;
+          invocation_context: string;
+          source_event_ids: string;
+        };
+        expect(committedDecision).toMatchObject({
+          id: memoryEvaluationDecisionIds[1],
+          request_id: memoryEvaluationRequests[1]?.requestId,
+          turn_id: null,
+          job_attempt_id: attemptsBeforeRetry[1]?.id,
+          domain: 'memory',
+          actor_user_id: identity?.canonical_user_id,
+          actor_class: 'system_worker',
+          invocation_context: 'background_worker',
+        });
+        expect(JSON.parse(committedDecision.source_event_ids)).toEqual([persisted?.raw_event_id]);
+        expect(
+          db.prepare('SELECT COUNT(*) AS count FROM evaluator_decisions WHERE id IN (?, ?)')
+            .get(memoryEvaluationDecisionIds[0], memoryEvaluationDecisionIds[1]),
+        ).toEqual({ count: 1 });
+        expectNoForeignKeyViolations();
+
+        db.exec('DROP TRIGGER fail_auto_extraction_job_completion');
+        const result = await app.processNextBackgroundJobForTesting();
+        expect(result).toMatchObject({ taskId: pendingJob.id, status: 'completed' });
+        const output = result?.output as { matched: boolean; count: number; memoryIds: string[] } | undefined;
+        expect(output).toMatchObject({ matched: true, count: 1 });
+        const memoryId = output?.memoryIds[0];
+        expect(memoryId).toMatch(/^extraction-v1-[a-f0-9]{64}$/);
+        expect(memoryId).toBe(committedBeforeRetry?.memory_id);
+        expect(memoryEvaluationRequests).toHaveLength(2);
+        expect(
+          db.prepare('SELECT COUNT(*) AS count FROM evaluator_decisions WHERE id IN (?, ?)')
+            .get(memoryEvaluationDecisionIds[0], memoryEvaluationDecisionIds[1]),
+        ).toEqual({ count: 1 });
+
+        const job = db.prepare('SELECT status, attempts, result FROM jobs WHERE id = ?').get(pendingJob.id) as {
+          status: string;
+          attempts: number;
+          result: string;
+        };
+        const attempts = db
+          .prepare('SELECT status, worker_id, result FROM job_attempts WHERE job_id = ?')
+          .all(pendingJob.id) as Array<{ status: string; worker_id: string; result: string }>;
+        const memory = db
+          .prepare(
+            `SELECT state, scope, canonical_user_id, content, evaluator_decision_id
+             FROM memory_records WHERE id = ?`,
+          )
+          .get(memoryId) as {
+            state: string;
+            scope: string;
+            canonical_user_id: string;
+            content: string;
+            evaluator_decision_id: string | null;
+          };
+        const source = db
+          .prepare('SELECT source_type, source_id FROM memory_sources WHERE memory_id = ?')
+          .get(memoryId) as { source_type: string; source_id: string };
+
+        expect(job.status).toBe('completed');
+        expect(job.attempts).toBe(3);
+        expect(JSON.parse(job.result).memoryIds).toEqual([memoryId]);
+        expect(attempts).toHaveLength(3);
+        expect(attempts.map((attempt) => attempt.status)).toEqual(['failed', 'failed', 'completed']);
+        expect(attempts[2]).toMatchObject({ status: 'completed', worker_id: 'lethebot-background-main' });
+        expect(memory).toMatchObject({
+          state: 'active',
+          scope: 'user',
+          canonical_user_id: identity?.canonical_user_id,
+          content: '我喜欢 后台任务测试',
+          evaluator_decision_id: committedDecision.id,
+        });
+        expect(source).toEqual({ source_type: 'chat_message', source_id: persisted?.id });
+        expect(db.prepare('SELECT COUNT(*) AS count FROM memory_revisions WHERE memory_id = ?').get(memoryId))
+          .toEqual({ count: 1 });
+        expect(
+          db.prepare('SELECT evaluator_decision_id FROM memory_revisions WHERE memory_id = ?').get(memoryId),
+        ).toEqual({ evaluator_decision_id: committedDecision.id });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE event_type = 'memory.create' AND event_id = ?")
+          .get(memoryId)).toEqual({ count: 1 });
+        expect(
+          db.prepare(
+            "SELECT evaluator_decision_id FROM audit_log WHERE event_type = 'memory.create' AND event_id = ?",
+          ).get(memoryId),
+        ).toEqual({ evaluator_decision_id: committedDecision.id });
+        expectNoForeignKeyViolations();
+      } finally {
+        app.getDatabase().exec('DROP TRIGGER IF EXISTS fail_auto_extraction_memory_create');
+        app.getDatabase().exec('DROP TRIGGER IF EXISTS fail_auto_extraction_job_completion');
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
     });
 
     it('should process retention jobs through durable worker and preserve database integrity', async () => {
@@ -6882,6 +11375,7 @@ describe('E2E Conversation Flow', () => {
       expect(result?.status).toBe('completed');
       expect(result?.output).toMatchObject({
         rawEventsDeleted: 1,
+        modelInvocationSourcesDeleted: 0,
         chatMessagesDeleted: 1,
         auditLogDeleted: 1,
         memoriesPurged: 1,
@@ -6900,7 +11394,10 @@ describe('E2E Conversation Flow', () => {
 
       expect(job.status).toBe('completed');
       expect(job.attempts).toBe(1);
-      expect(JSON.parse(job.result)).toMatchObject({ rawEventsDeleted: 1 });
+      expect(JSON.parse(job.result)).toMatchObject({
+        rawEventsDeleted: 1,
+        modelInvocationSourcesDeleted: 0,
+      });
       expect(attempts).toEqual([
         expect.objectContaining({
           status: 'completed',
@@ -8178,6 +12675,55 @@ describe('E2E Conversation Flow', () => {
   });
 
   describe('Concurrent requests', () => {
+    it('should resolve concurrent first events from one account to one canonical user', async () => {
+      const db = app.getDatabase();
+      const canonicalUsersBefore = db.prepare(
+        'SELECT COUNT(*) AS count FROM canonical_users'
+      ).get() as { count: number };
+      const platformAccountId = 923450101;
+      const requests = Array.from({ length: 5 }, (_, index) => sendEvent({
+        post_type: 'message',
+        message_type: 'private',
+        message_id: 923450001 + index,
+        user_id: platformAccountId,
+        message: `Concurrent same-account message ${index}`,
+        raw_message: `Concurrent same-account message ${index}`,
+        sender: {
+          user_id: platformAccountId,
+          nickname: 'ConcurrentIdentity',
+        },
+        time: Math.floor(Date.now() / 1000),
+      } satisfies OneBotMessage));
+
+      const responses = await Promise.all(requests);
+      await app.waitForIdle();
+
+      for (const response of responses) {
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({ status: 'ok' });
+      }
+
+      const mapping = db.prepare(
+        `SELECT canonical_user_id, status
+         FROM platform_accounts
+         WHERE platform = 'qq' AND platform_account_id = ?`
+      ).get(String(platformAccountId)) as {
+        canonical_user_id: string;
+        status: string;
+      } | undefined;
+      const canonicalUsersAfter = db.prepare(
+        'SELECT COUNT(*) AS count FROM canonical_users'
+      ).get() as { count: number };
+
+      expect(mapping).toMatchObject({ status: 'active' });
+      expect(canonicalUsersAfter.count).toBe(canonicalUsersBefore.count + 1);
+      expect(
+        db.prepare('SELECT COUNT(*) AS count FROM canonical_users WHERE id = ?')
+          .get(mapping?.canonical_user_id)
+      ).toEqual({ count: 1 });
+      expectNoForeignKeyViolations();
+    });
+
     it('should handle multiple concurrent requests', async () => {
       const requests = Array.from({ length: 5 }, (_, i) => {
         const onebotEvent: OneBotMessage = {

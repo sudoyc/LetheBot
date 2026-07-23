@@ -2,7 +2,11 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BackgroundWorker } from '../../../src/workers/background';
+import {
+  BackgroundWorker,
+  NonRetryableBackgroundTaskError,
+  type BackgroundTaskExecutionContext,
+} from '../../../src/workers/background';
 import { initDatabase, runMigration, closeDatabase } from '../../../src/storage/database';
 import { JobRepository } from '../../../src/storage/job-repository';
 
@@ -128,6 +132,39 @@ describe('BackgroundWorker', () => {
       expect(result).toBeNull();
     });
 
+    it('should pass undefined execution context to in-memory handlers without leaking metadata', async () => {
+      const observedContexts: Array<BackgroundTaskExecutionContext | undefined> = [];
+      const payload = { conversationId: 'conv-in-memory-execution-context', marker: 'unchanged' };
+      const worker5 = new BackgroundWorker({
+        handlers: {
+          summary: async (task, executionContext) => {
+            observedContexts.push(executionContext);
+            expect(task.payload).toEqual(payload);
+            return { handled: true };
+          },
+        },
+      });
+
+      const taskId = worker5.enqueue({ type: 'summary', payload });
+      const result = await worker5.processNext();
+      const [listedTask] = worker5.list();
+
+      expect(observedContexts).toEqual([undefined]);
+      expect(payload).toEqual({
+        conversationId: 'conv-in-memory-execution-context',
+        marker: 'unchanged',
+      });
+      expect(listedTask?.payload).toEqual(payload);
+      expect(result).toEqual({
+        taskId,
+        status: 'completed',
+        output: { handled: true },
+      });
+      expect(JSON.stringify({ payload, listedTask, result })).not.toMatch(
+        /"(?:jobId|jobAttemptId|attemptNumber)":/,
+      );
+    });
+
     it('should redact legacy in-memory task errors before returning', async () => {
       const rawSecret = 'sk-background-worker-legacy-error-secret-should-not-return';
       const rawPlatformId = 'qq-1234567890';
@@ -160,6 +197,348 @@ describe('BackgroundWorker', () => {
   });
 
   describe('durable job repository integration', () => {
+    it('recognizes a scheduled attention recheck and does not claim it before its due time', async () => {
+      const testDir = mkdtempSync(join(tmpdir(), 'lethebot-bg-worker-attention-'));
+      const db = initDatabase({ path: join(testDir, 'test.db') });
+
+      try {
+        runMigration(db, join(__dirname, '../../../migrations/001_initial_schema.sql'));
+        const jobRepository = new JobRepository(db);
+        const handled: string[] = [];
+        const durableWorker = new BackgroundWorker({
+          jobRepository,
+          workerId: 'worker-bg-attention',
+          handlers: {
+            attention_recheck: async (task) => {
+              handled.push(String(task.payload.candidateId));
+              return { candidateId: task.payload.candidateId, outcome: 'suppress' };
+            },
+          },
+        });
+        const dueAt = Date.now() + 15_000;
+        const taskId = durableWorker.enqueue({
+          type: 'attention_recheck',
+          payload: { candidateId: 'candidate-synthetic-attention' },
+          scheduledAt: dueAt,
+        });
+
+        expect(await durableWorker.processNext(dueAt - 1, ['attention_recheck'])).toBeNull();
+        expect(handled).toEqual([]);
+        expect(durableWorker.getStatus(taskId)).toBe('pending');
+
+        const result = await durableWorker.processNext(dueAt, ['attention_recheck']);
+
+        expect(result).toEqual({
+          taskId,
+          status: 'completed',
+          output: {
+            candidateId: 'candidate-synthetic-attention',
+            outcome: 'suppress',
+          },
+        });
+        expect(handled).toEqual(['candidate-synthetic-attention']);
+        expect(durableWorker.getStatus(taskId)).toBe('completed');
+        expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+      } finally {
+        closeDatabase(db);
+        rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('terminally rejects an attention recheck when its required handler is absent', async () => {
+      const testDir = mkdtempSync(join(tmpdir(), 'lethebot-bg-worker-attention-handler-'));
+      const db = initDatabase({ path: join(testDir, 'test.db') });
+
+      try {
+        runMigration(db, join(__dirname, '../../../migrations/001_initial_schema.sql'));
+        const jobRepository = new JobRepository(db);
+        const durableWorker = new BackgroundWorker({
+          jobRepository,
+          workerId: 'worker-bg-attention-handler',
+        });
+        const now = Date.now();
+        const taskId = durableWorker.enqueue({
+          type: 'attention_recheck',
+          payload: { candidateId: 'candidate-missing-handler' },
+          scheduledAt: now,
+          maxAttempts: 3,
+        });
+
+        const result = await durableWorker.processNext(now, ['attention_recheck']);
+
+        expect(result).toMatchObject({
+          taskId,
+          status: 'failed',
+          error: expect.stringContaining('requires a registered handler'),
+        });
+        expect(jobRepository.findById(taskId)).toMatchObject({
+          status: 'failed',
+          attempts: 1,
+          maxAttempts: 3,
+        });
+        expect(db.prepare(
+          'SELECT status FROM job_attempts WHERE job_id = ?',
+        ).get(taskId)).toEqual({ status: 'failed' });
+      } finally {
+        closeDatabase(db);
+        rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('terminally fails an explicitly non-retryable durable task', async () => {
+      const testDir = mkdtempSync(join(tmpdir(), 'lethebot-bg-worker-non-retryable-'));
+      const db = initDatabase({ path: join(testDir, 'test.db') });
+
+      try {
+        runMigration(db, join(__dirname, '../../../migrations/001_initial_schema.sql'));
+        const jobRepository = new JobRepository(db);
+        const durableWorker = new BackgroundWorker({
+          jobRepository,
+          workerId: 'worker-bg-non-retryable',
+          handlers: {
+            summary: async () => {
+              throw new NonRetryableBackgroundTaskError('deterministic task rejection');
+            },
+          },
+        });
+        const taskId = durableWorker.enqueue({
+          type: 'summary',
+          payload: { conversationId: 'conv-non-retryable' },
+          maxAttempts: 3,
+        });
+
+        const failed = await durableWorker.processNext();
+        const laterPoll = await durableWorker.processNext();
+
+        expect(failed).toEqual({
+          taskId,
+          status: 'failed',
+          error: 'deterministic task rejection',
+        });
+        expect(laterPoll).toBeNull();
+        expect(jobRepository.findById(taskId)).toMatchObject({
+          status: 'failed',
+          attempts: 1,
+          maxAttempts: 3,
+          error: 'deterministic task rejection',
+        });
+        expect(db.prepare(
+          'SELECT attempt_number, status, error FROM job_attempts WHERE job_id = ?',
+        ).all(taskId)).toEqual([{
+          attempt_number: 1,
+          status: 'failed',
+          error: 'deterministic task rejection',
+        }]);
+        expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+      } finally {
+        closeDatabase(db);
+        rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('should pass exact claimed execution metadata without persisting it in task data', async () => {
+      const testDir = mkdtempSync(join(tmpdir(), 'lethebot-bg-worker-execution-context-'));
+      const db = initDatabase({ path: join(testDir, 'test.db') });
+
+      try {
+        runMigration(db, join(__dirname, '../../../migrations/001_initial_schema.sql'));
+        const jobRepository = new JobRepository(db);
+        const observedContexts: Array<BackgroundTaskExecutionContext | undefined> = [];
+        const payload = { conversationId: 'conv-durable-execution-context', marker: 'unchanged' };
+        const durableWorker = new BackgroundWorker({
+          jobRepository,
+          workerId: 'worker-bg-execution-context',
+          handlers: {
+            summary: async (task, executionContext) => {
+              observedContexts.push(executionContext);
+              expect(task.payload).toEqual(payload);
+
+              if (observedContexts.length === 1) {
+                throw new Error('retry once');
+              }
+
+              return { handled: true };
+            },
+          },
+        });
+
+        const taskId = durableWorker.enqueue({ type: 'summary', payload });
+        const firstAttemptAt = Date.now() + 1_000;
+        const secondAttemptAt = firstAttemptAt + 1;
+        const firstResult = await durableWorker.processNext(firstAttemptAt);
+        const result = await durableWorker.processNext(secondAttemptAt);
+        const attempts = db
+          .prepare(
+            'SELECT id, attempt_number, started_at FROM job_attempts WHERE job_id = ? ORDER BY attempt_number',
+          )
+          .all(taskId) as Array<{ id: string; attempt_number: number; started_at: number }>;
+        const job = db.prepare('SELECT payload, result FROM jobs WHERE id = ?').get(taskId) as {
+          payload: string;
+          result: string;
+        };
+        const [listedTask] = durableWorker.list();
+
+        expect(observedContexts).toEqual(
+          attempts.map((attempt) => ({
+            jobId: taskId,
+            jobAttemptId: attempt.id,
+            attemptNumber: attempt.attempt_number,
+            now: attempt.started_at,
+          })),
+        );
+        expect(attempts.map((attempt) => attempt.attempt_number)).toEqual([1, 2]);
+        expect(observedContexts[0]?.jobAttemptId).not.toBe(observedContexts[1]?.jobAttemptId);
+        expect(payload).toEqual({
+          conversationId: 'conv-durable-execution-context',
+          marker: 'unchanged',
+        });
+        expect(JSON.parse(job.payload)).toEqual(payload);
+        expect(listedTask?.payload).toEqual(payload);
+        expect(JSON.parse(job.result)).toEqual({ handled: true });
+        expect(firstResult).toEqual({
+          taskId,
+          status: 'failed',
+          error: 'retry once',
+        });
+        expect(result).toEqual({
+          taskId,
+          status: 'completed',
+          output: { handled: true },
+        });
+        expect(
+          JSON.stringify({
+            payload,
+            listedTask,
+            persistedPayload: JSON.parse(job.payload),
+            persistedResult: JSON.parse(job.result),
+            firstResult,
+            result,
+          }),
+        ).not.toMatch(/"(?:jobId|jobAttemptId|attemptNumber)":/);
+        expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+      } finally {
+        closeDatabase(db);
+        rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('should read fresh execution time from an injected clock on every access', async () => {
+      const testDir = mkdtempSync(join(tmpdir(), 'lethebot-bg-worker-fresh-execution-time-'));
+      const db = initDatabase({ path: join(testDir, 'test.db') });
+
+      try {
+        runMigration(db, join(__dirname, '../../../migrations/001_initial_schema.sql'));
+        const jobRepository = new JobRepository(db);
+        const claimedAt = Date.now();
+        const firstReadAt = claimedAt + 10_000;
+        const secondReadAt = claimedAt + 20_000;
+        const completedAt = claimedAt + 30_000;
+        const times = [claimedAt, firstReadAt, secondReadAt, completedAt];
+        const clock = vi.fn(() => times.shift() ?? completedAt);
+        const observedTimes: number[] = [];
+        const durableWorker = new BackgroundWorker({
+          jobRepository,
+          workerId: 'worker-bg-fresh-execution-time',
+          clock,
+          handlers: {
+            attention_recheck: async (_task, executionContext) => {
+              if (!executionContext) {
+                throw new Error('Expected durable execution context');
+              }
+              observedTimes.push(executionContext.now);
+              await new Promise<void>((resolve) => setImmediate(resolve));
+              observedTimes.push(executionContext.now);
+              return { handled: true };
+            },
+          },
+        });
+        const taskId = durableWorker.enqueue({
+          type: 'attention_recheck',
+          payload: { candidateId: 'candidate-fresh-execution-time' },
+          scheduledAt: claimedAt,
+        });
+
+        const result = await durableWorker.processNext(undefined, ['attention_recheck']);
+        const attempt = db.prepare(
+          'SELECT started_at, completed_at FROM job_attempts WHERE job_id = ?',
+        ).get(taskId) as { started_at: number; completed_at: number };
+
+        expect(observedTimes).toEqual([firstReadAt, secondReadAt]);
+        expect(attempt.started_at).toBe(claimedAt);
+        expect(attempt.completed_at).toBe(completedAt);
+        expect(clock).toHaveBeenCalledTimes(4);
+        expect(result).toEqual({
+          taskId,
+          status: 'completed',
+          output: { handled: true },
+        });
+      } finally {
+        closeDatabase(db);
+        rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('should keep execution time and durable timestamps fixed when process time is explicit', async () => {
+      const testDir = mkdtempSync(join(tmpdir(), 'lethebot-bg-worker-fixed-execution-time-'));
+      const db = initDatabase({ path: join(testDir, 'test.db') });
+
+      try {
+        runMigration(db, join(__dirname, '../../../migrations/001_initial_schema.sql'));
+        const jobRepository = new JobRepository(db);
+        const fixedNow = Date.now() + 1_000;
+        const clock = vi.fn(() => fixedNow + 30_000);
+        const observedTimes: number[] = [];
+        const durableWorker = new BackgroundWorker({
+          jobRepository,
+          workerId: 'worker-bg-fixed-execution-time',
+          clock,
+          handlers: {
+            attention_recheck: async (_task, executionContext) => {
+              if (!executionContext) {
+                throw new Error('Expected durable execution context');
+              }
+              observedTimes.push(executionContext.now);
+              await new Promise<void>((resolve) => setImmediate(resolve));
+              observedTimes.push(executionContext.now);
+              return { handled: true };
+            },
+          },
+        });
+        const taskId = durableWorker.enqueue({
+          type: 'attention_recheck',
+          payload: { candidateId: 'candidate-fixed-execution-time' },
+          scheduledAt: fixedNow,
+        });
+
+        const result = await durableWorker.processNext(fixedNow, ['attention_recheck']);
+        const job = db.prepare(
+          `SELECT scheduled_at, started_at, completed_at, updated_at, heartbeat_at
+             FROM jobs WHERE id = ?`,
+        ).get(taskId) as Record<string, number>;
+        const attempt = db.prepare(
+          `SELECT started_at, completed_at, heartbeat_at
+             FROM job_attempts WHERE job_id = ?`,
+        ).get(taskId) as Record<string, number>;
+        const heartbeat = db.prepare(
+          'SELECT heartbeat_at FROM worker_heartbeats WHERE worker_id = ?',
+        ).get('worker-bg-fixed-execution-time') as { heartbeat_at: number };
+
+        expect(observedTimes).toEqual([fixedNow, fixedNow]);
+        expect(Object.values(job)).toEqual(Array(5).fill(fixedNow));
+        expect(Object.values(attempt)).toEqual(Array(3).fill(fixedNow));
+        expect(heartbeat.heartbeat_at).toBe(fixedNow);
+        expect(clock).not.toHaveBeenCalled();
+        expect(result).toEqual({
+          taskId,
+          status: 'completed',
+          output: { handled: true },
+        });
+      } finally {
+        closeDatabase(db);
+        rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
     it('should enqueue idempotently and process with job/attempt/heartbeat rows', async () => {
       const testDir = mkdtempSync(join(tmpdir(), 'lethebot-bg-worker-'));
       const db = initDatabase({ path: join(testDir, 'test.db') });
@@ -673,6 +1052,66 @@ describe('BackgroundWorker', () => {
       } finally {
         releaseHandler?.();
         vi.useRealTimers();
+        closeDatabase(db);
+        rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('does not report completion after the durable attempt loses lease authority', async () => {
+      const testDir = mkdtempSync(join(tmpdir(), 'lethebot-bg-worker-lost-lease-'));
+      const db = initDatabase({ path: join(testDir, 'test.db') });
+
+      try {
+        runMigration(db, join(__dirname, '../../../migrations/001_initial_schema.sql'));
+        const jobRepository = new JobRepository(db);
+        const durableWorker = new BackgroundWorker({
+          jobRepository,
+          workerId: 'worker-bg-lost-lease',
+          leaseMs: 60_000,
+          handlers: {
+            summary: async (task) => {
+              db.prepare('UPDATE jobs SET lease_expires_at = ? WHERE id = ?')
+                .run(Date.now(), task.id);
+              return { summary: 'handler finished after lease expiry' };
+            },
+          },
+        });
+        const taskId = durableWorker.enqueue({
+          type: 'summary',
+          payload: { conversationId: 'conv-lost-lease' },
+          maxAttempts: 2,
+        });
+
+        const result = await durableWorker.processNext();
+        const job = db.prepare(
+          `SELECT status, attempts, completed_at, error, result
+             FROM jobs WHERE id = ?`
+        ).get(taskId);
+        const attempt = db.prepare(
+          `SELECT status, completed_at, error, result
+             FROM job_attempts WHERE job_id = ?`
+        ).get(taskId);
+
+        expect(result).toMatchObject({
+          taskId,
+          status: 'failed',
+          error: expect.stringContaining('lost lease authority'),
+        });
+        expect(job).toEqual({
+          status: 'running',
+          attempts: 1,
+          completed_at: null,
+          error: null,
+          result: null,
+        });
+        expect(attempt).toEqual({
+          status: 'running',
+          completed_at: null,
+          error: null,
+          result: null,
+        });
+        expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+      } finally {
         closeDatabase(db);
         rmSync(testDir, { recursive: true, force: true });
       }

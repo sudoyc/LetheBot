@@ -33,6 +33,7 @@ describe('ListDirectoryHandler', () => {
     context = {
       toolCallId: 'test-call-id',
       turnId: 'test-turn-id',
+      signal: new AbortController().signal,
       workspaceRoot: tempDir,
       sandboxPolicy,
     };

@@ -4,7 +4,7 @@
  * 测试写入文件处理器
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -33,12 +33,14 @@ describe('WriteFileHandler', () => {
     context = {
       toolCallId: 'test-call-id',
       turnId: 'test-turn-id',
+      signal: new AbortController().signal,
       workspaceRoot: tempDir,
       sandboxPolicy,
     };
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await fs.promises.rm(tempDir, { recursive: true, force: true });
   });
 
@@ -77,6 +79,36 @@ describe('WriteFileHandler', () => {
         'utf8'
       );
       expect(written).toBe(content);
+    });
+
+    it('should stop before directory or file mutation when cancellation arrives after validation', async () => {
+      const controller = new AbortController();
+      const leakedReason = 'sk-write-abort-reason-must-not-leak';
+      context.signal = controller.signal;
+      vi.spyOn(fs.promises, 'access').mockImplementation(async () => {
+        controller.abort(leakedReason);
+        const error = new Error('not found') as NodeJS.ErrnoException;
+        error.code = 'ENOENT';
+        throw error;
+      });
+      const mkdirSpy = vi.spyOn(fs.promises, 'mkdir');
+      const writeFileSpy = vi.spyOn(fs.promises, 'writeFile');
+
+      const result = await handler.execute(
+        { path: 'cancelled.txt', content: 'must not be written' },
+        context
+      );
+
+      expect(result).toMatchObject({
+        status: 'error',
+        error: {
+          code: 'ABORT_ERR',
+          message: 'File operation aborted',
+        },
+      });
+      expect(JSON.stringify(result)).not.toContain(leakedReason);
+      expect(mkdirSpy).not.toHaveBeenCalled();
+      expect(writeFileSpy).not.toHaveBeenCalled();
     });
 
     it('should create parent directories', async () => {

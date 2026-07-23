@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type Database from 'better-sqlite3';
@@ -98,6 +98,8 @@ describe('ops maintenance CLI', () => {
 
     const metrics = JSON.parse(expectSuccessfulOps(['metrics', `--db=${dbPath}`])) as {
       rawEvents: { total: number };
+      eventIngressReceipts: { total: number; byDisposition: Record<string, number> };
+      eventProcessingAdmissions: { total: number; byState: Record<string, number> };
       chatMessages: { total: number };
       agentTurns: { total: number; byStatus: Record<string, number>; tokensTotal: number };
       contextTraces: { total: number };
@@ -125,6 +127,8 @@ describe('ops maintenance CLI', () => {
 
     expect(metrics).toMatchObject({
       rawEvents: { total: 2 },
+      eventIngressReceipts: { total: 0, byDisposition: {} },
+      eventProcessingAdmissions: { total: 0, byState: {} },
       chatMessages: { total: 2 },
       agentTurns: { total: 1, byStatus: { completed: 1 }, tokensTotal: 7 },
       contextTraces: { total: 1 },
@@ -196,8 +200,17 @@ describe('ops maintenance CLI', () => {
       'restore',
       `--backup=${backupPath}`,
       `--db=${restoredPath}`,
-    ])) as { integrityOk: boolean; restoredSizeBytes: number; targetPath: string };
-    expect(restore).toMatchObject({ integrityOk: true, targetPath: restoredPath });
+    ])) as {
+      integrityOk: boolean;
+      foreignKeyViolations: number;
+      restoredSizeBytes: number;
+      targetPath: string;
+    };
+    expect(restore).toMatchObject({
+      integrityOk: true,
+      foreignKeyViolations: 0,
+      targetPath: restoredPath,
+    });
     expect(restore.restoredSizeBytes).toBeGreaterThan(0);
 
     const restored = initDatabase({ path: restoredPath, readonly: true });
@@ -219,6 +232,7 @@ describe('ops maintenance CLI', () => {
     ])) as {
       result: {
         rawEventsDeleted: number;
+        modelInvocationSourcesDeleted: number;
         chatMessagesDeleted: number;
         auditLogDeleted: number;
         eventProcessingFailuresDeleted: number;
@@ -229,6 +243,7 @@ describe('ops maintenance CLI', () => {
     };
     expect(retention.result).toMatchObject({
       rawEventsDeleted: 1,
+      modelInvocationSourcesDeleted: 0,
       chatMessagesDeleted: 1,
       auditLogDeleted: 1,
       eventProcessingFailuresDeleted: 1,
@@ -243,6 +258,521 @@ describe('ops maintenance CLI', () => {
     expect(countRows(db, 'event_processing_failures')).toBe(1);
     expect(countRows(db, 'memory_records')).toBe(1);
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('runs doctor with read-only aggregate DB and configuration evidence', () => {
+    const now = Date.UTC(2026, 6, 3);
+    const old = now - 45 * 24 * 60 * 60 * 1000;
+    const recent = now - 2 * 24 * 60 * 60 * 1000;
+    const secret = 'sk-ops-doctor-secret-should-not-leak';
+    const platformId = 'qq-987654321';
+    const rawSensitiveDbPath = join(testDir, `api_key=${secret}-${platformId}.db`);
+
+    closeDatabase(db);
+    dbPath = rawSensitiveDbPath;
+    db = initDatabase({ path: dbPath });
+    runMigration(db, join(process.cwd(), 'migrations/001_initial_schema.sql'));
+    seedOperationalRows(old, recent);
+
+    const beforeRows = {
+      rawEvents: db.prepare('SELECT * FROM raw_events ORDER BY id').all(),
+      chatMessages: db.prepare('SELECT * FROM chat_messages ORDER BY id').all(),
+      turns: db.prepare('SELECT * FROM agent_turns ORDER BY id').all(),
+      jobs: db.prepare('SELECT * FROM jobs ORDER BY id').all(),
+      audit: db.prepare('SELECT * FROM audit_log ORDER BY id').all(),
+    };
+
+    const result = runOps(['doctor'], {
+      ONEBOT_HTTP_URL: `http://example.invalid/${secret}/${platformId}`,
+      ONEBOT_WS_URL: `ws://example.invalid/${secret}/${platformId}`,
+      ONEBOT_TOKEN: `token-${secret}-${platformId}`,
+      LETHEBOT_BOT_QQ_ID: platformId,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toBe('');
+    expect(result.stdout).not.toBe('');
+    const stdout = result.stdout;
+    const doctor = JSON.parse(stdout) as {
+      overall: string;
+      database: {
+        dbPath: string;
+        open: boolean;
+        readonly: boolean;
+        integrityOk: boolean;
+        integrityResult: string;
+        foreignKeyViolations: number;
+      };
+      schema: {
+        ready: boolean;
+        requiredTablesPresent: number;
+        requiredTablesTotal: number;
+        missingTables: string[];
+      };
+      counts: {
+        raw_events: number;
+        event_ingress_receipts: number;
+        event_processing_admissions: number;
+        chat_messages: number;
+        event_processing_failures: number;
+        agent_turns: number;
+        jobs: number;
+        audit_log: number;
+        memory_records: number;
+      };
+      configuration: {
+        oneBot: {
+          transport: string;
+          httpUrlConfigured: boolean;
+          wsUrlConfigured: boolean;
+          tokenConfigured: boolean;
+          botIdConfigured: boolean;
+        };
+        server: {
+          hostConfigured: boolean;
+          portConfigured: boolean;
+          healthPathConfigured: boolean;
+          readinessPathConfigured: boolean;
+          metricsPathConfigured: boolean;
+          eventPathConfigured: boolean;
+        };
+      };
+    };
+
+    expect(doctor.overall).toBe('ok');
+    expect(doctor.database).toMatchObject({
+      open: true,
+      readonly: true,
+      integrityOk: true,
+      integrityResult: 'ok',
+      foreignKeyViolations: 0,
+    });
+    expect(doctor.database.dbPath).toContain('[REDACTED:api_key_assignment]');
+    expect(doctor.database.dbPath).toContain('[REDACTED:platform_id]');
+    expect(doctor.schema.ready).toBe(true);
+    expect(doctor.schema.missingTables).toEqual([]);
+    expect(doctor.schema.requiredTablesPresent).toBe(doctor.schema.requiredTablesTotal);
+    expect(doctor.counts).toMatchObject({
+      raw_events: 2,
+      event_ingress_receipts: 0,
+      event_processing_admissions: 0,
+      chat_messages: 2,
+      event_processing_failures: 2,
+      agent_turns: 1,
+      jobs: 1,
+      audit_log: 2,
+      memory_records: 2,
+    });
+    expect(doctor.configuration.oneBot).toEqual({
+      transport: 'ws',
+      httpUrlConfigured: true,
+      wsUrlConfigured: true,
+      tokenConfigured: true,
+      botIdConfigured: true,
+    });
+    expect(doctor.configuration.server).toEqual({
+      hostConfigured: true,
+      portConfigured: true,
+      healthPathConfigured: true,
+      readinessPathConfigured: true,
+      metricsPathConfigured: true,
+      eventPathConfigured: true,
+    });
+
+    expect(stdout).not.toContain(secret);
+    expect(stdout).not.toContain(platformId);
+    expect(stdout).not.toContain('987654321');
+    expect(stdout).not.toContain(rawSensitiveDbPath);
+    expect(stdout).not.toContain('example.invalid');
+    expect(stdout).not.toContain('token-');
+    expect(stdout).not.toContain('private:qq-ops');
+    expect(stdout).not.toContain('qq-ops');
+    expect(stdout).not.toContain('hello');
+    expect(stdout).not.toContain('test audit');
+
+    reopenDb(true);
+    const afterRows = {
+      rawEvents: db.prepare('SELECT * FROM raw_events ORDER BY id').all(),
+      chatMessages: db.prepare('SELECT * FROM chat_messages ORDER BY id').all(),
+      turns: db.prepare('SELECT * FROM agent_turns ORDER BY id').all(),
+      jobs: db.prepare('SELECT * FROM jobs ORDER BY id').all(),
+      audit: db.prepare('SELECT * FROM audit_log ORDER BY id').all(),
+    };
+    expect(afterRows).toEqual(beforeRows);
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('reports a missing ingress receipt table as an incomplete schema', () => {
+    db.exec('DROP TABLE event_ingress_receipts');
+
+    const result = runOps(['doctor', `--db=${dbPath}`]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toBe('');
+    const doctor = JSON.parse(result.stdout) as {
+      overall: string;
+      schema: { ready: boolean; missingTables: string[] };
+      counts: { event_ingress_receipts?: number };
+    };
+
+    expect(doctor.overall).toBe('attention_required');
+    expect(doctor.schema.ready).toBe(false);
+    expect(doctor.schema.missingTables).toContain('event_ingress_receipts');
+    expect(doctor.counts.event_ingress_receipts).toBe(0);
+  });
+
+  it('rehearses backup, restore, retention, and doctor on a disposable DB with aggregate-only evidence', () => {
+    const secret = 'sk-ops-maintenance-rehearsal-secret-should-not-leak';
+    const platformId = 'qq-456789012';
+    const sensitiveRehearsalDir = join(testDir, platformId);
+    mkdirSync(sensitiveRehearsalDir, { recursive: true });
+    const sensitiveRehearsalDbPath = join(sensitiveRehearsalDir, `maintenance-${secret}.db`);
+    const expectedBackupPath = join(sensitiveRehearsalDir, 'maintenance-rehearsal.backup.db');
+    const expectedRestoredPath = join(sensitiveRehearsalDir, 'maintenance-rehearsal.restored.db');
+
+    const result = runOps(['rehearse-maintenance', `--db=${sensitiveRehearsalDbPath}`], {
+      ONEBOT_HTTP_URL: `http://example.invalid/${secret}/${platformId}`,
+      ONEBOT_WS_URL: `ws://example.invalid/${secret}/${platformId}`,
+      ONEBOT_TOKEN: `token-${secret}-${platformId}`,
+      LETHEBOT_BOT_QQ_ID: platformId,
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toBe('');
+    expect(result.stdout).toContain('[REDACTED:openai_like_api_key]');
+    expect(result.stdout).toContain('[REDACTED:platform_id]');
+    expect(result.stdout).not.toContain(secret);
+    expect(result.stdout).not.toContain(platformId);
+    expect(result.stdout).not.toContain('456789012');
+    expect(result.stdout).not.toContain(sensitiveRehearsalDbPath);
+    expect(result.stdout).not.toContain('example.invalid');
+    expect(result.stdout).not.toContain('token-');
+    expect(result.stdout).not.toContain('[synthetic ops rehearsal message]');
+
+    const rehearsal = JSON.parse(result.stdout) as {
+      success: boolean;
+      temporary: boolean;
+      dbPath: string;
+      backup: {
+        backupPath: string;
+        integrityOk: boolean;
+        backupSizeBytes: number;
+      };
+      restore: {
+        targetPath: string;
+        integrityOk: boolean;
+        foreignKeyViolations: number;
+        restoredSizeBytes: number;
+      };
+      doctor: {
+        beforeRetention: {
+          overall: string;
+          schemaReady: boolean;
+          foreignKeyViolations: number;
+        };
+        afterRetention: {
+          overall: string;
+          schemaReady: boolean;
+          foreignKeyViolations: number;
+        };
+      };
+      retention: {
+        policy: {
+          rawEventsDays: number;
+          chatMessagesDays: number;
+          auditLogDays: number;
+          disabledDeletedMemoryDays: number;
+          eventProcessingFailuresDays: number;
+        };
+        result: {
+          rawEventsDeleted: number;
+          modelInvocationSourcesDeleted: number;
+          chatMessagesDeleted: number;
+          auditLogDeleted: number;
+          eventProcessingFailuresDeleted: number;
+          memoriesPurged: number;
+          memorySourcesDeleted: number;
+          memoryRevisionsDeleted: number;
+        };
+      };
+      counts: {
+        sourceBefore: {
+          raw_events: number;
+          chat_messages: number;
+          event_processing_failures: number;
+          audit_log: number;
+          memory_records: number;
+          memory_sources: number;
+          memory_revisions: number;
+        };
+        restoredBefore: {
+          raw_events: number;
+          chat_messages: number;
+          event_processing_failures: number;
+          audit_log: number;
+          memory_records: number;
+          memory_sources: number;
+          memory_revisions: number;
+        };
+        restoredAfter: {
+          raw_events: number;
+          chat_messages: number;
+          event_processing_failures: number;
+          audit_log: number;
+          memory_records: number;
+          memory_sources: number;
+          memory_revisions: number;
+        };
+      };
+    };
+
+    expect(rehearsal.success).toBe(true);
+    expect(rehearsal.temporary).toBe(false);
+    expect(rehearsal.dbPath).toContain('[REDACTED:openai_like_api_key]');
+    expect(rehearsal.dbPath).toContain('[REDACTED:platform_id]');
+    expect(rehearsal.backup.backupPath).toContain('[REDACTED:platform_id]');
+    expect(rehearsal.backup.integrityOk).toBe(true);
+    expect(rehearsal.backup.backupSizeBytes).toBeGreaterThan(0);
+    expect(rehearsal.restore.targetPath).toContain('[REDACTED:platform_id]');
+    expect(rehearsal.restore.integrityOk).toBe(true);
+    expect(rehearsal.restore.foreignKeyViolations).toBe(0);
+    expect(rehearsal.restore.restoredSizeBytes).toBeGreaterThan(0);
+    expect(rehearsal.doctor.beforeRetention).toEqual({
+      overall: 'ok',
+      schemaReady: true,
+      foreignKeyViolations: 0,
+    });
+    expect(rehearsal.doctor.afterRetention).toEqual({
+      overall: 'ok',
+      schemaReady: true,
+      foreignKeyViolations: 0,
+    });
+    expect(rehearsal.retention.policy).toEqual({
+      rawEventsDays: 30,
+      chatMessagesDays: 30,
+      auditLogDays: 30,
+      disabledDeletedMemoryDays: 30,
+      eventProcessingFailuresDays: 30,
+    });
+    expect(rehearsal.retention.result).toMatchObject({
+      rawEventsDeleted: 1,
+      modelInvocationSourcesDeleted: 0,
+      chatMessagesDeleted: 1,
+      auditLogDeleted: 1,
+      eventProcessingFailuresDeleted: 1,
+      memoriesPurged: 1,
+      memorySourcesDeleted: 1,
+      memoryRevisionsDeleted: 1,
+    });
+    expect(rehearsal.counts.sourceBefore).toMatchObject({
+      raw_events: 2,
+      chat_messages: 2,
+      event_processing_failures: 2,
+      audit_log: 2,
+      memory_records: 2,
+      memory_sources: 1,
+      memory_revisions: 1,
+    });
+    expect(rehearsal.counts.restoredBefore).toEqual(rehearsal.counts.sourceBefore);
+    expect(rehearsal.counts.restoredAfter).toMatchObject({
+      raw_events: 1,
+      chat_messages: 1,
+      event_processing_failures: 1,
+      audit_log: 1,
+      memory_records: 1,
+      memory_sources: 0,
+      memory_revisions: 0,
+    });
+
+    expect(existsSync(sensitiveRehearsalDbPath)).toBe(true);
+    expect(existsSync(expectedBackupPath)).toBe(true);
+    expect(existsSync(expectedRestoredPath)).toBe(true);
+
+    const sourceDb = initDatabase({ path: sensitiveRehearsalDbPath, readonly: true });
+    try {
+      expect(countRows(sourceDb, 'raw_events')).toBe(2);
+      expect(countRows(sourceDb, 'chat_messages')).toBe(2);
+      expect(sourceDb.prepare(
+        `SELECT source_type, source_id, resolution_state,
+                raw_event_id, chat_message_id, tool_call_id, job_id, job_attempt_id
+         FROM memory_sources
+         WHERE memory_id = ?`,
+      ).get('rehearsal-memory-old-deleted')).toEqual({
+        source_type: 'raw_event',
+        source_id: 'rehearsal-raw-old',
+        resolution_state: 'internal',
+        raw_event_id: 'rehearsal-raw-old',
+        chat_message_id: null,
+        tool_call_id: null,
+        job_id: null,
+        job_attempt_id: null,
+      });
+      expect(sourceDb.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+    } finally {
+      closeDatabase(sourceDb);
+    }
+
+    const restoredDb = initDatabase({ path: expectedRestoredPath, readonly: true });
+    try {
+      expect(countRows(restoredDb, 'raw_events')).toBe(1);
+      expect(countRows(restoredDb, 'chat_messages')).toBe(1);
+      expect(countRows(restoredDb, 'event_processing_failures')).toBe(1);
+      expect(countRows(restoredDb, 'memory_records')).toBe(1);
+      expect(restoredDb.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+    } finally {
+      closeDatabase(restoredDb);
+    }
+  });
+
+  it('rehearses rollback by restoring a backup over a synthetic update with aggregate-only evidence', () => {
+    const secret = 'sk-ops-rollback-rehearsal-secret-should-not-leak';
+    const platformId = 'qq-567890123';
+    const sensitiveRollbackDir = join(testDir, platformId);
+    mkdirSync(sensitiveRollbackDir, { recursive: true });
+    const sensitiveRollbackDbPath = join(sensitiveRollbackDir, `rollback-${secret}.db`);
+    const expectedBackupPath = join(sensitiveRollbackDir, 'rollback-rehearsal.backup.db');
+
+    const result = runOps(['rehearse-rollback', `--db=${sensitiveRollbackDbPath}`], {
+      ONEBOT_HTTP_URL: `http://example.invalid/${secret}/${platformId}`,
+      ONEBOT_WS_URL: `ws://example.invalid/${secret}/${platformId}`,
+      ONEBOT_TOKEN: `token-${secret}-${platformId}`,
+      LETHEBOT_BOT_QQ_ID: platformId,
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toBe('');
+    expect(result.stdout).toContain('[REDACTED:openai_like_api_key]');
+    expect(result.stdout).toContain('[REDACTED:platform_id]');
+    expect(result.stdout).not.toContain(secret);
+    expect(result.stdout).not.toContain(platformId);
+    expect(result.stdout).not.toContain('567890123');
+    expect(result.stdout).not.toContain(sensitiveRollbackDbPath);
+    expect(result.stdout).not.toContain('example.invalid');
+    expect(result.stdout).not.toContain('token-');
+    expect(result.stdout).not.toContain('rollback-mutation');
+    expect(result.stdout).not.toContain('[synthetic ops rehearsal message]');
+
+    const rehearsal = JSON.parse(result.stdout) as {
+      success: boolean;
+      temporary: boolean;
+      dbPath: string;
+      backup: {
+        backupPath: string;
+        integrityOk: boolean;
+        backupSizeBytes: number;
+      };
+      restore: {
+        targetPath: string;
+        overwrite: boolean;
+        integrityOk: boolean;
+        foreignKeyViolations: number;
+        restoredSizeBytes: number;
+      };
+      doctor: {
+        afterRollback: {
+          overall: string;
+          schemaReady: boolean;
+          foreignKeyViolations: number;
+        };
+      };
+      rollback: {
+        restoredMatchesBackup: boolean;
+        syntheticRowsRemoved: boolean;
+      };
+      fingerprints: {
+        beforeUpdate: string;
+        afterSyntheticUpdate: string;
+        afterRollback: string;
+      };
+      counts: {
+        beforeUpdate: {
+          raw_events: number;
+          chat_messages: number;
+          event_processing_failures: number;
+          audit_log: number;
+          memory_records: number;
+          memory_sources: number;
+          memory_revisions: number;
+        };
+        afterSyntheticUpdate: {
+          raw_events: number;
+          chat_messages: number;
+          event_processing_failures: number;
+          audit_log: number;
+          memory_records: number;
+          memory_sources: number;
+          memory_revisions: number;
+        };
+        afterRollback: {
+          raw_events: number;
+          chat_messages: number;
+          event_processing_failures: number;
+          audit_log: number;
+          memory_records: number;
+          memory_sources: number;
+          memory_revisions: number;
+        };
+      };
+    };
+
+    expect(rehearsal.success).toBe(true);
+    expect(rehearsal.temporary).toBe(false);
+    expect(rehearsal.dbPath).toContain('[REDACTED:openai_like_api_key]');
+    expect(rehearsal.dbPath).toContain('[REDACTED:platform_id]');
+    expect(rehearsal.backup.backupPath).toContain('[REDACTED:platform_id]');
+    expect(rehearsal.backup.integrityOk).toBe(true);
+    expect(rehearsal.backup.backupSizeBytes).toBeGreaterThan(0);
+    expect(rehearsal.restore.targetPath).toContain('[REDACTED:platform_id]');
+    expect(rehearsal.restore.overwrite).toBe(true);
+    expect(rehearsal.restore.integrityOk).toBe(true);
+    expect(rehearsal.restore.foreignKeyViolations).toBe(0);
+    expect(rehearsal.restore.restoredSizeBytes).toBeGreaterThan(0);
+    expect(rehearsal.doctor.afterRollback).toEqual({
+      overall: 'ok',
+      schemaReady: true,
+      foreignKeyViolations: 0,
+    });
+    expect(rehearsal.rollback).toEqual({
+      restoredMatchesBackup: true,
+      syntheticRowsRemoved: true,
+    });
+    expect(rehearsal.counts.beforeUpdate).toMatchObject({
+      raw_events: 2,
+      chat_messages: 2,
+      event_processing_failures: 2,
+      audit_log: 2,
+      memory_records: 2,
+      memory_sources: 1,
+      memory_revisions: 1,
+    });
+    expect(rehearsal.counts.afterSyntheticUpdate).toMatchObject({
+      raw_events: 3,
+      chat_messages: 3,
+      event_processing_failures: 3,
+      audit_log: 3,
+      memory_records: 3,
+      memory_sources: 2,
+      memory_revisions: 2,
+    });
+    expect(rehearsal.counts.afterRollback).toEqual(rehearsal.counts.beforeUpdate);
+    expect(rehearsal.fingerprints.beforeUpdate).toMatch(/^[a-f0-9]{64}$/);
+    expect(rehearsal.fingerprints.afterSyntheticUpdate).toMatch(/^[a-f0-9]{64}$/);
+    expect(rehearsal.fingerprints.afterRollback).toBe(rehearsal.fingerprints.beforeUpdate);
+    expect(rehearsal.fingerprints.afterSyntheticUpdate).not.toBe(rehearsal.fingerprints.beforeUpdate);
+
+    expect(existsSync(sensitiveRollbackDbPath)).toBe(true);
+    expect(existsSync(expectedBackupPath)).toBe(true);
+
+    const rollbackDb = initDatabase({ path: sensitiveRollbackDbPath, readonly: true });
+    try {
+      expect(countRows(rollbackDb, 'raw_events')).toBe(2);
+      expect(countRows(rollbackDb, 'chat_messages')).toBe(2);
+      const mutation = rollbackDb
+        .prepare("SELECT COUNT(*) AS count FROM raw_events WHERE id = 'rollback-mutation-raw'")
+        .get() as { count: number };
+      expect(mutation.count).toBe(0);
+      expect(rollbackDb.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+    } finally {
+      closeDatabase(rollbackDb);
+    }
   });
 
   it('reports final worker failures in metrics without leaking job, worker, or secret details', async () => {
@@ -820,13 +1350,89 @@ describe('ops maintenance CLI', () => {
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 
+  it('rejects nonempty durable worker state before a soak can claim unrelated jobs', () => {
+    const soakDbPath = join(testDir, 'worker-soak-nonempty.db');
+    const soakDb = initDatabase({ path: soakDbPath });
+    let unrelatedJobId: string;
+    try {
+      runMigration(soakDb, join(process.cwd(), 'migrations/001_initial_schema.sql'));
+      unrelatedJobId = new JobRepository(soakDb).enqueue({
+        type: 'retention',
+        payload: { unrelated: true },
+        idempotencyKey: 'unrelated-worker-soak-guard',
+      });
+    } finally {
+      closeDatabase(soakDb);
+    }
+
+    const result = runOps([
+      'worker-soak',
+      `--db=${soakDbPath}`,
+      '--duration-ms=500',
+      '--interval-ms=20',
+    ]);
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('Worker soak requires empty durable worker tables');
+
+    const verifiedDb = initDatabase({ path: soakDbPath, readonly: true });
+    try {
+      expect(verifiedDb.prepare(
+        'SELECT status, attempts FROM jobs WHERE id = ?',
+      ).get(unrelatedJobId)).toEqual({ status: 'pending', attempts: 0 });
+      expect(countRows(verifiedDb, 'jobs')).toBe(1);
+      expect(countRows(verifiedDb, 'job_attempts')).toBe(0);
+      expect(countRows(verifiedDb, 'worker_heartbeats')).toBe(0);
+    } finally {
+      closeDatabase(verifiedDb);
+    }
+  });
+
+  it('reports scheduler producer failures as unhealthy aggregate evidence', () => {
+    const soakDbPath = join(testDir, 'worker-soak-producer-failure.db');
+    const soakDb = initDatabase({ path: soakDbPath });
+    try {
+      runMigration(soakDb, join(process.cwd(), 'migrations/001_initial_schema.sql'));
+      soakDb.exec(`
+        CREATE TRIGGER fail_first_soak_producer
+        BEFORE INSERT ON jobs
+        WHEN NEW.idempotency_key LIKE 'worker-soak:%:load:1'
+        BEGIN
+          SELECT RAISE(ABORT, 'synthetic producer failure must stay private');
+        END;
+      `);
+    } finally {
+      closeDatabase(soakDb);
+    }
+
+    const result = runOps([
+      'worker-soak',
+      `--db=${soakDbPath}`,
+      '--duration-ms=500',
+      '--interval-ms=20',
+    ]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toBe('');
+    expect(result.stdout).not.toContain('synthetic producer failure');
+    const soak = JSON.parse(result.stdout) as {
+      success: boolean;
+      schedulerErrors: { producer: number; consumer: number; total: number };
+      isolation: { clean: boolean };
+    };
+    expect(soak.success).toBe(false);
+    expect(soak.schedulerErrors).toEqual({ producer: 1, consumer: 0, total: 1 });
+    expect(soak.isolation.clean).toBe(true);
+  });
+
   it('runs an opt-in worker scheduler soak with aggregate-only evidence', () => {
     const soakDbPath = join(testDir, 'worker-soak.db');
     const soak = JSON.parse(expectSuccessfulOps([
       'worker-soak',
       `--db=${soakDbPath}`,
-      '--duration-ms=220',
-      '--interval-ms=10',
+      '--duration-ms=500',
+      '--interval-ms=20',
     ])) as {
       dbPath: string;
       temporary: boolean;
@@ -834,6 +1440,17 @@ describe('ops maintenance CLI', () => {
       ticks: number;
       processed: number;
       outcomes: { byStatus: Record<string, number> };
+      load: {
+        windows: number;
+        enqueued: number;
+        enqueuedByWindow: number[];
+        completedByWindow: number[];
+        lastEnqueueOffsetMs: number;
+        emptyPolls: number;
+      };
+      drain: { processed: number; timedOut: boolean };
+      schedulerErrors: { producer: number; consumer: number; total: number };
+      isolation: { clean: boolean };
       jobs: {
         total: number;
         byStatus: Record<string, number>;
@@ -866,15 +1483,26 @@ describe('ops maintenance CLI', () => {
     expect(soak.temporary).toBe(false);
     expect(soak.success).toBe(true);
     expect(soak.ticks).toBeGreaterThanOrEqual(4);
-    expect(soak.processed).toBeGreaterThanOrEqual(8);
-    expect(soak.outcomes.byStatus.completed).toBe(7);
+    expect(soak.load.windows).toBe(3);
+    expect(soak.load.enqueued).toBeGreaterThanOrEqual(3);
+    expect(soak.load.enqueuedByWindow).toHaveLength(3);
+    expect(soak.load.completedByWindow).toHaveLength(3);
+    expect(soak.load.enqueuedByWindow.every((count) => count >= 1)).toBe(true);
+    expect(soak.load.completedByWindow.every((count) => count >= 1)).toBe(true);
+    expect(soak.load.lastEnqueueOffsetMs).toBeGreaterThanOrEqual(460);
+    expect(soak.load.emptyPolls).toBe(0);
+    expect(soak.drain.timedOut).toBe(false);
+    expect(soak.schedulerErrors).toEqual({ producer: 0, consumer: 0, total: 0 });
+    expect(soak.isolation.clean).toBe(true);
+    expect(soak.processed).toBe(soak.jobs.total + 1);
+    expect(soak.outcomes.byStatus.completed).toBe(soak.jobs.total);
     expect(soak.outcomes.byStatus.failed).toBe(1);
+    expect(soak.jobs.total).toBe(7 + soak.load.enqueued);
     expect(soak.jobs).toMatchObject({
-      total: 7,
-      completed: 7,
+      completed: soak.jobs.total,
       running: 0,
       failed: 0,
-      byStatus: { completed: 7 },
+      byStatus: { completed: soak.jobs.total },
       byType: {
         admin_digest: 1,
         conflict: 1,
@@ -882,16 +1510,16 @@ describe('ops maintenance CLI', () => {
         decay: 1,
         summary: 1,
         extraction: 1,
-        retention: 1,
+        retention: 1 + soak.load.enqueued,
       },
     });
+    expect(soak.jobAttempts.total).toBe(soak.jobs.total + 1);
     expect(soak.jobAttempts).toMatchObject({
-      total: 8,
-      completed: 7,
+      completed: soak.jobs.total,
       failed: 1,
       running: 0,
       byStatus: {
-        completed: 7,
+        completed: soak.jobs.total,
         failed: 1,
       },
       plannedRetryObserved: true,
@@ -912,8 +1540,8 @@ describe('ops maintenance CLI', () => {
 
     const soakDb = initDatabase({ path: soakDbPath, readonly: true });
     try {
-      expect(countRows(soakDb, 'jobs')).toBe(7);
-      expect(countRows(soakDb, 'job_attempts')).toBe(8);
+      expect(countRows(soakDb, 'jobs')).toBe(soak.jobs.total);
+      expect(countRows(soakDb, 'job_attempts')).toBe(soak.jobAttempts.total);
       expect(countRows(soakDb, 'worker_heartbeats')).toBe(1);
       expect(soakDb.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
     } finally {
@@ -926,8 +1554,8 @@ describe('ops maintenance CLI', () => {
     const result = runOps([
       'worker-soak',
       `--db=${soakDbPath}`,
-      '--duration-ms=220',
-      '--interval-ms=10',
+      '--duration-ms=500',
+      '--interval-ms=20',
     ], { LOG_LEVEL: undefined });
 
     expect(result.status, result.stderr).toBe(0);
@@ -941,8 +1569,10 @@ describe('ops maintenance CLI', () => {
       success: boolean;
       temporary: boolean;
       processed: number;
-      jobs: { completed: number; failed: number };
-      jobAttempts: { failed: number; plannedRetryObserved: boolean };
+      load: { enqueued: number; emptyPolls: number; completedByWindow: number[] };
+      drain: { timedOut: boolean };
+      jobs: { total: number; completed: number; failed: number };
+      jobAttempts: { total: number; failed: number; plannedRetryObserved: boolean };
       leaseExtensions: { observed: boolean };
       foreignKeyViolations: number;
     };
@@ -950,10 +1580,6 @@ describe('ops maintenance CLI', () => {
     expect(soak).toMatchObject({
       success: true,
       temporary: false,
-      jobs: {
-        completed: 7,
-        failed: 0,
-      },
       jobAttempts: {
         failed: 1,
         plannedRetryObserved: true,
@@ -963,12 +1589,20 @@ describe('ops maintenance CLI', () => {
       },
       foreignKeyViolations: 0,
     });
-    expect(soak.processed).toBeGreaterThanOrEqual(8);
+    expect(soak.load.enqueued).toBeGreaterThanOrEqual(3);
+    expect(soak.load.emptyPolls).toBe(0);
+    expect(soak.load.completedByWindow.every((count) => count >= 1)).toBe(true);
+    expect(soak.drain.timedOut).toBe(false);
+    expect(soak.jobs.total).toBe(7 + soak.load.enqueued);
+    expect(soak.jobs.completed).toBe(soak.jobs.total);
+    expect(soak.jobs.failed).toBe(0);
+    expect(soak.jobAttempts.total).toBe(soak.jobs.total + 1);
+    expect(soak.processed).toBe(soak.jobAttempts.total);
 
     const soakDb = initDatabase({ path: soakDbPath, readonly: true });
     try {
-      expect(countRows(soakDb, 'jobs')).toBe(7);
-      expect(countRows(soakDb, 'job_attempts')).toBe(8);
+      expect(countRows(soakDb, 'jobs')).toBe(soak.jobs.total);
+      expect(countRows(soakDb, 'job_attempts')).toBe(soak.jobAttempts.total);
       expect(countRows(soakDb, 'worker_heartbeats')).toBe(1);
       expect(soakDb.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
     } finally {
@@ -980,8 +1614,8 @@ describe('ops maintenance CLI', () => {
     let temporarySoakDir: string | undefined;
     const result = runOps([
       'worker-soak',
-      '--duration-ms=220',
-      '--interval-ms=10',
+      '--duration-ms=500',
+      '--interval-ms=20',
     ], { LOG_LEVEL: undefined });
 
     expect(result.status, result.stderr).toBe(0);
@@ -996,8 +1630,10 @@ describe('ops maintenance CLI', () => {
       temporary: boolean;
       success: boolean;
       processed: number;
-      jobs: { completed: number; failed: number };
-      jobAttempts: { failed: number; plannedRetryObserved: boolean };
+      load: { enqueued: number; emptyPolls: number; completedByWindow: number[] };
+      drain: { timedOut: boolean };
+      jobs: { total: number; completed: number; failed: number };
+      jobAttempts: { total: number; failed: number; plannedRetryObserved: boolean };
       leaseExtensions: { observed: boolean };
       foreignKeyViolations: number;
     };
@@ -1011,10 +1647,6 @@ describe('ops maintenance CLI', () => {
       temporarySoakDir = dirname(soak.dbPath);
       expect(soak).toMatchObject({
         success: true,
-        jobs: {
-          completed: 7,
-          failed: 0,
-        },
         jobAttempts: {
           failed: 1,
           plannedRetryObserved: true,
@@ -1024,12 +1656,20 @@ describe('ops maintenance CLI', () => {
         },
         foreignKeyViolations: 0,
       });
-      expect(soak.processed).toBeGreaterThanOrEqual(8);
+      expect(soak.load.enqueued).toBeGreaterThanOrEqual(3);
+      expect(soak.load.emptyPolls).toBe(0);
+      expect(soak.load.completedByWindow.every((count) => count >= 1)).toBe(true);
+      expect(soak.drain.timedOut).toBe(false);
+      expect(soak.jobs.total).toBe(7 + soak.load.enqueued);
+      expect(soak.jobs.completed).toBe(soak.jobs.total);
+      expect(soak.jobs.failed).toBe(0);
+      expect(soak.jobAttempts.total).toBe(soak.jobs.total + 1);
+      expect(soak.processed).toBe(soak.jobAttempts.total);
 
       const soakDb = initDatabase({ path: soak.dbPath, readonly: true });
       try {
-        expect(countRows(soakDb, 'jobs')).toBe(7);
-        expect(countRows(soakDb, 'job_attempts')).toBe(8);
+        expect(countRows(soakDb, 'jobs')).toBe(soak.jobs.total);
+        expect(countRows(soakDb, 'job_attempts')).toBe(soak.jobAttempts.total);
         expect(countRows(soakDb, 'worker_heartbeats')).toBe(1);
         expect(soakDb.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
       } finally {
@@ -1057,8 +1697,8 @@ describe('ops maintenance CLI', () => {
     const soakResult = runOps([
       'worker-soak',
       `--db=${sensitiveSoakDbPath}`,
-      '--duration-ms=220',
-      '--interval-ms=10',
+      '--duration-ms=500',
+      '--interval-ms=20',
       `--worker-id=${sensitiveWorkerId}`,
     ]);
 
@@ -1075,6 +1715,10 @@ describe('ops maintenance CLI', () => {
       dbPath: string;
       temporary: boolean;
       success: boolean;
+      load: { enqueued: number; emptyPolls: number; completedByWindow: number[] };
+      drain: { timedOut: boolean };
+      jobs: { total: number; completed: number; failed: number };
+      jobAttempts: { total: number };
       workerHeartbeat: {
         workerType: string;
         status: string;
@@ -1091,6 +1735,14 @@ describe('ops maintenance CLI', () => {
     expect(soak.dbPath).toContain('[REDACTED:platform_id]');
     expect(soak.temporary).toBe(false);
     expect(soak.success).toBe(true);
+    expect(soak.load.enqueued).toBeGreaterThanOrEqual(3);
+    expect(soak.load.emptyPolls).toBe(0);
+    expect(soak.load.completedByWindow.every((count) => count >= 1)).toBe(true);
+    expect(soak.drain.timedOut).toBe(false);
+    expect(soak.jobs.total).toBe(7 + soak.load.enqueued);
+    expect(soak.jobs.completed).toBe(soak.jobs.total);
+    expect(soak.jobs.failed).toBe(0);
+    expect(soak.jobAttempts.total).toBe(soak.jobs.total + 1);
     expect(soak.leaseExtensions.observed).toBe(true);
     expect(soak.leaseExtensions.count).toBeGreaterThanOrEqual(1);
     expect(soak.workerHeartbeat).toEqual({
@@ -1106,8 +1758,8 @@ describe('ops maintenance CLI', () => {
         .prepare('SELECT worker_id FROM worker_heartbeats WHERE worker_id = ?')
         .get(sensitiveWorkerId) as { worker_id: string } | undefined;
       expect(workerRow?.worker_id).toBe(sensitiveWorkerId);
-      expect(countRows(soakDb, 'jobs')).toBe(7);
-      expect(countRows(soakDb, 'job_attempts')).toBe(8);
+      expect(countRows(soakDb, 'jobs')).toBe(soak.jobs.total);
+      expect(countRows(soakDb, 'job_attempts')).toBe(soak.jobAttempts.total);
       expect(countRows(soakDb, 'worker_heartbeats')).toBe(1);
       expect(soakDb.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
     } finally {
@@ -1559,6 +2211,51 @@ describe('ops maintenance CLI', () => {
     expect(corruptBackup.stderr).not.toContain('\n    at ');
     expect(existsSync(corruptRestoreTarget)).toBe(false);
 
+    const invalidForeignKeyBackupPath = join(
+      sensitiveDir,
+      `invalid-fk-backup-${secret}-${platformId}.db`,
+    );
+    const invalidForeignKeyDb = initDatabase({ path: invalidForeignKeyBackupPath });
+    try {
+      runMigration(invalidForeignKeyDb, join(process.cwd(), 'migrations/001_initial_schema.sql'));
+      invalidForeignKeyDb.pragma('foreign_keys = OFF');
+      invalidForeignKeyDb.prepare(
+        `INSERT INTO chat_messages (
+          id, raw_event_id, message_id, conversation_id,
+          conversation_type, sender_id, text, timestamp
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        'orphan-cli-chat-message',
+        'missing-cli-raw-event',
+        'orphan-cli-platform-message',
+        'private:test',
+        'private',
+        'test-user',
+        'orphan',
+        now,
+      );
+    } finally {
+      closeDatabase(invalidForeignKeyDb);
+    }
+
+    const invalidForeignKeyRestore = runOps([
+      'restore',
+      `--backup=${invalidForeignKeyBackupPath}`,
+      `--db=${dbPath}`,
+      '--overwrite',
+    ]);
+    expect(invalidForeignKeyRestore.status).toBe(1);
+    expect(invalidForeignKeyRestore.stdout).toBe('');
+    expect(invalidForeignKeyRestore.stderr).toContain('foreign key check failed: 1 violation');
+    expect(invalidForeignKeyRestore.stderr).not.toContain(secret);
+    expect(invalidForeignKeyRestore.stderr).not.toContain(platformId);
+    expect(invalidForeignKeyRestore.stderr).not.toContain('123456789');
+    expect(invalidForeignKeyRestore.stderr).not.toContain(invalidForeignKeyBackupPath);
+    expect(invalidForeignKeyRestore.stderr).not.toContain(dbPath);
+    expect(invalidForeignKeyRestore.stderr).not.toContain('src/scripts');
+    expect(invalidForeignKeyRestore.stderr).not.toContain('\n    at ');
+    expect(readdirSync(testDir).filter((entry) => entry.startsWith('.lethebot-restore-'))).toEqual([]);
+
     reopenDb(true);
     expect(countRows(db, 'raw_events')).toBe(1);
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
@@ -1573,6 +2270,14 @@ describe('ops maintenance CLI', () => {
     expectFailedOps(['retention', `--db=${dbPath}`, '--raw-days=-1'], 'Invalid --raw-days: -1');
     expectFailedOps(['worker-soak', '--duration-ms=0'], 'Invalid --duration-ms: 0');
     expectFailedOps(['metrics', `--db=${dbPath}`, '--since'], 'Missing value for --since');
+    expectFailedOps(
+      ['rehearse-maintenance', `--db=${dbPath}`],
+      `Rehearsal database already exists: ${dbPath}`,
+    );
+    expectFailedOps(
+      ['rehearse-rollback', `--db=${dbPath}`],
+      `Rollback rehearsal database already exists: ${dbPath}`,
+    );
 
     const secret = 'sk-ops-maintenance-secret-should-not-leak';
     const platformId = 'qq-123456789';

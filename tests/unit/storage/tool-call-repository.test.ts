@@ -3,8 +3,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type Database from 'better-sqlite3';
-import { initDatabase, runMigration, closeDatabase } from '../../../src/storage/database';
+import { initDatabase, runMigrations, closeDatabase } from '../../../src/storage/database';
 import { ToolCallRepository } from '../../../src/storage/tool-call-repository';
+import { EvaluatorDecisionRepository } from '../../../src/storage/evaluator-decision-repository';
 
 describe('ToolCallRepository', () => {
   let testDir: string;
@@ -14,7 +15,7 @@ describe('ToolCallRepository', () => {
   beforeEach(() => {
     testDir = mkdtempSync(join(tmpdir(), 'lethebot-tool-call-'));
     db = initDatabase({ path: join(testDir, 'test.db') });
-    runMigration(db, join(__dirname, '../../../migrations/001_initial_schema.sql'));
+    runMigrations(db, join(__dirname, '../../../migrations'));
     repo = new ToolCallRepository(db);
 
     const now = Date.now();
@@ -67,6 +68,65 @@ describe('ToolCallRepository', () => {
     });
     expect(byTurn.map((toolCall) => toolCall.id)).toEqual(['tc-001']);
     expect(fkCheck).toHaveLength(0);
+  });
+
+  it('persists the evaluator decision linked to a tool call', async () => {
+    const evaluatorDecisionId = await new EvaluatorDecisionRepository(db).createToolDecision({
+      request: {
+        requestId: 'request-tool-link',
+        domain: 'tool',
+        turnId: 'turn-tool',
+        actor: { canonicalUserId: 'user-alice', actorClass: 'user' },
+        context: 'private_chat',
+        sourceEventIds: ['evt-tool'],
+        contextSummary: 'bounded tool context',
+        toolName: 'test.tool',
+        capabilities: ['network'],
+        toolInput: { query: 'hello' },
+        proposedReason: 'test evaluator linkage',
+        createdAt: new Date('2026-07-11T02:03:04.000Z'),
+      },
+      result: {
+        decisionId: 'evaluator-tool-link',
+        requestId: 'request-tool-link',
+        domain: 'tool',
+        decision: 'approve',
+        reason: 'approved',
+        confidence: 0.9,
+        riskLevel: 'medium',
+        decidedAt: new Date('2026-07-11T02:03:05.000Z'),
+        evaluatorVersion: 'test-v1',
+      },
+    });
+
+    await repo.create({
+      id: 'tc-evaluator-link',
+      turnId: 'turn-tool',
+      toolName: 'test.tool',
+      input: { query: 'hello' },
+      output: { ok: true },
+      requestedBy: 'pi',
+      actor: { canonicalUserId: 'user-alice', actorClass: 'user' },
+      context: 'private_chat',
+      status: 'success',
+      executionTimeMs: 12,
+      secretsRedacted: false,
+      evaluatorDecisionId,
+    });
+
+    await expect(repo.findById('tc-evaluator-link')).resolves.toMatchObject({
+      id: 'tc-evaluator-link',
+      evaluatorDecisionId: 'evaluator-tool-link',
+    });
+    await expect(repo.listByTurnId('turn-tool')).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'tc-evaluator-link',
+        evaluatorDecisionId: 'evaluator-tool-link',
+      }),
+    ]));
+    expect(() => db.prepare('DELETE FROM evaluator_decisions WHERE id = ?')
+      .run('evaluator-tool-link')).toThrow();
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 
   it('redacts sensitive tool call payloads and errors before durable persistence', async () => {

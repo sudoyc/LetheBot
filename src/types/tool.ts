@@ -75,10 +75,14 @@ export interface ToolHandlerRequest {
   toolCallId: string;
   turnId: string;
   toolName: string;
+  signal: AbortSignal;
+  evaluatorDecisionId?: string;
+  sourceEventIds?: string[];
   input: unknown;
   actor: {
     canonicalUserId?: string;
     actorClass: ActorClass;
+    groupId?: string;
   };
   context: InvocationContext;
 }
@@ -138,6 +142,7 @@ export interface ToolCallRequest {
   actor: {
     canonicalUserId?: string;
     actorClass: ActorClass;
+    groupId?: string;
   };
 
   context: InvocationContext;

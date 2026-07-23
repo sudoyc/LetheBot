@@ -6,8 +6,8 @@
 
 import type Database from 'better-sqlite3';
 import { ulid } from 'ulidx';
-import { redactSecretsInText } from '../memory/secret-scan';
-import type { AgentTurn } from '../types/agent';
+import { redactSecretsInText } from '../memory/secret-scan.js';
+import type { AgentTurn } from '../types/agent.js';
 
 export interface CreateAgentTurnInput {
   id?: string;
@@ -70,7 +70,7 @@ export class TurnRepository {
       .run('running', contextPackId, id);
   }
 
-  async markCompleted(id: string, input: CompleteAgentTurnInput): Promise<void> {
+  markCompleted(id: string, input: CompleteAgentTurnInput): void {
     const completedAt = input.completedAt ?? new Date();
 
     this.db
@@ -107,6 +107,25 @@ export class TurnRepository {
          WHERE id = ?`
       )
       .run('failed', redactedErrorMessage, completedAt.getTime(), id);
+  }
+
+  markAbortedByTriggerEvent(
+    triggerEventId: string,
+    reason: string,
+    completedAt: Date = new Date(),
+  ): number {
+    const redactedReason = redactTurnFailureText(reason);
+
+    return this.db
+      .prepare(
+        `UPDATE agent_turns
+         SET status = 'aborted',
+             response_text = ?,
+             completed_at = ?
+         WHERE trigger_event_id = ?
+           AND status IN ('pending', 'running')`
+      )
+      .run(redactedReason, completedAt.getTime(), triggerEventId).changes;
   }
 }
 

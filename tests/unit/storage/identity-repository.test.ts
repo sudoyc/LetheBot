@@ -21,6 +21,7 @@ describe('IdentityRepository', () => {
 
   afterEach(() => {
     if (db) {
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
       closeDatabase(db);
     }
     rmSync(testDir, { recursive: true, force: true });
@@ -50,8 +51,8 @@ describe('IdentityRepository', () => {
   });
 
   describe('Platform accounts', () => {
-    it('should upsert platform account', async () => {
-      await repo.upsertPlatformAccount({
+    it('should create platform account', async () => {
+      await repo.createPlatformAccount({
         platform: 'qq',
         platformAccountId: '123456',
         canonicalUserId: 'user-001',
@@ -65,8 +66,8 @@ describe('IdentityRepository', () => {
       expect(accounts[0].platformAccountId).toBe('123456');
     });
 
-    it('should find canonical user by platform account', async () => {
-      await repo.upsertPlatformAccount({
+    it('should find an active platform account and its canonical user', async () => {
+      await repo.createPlatformAccount({
         platform: 'qq',
         platformAccountId: '123456',
         canonicalUserId: 'user-alice',
@@ -75,17 +76,122 @@ describe('IdentityRepository', () => {
         status: 'active',
       });
 
+      const account = await repo.findPlatformAccount('qq', '123456');
       const userId = await repo.findCanonicalUserId('qq', '123456');
+
+      expect(account).toMatchObject({
+        platform: 'qq',
+        platformAccountId: '123456',
+        canonicalUserId: 'user-alice',
+        accountType: 'private',
+        verifiedLevel: 'observed',
+        status: 'active',
+        firstSeenAt: expect.any(Date),
+        lastSeenAt: expect.any(Date),
+      });
       expect(userId).toBe('user-alice');
     });
 
     it('should return null for unknown platform account', async () => {
+      const account = await repo.findPlatformAccount('qq', 'unknown');
       const userId = await repo.findCanonicalUserId('qq', 'unknown');
+
+      expect(account).toBeNull();
       expect(userId).toBeNull();
     });
 
-    it('should update existing platform account', async () => {
-      await repo.upsertPlatformAccount({
+    it.each(['disabled', 'deleted'] as const)(
+      'should expose a %s mapping without resolving its canonical user',
+      async (status) => {
+        await repo.createPlatformAccount({
+          platform: 'qq',
+          platformAccountId: `account-${status}`,
+          canonicalUserId: `user-${status}`,
+          accountType: 'private',
+          verifiedLevel: 'owner_verified',
+          status,
+        });
+
+        const account = await repo.findPlatformAccount('qq', `account-${status}`);
+        const userId = await repo.findCanonicalUserId('qq', `account-${status}`);
+
+        expect(account).toMatchObject({
+          canonicalUserId: `user-${status}`,
+          status,
+        });
+        expect(userId).toBeNull();
+      }
+    );
+
+    it('should create an active mapping for an unknown platform account', async () => {
+      const canonicalUserId = await repo.getOrCreateCanonicalUser('qq', 'new-account');
+
+      expect(canonicalUserId).toMatch(/^user-/);
+      await expect(repo.findPlatformAccount('qq', 'new-account')).resolves.toMatchObject({
+        canonicalUserId,
+        status: 'active',
+        verifiedLevel: 'observed',
+      });
+      expect(
+        db.prepare('SELECT COUNT(*) AS count FROM canonical_users').get()
+      ).toEqual({ count: 1 });
+    });
+
+    it('should resolve concurrent first-seen calls to one canonical user', async () => {
+      const resolvedIds = await Promise.all(
+        Array.from({ length: 8 }, () =>
+          repo.getOrCreateCanonicalUser('qq', 'concurrent-new-account')
+        )
+      );
+
+      expect(new Set(resolvedIds)).toEqual(new Set([resolvedIds[0]]));
+      expect(
+        db.prepare('SELECT COUNT(*) AS count FROM canonical_users').get()
+      ).toEqual({ count: 1 });
+      await expect(repo.findPlatformAccount('qq', 'concurrent-new-account')).resolves.toMatchObject({
+        canonicalUserId: resolvedIds[0],
+        status: 'active',
+      });
+    });
+
+    it.each(['disabled', 'deleted'] as const)(
+      'should refuse a %s mapping without mutating or reactivating it',
+      async (status) => {
+        await repo.createPlatformAccount({
+          platform: 'qq',
+          platformAccountId: `inactive-${status}`,
+          canonicalUserId: `user-inactive-${status}`,
+          accountType: 'private',
+          verifiedLevel: 'owner_verified',
+          status,
+        });
+        const accountBefore = db
+          .prepare('SELECT * FROM platform_accounts WHERE platform = ? AND platform_account_id = ?')
+          .get('qq', `inactive-${status}`);
+        const userBefore = db
+          .prepare('SELECT * FROM canonical_users WHERE id = ?')
+          .get(`user-inactive-${status}`);
+
+        await expect(
+          repo.getOrCreateCanonicalUser('qq', `inactive-${status}`)
+        ).rejects.toThrow(`Cannot resolve ${status} platform account`);
+
+        expect(
+          db.prepare('SELECT * FROM platform_accounts WHERE platform = ? AND platform_account_id = ?')
+            .get('qq', `inactive-${status}`)
+        ).toEqual(accountBefore);
+        expect(
+          db.prepare('SELECT * FROM canonical_users WHERE id = ?')
+            .get(`user-inactive-${status}`)
+        ).toEqual(userBefore);
+        expect(
+          db.prepare('SELECT COUNT(*) AS count FROM canonical_users').get()
+        ).toEqual({ count: 1 });
+      }
+    );
+
+    it('should reject remapping an existing platform account', async () => {
+      await repo.createPlatformAccount({
         platform: 'qq',
         platformAccountId: '123456',
         canonicalUserId: 'user-001',
@@ -94,24 +200,53 @@ describe('IdentityRepository', () => {
         status: 'active',
       });
 
-      await repo.upsertPlatformAccount({
+      const before = await repo.findPlatformAccount('qq', '123456');
+
+      await expect(repo.createPlatformAccount({
         platform: 'qq',
         platformAccountId: '123456',
         canonicalUserId: 'user-002',
         accountType: 'private',
         verifiedLevel: 'owner_verified',
         status: 'active',
-      });
+      })).rejects.toThrow('platform account mapping already exists');
 
-      const userId = await repo.findCanonicalUserId('qq', '123456');
-      expect(userId).toBe('user-002');
-
-      const account = (await repo.getPlatformAccounts('user-002'))[0];
-      expect(account.verifiedLevel).toBe('owner_verified');
+      await expect(repo.findPlatformAccount('qq', '123456')).resolves.toEqual(before);
+      expect(
+        db.prepare('SELECT COUNT(*) AS count FROM canonical_users WHERE id = ?').get('user-002')
+      ).toEqual({ count: 0 });
     });
 
+    it.each(['disabled', 'deleted'] as const)(
+      'should reject reactivating a %s mapping through generic upsert',
+      async (status) => {
+        await repo.createPlatformAccount({
+          platform: 'qq',
+          platformAccountId: `generic-upsert-${status}`,
+          canonicalUserId: `user-generic-upsert-${status}`,
+          accountType: 'private',
+          verifiedLevel: 'owner_verified',
+          status,
+        });
+        const before = await repo.findPlatformAccount('qq', `generic-upsert-${status}`);
+
+        await expect(repo.createPlatformAccount({
+          platform: 'qq',
+          platformAccountId: `generic-upsert-${status}`,
+          canonicalUserId: `user-generic-upsert-${status}`,
+          accountType: 'private',
+          verifiedLevel: 'owner_verified',
+          status: 'active',
+        })).rejects.toThrow('platform account mapping already exists');
+
+        await expect(
+          repo.findPlatformAccount('qq', `generic-upsert-${status}`)
+        ).resolves.toEqual(before);
+      }
+    );
+
     it('should get all platform accounts for user', async () => {
-      await repo.upsertPlatformAccount({
+      await repo.createPlatformAccount({
         platform: 'qq',
         platformAccountId: '111111',
         canonicalUserId: 'user-001',
@@ -120,7 +255,7 @@ describe('IdentityRepository', () => {
         status: 'active',
       });
 
-      await repo.upsertPlatformAccount({
+      await repo.createPlatformAccount({
         platform: 'qq',
         platformAccountId: '222222',
         canonicalUserId: 'user-001',

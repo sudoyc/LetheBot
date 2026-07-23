@@ -5,8 +5,15 @@
  */
 
 import type Database from 'better-sqlite3';
-import type { PlatformAccountMapping, DisplayProfile } from '../types/identity';
+import type { PlatformAccountMapping, DisplayProfile } from '../types/identity.js';
 import { ulid } from 'ulidx';
+
+export class InactivePlatformAccountError extends Error {
+  constructor(public readonly status: Extract<PlatformAccountMapping['status'], 'disabled' | 'deleted'>) {
+    super(`Cannot resolve ${status} platform account`);
+    this.name = 'InactivePlatformAccountError';
+  }
+}
 
 /**
  * 身份仓储
@@ -22,7 +29,10 @@ export class IdentityRepository {
    * 确保 canonical user 存在
    */
   async ensureCanonicalUser(userId: string): Promise<void> {
-    const now = Date.now();
+    this.ensureCanonicalUserSync(userId, Date.now());
+  }
+
+  private ensureCanonicalUserSync(userId: string, now: number): void {
     this.db
       .prepare(
         `INSERT INTO canonical_users (id, created_at, last_seen_at)
@@ -33,48 +43,55 @@ export class IdentityRepository {
   }
 
   /**
-   * 创建或更新平台账号映射
+   * 创建新的平台账号映射。Relink and lifecycle changes require separate
+   * verified/audited paths.
    */
-  async upsertPlatformAccount(mapping: Omit<PlatformAccountMapping, 'firstSeenAt' | 'lastSeenAt'>): Promise<void> {
-    const now = Date.now();
+  async createPlatformAccount(mapping: Omit<PlatformAccountMapping, 'firstSeenAt' | 'lastSeenAt'>): Promise<void> {
+    const writeMapping = this.db.transaction(() => {
+      const now = Date.now();
+      const existing = this.findPlatformAccountSync(mapping.platform, mapping.platformAccountId);
+      if (existing) {
+        throw new Error('platform account mapping already exists');
+      }
 
-    // 确保 canonical user 存在
-    await this.ensureCanonicalUser(mapping.canonicalUserId);
+      this.ensureCanonicalUserSync(mapping.canonicalUserId, now);
+      this.insertPlatformAccount(mapping, now);
+    });
 
-    this.db
-      .prepare(
-        `INSERT INTO platform_accounts (
-          platform, platform_account_id, canonical_user_id,
-          account_type, verified_level, status,
-          first_seen_at, last_seen_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(platform, platform_account_id) DO UPDATE SET
-          canonical_user_id = excluded.canonical_user_id,
-          verified_level = excluded.verified_level,
-          status = excluded.status,
-          last_seen_at = excluded.last_seen_at`
-      )
-      .run(
-        mapping.platform,
-        mapping.platformAccountId,
-        mapping.canonicalUserId,
-        mapping.accountType,
-        mapping.verifiedLevel,
-        mapping.status,
-        now,
-        now
-      );
+    writeMapping.immediate();
   }
 
   /**
-   * 根据平台账号查找 canonical user ID
+   * 根据平台账号查找完整映射，包括非 active 状态。
    */
-  async findCanonicalUserId(platform: string, platformAccountId: string): Promise<string | null> {
-    const row = this.db
-      .prepare('SELECT canonical_user_id FROM platform_accounts WHERE platform = ? AND platform_account_id = ?')
-      .get(platform, platformAccountId) as { canonical_user_id: string } | undefined;
+  async findPlatformAccount(
+    platform: PlatformAccountMapping['platform'],
+    platformAccountId: string
+  ): Promise<PlatformAccountMapping | null> {
+    return this.findPlatformAccountSync(platform, platformAccountId);
+  }
 
-    return row?.canonical_user_id ?? null;
+  private findPlatformAccountSync(
+    platform: PlatformAccountMapping['platform'],
+    platformAccountId: string
+  ): PlatformAccountMapping | null {
+    const row = this.db
+      .prepare('SELECT * FROM platform_accounts WHERE platform = ? AND platform_account_id = ?')
+      .get(platform, platformAccountId) as Record<string, unknown> | undefined;
+
+    return row ? this.rowToPlatformAccount(row) : null;
+  }
+
+  /**
+   * 根据 active 平台账号查找 canonical user ID
+   */
+  async findCanonicalUserId(
+    platform: PlatformAccountMapping['platform'],
+    platformAccountId: string
+  ): Promise<string | null> {
+    const account = await this.findPlatformAccount(platform, platformAccountId);
+
+    return account?.status === 'active' ? account.canonicalUserId : null;
   }
 
   /**
@@ -85,24 +102,59 @@ export class IdentityRepository {
     platformAccountId: string,
     accountType: PlatformAccountMapping['accountType'] = 'private'
   ): Promise<string> {
-    const existing = await this.findCanonicalUserId(platform, platformAccountId);
+    const resolveIdentity = this.db.transaction(() => {
+      const now = Date.now();
+      const existing = this.findPlatformAccountSync(platform, platformAccountId);
+      if (existing) {
+        if (existing.status !== 'active') {
+          throw new InactivePlatformAccountError(existing.status);
+        }
 
-    if (existing) {
-      await this.ensureCanonicalUser(existing);
-      return existing;
-    }
+        this.ensureCanonicalUserSync(existing.canonicalUserId, now);
+        this.db.prepare(
+          `UPDATE platform_accounts
+           SET last_seen_at = ?
+           WHERE platform = ? AND platform_account_id = ?`
+        ).run(now, platform, platformAccountId);
+        return existing.canonicalUserId;
+      }
 
-    const canonicalUserId = `user-${ulid()}`;
-    await this.upsertPlatformAccount({
-      platform,
-      platformAccountId,
-      canonicalUserId,
-      accountType,
-      verifiedLevel: 'observed',
-      status: 'active',
+      const canonicalUserId = `user-${ulid()}`;
+      this.ensureCanonicalUserSync(canonicalUserId, now);
+      this.insertPlatformAccount({
+        platform,
+        platformAccountId,
+        canonicalUserId,
+        accountType,
+        verifiedLevel: 'observed',
+        status: 'active',
+      }, now);
+      return canonicalUserId;
     });
 
-    return canonicalUserId;
+    return resolveIdentity.immediate();
+  }
+
+  private insertPlatformAccount(
+    mapping: Omit<PlatformAccountMapping, 'firstSeenAt' | 'lastSeenAt'>,
+    now: number
+  ): void {
+    this.db.prepare(
+      `INSERT INTO platform_accounts (
+        platform, platform_account_id, canonical_user_id,
+        account_type, verified_level, status,
+        first_seen_at, last_seen_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      mapping.platform,
+      mapping.platformAccountId,
+      mapping.canonicalUserId,
+      mapping.accountType,
+      mapping.verifiedLevel,
+      mapping.status,
+      now,
+      now
+    );
   }
 
   /**

@@ -131,6 +131,7 @@ describe('File Operations Integration', () => {
       const context: FileOperationContext = {
         toolCallId: 'test-call-1',
         turnId: 'test-turn-1',
+        signal: new AbortController().signal,
         workspaceRoot: tempDir,
         sandboxPolicy: {
           filesystem: 'workspace_write',
@@ -195,6 +196,7 @@ describe('File Operations Integration', () => {
       const context: FileOperationContext = {
         toolCallId: 'test-call',
         turnId: 'test-turn',
+        signal: new AbortController().signal,
         workspaceRoot: tempDir,
         sandboxPolicy: {
           filesystem: 'workspace_write',
@@ -240,6 +242,7 @@ describe('File Operations Integration', () => {
       const context: FileOperationContext = {
         toolCallId: 'test-call',
         turnId: 'test-turn',
+        signal: new AbortController().signal,
         workspaceRoot: tempDir,
         sandboxPolicy: {
           filesystem: 'workspace_write',
@@ -280,6 +283,7 @@ describe('File Operations Integration', () => {
       const context: FileOperationContext = {
         toolCallId: 'test-call',
         turnId: 'test-turn',
+        signal: new AbortController().signal,
         workspaceRoot: tempDir,
         sandboxPolicy: {
           filesystem: 'workspace_write',

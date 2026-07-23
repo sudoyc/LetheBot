@@ -4,9 +4,9 @@
  * Pi SDK 适配器类型定义
  */
 
-import type { ContextPack } from '../types/context';
-import type { ActionDecision } from '../types/action';
-import type { ToolCallRequest } from '../types/tool';
+import type { ContextPack } from '../types/context.js';
+import type { ActionDecision } from '../types/action.js';
+import type { ToolCallRequest } from '../types/tool.js';
 
 export interface AgentTurnInput {
   contextPack: ContextPack;

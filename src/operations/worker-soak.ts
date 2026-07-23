@@ -30,6 +30,26 @@ export interface WorkerSchedulerSoakResult {
   outcomes: {
     byStatus: Record<string, number>;
   };
+  load: {
+    windows: number;
+    enqueued: number;
+    enqueuedByWindow: number[];
+    completedByWindow: number[];
+    lastEnqueueOffsetMs: number;
+    emptyPolls: number;
+  };
+  drain: {
+    processed: number;
+    timedOut: boolean;
+  };
+  schedulerErrors: {
+    producer: number;
+    consumer: number;
+    total: number;
+  };
+  isolation: {
+    clean: boolean;
+  };
   jobs: {
     total: number;
     byStatus: Record<string, number>;
@@ -82,20 +102,32 @@ const silentSchedulerLogger: SchedulerLogger = {
   error: () => {},
 };
 
+const SUSTAINED_LOAD_WINDOWS = 3;
+
 export async function runWorkerSchedulerSoak(
   options: WorkerSchedulerSoakOptions,
 ): Promise<WorkerSchedulerSoakResult> {
+  assertEmptyWorkerState(options.db);
   const durationMs = options.durationMs ?? 15_000;
   const intervalMs = options.intervalMs ?? 1_000;
   const workerId = options.workerId ?? 'ops-worker-soak';
   const leaseMs = Math.max(intervalMs * 4, 40);
   const runId = randomUUID();
-  const startedAtMs = Date.now();
+  const setupAtMs = Date.now();
+  let startedAtMs = 0;
+  let loadDeadlineMs = 0;
   const jobRepository = new JobRepository(options.db);
   const scheduler = new WorkerScheduler({ logger: silentSchedulerLogger });
   const outcomes: TaskResult[] = [];
+  const loadEnqueuedAtMs: number[] = [];
+  const loadCompletedAtMs: number[] = [];
   let ticks = 0;
-  let inFlight = false;
+  let loadEmptyPolls = 0;
+  let producerSequence = 0;
+  let drainProcessed = 0;
+  let drainTimedOut = false;
+  let producerErrors = 0;
+  let consumerErrors = 0;
   let extractionAttempts = 0;
   let leaseExtensionCount = 0;
   let leaseExtensionObserved: (() => void) | undefined;
@@ -105,9 +137,12 @@ export async function runWorkerSchedulerSoak(
   const originalExtendLease = jobRepository.extendLease.bind(jobRepository);
 
   jobRepository.extendLease = (extendOptions) => {
-    originalExtendLease(extendOptions);
-    leaseExtensionCount += 1;
-    leaseExtensionObserved?.();
+    const extended = originalExtendLease(extendOptions);
+    if (extended) {
+      leaseExtensionCount += 1;
+      leaseExtensionObserved?.();
+    }
+    return extended;
   };
 
   const worker = new BackgroundWorker({
@@ -155,70 +190,135 @@ export async function runWorkerSchedulerSoak(
       type: 'retention',
       payload: { dryRun: true },
       idempotencyKey: `worker-soak:${runId}:retention`,
-      scheduledAt: startedAtMs + intervalMs * 2,
       maxAttempts: 2,
     }),
     worker.enqueue({
       type: 'admin_digest',
-      payload: { sinceMs: startedAtMs - intervalMs, untilMs: startedAtMs },
+      payload: { sinceMs: setupAtMs - intervalMs, untilMs: setupAtMs },
       idempotencyKey: `worker-soak:${runId}:admin-digest`,
-      scheduledAt: startedAtMs + intervalMs * 3,
       maxAttempts: 2,
     }),
     worker.enqueue({
       type: 'conflict',
       payload: { limit: 10 },
       idempotencyKey: `worker-soak:${runId}:conflict`,
-      scheduledAt: startedAtMs + intervalMs * 4,
       maxAttempts: 2,
     }),
     worker.enqueue({
       type: 'decay',
       payload: { limit: 10, dryRun: true },
       idempotencyKey: `worker-soak:${runId}:decay`,
-      scheduledAt: startedAtMs + intervalMs * 5,
       maxAttempts: 2,
     }),
     worker.enqueue({
       type: 'consolidation',
       payload: { limit: 10 },
       idempotencyKey: `worker-soak:${runId}:consolidation`,
-      scheduledAt: startedAtMs + intervalMs * 6,
       maxAttempts: 2,
     }),
   ];
 
   scheduler.register({
-    name: `worker-soak-${runId}`,
+    name: `worker-soak-consumer-${runId}`,
     intervalMs,
     handler: async () => {
-      if (inFlight) {
+      const tickStartedAtMs = Date.now();
+      if (tickStartedAtMs >= loadDeadlineMs) {
         return;
       }
-
-      inFlight = true;
       ticks += 1;
       try {
         const result = await worker.processNext();
         if (result) {
           outcomes.push(result);
+          const completedAtMs = Date.now();
+          if (result.status === 'completed' && completedAtMs < loadDeadlineMs) {
+            loadCompletedAtMs.push(completedAtMs);
+          }
+        } else {
+          loadEmptyPolls += 1;
         }
-      } finally {
-        inFlight = false;
+      } catch {
+        consumerErrors += 1;
       }
     },
   });
 
+  scheduler.register({
+    name: `worker-soak-producer-${runId}`,
+    intervalMs,
+    handler: async () => {
+      if (Date.now() >= loadDeadlineMs) {
+        return;
+      }
+      producerSequence += 1;
+      try {
+        jobIds.push(worker.enqueue({
+          type: 'retention',
+          payload: { dryRun: true, sequence: producerSequence },
+          idempotencyKey: `worker-soak:${runId}:load:${producerSequence}`,
+          maxAttempts: 2,
+        }));
+        loadEnqueuedAtMs.push(Date.now());
+      } catch {
+        producerErrors += 1;
+      }
+    },
+  });
+
+  startedAtMs = Date.now();
+  loadDeadlineMs = startedAtMs + durationMs;
   scheduler.start();
   try {
     await sleep(durationMs);
   } finally {
-    scheduler.stop();
+    await scheduler.stopAndDrain();
+  }
+
+  if (loadEnqueuedAtMs.length > 0) {
+    const drainDeadlineMs = Date.now() + Math.min(
+      Math.max(intervalMs * 10, 1_000),
+      30_000,
+    );
+    const drainAttemptLimit = jobIds.length + 1;
+    let drainAttempts = 0;
+    while (!allJobsTerminal(readJobRows(options.db, runId), jobIds.length)) {
+      if (Date.now() >= drainDeadlineMs || drainAttempts >= drainAttemptLimit) {
+        drainTimedOut = true;
+        break;
+      }
+
+      drainAttempts += 1;
+      try {
+        const result = await worker.processNext();
+        if (result) {
+          outcomes.push(result);
+          drainProcessed += 1;
+        } else {
+          await sleep(Math.min(intervalMs, 25));
+        }
+      } catch {
+        consumerErrors += 1;
+      }
+    }
+
+    if (!drainTimedOut) {
+      try {
+        const finalIdleResult = await worker.processNext();
+        if (finalIdleResult) {
+          outcomes.push(finalIdleResult);
+          drainProcessed += 1;
+        }
+      } catch {
+        consumerErrors += 1;
+      }
+    }
   }
 
   const completedAtMs = Date.now();
-  const jobs = readJobRows(options.db, jobIds);
-  const attempts = readAttemptRows(options.db, jobIds);
+  const jobs = readJobRows(options.db, runId);
+  const attempts = readAttemptRows(options.db, runId);
+  const workerStateCounts = readWorkerStateCounts(options.db);
   const heartbeat = options.db
     .prepare(
       `SELECT worker_type, status, current_job_id
@@ -231,6 +331,21 @@ export async function runWorkerSchedulerSoak(
   const jobsByType = countBy(jobs.map((row) => row.type));
   const attemptsByStatus = countBy(attempts.map((row) => row.status));
   const outcomesByStatus = countBy(outcomes.map((result) => result.status));
+  const enqueuedByWindow = countTimestampsByWindow(
+    loadEnqueuedAtMs,
+    startedAtMs,
+    durationMs,
+    SUSTAINED_LOAD_WINDOWS,
+  );
+  const completedByWindow = countTimestampsByWindow(
+    loadCompletedAtMs,
+    startedAtMs,
+    durationMs,
+    SUSTAINED_LOAD_WINDOWS,
+  );
+  const lastEnqueueOffsetMs = loadEnqueuedAtMs.length > 0
+    ? Math.max(...loadEnqueuedAtMs) - startedAtMs
+    : 0;
   const completedJobs = jobsByStatus.completed ?? 0;
   const runningAttempts = attemptsByStatus.running ?? 0;
   const failedAttempts = attemptsByStatus.failed ?? 0;
@@ -242,6 +357,16 @@ export async function runWorkerSchedulerSoak(
         currentJobIdPresent: heartbeat.current_job_id !== null,
       }
     : null;
+  const sustainedLoadObserved =
+    enqueuedByWindow.every((count) => count >= 1) &&
+    completedByWindow.every((count) => count >= 1) &&
+    lastEnqueueOffsetMs >= Math.max(0, durationMs - intervalMs * 2) &&
+    loadEmptyPolls === 0;
+  const schedulerErrorCount = producerErrors + consumerErrors;
+  const isolationClean =
+    workerStateCounts.jobs === jobs.length &&
+    workerStateCounts.attempts === attempts.length &&
+    workerStateCounts.heartbeats === (heartbeatSummary ? 1 : 0);
 
   return {
     runId,
@@ -253,6 +378,26 @@ export async function runWorkerSchedulerSoak(
     processed: outcomes.length,
     outcomes: {
       byStatus: outcomesByStatus,
+    },
+    load: {
+      windows: SUSTAINED_LOAD_WINDOWS,
+      enqueued: loadEnqueuedAtMs.length,
+      enqueuedByWindow,
+      completedByWindow,
+      lastEnqueueOffsetMs,
+      emptyPolls: loadEmptyPolls,
+    },
+    drain: {
+      processed: drainProcessed,
+      timedOut: drainTimedOut,
+    },
+    schedulerErrors: {
+      producer: producerErrors,
+      consumer: consumerErrors,
+      total: schedulerErrorCount,
+    },
+    isolation: {
+      clean: isolationClean,
     },
     jobs: {
       total: jobs.length,
@@ -269,7 +414,8 @@ export async function runWorkerSchedulerSoak(
       running: runningAttempts,
       completed: completedAttempts,
       failed: failedAttempts,
-      plannedRetryObserved: failedAttempts >= 1 && completedAttempts >= 3,
+      plannedRetryObserved:
+        failedAttempts === 1 && completedAttempts === jobs.length,
     },
     leaseExtensions: {
       observed: leaseExtensionCount > 0,
@@ -278,9 +424,22 @@ export async function runWorkerSchedulerSoak(
     workerHeartbeat: heartbeatSummary,
     foreignKeyViolations,
     success:
+      sustainedLoadObserved &&
+      !drainTimedOut &&
+      schedulerErrorCount === 0 &&
+      isolationClean &&
+      jobs.length === jobIds.length &&
       completedJobs === jobIds.length &&
+      (jobsByStatus.pending ?? 0) === 0 &&
+      (jobsByStatus.running ?? 0) === 0 &&
+      (jobsByStatus.failed ?? 0) === 0 &&
+      attempts.length === jobs.length + 1 &&
+      outcomes.length === attempts.length &&
+      (outcomesByStatus.completed ?? 0) === jobs.length &&
+      (outcomesByStatus.failed ?? 0) === 1 &&
       runningAttempts === 0 &&
-      failedAttempts >= 1 &&
+      failedAttempts === 1 &&
+      completedAttempts === jobs.length &&
       leaseExtensionCount > 0 &&
       heartbeatSummary?.status === 'idle' &&
       heartbeatSummary.currentJobIdPresent === false &&
@@ -288,18 +447,65 @@ export async function runWorkerSchedulerSoak(
   };
 }
 
-function readJobRows(db: BetterSqlite3.Database, jobIds: string[]): JobStatusRow[] {
-  const placeholders = jobIds.map(() => '?').join(', ');
-  return db
-    .prepare(`SELECT type, status FROM jobs WHERE id IN (${placeholders})`)
-    .all(...jobIds) as JobStatusRow[];
+function assertEmptyWorkerState(db: BetterSqlite3.Database): void {
+  const counts = readWorkerStateCounts(db);
+  if (counts.jobs !== 0 || counts.attempts !== 0 || counts.heartbeats !== 0) {
+    throw new Error('Worker soak requires empty durable worker tables');
+  }
 }
 
-function readAttemptRows(db: BetterSqlite3.Database, jobIds: string[]): AttemptStatusRow[] {
-  const placeholders = jobIds.map(() => '?').join(', ');
+function readWorkerStateCounts(db: BetterSqlite3.Database): {
+  jobs: number;
+  attempts: number;
+  heartbeats: number;
+} {
+  return db.prepare(
+    `SELECT
+       (SELECT COUNT(*) FROM jobs) AS jobs,
+       (SELECT COUNT(*) FROM job_attempts) AS attempts,
+       (SELECT COUNT(*) FROM worker_heartbeats) AS heartbeats`,
+  ).get() as { jobs: number; attempts: number; heartbeats: number };
+}
+
+function readJobRows(db: BetterSqlite3.Database, runId: string): JobStatusRow[] {
   return db
-    .prepare(`SELECT status FROM job_attempts WHERE job_id IN (${placeholders})`)
-    .all(...jobIds) as AttemptStatusRow[];
+    .prepare('SELECT type, status FROM jobs WHERE idempotency_key LIKE ?')
+    .all(`worker-soak:${runId}:%`) as JobStatusRow[];
+}
+
+function readAttemptRows(db: BetterSqlite3.Database, runId: string): AttemptStatusRow[] {
+  return db
+    .prepare(
+      `SELECT attempt.status
+       FROM job_attempts attempt
+       JOIN jobs job ON job.id = attempt.job_id
+       WHERE job.idempotency_key LIKE ?`,
+    )
+    .all(`worker-soak:${runId}:%`) as AttemptStatusRow[];
+}
+
+function allJobsTerminal(rows: JobStatusRow[], expectedCount: number): boolean {
+  return rows.length === expectedCount && rows.every(
+    (row) => row.status === 'completed' || row.status === 'failed',
+  );
+}
+
+function countTimestampsByWindow(
+  timestamps: number[],
+  startedAtMs: number,
+  durationMs: number,
+  windows: number,
+): number[] {
+  const counts = Array.from({ length: windows }, () => 0);
+  for (const timestamp of timestamps) {
+    const offsetMs = timestamp - startedAtMs;
+    if (offsetMs < 0 || offsetMs >= durationMs) {
+      continue;
+    }
+    const index = Math.min(windows - 1, Math.floor(offsetMs * windows / durationMs));
+    counts[index] = (counts[index] ?? 0) + 1;
+  }
+  return counts;
 }
 
 function countBy(values: string[]): Record<string, number> {

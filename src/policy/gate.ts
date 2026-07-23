@@ -4,8 +4,9 @@
  * L0 策略门控 - 强制权限检查，不受 evaluatorPolicy 绕过
  */
 
-import type { ToolRegistry, ActorContext } from '../tools/registry';
-import type { InvocationContext } from '../types/tool';
+import type { ToolRegistry, ActorContext } from '../tools/registry.js';
+import type { InvocationContext } from '../types/tool.js';
+import { isSupportedToolExecution } from '../tools/sandbox-policy.js';
 
 export interface PolicyCheckRequest {
   toolName: string;
@@ -43,6 +44,13 @@ export class PolicyGate {
       return {
         allowed: false,
         reason: `Permission denied: ${toolName} not allowed for ${actor.actorClass} in ${context}`,
+      };
+    }
+
+    if (!isSupportedToolExecution(tool.sandboxPolicy.execution)) {
+      return {
+        allowed: false,
+        reason: `Tool execution backend is unavailable for ${toolName}; only in_process is supported`,
       };
     }
 

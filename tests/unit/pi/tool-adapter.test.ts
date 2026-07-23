@@ -1,5 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
-import { convertToolsToPiFormat } from '../../../src/pi/tool-adapter';
+import {
+  convertToolsToPiFormat,
+  createMockPiTool,
+  toProviderToolName,
+} from '../../../src/pi/tool-adapter';
 import type { ToolHandler, ToolRegistryEntry } from '../../../src/types/tool';
 
 function createEntry(name: unknown): ToolRegistryEntry {
@@ -18,7 +22,7 @@ function createEntry(name: unknown): ToolRegistryEntry {
     sandboxPolicy: {
       filesystem: 'none',
       network: 'none',
-      execution: 'none',
+      execution: 'in_process',
     },
     outputSensitivity: 'normal',
     piSchema: {
@@ -29,7 +33,99 @@ function createEntry(name: unknown): ToolRegistryEntry {
   };
 }
 
+describe('tool-adapter provider names', () => {
+  it('preserves safe canonical names and deterministically aliases unsafe or overlong names', () => {
+    const safeName = 'safe_Tool-01';
+    const maxLengthSafeName = 'a'.repeat(64);
+
+    expect(toProviderToolName(safeName)).toBe(safeName);
+    expect(toProviderToolName(maxLengthSafeName)).toBe(maxLengthSafeName);
+
+    for (const canonicalName of ['memory.search', 'a'.repeat(65), '工具.搜索']) {
+      const providerName = toProviderToolName(canonicalName);
+      expect(providerName).toBe(toProviderToolName(canonicalName));
+      expect(providerName).toMatch(/^[A-Za-z0-9_-]{1,64}$/);
+      expect(providerName).not.toBe(canonicalName);
+    }
+  });
+
+  it('uses the provider alias while preserving the canonical name for handler execution', async () => {
+    const entry = createEntry('memory.search');
+    const handler = vi.fn().mockResolvedValue('canonical handler result');
+    entry.handler = handler;
+
+    const [tool] = convertToolsToPiFormat([entry], () => handler, {
+      turnId: 'turn-provider-alias',
+      actor: { actorClass: 'user' },
+      invocationContext: 'private_chat',
+    });
+
+    expect(tool?.name).toBe(toProviderToolName(entry.name));
+    expect(tool?.name).toMatch(/^[A-Za-z0-9_-]{1,64}$/);
+    entry.name = 'mutated.after_conversion';
+    await tool?.execute('tc-provider-alias', {});
+    expect(handler).toHaveBeenCalledWith(expect.objectContaining({
+      toolName: 'memory.search',
+      turnId: 'turn-provider-alias',
+    }));
+  });
+
+  it('fails the whole batch when two canonical names map to one provider name', () => {
+    const unsafeEntry = createEntry('memory.search');
+    const collidingSafeEntry = createEntry(toProviderToolName(unsafeEntry.name));
+
+    expect(() => convertToolsToPiFormat(
+      [unsafeEntry, collidingSafeEntry],
+      (name) => name === unsafeEntry.name ? unsafeEntry.handler : collidingSafeEntry.handler,
+      {
+        turnId: 'turn-provider-alias-collision',
+        actor: { actorClass: 'user' },
+        invocationContext: 'private_chat',
+      },
+    )).toThrow(/provider tool name collision/i);
+  });
+
+  it('aliases unsafe names created through the mock Pi helper', () => {
+    const tool = createMockPiTool('memory.search', 'Mock memory search', async () => 'ok');
+
+    expect(tool.name).toBe(toProviderToolName('memory.search'));
+    expect(tool.name).toMatch(/^[A-Za-z0-9_-]{1,64}$/);
+  });
+});
+
 describe('tool-adapter diagnostics', () => {
+  it.each(['none', 'subprocess', 'docker'] as const)(
+    'does not expose a tool that declares unsupported %s execution',
+    (execution) => {
+      const entry = createEntry(`unsupported-${execution}`);
+      entry.sandboxPolicy.execution = execution;
+
+      const tools = convertToolsToPiFormat([entry], () => entry.handler, {
+        turnId: `turn-unsupported-${execution}`,
+        actor: { actorClass: 'user' },
+        invocationContext: 'private_chat',
+      });
+
+      expect(tools).toEqual([]);
+    }
+  );
+
+  it('rechecks execution metadata before invoking a converted handler', async () => {
+    const entry = createEntry('mutated-execution');
+    const handler = vi.fn().mockResolvedValue('must not run');
+    entry.handler = handler;
+    const [tool] = convertToolsToPiFormat([entry], () => entry.handler, {
+      turnId: 'turn-mutated-execution',
+      actor: { actorClass: 'user' },
+      invocationContext: 'private_chat',
+    });
+    entry.sandboxPolicy.execution = 'subprocess';
+
+    await expect(tool?.execute('tc-mutated-execution', {}))
+      .rejects.toThrow(/execution backend/i);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
   it('redacts missing-handler warning tool names before direct console output', () => {
     const rawSecret = 'sk-tooladapter-warning-secret-should-not-leak';
     const rawPlatformId = 'qq-1234567890';
@@ -202,5 +298,123 @@ describe('tool-adapter diagnostics', () => {
     expect(errorDiagnostic).not.toContain('    at ');
 
     consoleError.mockRestore();
+  });
+});
+
+describe('tool-adapter cooperative runtime limits', () => {
+  const context = {
+    turnId: 'turn-tool-runtime',
+    actor: { actorClass: 'user' as const },
+    invocationContext: 'private_chat' as const,
+  };
+
+  it('rejects a pre-aborted call without invoking the handler or exposing its reason', async () => {
+    const secret = 'sk-preaborted-tool-reason-should-not-leak';
+    const handler = vi.fn().mockResolvedValue('must not run');
+    const entry = createEntry('preaborted_tool');
+    entry.handler = handler;
+    entry.sandboxPolicy.maxRuntimeMs = 100;
+    const [tool] = convertToolsToPiFormat([entry], () => entry.handler, context);
+    const controller = new AbortController();
+    controller.abort(new Error(`api_key=${secret}`));
+
+    const error = await tool?.execute('tc-preaborted', {}, controller.signal).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe('Tool execution aborted');
+    expect((error as Error).message).not.toContain(secret);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('forwards upstream abort, waits for settlement, and removes its listener', async () => {
+    const abortReasonSecret = 'sk-upstream-abort-reason-should-not-leak';
+    const cleanupSecret = 'sk-handler-cleanup-error-should-not-leak';
+    const controller = new AbortController();
+    const addListener = vi.spyOn(controller.signal, 'addEventListener');
+    const removeListener = vi.spyOn(controller.signal, 'removeEventListener');
+    let handlerSignal: AbortSignal | undefined;
+    let releaseHandler: (() => void) | undefined;
+    const handler: ToolHandler = async (request) => {
+      handlerSignal = request.signal;
+      await new Promise<void>((resolve) => {
+        releaseHandler = resolve;
+      });
+      throw new Error(`cleanup failed api_key=${cleanupSecret}`);
+    };
+    const entry = createEntry('upstream_abort_tool');
+    entry.handler = handler;
+    const [tool] = convertToolsToPiFormat([entry], () => entry.handler, context);
+    let settled = false;
+    const execution = tool?.execute('tc-upstream-abort', {}, controller.signal)
+      .finally(() => {
+        settled = true;
+      });
+
+    await Promise.resolve();
+    controller.abort(new Error(`api_key=${abortReasonSecret}`));
+    await Promise.resolve();
+
+    expect(handlerSignal?.aborted).toBe(true);
+    expect(settled).toBe(false);
+    releaseHandler?.();
+    const error = await execution?.catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe('Tool execution aborted');
+    expect((error as Error).message).not.toContain(abortReasonSecret);
+    expect((error as Error).message).not.toContain(cleanupSecret);
+    expect(addListener).toHaveBeenCalledOnce();
+    expect(removeListener).toHaveBeenCalledOnce();
+  });
+
+  it('aborts at maxRuntimeMs, waits for settlement, and can be reused without a stale timer', async () => {
+    vi.useFakeTimers();
+    let invocation = 0;
+    const handlerSignals: AbortSignal[] = [];
+    let releaseFirst: (() => void) | undefined;
+    const handler: ToolHandler = async (request) => {
+      invocation += 1;
+      handlerSignals.push(request.signal);
+      if (invocation === 1) {
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+        return 'late result must fail';
+      }
+      return 'reused successfully';
+    };
+    const entry = createEntry('runtime_limited_tool');
+    entry.handler = handler;
+    entry.sandboxPolicy.maxRuntimeMs = 100;
+    const [tool] = convertToolsToPiFormat([entry], () => entry.handler, context);
+    let firstSettled = false;
+    const firstExecution = tool?.execute('tc-runtime-timeout', {}).finally(() => {
+      firstSettled = true;
+    });
+
+    try {
+      await vi.advanceTimersByTimeAsync(100);
+      expect(handlerSignals[0]?.aborted).toBe(true);
+      expect(firstSettled).toBe(false);
+
+      releaseFirst?.();
+      const firstError = await firstExecution?.catch((caught) => caught);
+      expect(firstError).toBeInstanceOf(Error);
+      expect((firstError as Error).message).toBe('Tool runtime limit exceeded');
+      expect(vi.getTimerCount()).toBe(0);
+
+      const secondResult = await tool?.execute('tc-runtime-reuse', {});
+      expect(secondResult?.content[0]).toEqual({ type: 'text', text: 'reused successfully' });
+      expect(handlerSignals[1]?.aborted).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(200);
+      expect(handlerSignals[1]?.aborted).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      releaseFirst?.();
+      await firstExecution?.catch(() => undefined);
+      vi.useRealTimers();
+    }
   });
 });

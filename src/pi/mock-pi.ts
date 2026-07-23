@@ -5,8 +5,8 @@
  */
 
 import { ulid } from 'ulidx';
-import type { AgentTurnInput, AgentTurnOutput } from './types';
-import type { ActionDecision } from '../types/action';
+import type { AgentTurnInput, AgentTurnOutput } from './types.js';
+import type { ActionDecision } from '../types/action.js';
 
 export class MockPi {
   /**

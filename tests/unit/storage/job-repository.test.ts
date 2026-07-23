@@ -971,6 +971,77 @@ describe('JobRepository', () => {
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 
+  it('rejects terminal and renewal writes after the current attempt lease expires', () => {
+    for (const operation of ['complete', 'fail', 'extendLease'] as const) {
+      const jobId = repo.enqueue({
+        type: 'summary',
+        payload: { conversationId: `conv-expired-${operation}` },
+        maxAttempts: 3,
+        now: 1000,
+      });
+      const claimed = repo.claimNext({
+        workerId: `worker-expired-${operation}`,
+        now: 1000,
+        leaseMs: 500,
+      });
+      if (!claimed) {
+        throw new Error(`Expected ${operation} attempt to be claimed`);
+      }
+
+      const accepted = operation === 'complete'
+        ? repo.complete({
+            jobId,
+            attemptId: claimed.attemptId,
+            result: { stale: operation },
+            now: 1500,
+          })
+        : operation === 'fail'
+          ? repo.fail({
+              jobId,
+              attemptId: claimed.attemptId,
+              error: 'stale failure after lease expiry',
+              now: 1500,
+            })
+          : repo.extendLease({
+              jobId,
+              attemptId: claimed.attemptId,
+              workerId: `worker-expired-${operation}`,
+              leaseMs: 1000,
+              now: 1500,
+            });
+
+      const job = db.prepare(
+        `SELECT status, attempts, lease_owner, lease_expires_at, heartbeat_at,
+                completed_at, error, result
+           FROM jobs WHERE id = ?`
+      ).get(jobId);
+      const attempt = db.prepare(
+        `SELECT status, completed_at, heartbeat_at, error, result
+           FROM job_attempts WHERE id = ?`
+      ).get(claimed.attemptId);
+
+      expect(accepted).toBe(false);
+      expect(job).toEqual({
+        status: 'running',
+        attempts: 1,
+        lease_owner: `worker-expired-${operation}`,
+        lease_expires_at: 1500,
+        heartbeat_at: 1000,
+        completed_at: null,
+        error: null,
+        result: null,
+      });
+      expect(attempt).toEqual({
+        status: 'running',
+        completed_at: null,
+        heartbeat_at: 1000,
+        error: null,
+        result: null,
+      });
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+    }
+  });
+
   it('ignores stale attempt completion, failure, and lease extension after retry claim', () => {
     const jobId = repo.enqueue({
       type: 'summary',

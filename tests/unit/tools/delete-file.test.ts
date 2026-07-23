@@ -4,7 +4,7 @@
  * 测试删除文件处理器
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -33,12 +33,14 @@ describe('DeleteFileHandler', () => {
     context = {
       toolCallId: 'test-call-id',
       turnId: 'test-turn-id',
+      signal: new AbortController().signal,
       workspaceRoot: tempDir,
       sandboxPolicy,
     };
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await fs.promises.rm(tempDir, { recursive: true, force: true });
   });
 
@@ -68,6 +70,33 @@ describe('DeleteFileHandler', () => {
 
       expect(result.status).toBe('error');
       expect(result.error?.code).toBe('FILE_NOT_FOUND');
+    });
+
+    it('should stop before deletion when cancellation arrives after the final stat', async () => {
+      const filePath = path.join(tempDir, 'cancelled.txt');
+      await fs.promises.writeFile(filePath, 'keep me');
+      const controller = new AbortController();
+      const leakedReason = 'sk-delete-abort-reason-must-not-leak';
+      context.signal = controller.signal;
+      vi.spyOn(fs.promises, 'stat').mockImplementationOnce(async (target) => {
+        const stats = await fs.promises.lstat(target);
+        controller.abort(leakedReason);
+        return stats;
+      });
+      const unlinkSpy = vi.spyOn(fs.promises, 'unlink');
+
+      const result = await handler.execute({ path: 'cancelled.txt' }, context);
+
+      expect(result).toMatchObject({
+        status: 'error',
+        error: {
+          code: 'ABORT_ERR',
+          message: 'File operation aborted',
+        },
+      });
+      expect(JSON.stringify(result)).not.toContain(leakedReason);
+      expect(unlinkSpy).not.toHaveBeenCalled();
+      await expect(fs.promises.readFile(filePath, 'utf8')).resolves.toBe('keep me');
     });
   });
 

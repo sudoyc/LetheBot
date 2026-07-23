@@ -5,14 +5,18 @@
 import Database from 'better-sqlite3';
 import type BetterSqlite3 from 'better-sqlite3';
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
+  linkSync,
+  mkdtempSync,
   mkdirSync,
+  renameSync,
   rmSync,
   statSync,
 } from 'node:fs';
-import { dirname } from 'node:path';
-import { redactSecretsInText } from '../memory/secret-scan';
+import { dirname, join } from 'node:path';
+import { redactSecretsInText } from '../memory/secret-scan.js';
 
 export interface SqliteBackupOptions {
   sourcePath: string;
@@ -40,6 +44,7 @@ export interface SqliteRestoreResult {
   targetPath: string;
   integrityOk: boolean;
   integrityResult: string;
+  foreignKeyViolations: number;
   restoredSizeBytes: number;
 }
 
@@ -53,10 +58,12 @@ export interface RetentionPolicy {
 
 export interface RetentionResult {
   rawEventsDeleted: number;
+  modelInvocationSourcesDeleted: number;
   chatMessagesDeleted: number;
   auditLogDeleted: number;
   eventProcessingFailuresDeleted: number;
   memoriesPurged: number;
+  actionMemoryLinksCleared: number;
   memorySourcesDeleted: number;
   memoryRevisionsDeleted: number;
   memoryFtsRowsDeleted: number;
@@ -67,6 +74,14 @@ export interface OperationsMetrics {
   sinceMs?: number;
   rawEvents: {
     total: number;
+  };
+  eventIngressReceipts: {
+    total: number;
+    byDisposition: Record<string, number>;
+  };
+  eventProcessingAdmissions: {
+    total: number;
+    byState: Record<string, number>;
   };
   chatMessages: {
     total: number;
@@ -131,6 +146,14 @@ export interface OperationsMetrics {
 }
 
 const AGENT_TURN_STATUSES = ['pending', 'running', 'completed', 'failed', 'aborted'] as const;
+const INGRESS_DISPOSITIONS = ['accepted', 'duplicate'] as const;
+const EVENT_PROCESSING_ADMISSION_STATES = [
+  'accepted',
+  'processing',
+  'completed',
+  'failed',
+  'interrupted_review',
+] as const;
 const ACTION_DECIDED_BY_VALUES = ['attention', 'pi', 'evaluator'] as const;
 const RISK_LEVELS = ['low', 'medium', 'high', 'prohibited'] as const;
 const ACTION_EXECUTION_STATUSES = ['success', 'downgraded', 'failed', 'rejected'] as const;
@@ -155,6 +178,7 @@ const JOB_STATUSES = ['pending', 'running', 'completed', 'failed'] as const;
 const JOB_TYPES = [
   'summary',
   'extraction',
+  'attention_recheck',
   'retention',
   'admin_digest',
   'conflict',
@@ -179,6 +203,7 @@ const EVENT_PROCESSING_STAGES = [
   'display_metadata',
   'chat_message_store',
   'attention_analysis',
+  'delayed_attention_persist',
   'turn_create',
   'context_building',
   'pi_inference',
@@ -186,9 +211,95 @@ const EVENT_PROCESSING_STAGES = [
   'action_execution',
   'bot_response_persist',
   'memory_extraction',
+  'memory_extraction_enqueue',
   'turn_complete',
 ] as const;
 const CONVERSATION_TYPES = ['private', 'group'] as const;
+
+const RAW_EVENT_RETENTION_PREDICATE = `raw_events.timestamp < ?
+  AND NOT EXISTS (
+    SELECT 1 FROM chat_messages WHERE raw_event_id = raw_events.id
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM agent_turns WHERE trigger_event_id = raw_events.id
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM memory_sources
+    WHERE (resolution_state = 'internal' AND raw_event_id = raw_events.id)
+       OR (resolution_state = 'legacy_unresolved'
+           AND source_type = 'raw_event'
+           AND source_id = raw_events.id)
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM event_processing_admissions
+    WHERE raw_event_id = raw_events.id
+      AND state IN ('accepted', 'processing')
+  )`;
+
+const ACTIVE_DELAYED_ATTENTION_CHAT_GUARD = `
+  AND NOT EXISTS (
+    SELECT 1
+    FROM attention_candidates AS candidate
+    JOIN jobs AS job ON job.id = candidate.job_id
+    WHERE candidate.source_chat_message_id = chat_messages.id
+      AND job.status IN ('pending', 'running')
+  )`;
+
+const ACTIVE_DELAYED_ATTENTION_RAW_GUARD = `
+  AND NOT EXISTS (
+    SELECT 1
+    FROM attention_candidates AS candidate
+    JOIN jobs AS job ON job.id = candidate.job_id
+    WHERE candidate.source_raw_event_id = raw_events.id
+      AND job.status IN ('pending', 'running')
+  )`;
+
+const ACTIVE_GROUP_SUMMARY_CHAT_GUARD = `
+  AND NOT EXISTS (
+    SELECT 1
+    FROM jobs AS summary_job
+    JOIN json_each(
+      CASE
+        WHEN json_valid(summary_job.payload) THEN
+          CASE
+            WHEN json_type(summary_job.payload, '$.sourceChatMessageIds') = 'array'
+              THEN summary_job.payload
+            ELSE '{"sourceChatMessageIds":[]}'
+          END
+        ELSE '{"sourceChatMessageIds":[]}'
+      END,
+      '$.sourceChatMessageIds'
+    ) AS summary_source
+    WHERE summary_job.type = 'summary'
+      AND summary_job.status IN ('pending', 'running')
+      AND summary_source.type = 'text'
+      AND summary_source.value = chat_messages.id
+  )`;
+
+const ACTIVE_GROUP_SUMMARY_RAW_GUARD = `
+  AND NOT EXISTS (
+    SELECT 1
+    FROM jobs AS summary_job
+    JOIN json_each(
+      CASE
+        WHEN json_valid(summary_job.payload) THEN
+          CASE
+            WHEN json_type(summary_job.payload, '$.sourceChatMessageIds') = 'array'
+              THEN summary_job.payload
+            ELSE '{"sourceChatMessageIds":[]}'
+          END
+        ELSE '{"sourceChatMessageIds":[]}'
+      END,
+      '$.sourceChatMessageIds'
+    ) AS summary_source
+    JOIN chat_messages AS summary_message ON summary_message.id = summary_source.value
+    WHERE summary_job.type = 'summary'
+      AND summary_job.status IN ('pending', 'running')
+      AND summary_source.type = 'text'
+      AND summary_message.raw_event_id = raw_events.id
+  )`;
 
 export async function backupSqliteDatabase(
   options: SqliteBackupOptions,
@@ -198,24 +309,37 @@ export async function backupSqliteDatabase(
   }
 
   ensureParentDirectory(options.backupPath);
-
-  const source = new Database(options.sourcePath, { readonly: true });
+  const candidateDirectory = mkdtempSync(
+    join(dirname(options.backupPath), '.lethebot-backup-'),
+  );
+  const candidatePath = join(candidateDirectory, 'candidate.db');
   try {
-    const metadata = await source.backup(options.backupPath);
-    const integrity = verifySqliteIntegrity(options.backupPath);
-    const backupSizeBytes = statSync(options.backupPath).size;
+    chmodSync(candidateDirectory, 0o700);
+    const source = new Database(options.sourcePath, { readonly: true });
+    try {
+      const metadata = await source.backup(candidatePath);
+      chmodSync(candidatePath, 0o600);
+      const integrity = verifySqliteIntegrity(candidatePath);
+      if (!integrity.ok) {
+        throw new Error(`Backup integrity check failed: ${integrity.result}`);
+      }
+      const backupSizeBytes = statSync(candidatePath).size;
+      publishFileWithoutOverwrite(candidatePath, options.backupPath, 'Backup database');
 
-    return {
-      sourcePath: options.sourcePath,
-      backupPath: options.backupPath,
-      totalPages: metadata.totalPages,
-      remainingPages: metadata.remainingPages,
-      integrityOk: integrity.ok,
-      integrityResult: integrity.result,
-      backupSizeBytes,
-    };
+      return {
+        sourcePath: options.sourcePath,
+        backupPath: options.backupPath,
+        totalPages: metadata.totalPages,
+        remainingPages: metadata.remainingPages,
+        integrityOk: integrity.ok,
+        integrityResult: integrity.result,
+        backupSizeBytes,
+      };
+    } finally {
+      source.close();
+    }
   } finally {
-    source.close();
+    rmSync(candidateDirectory, { recursive: true, force: true });
   }
 }
 
@@ -235,22 +359,74 @@ export function restoreSqliteDatabase(
     throw new Error(`Target database already exists: ${options.targetPath}`);
   }
 
+  assertDistinctRestoreFiles(options.backupPath, options.targetPath);
+  assertNoRestoreSidecars(options.targetPath);
   ensureParentDirectory(options.targetPath);
-  if (existsSync(options.targetPath)) {
-    rmSync(options.targetPath, { force: true });
+  const candidateDirectory = mkdtempSync(
+    join(dirname(options.targetPath), '.lethebot-restore-'),
+  );
+  const candidatePath = join(candidateDirectory, 'candidate.db');
+
+  try {
+    chmodSync(candidateDirectory, 0o700);
+    copyFileSync(options.backupPath, candidatePath);
+    chmodSync(candidatePath, 0o600);
+    const restoredIntegrity = verifySqliteIntegrity(candidatePath);
+    if (!restoredIntegrity.ok) {
+      throw new Error(`Restore candidate integrity check failed: ${restoredIntegrity.result}`);
+    }
+
+    const foreignKeyViolations = countSqliteForeignKeyViolations(candidatePath);
+    if (foreignKeyViolations > 0) {
+      throw new Error(
+        `Restore candidate foreign key check failed: ${foreignKeyViolations} violation(s)`,
+      );
+    }
+
+    if (existsSync(options.targetPath) && !options.overwrite) {
+      throw new Error(`Target database already exists: ${options.targetPath}`);
+    }
+    assertNoRestoreSidecars(options.targetPath);
+
+    const restoredSizeBytes = statSync(candidatePath).size;
+    if (options.overwrite) {
+      renameSync(candidatePath, options.targetPath);
+    } else {
+      publishFileWithoutOverwrite(candidatePath, options.targetPath, 'Target database');
+    }
+
+    return {
+      backupPath: options.backupPath,
+      targetPath: options.targetPath,
+      integrityOk: true,
+      integrityResult: restoredIntegrity.result,
+      foreignKeyViolations,
+      restoredSizeBytes,
+    };
+  } finally {
+    rmSync(candidateDirectory, { recursive: true, force: true });
   }
+}
 
-  copyFileSync(options.backupPath, options.targetPath);
-  const restoredIntegrity = verifySqliteIntegrity(options.targetPath);
-  const restoredSizeBytes = statSync(options.targetPath).size;
+function publishFileWithoutOverwrite(
+  sourcePath: string,
+  targetPath: string,
+  label: string,
+): void {
+  try {
+    linkSync(sourcePath, targetPath);
+  } catch (error) {
+    if (isAlreadyExistsError(error)) {
+      throw new Error(`${label} already exists: ${targetPath}`, { cause: error });
+    }
+    throw error;
+  }
+}
 
-  return {
-    backupPath: options.backupPath,
-    targetPath: options.targetPath,
-    integrityOk: restoredIntegrity.ok,
-    integrityResult: restoredIntegrity.result,
-    restoredSizeBytes,
-  };
+function isAlreadyExistsError(error: unknown): boolean {
+  return error instanceof Error
+    && 'code' in error
+    && (error as NodeJS.ErrnoException).code === 'EEXIST';
 }
 
 export function verifySqliteIntegrity(dbPath: string): { ok: boolean; result: string } {
@@ -266,6 +442,35 @@ export function verifySqliteIntegrity(dbPath: string): { ok: boolean; result: st
   }
 }
 
+function countSqliteForeignKeyViolations(dbPath: string): number {
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    return db.prepare('PRAGMA foreign_key_check').all().length;
+  } finally {
+    db.close();
+  }
+}
+
+function assertDistinctRestoreFiles(backupPath: string, targetPath: string): void {
+  if (!existsSync(targetPath)) {
+    return;
+  }
+
+  const backup = statSync(backupPath);
+  const target = statSync(targetPath);
+  if (backup.dev === target.dev && backup.ino === target.ino) {
+    throw new Error('Backup and target database must be different files');
+  }
+}
+
+function assertNoRestoreSidecars(targetPath: string): void {
+  if (existsSync(`${targetPath}-wal`) || existsSync(`${targetPath}-shm`)) {
+    throw new Error(
+      'Target database sidecar exists; stop LetheBot and copy the DB, WAL, and SHM aside before restore',
+    );
+  }
+}
+
 export function applyRetentionPolicy(
   db: BetterSqlite3.Database,
   policy: RetentionPolicy,
@@ -273,31 +478,110 @@ export function applyRetentionPolicy(
 ): RetentionResult {
   const result: RetentionResult = {
     rawEventsDeleted: 0,
+    modelInvocationSourcesDeleted: 0,
     chatMessagesDeleted: 0,
     auditLogDeleted: 0,
     eventProcessingFailuresDeleted: 0,
     memoriesPurged: 0,
+    actionMemoryLinksCleared: 0,
     memorySourcesDeleted: 0,
     memoryRevisionsDeleted: 0,
     memoryFtsRowsDeleted: 0,
   };
+  const hasDelayedAttentionSchema = db.prepare(
+    `SELECT 1
+     FROM sqlite_schema
+     WHERE type = 'table' AND name = 'attention_candidates'`,
+  ).get() !== undefined;
+  const activeAttentionChatGuard = hasDelayedAttentionSchema
+    ? ACTIVE_DELAYED_ATTENTION_CHAT_GUARD
+    : '';
+  const rawEventRetentionPredicate = `${RAW_EVENT_RETENTION_PREDICATE}${ACTIVE_GROUP_SUMMARY_RAW_GUARD}${
+    hasDelayedAttentionSchema ? ACTIVE_DELAYED_ATTENTION_RAW_GUARD : ''
+  }`;
 
   db.transaction(() => {
+    const memoryCutoff = cutoffMs(policy.disabledDeletedMemoryDays, nowMs);
+    if (memoryCutoff !== undefined) {
+      const memories = db
+        .prepare(
+          `SELECT id
+           FROM memory_records
+           WHERE state IN ('disabled', 'deleted') AND updated_at < ?`
+        )
+        .all(memoryCutoff) as Array<{ id: string }>;
+
+      for (const memory of memories) {
+        result.actionMemoryLinksCleared += db
+          .prepare('UPDATE action_executions SET executed_memory_id = NULL WHERE executed_memory_id = ?')
+          .run(memory.id).changes;
+        result.memorySourcesDeleted += db
+          .prepare('DELETE FROM memory_sources WHERE memory_id = ?')
+          .run(memory.id).changes;
+        result.memoryRevisionsDeleted += db
+          .prepare('DELETE FROM memory_revisions WHERE memory_id = ?')
+          .run(memory.id).changes;
+        result.memoriesPurged += db
+          .prepare('DELETE FROM memory_records WHERE id = ?')
+          .run(memory.id).changes;
+      }
+
+      if (memories.length > 0) {
+        db.prepare("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')").run();
+      }
+    }
+
     const chatCutoff = cutoffMs(policy.chatMessagesDays, nowMs);
     if (chatCutoff !== undefined) {
       result.chatMessagesDeleted = db
-        .prepare('DELETE FROM chat_messages WHERE timestamp < ?')
+        .prepare(
+          `DELETE FROM chat_messages
+           WHERE timestamp < ?
+             AND NOT EXISTS (
+               SELECT 1
+               FROM memory_sources
+               WHERE (resolution_state = 'internal'
+                      AND (chat_message_id = chat_messages.id
+                           OR raw_event_id = chat_messages.raw_event_id))
+                  OR (resolution_state = 'legacy_unresolved'
+                      AND ((source_type = 'chat_message'
+                            AND (source_id = chat_messages.id
+                                 OR source_id = chat_messages.message_id))
+                           OR (source_type = 'raw_event'
+                               AND source_id = chat_messages.raw_event_id)))
+             )
+             AND NOT EXISTS (
+               SELECT 1
+               FROM jobs
+               WHERE type = 'extraction'
+                 AND status IN ('pending', 'running')
+                 AND CASE
+                   WHEN json_valid(payload) THEN json_extract(payload, '$.sourceChatMessageId')
+                   ELSE NULL
+                 END = chat_messages.id
+             )
+             ${ACTIVE_GROUP_SUMMARY_CHAT_GUARD}
+             ${activeAttentionChatGuard}`
+        )
         .run(chatCutoff).changes;
     }
 
     const rawCutoff = cutoffMs(policy.rawEventsDays, nowMs);
     if (rawCutoff !== undefined) {
+      result.modelInvocationSourcesDeleted = db
+        .prepare(
+          `DELETE FROM model_invocation_sources
+           WHERE raw_event_id IN (
+             SELECT raw_events.id
+             FROM raw_events
+             WHERE ${rawEventRetentionPredicate}
+           )`
+        )
+        .run(rawCutoff).changes;
       result.rawEventsDeleted = db
         .prepare(
           `DELETE FROM raw_events
-           WHERE timestamp < ?
-             AND id NOT IN (SELECT raw_event_id FROM chat_messages)
-             AND id NOT IN (SELECT trigger_event_id FROM agent_turns)`
+           WHERE ${rawEventRetentionPredicate}`
         )
         .run(rawCutoff).changes;
     }
@@ -316,32 +600,6 @@ export function applyRetentionPolicy(
         .run(eventFailureCutoff).changes;
     }
 
-    const memoryCutoff = cutoffMs(policy.disabledDeletedMemoryDays, nowMs);
-    if (memoryCutoff !== undefined) {
-      const memories = db
-        .prepare(
-          `SELECT id
-           FROM memory_records
-           WHERE state IN ('disabled', 'deleted') AND updated_at < ?`
-        )
-        .all(memoryCutoff) as Array<{ id: string }>;
-
-      for (const memory of memories) {
-        result.memorySourcesDeleted += db
-          .prepare('DELETE FROM memory_sources WHERE memory_id = ?')
-          .run(memory.id).changes;
-        result.memoryRevisionsDeleted += db
-          .prepare('DELETE FROM memory_revisions WHERE memory_id = ?')
-          .run(memory.id).changes;
-        result.memoriesPurged += db
-          .prepare('DELETE FROM memory_records WHERE id = ?')
-          .run(memory.id).changes;
-      }
-
-      if (memories.length > 0) {
-        db.prepare("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')").run();
-      }
-    }
   })();
 
   return result;
@@ -357,6 +615,14 @@ export function collectOperationsMetrics(
     sinceMs,
     rawEvents: {
       total: countRows(db, 'raw_events', 'created_at', sinceMs),
+    },
+    eventIngressReceipts: {
+      total: countRows(db, 'event_ingress_receipts', 'received_at', sinceMs),
+      byDisposition: countBy(db, 'event_ingress_receipts', 'disposition', 'received_at', sinceMs),
+    },
+    eventProcessingAdmissions: {
+      total: countRows(db, 'event_processing_admissions', 'accepted_at', sinceMs),
+      byState: countBy(db, 'event_processing_admissions', 'state', 'accepted_at', sinceMs),
     },
     chatMessages: {
       total: countRows(db, 'chat_messages', 'timestamp', sinceMs),
@@ -436,6 +702,34 @@ export function formatOperationsMetricsPrometheus(metrics: OperationsMetrics): s
   ];
 
   appendGauge(lines, 'lethebot_raw_events_total', 'Raw events stored.', metrics.rawEvents.total);
+  appendGauge(
+    lines,
+    'lethebot_event_ingress_receipts_total',
+    'Accepted and duplicate gateway ingress receipts stored.',
+    metrics.eventIngressReceipts.total,
+  );
+  appendLabelCounts(
+    lines,
+    'lethebot_event_ingress_receipts_disposition_total',
+    'Gateway ingress receipts by bounded disposition.',
+    'disposition',
+    metrics.eventIngressReceipts.byDisposition,
+    INGRESS_DISPOSITIONS,
+  );
+  appendGauge(
+    lines,
+    'lethebot_event_processing_admissions_total',
+    'Durable event-processing admissions stored.',
+    metrics.eventProcessingAdmissions.total,
+  );
+  appendLabelCounts(
+    lines,
+    'lethebot_event_processing_admissions_state_total',
+    'Event-processing admissions by bounded lifecycle state.',
+    'state',
+    metrics.eventProcessingAdmissions.byState,
+    EVENT_PROCESSING_ADMISSION_STATES,
+  );
   appendGauge(lines, 'lethebot_chat_messages_total', 'Chat messages stored.', metrics.chatMessages.total);
   appendGauge(lines, 'lethebot_agent_turns_total', 'Agent turns stored.', metrics.agentTurns.total);
   appendGauge(lines, 'lethebot_agent_turn_tokens_total', 'Total tokens recorded on agent turns.', metrics.agentTurns.tokensTotal);

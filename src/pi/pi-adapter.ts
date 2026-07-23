@@ -21,18 +21,50 @@ import {
 } from '@earendil-works/pi-agent-core';
 import { getModel } from '@earendil-works/pi-ai/compat';
 import type { Api, Message, Model, TextContent } from '@earendil-works/pi-ai';
+import { ulid } from 'ulidx';
+import { isDeepStrictEqual } from 'node:util';
 import { createDeepSeekModel } from './deepseek-provider.js';
+import {
+  createProviderToolNameMap,
+  toProviderToolName,
+} from './tool-adapter.js';
 import type { ContextPack, RecentMessage } from '../types/context.js';
-import type { ToolRegistry } from '../tools/registry.js';
+import type { ActorContext, ToolRegistry } from '../tools/registry.js';
 import type { PolicyGate } from '../policy/gate.js';
 import type { ActorClass, InvocationContext, ToolHandler } from '../types/tool.js';
 import type { AuditEntry } from '../types/audit.js';
 import type { ToolCallRecordInput } from '../storage/tool-call-repository.js';
+import type {
+  LocalToolEffectCoordinator,
+  LocalToolTerminalEvidence,
+} from '../storage/local-tool-effect-coordinator.js';
+import {
+  isPreparedLocalToolEffect,
+  type PreparedLocalToolEffect,
+} from '../tools/prepared-local-effect.js';
+import { limitToolOutput } from '../tools/output-limit.js';
+import {
+  getToolRuntimeFailure,
+  startToolRuntimeGuard,
+} from '../tools/runtime-limit.js';
+import { isSupportedToolExecution } from '../tools/sandbox-policy.js';
 import { redactSecretsInText } from '../memory/secret-scan.js';
+import type {
+  IEvaluator,
+  ToolEvaluationRequest,
+  ToolEvaluationResult,
+} from '../types/evaluator.js';
 
 type ToolResultContent = AfterToolCallContext['result']['content'];
 
 type AuditLevel = AuditEntry['level'];
+
+const DEFAULT_TURN_TIMEOUT_MS = 120_000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const MAX_TOOL_EVALUATOR_CONTEXT_SUMMARY_CHARS = 512;
+const MAX_TOOL_EVALUATOR_USER_UTTERANCE_CHARS = 256;
+const TOOL_EVALUATOR_USER_UTTERANCE_TRUNCATION_MARKER =
+  '[TRUNCATED:tool_evaluator_user_utterance]';
 
 interface ToolAuditWriter {
   create(entry: Omit<AuditEntry, 'id'>): Promise<string>;
@@ -41,6 +73,46 @@ interface ToolAuditWriter {
 interface ToolCallWriter {
   create(entry: ToolCallRecordInput): Promise<string>;
 }
+
+interface ToolEvaluatorEvidence {
+  request: ToolEvaluationRequest;
+  result: ToolEvaluationResult;
+}
+
+interface ToolEvaluatorDecisionWriter {
+  createToolDecision(evidence: ToolEvaluatorEvidence): Promise<string>;
+}
+
+interface ToolAuditInput {
+  entry: ReturnType<ToolRegistry['getAll']>[number];
+  toolCallId: string;
+  turnId?: string;
+  params: unknown;
+  status: ToolCallRecordInput['status'];
+  actor: ActorContext;
+  invocationContext: InvocationContext;
+  requestedBy?: ToolCallRecordInput['requestedBy'];
+  summary: string;
+  output?: unknown;
+  errorMessage?: string;
+  errorCode?: string;
+  evaluatorDecisionId?: string;
+  executionTimeMs?: number;
+  redactionApplied: boolean;
+}
+
+interface ApprovedToolEvaluation {
+  evaluatorDecisionId: string;
+}
+
+type ToolEvaluationAuthorization =
+  | ({ allowed: true } & ApprovedToolEvaluation)
+  | {
+      allowed: false;
+      reason: string;
+      errorCode: string;
+      evaluatorDecisionId?: string;
+    };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -59,9 +131,11 @@ export interface PiAdapterInput {
   actor: {
     canonicalUserId?: string;
     actorClass: ActorClass;
+    groupId?: string;
   };
   invocationContext: InvocationContext;
   turnId: string;
+  sourceEventIds?: string[];
 }
 
 /**
@@ -100,11 +174,18 @@ export class PiAdapter {
   private policyGate: PolicyGate;
   private currentTurnId?: string;
   private events: PiAdapterEvent[] = [];
-  private executedToolCallIds: string[] = [];
-  private currentActor?: { canonicalUserId?: string; actorClass: ActorClass };
+  private recordedToolCallIds: string[] = [];
+  private currentActor?: ActorContext;
   private currentInvocationContext?: InvocationContext;
   private auditRepository?: ToolAuditWriter;
   private toolCallRepository?: ToolCallWriter;
+  private evaluator?: Pick<IEvaluator, 'evaluateTool'>;
+  private evaluatorDecisionWriter?: ToolEvaluatorDecisionWriter;
+  private localToolEffectCoordinator?: LocalToolEffectCoordinator;
+  private readonly turnTimeoutMs: number;
+  private turnLeaseTail: Promise<void> = Promise.resolve();
+  private providerToolNameToCanonical = new Map<string, string>();
+  private toolDirectoryGeneration = 0;
 
   constructor(options: {
     toolRegistry: ToolRegistry;
@@ -113,13 +194,30 @@ export class PiAdapter {
     model: string;
     apiKey?: string;
     baseUrl?: string;
+    turnTimeoutMs?: number;
     auditRepository?: ToolAuditWriter;
     toolCallRepository?: ToolCallWriter;
+    evaluator?: Pick<IEvaluator, 'evaluateTool'>;
+    evaluatorDecisionWriter?: ToolEvaluatorDecisionWriter;
+    localToolEffectCoordinator?: LocalToolEffectCoordinator;
   }) {
+    const turnTimeoutMs = options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS;
+    if (
+      !Number.isSafeInteger(turnTimeoutMs)
+      || turnTimeoutMs < 1
+      || turnTimeoutMs > MAX_TIMER_DELAY_MS
+    ) {
+      throw new Error(`turnTimeoutMs must be an integer between 1 and ${MAX_TIMER_DELAY_MS}`);
+    }
+
     this.toolRegistry = options.toolRegistry;
     this.policyGate = options.policyGate;
     this.auditRepository = options.auditRepository;
     this.toolCallRepository = options.toolCallRepository;
+    this.evaluator = options.evaluator;
+    this.evaluatorDecisionWriter = options.evaluatorDecisionWriter;
+    this.localToolEffectCoordinator = options.localToolEffectCoordinator;
+    this.turnTimeoutMs = turnTimeoutMs;
 
     // Create model configuration
     let model: Model<Api>;
@@ -169,12 +267,13 @@ export class PiAdapter {
    * Run a single agent turn
    */
   async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
-    this.currentTurnId = input.turnId;
-    this.events = [];
-    this.executedToolCallIds = [];
-    this.setCurrentContext(input);
+    const releaseTurnLease = await this.acquireTurnLease();
+    let deadlineReached = false;
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
 
     try {
+      this.prepareTurn(input);
+
       // Update system prompt and tools
       this.agent.state.systemPrompt = input.systemPrompt;
       this.agent.state.tools = this.convertTools(input);
@@ -183,24 +282,43 @@ export class PiAdapter {
       const messages = this.contextPackToMessages(input.contextPack);
 
       // Run Pi agent
+      deadlineTimer = setTimeout(() => {
+        deadlineReached = true;
+        this.agent.abort();
+      }, this.turnTimeoutMs);
       await this.agent.prompt(messages);
 
       // Wait for completion
       await this.agent.waitForIdle();
 
+      if (deadlineReached) {
+        throw new Error(`Pi turn timed out after ${this.turnTimeoutMs} ms`);
+      }
+
       // Extract result
       return this.extractOutput(input.turnId);
     } catch (error) {
-      console.error('[PiAdapter] runTurn failed:', formatRuntimeFailureDiagnostic(error));
+      if (deadlineReached) {
+        await this.agent.waitForIdle().catch(() => undefined);
+      }
+      const failure = deadlineReached
+        ? new Error(`Pi turn timed out after ${this.turnTimeoutMs} ms`)
+        : error;
+      console.error('[PiAdapter] runTurn failed:', formatRuntimeFailureDiagnostic(failure));
 
       return {
         turnId: input.turnId,
-        toolCallIds: this.executedToolCallIds,
+        toolCallIds: this.recordedToolCallIds,
         events: this.events,
         tokensUsed: { input: 0, output: 0, total: 0 },
         status: 'failed',
-        errorMessage: extractRuntimeFailureMessage(error),
+        errorMessage: extractRuntimeFailureMessage(failure),
       };
+    } finally {
+      if (deadlineTimer !== undefined) {
+        clearTimeout(deadlineTimer);
+      }
+      releaseTurnLease();
     }
   }
 
@@ -208,51 +326,61 @@ export class PiAdapter {
    * Stream a turn (returns async iterator)
    */
   async *streamTurn(input: PiAdapterInput): AsyncGenerator<PiAdapterEvent> {
-    this.currentTurnId = input.turnId;
-    this.events = [];
-    this.executedToolCallIds = [];
-    this.setCurrentContext(input);
+    const releaseTurnLease = await this.acquireTurnLease();
+    let runPromise: Promise<void> | undefined;
 
-    // Update system prompt and tools
-    this.agent.state.systemPrompt = input.systemPrompt;
-    this.agent.state.tools = this.convertTools(input);
+    try {
+      this.prepareTurn(input);
 
-    // Convert ContextPack to AgentMessage[]
-    const messages = this.contextPackToMessages(input.contextPack);
+      // Update system prompt and tools
+      this.agent.state.systemPrompt = input.systemPrompt;
+      this.agent.state.tools = this.convertTools(input);
 
-    // Start agent turn (non-blocking)
-    const runPromise = this.agent.prompt(messages);
+      // Convert ContextPack to AgentMessage[]
+      const messages = this.contextPackToMessages(input.contextPack);
 
-    // Yield events as they arrive
-    let eventIndex = 0;
-    while (true) {
-      // Check if new events arrived
-      if (eventIndex < this.events.length) {
+      // Start agent turn (non-blocking)
+      runPromise = this.agent.prompt(messages);
+
+      // Yield events as they arrive
+      let eventIndex = 0;
+      while (true) {
+        // Check if new events arrived
+        if (eventIndex < this.events.length) {
+          const event = this.events[eventIndex];
+          if (event) {
+            yield event;
+          }
+          eventIndex++;
+        } else if (!this.agent.state.isStreaming) {
+          // Agent finished and no more events
+          break;
+        } else {
+          // Wait a bit for next event
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
+
+      // Ensure agent is fully idle
+      await this.agent.waitForIdle();
+      await runPromise;
+
+      // Yield any remaining events
+      while (eventIndex < this.events.length) {
         const event = this.events[eventIndex];
         if (event) {
           yield event;
         }
         eventIndex++;
-      } else if (!this.agent.state.isStreaming) {
-        // Agent finished and no more events
-        break;
-      } else {
-        // Wait a bit for next event
-        await new Promise((resolve) => setTimeout(resolve, 10));
       }
-    }
-
-    // Ensure agent is fully idle
-    await this.agent.waitForIdle();
-    await runPromise;
-
-    // Yield any remaining events
-    while (eventIndex < this.events.length) {
-      const event = this.events[eventIndex];
-      if (event) {
-        yield event;
+    } finally {
+      if (runPromise) {
+        if (this.agent.state.isStreaming) {
+          this.agent.abort();
+        }
+        await Promise.allSettled([runPromise, this.agent.waitForIdle()]);
       }
-      eventIndex++;
+      releaseTurnLease();
     }
   }
 
@@ -304,7 +432,11 @@ export class PiAdapter {
     if (pack.injectedIdentityData && pack.injectedIdentityData.length > 0) {
       contextLines.push('## Identity');
       pack.injectedIdentityData.forEach((field) => {
-        contextLines.push(formatIdentityPromptLine(field));
+        contextLines.push(formatIdentityPromptLine(
+          field.name === 'target_user_ref'
+            ? { ...field, value: resolveCurrentSpeakerRef(pack) }
+            : field,
+        ));
       });
       contextLines.push('');
     }
@@ -318,6 +450,13 @@ export class PiAdapter {
       pack.participants.forEach((p) => {
         contextLines.push(formatParticipantPromptLine(p));
       });
+      contextLines.push('');
+    }
+
+    const messageReferenceLines = formatMessageReferencePromptLines(pack);
+    if (messageReferenceLines.length > 0) {
+      contextLines.push('## Message References');
+      contextLines.push(...messageReferenceLines);
       contextLines.push('');
     }
 
@@ -421,149 +560,255 @@ export class PiAdapter {
    */
   private convertTools(input: PiAdapterInput): AgentTool[] {
     const tools: AgentTool[] = [];
+    const actor = this.buildActorContext(input);
 
     // Get all registered tools
     const registryTools = this.toolRegistry.getAll();
+    const allowedTools = registryTools.filter((entry) =>
+      isSupportedToolExecution(entry.sandboxPolicy.execution)
+      && this.toolRegistry.checkPermission(entry.name, actor, input.invocationContext)
+    );
+    const providerToolNames = createProviderToolNameMap(
+      allowedTools.map((entry) => entry.name),
+    );
+    const generation = this.toolDirectoryGeneration;
 
-    registryTools.forEach((entry) => {
-      // Check if tool is allowed for this actor/context
-      const allowed = this.toolRegistry.checkPermission(
-        entry.name,
-        {
-          canonicalUserId: input.actor.canonicalUserId,
-          actorClass: input.actor.actorClass,
-        },
-        input.invocationContext
-      );
-
-      if (!allowed) {
-        // Skip tools this actor can't use
-        return;
-      }
-
+    allowedTools.forEach((entry) => {
+      const canonicalName = entry.name;
+      const canonicalEntry = { ...entry, name: canonicalName };
+      const providerName = toProviderToolName(canonicalName);
       // Convert to Pi AgentTool
       const piTool: AgentTool = {
-        name: entry.name,
-        description: entry.description,
-        label: entry.name, // Or derive from name
-        parameters: entry.piSchema.input as AgentTool['parameters'], // TypeBox TSchema
+        name: providerName,
+        description: canonicalEntry.description,
+        label: canonicalName,
+        parameters: canonicalEntry.piSchema.input as AgentTool['parameters'], // TypeBox TSchema
 
-        execute: async (toolCallId, params, _signal, _onUpdate) => {
+        execute: async (toolCallId, params, signal, _onUpdate) => {
+          if (
+            generation !== this.toolDirectoryGeneration
+            || this.providerToolNameToCanonical.get(providerName) !== canonicalName
+          ) {
+            throw new Error('Tool is not available for the current turn');
+          }
+
           const startedAt = Date.now();
           const policyResult = this.policyGate.checkToolCall({
-            toolName: entry.name,
-            actor: {
-              canonicalUserId: input.actor.canonicalUserId,
-              actorClass: input.actor.actorClass,
-            },
+            toolName: canonicalName,
+            actor,
             context: input.invocationContext,
           });
 
-          if (!policyResult.allowed || policyResult.requiresEvaluator) {
-            const reason = policyResult.allowed && policyResult.requiresEvaluator
-              ? 'Tool requires evaluator review'
-              : policyResult.reason || 'Policy gate denied execution';
+          if (!policyResult.allowed) {
+            const reason = policyResult.reason || 'Policy gate denied execution';
 
             await this.auditToolCall({
-              entry,
+              entry: canonicalEntry,
               toolCallId,
               turnId: input.turnId,
               params,
               status: 'rejected',
-              actor: input.actor,
+              actor,
               invocationContext: input.invocationContext,
-              summary: `${entry.name} rejected: ${reason}`,
+              summary: `${canonicalName} rejected: ${reason}`,
               errorMessage: reason,
-              errorCode: policyResult.allowed ? 'EVALUATOR_REQUIRED' : 'POLICY_DENIED',
+              errorCode: 'POLICY_DENIED',
               executionTimeMs: Date.now() - startedAt,
               redactionApplied: false,
             });
+            this.recordToolCallId(toolCallId);
 
             throw new Error(reason);
           }
 
+          let evaluatorDecisionId: string | undefined;
+          if (policyResult.requiresEvaluator) {
+            const authorization = await this.evaluateRequiredTool({
+              entry: canonicalEntry,
+              params,
+              actor,
+              invocationContext: input.invocationContext,
+              turnId: input.turnId,
+              sourceEventIds: input.sourceEventIds ?? [],
+              contextSummary: this.buildToolContextSummary(input.contextPack),
+            });
+
+            if (!authorization.allowed) {
+              await this.auditToolCall({
+                entry: canonicalEntry,
+                toolCallId,
+                turnId: input.turnId,
+                params,
+                status: 'rejected',
+                actor,
+                invocationContext: input.invocationContext,
+                summary: `${canonicalName} rejected by evaluator policy`,
+                errorMessage: authorization.reason,
+                errorCode: authorization.errorCode,
+                evaluatorDecisionId: authorization.evaluatorDecisionId,
+                executionTimeMs: Date.now() - startedAt,
+                redactionApplied: false,
+              });
+              this.recordToolCallId(toolCallId);
+              throw new Error(authorization.reason);
+            }
+
+            evaluatorDecisionId = authorization.evaluatorDecisionId;
+
+            const finalPolicyResult = this.policyGate.checkToolCall({
+              toolName: canonicalName,
+              actor,
+              context: input.invocationContext,
+            });
+            if (!finalPolicyResult.allowed) {
+              const reason = finalPolicyResult.reason || 'Policy gate denied execution after evaluator review';
+              await this.auditToolCall({
+                entry: canonicalEntry,
+                toolCallId,
+                turnId: input.turnId,
+                params,
+                status: 'rejected',
+                actor,
+                invocationContext: input.invocationContext,
+                summary: `${canonicalName} rejected after evaluator review`,
+                errorMessage: reason,
+                errorCode: 'POLICY_DENIED_AFTER_EVALUATION',
+                evaluatorDecisionId,
+                executionTimeMs: Date.now() - startedAt,
+                redactionApplied: false,
+              });
+              this.recordToolCallId(toolCallId);
+              throw new Error(reason);
+            }
+          }
+
           // Execute tool handler
-          const handler = this.toolRegistry.getHandler(entry.name);
+          const handler = this.toolRegistry.getHandler(canonicalName);
           if (!isToolHandler(handler)) {
-            const reason = `No resolved function handler for tool: ${entry.name}`;
+            const reason = `No resolved function handler for tool: ${canonicalName}`;
             await this.auditToolCall({
-              entry,
+              entry: canonicalEntry,
               toolCallId,
               turnId: input.turnId,
               params,
               status: 'error',
-              actor: input.actor,
+              actor,
               invocationContext: input.invocationContext,
-              summary: `${entry.name} failed: missing handler`,
+              summary: `${canonicalName} failed: missing handler`,
               errorMessage: reason,
               errorCode: 'HANDLER_NOT_FOUND',
+              evaluatorDecisionId,
               executionTimeMs: Date.now() - startedAt,
               redactionApplied: false,
             });
+            this.recordToolCallId(toolCallId);
             throw new Error(reason);
           }
 
+          let preparedEffect: PreparedLocalToolEffect | undefined;
+          const runtimeGuard = startToolRuntimeGuard(
+            signal,
+            canonicalEntry.sandboxPolicy.maxRuntimeMs,
+          );
           try {
-            // Call handler with LetheBot-specific context
-            const result = await handler({
-              toolCallId,
-              turnId: input.turnId,
-              toolName: entry.name,
-              input: params,
-              actor: input.actor,
-              context: input.invocationContext,
-            });
+            let handlerResult: unknown;
+            try {
+              runtimeGuard.throwIfAbortedOrExpired();
+              try {
+                handlerResult = await handler({
+                  toolCallId,
+                  turnId: input.turnId,
+                  toolName: canonicalName,
+                  signal: runtimeGuard.signal,
+                  input: params,
+                  actor,
+                  context: input.invocationContext,
+                  ...(evaluatorDecisionId ? { evaluatorDecisionId } : {}),
+                  ...(input.sourceEventIds && input.sourceEventIds.length > 0
+                    ? { sourceEventIds: [...input.sourceEventIds] }
+                    : {}),
+                });
+              } catch (error) {
+                runtimeGuard.throwIfAbortedOrExpired();
+                throw error;
+              }
+              preparedEffect = isPreparedLocalToolEffect(handlerResult)
+                ? handlerResult
+                : undefined;
+              runtimeGuard.throwIfAbortedOrExpired();
+            } finally {
+              runtimeGuard.dispose();
+            }
+            const result = preparedEffect ? preparedEffect.publicResult : handlerResult;
 
             // Track executed tool
-            this.executedToolCallIds.push(toolCallId);
+            this.recordToolCallId(toolCallId);
 
             const formatted = this.formatToolResult(result);
-            const redacted = redactSecretsInText(formatted);
+            const redactedText = redactRuntimeDiagnosticText(formatted);
             const redactedDetails = this.redactStructuredValue(result);
-            const redactionApplied = redacted.findings.length > 0 || redactedDetails.redacted;
+            const limitedOutput = limitToolOutput(
+              redactedText,
+              redactedDetails.value,
+              canonicalEntry.sandboxPolicy.maxOutputBytes,
+            );
+            const redactionApplied = redactedText !== formatted
+              || containsRedactionMarker(redactedText)
+              || redactedDetails.redacted;
 
-            await this.auditToolCall({
-              entry,
-              toolCallId,
-              turnId: input.turnId,
-              params,
-              status: 'success',
-              actor: input.actor,
-              invocationContext: input.invocationContext,
-              summary: `${entry.name} executed${redactionApplied ? ' (redacted)' : ''}`,
-              output: redactedDetails.value,
-              executionTimeMs: Date.now() - startedAt,
-              redactionApplied,
-            });
+            await this.auditToolCall(
+              {
+                entry: canonicalEntry,
+                toolCallId,
+                turnId: input.turnId,
+                params,
+                status: 'success',
+                actor,
+                invocationContext: input.invocationContext,
+                summary: `${canonicalName} executed${redactionApplied ? ' (redacted)' : ''}${limitedOutput.truncated ? ' (output truncated)' : ''}`,
+                output: limitedOutput.durableOutput,
+                evaluatorDecisionId,
+                executionTimeMs: Date.now() - startedAt,
+                redactionApplied,
+              },
+              preparedEffect ? { preparedEffect } : undefined,
+            );
 
             // Convert to Pi AgentToolResult
             return {
               content: [
                 {
                   type: 'text',
-                  text: redacted.text,
+                  text: limitedOutput.promptText,
                 },
               ],
-              details: redactedDetails.value,
+              details: limitedOutput.durableOutput,
               terminate: false,
             };
           } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
+            const runtimeFailure = getToolRuntimeFailure(error);
+            const message = runtimeFailure?.message
+              ?? (error instanceof Error ? error.message : String(error));
             const redactedMessage = redactSecretsInText(message);
-            await this.auditToolCall({
-              entry,
-              toolCallId,
-              turnId: input.turnId,
-              params,
-              status: 'error',
-              actor: input.actor,
-              invocationContext: input.invocationContext,
-              summary: `${entry.name} failed: ${redactedMessage.text}`,
-              errorMessage: redactedMessage.text,
-              errorCode: 'TOOL_HANDLER_ERROR',
-              executionTimeMs: Date.now() - startedAt,
-              redactionApplied: redactedMessage.findings.length > 0,
-            });
+            await this.auditToolCall(
+              {
+                entry: canonicalEntry,
+                toolCallId,
+                turnId: input.turnId,
+                params,
+                status: runtimeFailure?.status ?? 'error',
+                actor,
+                invocationContext: input.invocationContext,
+                summary: `${canonicalName} failed: ${redactedMessage.text}`,
+                errorMessage: redactedMessage.text,
+                errorCode: runtimeFailure?.code ?? 'TOOL_HANDLER_ERROR',
+                evaluatorDecisionId,
+                executionTimeMs: Date.now() - startedAt,
+                redactionApplied: redactedMessage.findings.length > 0,
+              },
+              preparedEffect ? { atomicTerminal: true } : undefined,
+            );
+            this.recordToolCallId(toolCallId);
             throw new Error(redactedMessage.text);
           }
         },
@@ -572,6 +817,7 @@ export class PiAdapter {
       tools.push(piTool);
     });
 
+    this.providerToolNameToCanonical = providerToolNames;
     return tools;
   }
 
@@ -692,18 +938,182 @@ export class PiAdapter {
 
     if (agent.state.errorMessage) {
       status = 'failed';
-      errorMessage = agent.state.errorMessage;
+      errorMessage = redactRuntimeDiagnosticText(agent.state.errorMessage);
     }
 
     return {
       turnId,
       responseText,
-      toolCallIds: this.executedToolCallIds,
+      toolCallIds: this.recordedToolCallIds,
       events: this.events,
       tokensUsed,
       status,
       errorMessage,
     };
+  }
+
+  private async evaluateRequiredTool(input: {
+    entry: ReturnType<ToolRegistry['getAll']>[number];
+    params: unknown;
+    actor: ActorContext;
+    invocationContext: InvocationContext;
+    turnId?: string;
+    sourceEventIds: string[];
+    contextSummary: string;
+  }): Promise<ToolEvaluationAuthorization> {
+    if (!this.evaluator || !this.evaluatorDecisionWriter) {
+      return {
+        allowed: false,
+        reason: 'Tool requires evaluator review',
+        errorCode: 'EVALUATOR_REQUIRED',
+      };
+    }
+
+    if (!input.turnId) {
+      return {
+        allowed: false,
+        reason: 'Tool evaluator review requires a current turn',
+        errorCode: 'EVALUATOR_TURN_REQUIRED',
+      };
+    }
+
+    if (
+      input.sourceEventIds.length === 0
+      || input.sourceEventIds.some((sourceEventId) =>
+        typeof sourceEventId !== 'string' || sourceEventId.trim().length === 0
+      )
+    ) {
+      return {
+        allowed: false,
+        reason: 'Tool evaluator review requires source event evidence',
+        errorCode: 'EVALUATOR_SOURCE_REQUIRED',
+      };
+    }
+
+    const toolInput = cloneToolInput(input.params);
+    if (!toolInput) {
+      return {
+        allowed: false,
+        reason: 'Tool evaluator input must be a cloneable object',
+        errorCode: 'EVALUATOR_INPUT_INVALID',
+      };
+    }
+
+    const request: ToolEvaluationRequest = {
+      requestId: ulid(),
+      domain: 'tool',
+      turnId: input.turnId,
+      actor: {
+        canonicalUserId: input.actor.canonicalUserId,
+        actorClass: input.actor.actorClass,
+      },
+      context: input.invocationContext,
+      sourceEventIds: [...new Set(input.sourceEventIds)],
+      contextSummary: input.contextSummary.slice(0, MAX_TOOL_EVALUATOR_CONTEXT_SUMMARY_CHARS),
+      createdAt: new Date(),
+      toolName: input.entry.name,
+      capabilities: [...input.entry.capabilities],
+      toolInput,
+      proposedReason: 'Pi requested a registered evaluator-required tool',
+    };
+
+    const evaluatorRequest = structuredClone(request);
+    let result: ToolEvaluationResult;
+    try {
+      result = await this.evaluator.evaluateTool(evaluatorRequest);
+    } catch {
+      return {
+        allowed: false,
+        reason: 'Tool evaluator review failed',
+        errorCode: 'EVALUATOR_ERROR',
+      };
+    }
+
+    if (!isDeepStrictEqual(evaluatorRequest, request)) {
+      return {
+        allowed: false,
+        reason: 'Tool evaluator mutated its review request',
+        errorCode: 'EVALUATOR_REQUEST_MUTATED',
+      };
+    }
+
+    if (!isValidToolEvaluationResult(result, request.requestId)) {
+      return {
+        allowed: false,
+        reason: 'Tool evaluator returned an invalid decision',
+        errorCode: 'EVALUATOR_INVALID_RESULT',
+      };
+    }
+
+    let evaluatorDecisionId: string;
+    try {
+      evaluatorDecisionId = await this.evaluatorDecisionWriter.createToolDecision({ request, result });
+    } catch {
+      return {
+        allowed: false,
+        reason: 'Tool evaluator decision could not be recorded',
+        errorCode: 'EVALUATOR_PERSISTENCE_ERROR',
+      };
+    }
+
+    if (evaluatorDecisionId !== result.decisionId) {
+      return {
+        allowed: false,
+        reason: 'Tool evaluator decision identity mismatch',
+        errorCode: 'EVALUATOR_IDENTITY_MISMATCH',
+      };
+    }
+
+    if (result.decision !== 'approve') {
+      return {
+        allowed: false,
+        reason: 'Tool evaluator did not approve execution',
+        errorCode: `EVALUATOR_${result.decision.toUpperCase()}`,
+        evaluatorDecisionId,
+      };
+    }
+
+    if (result.riskLevel === 'prohibited') {
+      return {
+        allowed: false,
+        reason: 'Tool evaluator classified execution as prohibited',
+        errorCode: 'EVALUATOR_PROHIBITED',
+        evaluatorDecisionId,
+      };
+    }
+
+    if (
+      result.modifiedToolInput !== undefined
+      || result.alternativeTool !== undefined
+      || result.additionalConstraints !== undefined
+    ) {
+      return {
+        allowed: false,
+        reason: 'Tool evaluator requested unsupported execution changes',
+        errorCode: 'EVALUATOR_CHANGES_UNSUPPORTED',
+        evaluatorDecisionId,
+      };
+    }
+
+    return {
+      allowed: true,
+      evaluatorDecisionId,
+    };
+  }
+
+  private buildToolContextSummary(pack: ContextPack): string {
+    const latestUserUtterance = [...pack.recentMessages]
+      .reverse()
+      .find((message) => !message.isFromBot && typeof message.text === 'string')
+      ?.text;
+
+    return buildBoundedToolEvaluatorContextSummary({
+      latestUserUtterance,
+      conversationType: pack.conversation.conversationType,
+      groupContext: Boolean(pack.conversation.groupId),
+      recentMessageCount: pack.recentMessages.length,
+      selectedMemoryCount: pack.memory.selectedMemoryIds.length,
+    });
   }
 
   /**
@@ -719,7 +1129,13 @@ export class PiAdapter {
     context: BeforeToolCallContext,
     _signal?: AbortSignal
   ): Promise<BeforeToolCallResult | undefined> {
-    const toolName = context.toolCall.name;
+    const toolName = this.providerToolNameToCanonical.get(context.toolCall.name);
+    if (!toolName) {
+      return {
+        block: true,
+        reason: 'Unknown provider tool name',
+      };
+    }
 
     // Get actor context from current turn
     const actor = this.getCurrentActor();
@@ -757,6 +1173,7 @@ export class PiAdapter {
           errorCode: 'POLICY_DENIED',
           redactionApplied: false,
         });
+        this.recordToolCallId(context.toolCall.id);
       }
 
       // Block tool execution
@@ -767,33 +1184,10 @@ export class PiAdapter {
     }
 
     if (policyResult.requiresEvaluator) {
-      const reason = 'Tool requires evaluator review (not yet implemented in adapter)';
-      if (tool) {
-        await this.auditToolCall({
-          entry: tool,
-          toolCallId: context.toolCall.id,
-          turnId: this.currentTurnId,
-          params: context.args,
-          status: 'rejected',
-          actor,
-          invocationContext,
-          summary: `${toolName} rejected: ${reason}`,
-          errorMessage: reason,
-          errorCode: 'EVALUATOR_REQUIRED',
-          redactionApplied: false,
-        });
-      }
-
-      // Tool requires evaluator review
-      // In P0, we might block and defer to orchestrator
-      // Or we could allow with flag for later evaluation
-
-      // For MVP: block tools that require evaluator
-      // Let orchestrator handle evaluator flow separately
-      return {
-        block: true,
-        reason,
-      };
+      // Pi validates arguments before this hook and invokes the wrapped execute
+      // next. Evaluator review happens there exactly once so direct execution
+      // tests and the real Pi loop share the same final authority boundary.
+      return undefined;
     }
 
     // Allow execution
@@ -813,11 +1207,20 @@ export class PiAdapter {
     context: AfterToolCallContext,
     _signal?: AbortSignal
   ): Promise<AfterToolCallResult | undefined> {
-    const toolName = context.toolCall.name;
+    const toolName = this.providerToolNameToCanonical.get(context.toolCall.name);
+    if (!toolName) {
+      return {
+        content: [{ type: 'text', text: 'Unknown provider tool name' }],
+        isError: true,
+      };
+    }
     const tool = this.toolRegistry.get(toolName);
 
     if (!tool) {
-      return undefined;
+      return {
+        content: [{ type: 'text', text: 'Provider tool is unavailable' }],
+        isError: true,
+      };
     }
 
     // Check output sensitivity
@@ -888,19 +1291,26 @@ export class PiAdapter {
     return { hasSecrets, redactedContent };
   }
 
-  private redactStructuredValue(value: unknown): { value: unknown; redacted: boolean } {
+  private redactStructuredValue(
+    value: unknown,
+    path: string[] = [],
+  ): { value: unknown; redacted: boolean } {
     if (typeof value === 'string') {
-      const redacted = redactSecretsInText(value);
+      const redacted = redactRuntimeDiagnosticText(value);
       return {
-        value: redacted.text,
-        redacted: redacted.findings.length > 0,
+        value: redacted,
+        redacted: redacted !== value || containsRedactionMarker(redacted),
       };
+    }
+
+    if (typeof value === 'number' && shouldRedactNumericPlatformId(path, value)) {
+      return { value: '[REDACTED:platform_id]', redacted: true };
     }
 
     if (Array.isArray(value)) {
       let redacted = false;
       const items = value.map((item) => {
-        const result = this.redactStructuredValue(item);
+        const result = this.redactStructuredValue(item, path);
         redacted = redacted || result.redacted;
         return result.value;
       });
@@ -912,9 +1322,13 @@ export class PiAdapter {
       const result: Record<string, unknown> = {};
 
       for (const [key, child] of Object.entries(value)) {
-        const childResult = this.redactStructuredValue(child);
-        redacted = redacted || childResult.redacted;
-        result[key] = childResult.value;
+        const redactedKey = redactRuntimeDiagnosticText(key);
+        const childResult = this.redactStructuredValue(child, [...path, key]);
+        redacted = redacted
+          || redactedKey !== key
+          || containsRedactionMarker(redactedKey)
+          || childResult.redacted;
+        result[redactedKey] = childResult.value;
       }
 
       return { value: result, redacted };
@@ -923,22 +1337,57 @@ export class PiAdapter {
     return { value, redacted: false };
   }
 
-  private async auditToolCall(input: {
-    entry: ReturnType<ToolRegistry['getAll']>[number];
-    toolCallId: string;
-    turnId?: string;
-    params: unknown;
-    status: 'success' | 'error' | 'rejected';
-    actor: { canonicalUserId?: string; actorClass: ActorClass };
-    invocationContext: InvocationContext;
-    requestedBy?: ToolCallRecordInput['requestedBy'];
-    summary: string;
-    output?: unknown;
-    errorMessage?: string;
-    errorCode?: string;
-    executionTimeMs?: number;
-    redactionApplied: boolean;
-  }): Promise<void> {
+  private recordToolCallId(toolCallId: string): void {
+    if (!this.recordedToolCallIds.includes(toolCallId)) {
+      this.recordedToolCallIds.push(toolCallId);
+    }
+  }
+
+  private async auditToolCall(
+    input: ToolAuditInput,
+    options?: {
+      preparedEffect?: PreparedLocalToolEffect;
+      atomicTerminal?: boolean;
+    },
+  ): Promise<void> {
+    const evidence = this.buildToolTerminalEvidence(input);
+
+    if (options?.preparedEffect) {
+      if (!this.localToolEffectCoordinator || !evidence.toolCall) {
+        throw new Error('prepared local tool effect requires atomic terminal persistence');
+      }
+      this.localToolEffectCoordinator.commitEffectAndTerminal(options.preparedEffect, {
+        toolCall: evidence.toolCall,
+        audit: evidence.audit,
+      });
+      return;
+    }
+
+    if (options?.atomicTerminal) {
+      if (!this.localToolEffectCoordinator || !evidence.toolCall) {
+        throw new Error(
+          'atomic tool terminal persistence requires a coordinator and turn id'
+        );
+      }
+      this.localToolEffectCoordinator.commitTerminalPair({
+        toolCall: evidence.toolCall,
+        audit: evidence.audit,
+      });
+      return;
+    }
+
+    if (this.toolCallRepository && evidence.toolCall) {
+      await this.toolCallRepository.create(evidence.toolCall);
+    }
+
+    if (this.auditRepository) {
+      await this.auditRepository.create(evidence.audit);
+    }
+  }
+
+  private buildToolTerminalEvidence(
+    input: ToolAuditInput,
+  ): Omit<LocalToolTerminalEvidence, 'toolCall'> & { toolCall?: ToolCallRecordInput } {
     const params = this.redactStructuredValue(input.params);
     const redactionApplied = input.redactionApplied || params.redacted;
     const level = this.auditLevelForExecution(input.entry.auditLevel, redactionApplied);
@@ -947,6 +1396,7 @@ export class PiAdapter {
           toolName: input.entry.name,
           status: input.status,
           capabilities: input.entry.capabilities,
+          ...(input.actor.groupId ? { groupId: input.actor.groupId } : {}),
           redactionApplied,
           errorMessage: input.errorMessage,
         }
@@ -954,6 +1404,7 @@ export class PiAdapter {
           toolName: input.entry.name,
           status: input.status,
           capabilities: input.entry.capabilities,
+          ...(input.actor.groupId ? { groupId: input.actor.groupId } : {}),
           input: params.value,
           output: input.output,
           errorMessage: input.errorMessage,
@@ -961,26 +1412,28 @@ export class PiAdapter {
         };
 
     const turnId = input.turnId ?? this.currentTurnId;
-    if (this.toolCallRepository && turnId) {
-      await this.toolCallRepository.create({
-        id: input.toolCallId,
-        turnId,
-        toolName: input.entry.name,
-        input: params.value,
-        output: input.output,
-        requestedBy: input.requestedBy ?? 'pi',
-        actor: input.actor,
-        context: input.invocationContext,
-        status: input.status,
-        errorCode: input.errorCode ?? this.defaultToolErrorCode(input.status),
-        errorMessage: input.errorMessage,
-        executionTimeMs: input.executionTimeMs,
-        secretsRedacted: redactionApplied,
-      });
-    }
+    const toolCall = turnId
+      ? {
+          id: input.toolCallId,
+          turnId,
+          toolName: input.entry.name,
+          input: params.value,
+          output: input.output,
+          requestedBy: input.requestedBy ?? 'pi',
+          actor: input.actor,
+          context: input.invocationContext,
+          status: input.status,
+          errorCode: input.errorCode ?? this.defaultToolErrorCode(input.status),
+          errorMessage: input.errorMessage,
+          evaluatorDecisionId: input.evaluatorDecisionId,
+          executionTimeMs: input.executionTimeMs,
+          secretsRedacted: redactionApplied,
+        }
+      : undefined;
 
-    if (this.auditRepository) {
-      await this.auditRepository.create({
+    return {
+      toolCall,
+      audit: {
         timestamp: new Date(),
         category: 'tool',
         level,
@@ -995,16 +1448,21 @@ export class PiAdapter {
         details,
         redacted: redactionApplied || level === 'redacted_full',
         riskLevel: this.toolRiskLevel(input.entry),
-      });
-    }
+        evaluatorDecisionId: input.evaluatorDecisionId,
+      },
+    };
   }
 
-  private defaultToolErrorCode(status: 'success' | 'error' | 'rejected'): string | undefined {
+  private defaultToolErrorCode(status: ToolCallRecordInput['status']): string | undefined {
     if (status === 'success') {
       return undefined;
     }
 
-    return status === 'rejected' ? 'TOOL_REJECTED' : 'TOOL_ERROR';
+    if (status === 'rejected') {
+      return 'TOOL_REJECTED';
+    }
+
+    return status === 'timeout' ? 'TOOL_TIMEOUT' : 'TOOL_ERROR';
   }
 
   private auditLevelForExecution(
@@ -1018,7 +1476,7 @@ export class PiAdapter {
     return configured === 'none' ? 'summary' : configured;
   }
 
-  private toolAuditEventType(status: 'success' | 'error' | 'rejected'): string {
+  private toolAuditEventType(status: ToolCallRecordInput['status']): string {
     if (status === 'success') {
       return 'tool.executed';
     }
@@ -1052,9 +1510,171 @@ export class PiAdapter {
    * (Called at beginning of runTurn/streamTurn)
    */
   private setCurrentContext(input: PiAdapterInput): void {
-    this.currentActor = input.actor;
+    this.currentActor = this.buildActorContext(input);
     this.currentInvocationContext = input.invocationContext;
   }
+
+  private prepareTurn(input: PiAdapterInput): void {
+    this.currentTurnId = input.turnId;
+    this.events = [];
+    this.recordedToolCallIds = [];
+    this.setCurrentContext(input);
+    this.toolDirectoryGeneration += 1;
+    this.providerToolNameToCanonical = new Map();
+    this.agent.reset();
+    this.agent.state.tools = [];
+  }
+
+  private async acquireTurnLease(): Promise<() => void> {
+    const previousLease = this.turnLeaseTail;
+    let releaseLease = (): void => undefined;
+    this.turnLeaseTail = new Promise<void>((resolve) => {
+      releaseLease = resolve;
+    });
+    await previousLease;
+
+    let released = false;
+    return () => {
+      if (!released) {
+        released = true;
+        releaseLease();
+      }
+    };
+  }
+
+  private buildActorContext(input: PiAdapterInput): ActorContext {
+    const actor: ActorContext = {
+      actorClass: input.actor.actorClass,
+    };
+
+    if (input.actor.canonicalUserId !== undefined) {
+      actor.canonicalUserId = input.actor.canonicalUserId;
+    }
+
+    const groupId = input.actor.groupId ?? input.contextPack.conversation.groupId;
+    if (groupId) {
+      actor.groupId = groupId;
+    }
+
+    return actor;
+  }
+}
+
+function buildBoundedToolEvaluatorContextSummary(input: {
+  latestUserUtterance?: string;
+  conversationType: ContextPack['conversation']['conversationType'];
+  groupContext: boolean;
+  recentMessageCount: number;
+  selectedMemoryCount: number;
+}): string {
+  const metadata = {
+    conversationType: input.conversationType,
+    groupContext: input.groupContext,
+    recentMessageCount: input.recentMessageCount,
+    selectedMemoryCount: input.selectedMemoryCount,
+  };
+  if (input.latestUserUtterance === undefined) {
+    return JSON.stringify(metadata);
+  }
+
+  const characters = Array.from(redactRuntimeDiagnosticText(input.latestUserUtterance));
+  const maximumPrefixLength = extendPrefixThroughRedactionMarker(
+    characters,
+    Math.min(
+      characters.length,
+      MAX_TOOL_EVALUATOR_USER_UTTERANCE_CHARS,
+    ),
+  );
+  let low = 0;
+  let high = maximumPrefixLength;
+  let best = JSON.stringify(metadata);
+
+  while (low <= high) {
+    const prefixLength = Math.floor((low + high) / 2);
+    const safePrefixLength = extendPrefixThroughRedactionMarker(characters, prefixLength);
+    const truncated = safePrefixLength < characters.length;
+    const candidateUtterance = `${characters.slice(0, safePrefixLength).join('')}${
+      truncated ? TOOL_EVALUATOR_USER_UTTERANCE_TRUNCATION_MARKER : ''
+    }`;
+    const candidate = JSON.stringify({
+      latestUserUtterance: candidateUtterance,
+      ...metadata,
+    });
+
+    if (candidate.length <= MAX_TOOL_EVALUATOR_CONTEXT_SUMMARY_CHARS) {
+      best = candidate;
+      low = prefixLength + 1;
+    } else {
+      high = prefixLength - 1;
+    }
+  }
+
+  return best;
+}
+
+function extendPrefixThroughRedactionMarker(
+  characters: string[],
+  prefixLength: number,
+): number {
+  const prefix = characters.slice(0, prefixLength).join('');
+  const markerStart = prefix.lastIndexOf('[REDACTED:');
+  if (markerStart < 0 || prefix.indexOf(']', markerStart) >= 0) {
+    return prefixLength;
+  }
+
+  const markerEnd = characters.indexOf(']', prefixLength);
+  return markerEnd < 0 ? prefixLength : markerEnd + 1;
+}
+
+function cloneToolInput(value: unknown): Record<string, unknown> | undefined {
+  if (!isPlainRecord(value)) {
+    return undefined;
+  }
+
+  try {
+    const cloned = structuredClone(value);
+    return isPlainRecord(cloned) ? cloned : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value) || Array.isArray(value)) {
+    return false;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isValidToolEvaluationResult(
+  value: unknown,
+  requestId: string,
+): value is ToolEvaluationResult {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  const decisions = new Set(['approve', 'reject', 'downgrade', 'propose']);
+  const riskLevels = new Set(['low', 'medium', 'high', 'prohibited']);
+  return value.domain === 'tool'
+    && typeof value.decisionId === 'string'
+    && value.decisionId.length > 0
+    && value.requestId === requestId
+    && typeof value.decision === 'string'
+    && decisions.has(value.decision)
+    && typeof value.reason === 'string'
+    && typeof value.confidence === 'number'
+    && Number.isFinite(value.confidence)
+    && value.confidence >= 0
+    && value.confidence <= 1
+    && typeof value.riskLevel === 'string'
+    && riskLevels.has(value.riskLevel)
+    && value.decidedAt instanceof Date
+    && Number.isFinite(value.decidedAt.getTime())
+    && typeof value.evaluatorVersion === 'string'
+    && value.evaluatorVersion.length > 0;
 }
 
 
@@ -1117,7 +1737,15 @@ function formatParticipantPromptLine(participant: ContextPack['participants'][nu
   if (participant.isAdmin) flags.push('admin');
   if (participant.isTrusted) flags.push('trusted');
 
-  const parts = [`- display_name=${formatPromptDataLiteral(participant.displayName)}`];
+  const participantWithRef = participant as ContextPack['participants'][number] & {
+    speakerRef?: string;
+  };
+  const parts = [
+    ...(participantWithRef.speakerRef
+      ? [`- speaker_ref=${validatePromptRef(participantWithRef.speakerRef, 'speaker')}`]
+      : ['-']),
+    `display_name=${formatPromptDataLiteral(participant.displayName)}`,
+  ];
   if (flags.length > 0) {
     parts.push(`flags=[${flags.join(', ')}]`);
   }
@@ -1129,6 +1757,105 @@ function formatParticipantPromptLine(participant: ContextPack['participants'][nu
   }
 
   return parts.join(' ');
+}
+
+function formatMessageReferencePromptLines(pack: ContextPack): string[] {
+  const referencedPack = pack;
+  const hasAnyReferenceData = referencedPack.currentMessageRef !== undefined
+    || referencedPack.replyReference !== undefined
+    || referencedPack.recentMessages.some((message) => (
+      message.messageRef !== undefined
+      || message.speakerRef !== undefined
+      || message.isCurrent !== undefined
+    ));
+  if (!hasAnyReferenceData) {
+    return [];
+  }
+
+  const currentMessageRef = validatePromptRef(referencedPack.currentMessageRef, 'message');
+  const lines = referencedPack.recentMessages.map((message) => {
+    const messageRef = validatePromptRef(message.messageRef, 'message');
+    const speakerRef = validatePromptRef(message.speakerRef, 'speaker');
+    if (typeof message.isCurrent !== 'boolean') {
+      throw new Error('Pi context message reference requires an explicit current marker');
+    }
+    return {
+      messageRef,
+      isCurrent: message.isCurrent,
+      line: `- message_ref=${messageRef} speaker_ref=${speakerRef} role=${message.isFromBot ? 'bot' : 'human'} current=${message.isCurrent}`,
+    };
+  });
+  if (new Set(lines.map((message) => message.messageRef)).size !== lines.length) {
+    throw new Error('Pi context message references must be unique');
+  }
+  const currentMessages = lines.filter((message) => message.isCurrent);
+  if (currentMessages.length !== 1 || currentMessages[0]?.messageRef !== currentMessageRef) {
+    throw new Error('Pi context current message reference is inconsistent');
+  }
+
+  const promptLines = lines.map((message) => message.line);
+  if (referencedPack.replyReference) {
+    promptLines.push(formatReplyReferencePromptLine(
+      referencedPack.replyReference,
+      currentMessageRef,
+    ));
+  }
+  return promptLines;
+}
+
+function formatReplyReferencePromptLine(
+  reference: NonNullable<ContextPack['replyReference']>,
+  currentMessageRef: string,
+): string {
+  const sourceMessageRef = validatePromptRef(reference.sourceMessageRef, 'message');
+  if (sourceMessageRef !== currentMessageRef) {
+    throw new Error('Pi context reply source does not match the current message');
+  }
+  if (reference.status === 'unresolved') {
+    if (
+      reference.targetMessageRef !== undefined
+      || reference.targetSpeakerRef !== undefined
+      || reference.targetRole !== undefined
+      || reference.targetInRollingWindow !== undefined
+    ) {
+      throw new Error('Pi unresolved reply reference cannot contain a target');
+    }
+    return `- reply status=unresolved source_message_ref=${sourceMessageRef}`;
+  }
+  if (reference.status !== 'resolved') {
+    throw new Error('Pi context reply reference status is invalid');
+  }
+
+  const targetMessageRef = validatePromptRef(reference.targetMessageRef, 'message');
+  const targetSpeakerRef = validatePromptRef(reference.targetSpeakerRef, 'speaker');
+  if (
+    (reference.targetRole !== 'human' && reference.targetRole !== 'bot')
+    || typeof reference.targetInRollingWindow !== 'boolean'
+  ) {
+    throw new Error('Pi resolved reply reference target is invalid');
+  }
+  return `- reply status=resolved source_message_ref=${sourceMessageRef} target_message_ref=${targetMessageRef} target_speaker_ref=${targetSpeakerRef} target_role=${reference.targetRole} target_in_rolling_window=${reference.targetInRollingWindow}`;
+}
+
+function validatePromptRef(
+  value: string | undefined,
+  kind: 'message' | 'speaker',
+): string {
+  if (typeof value !== 'string' || !new RegExp(`^${kind}_[1-9]\\d*$`).test(value)) {
+    throw new Error(`Pi context ${kind} ref is invalid`);
+  }
+  return value;
+}
+
+function resolveCurrentSpeakerRef(pack: ContextPack): string {
+  const currentMessageRef = validatePromptRef(pack.currentMessageRef, 'message');
+  const currentMessage = pack.recentMessages.find((message) => (
+    message.messageRef === currentMessageRef && message.isCurrent === true
+  ));
+  if (!currentMessage) {
+    throw new Error('Pi target user ref requires the explicit current message');
+  }
+  return validatePromptRef(currentMessage.speakerRef, 'speaker');
 }
 
 function formatIdentityPromptLine(field: NonNullable<ContextPack['injectedIdentityData']>[number]): string {
@@ -1157,4 +1884,25 @@ function redactPlatformIdentifiers(value: string): string {
   return value
     .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
     .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
+}
+
+function shouldRedactNumericPlatformId(path: string[], value: number): boolean {
+  return Number.isInteger(value)
+    && isPlatformIdField(path)
+    && /^\d{8,12}$/.test(String(Math.abs(value)));
+}
+
+function isPlatformIdField(path: string[]): boolean {
+  const key = path.at(-1);
+  if (!key) {
+    return false;
+  }
+
+  return /(^|_)(?:target|subject|recipient|actor|owner)?[_-]?(user|sender|group|message|conversation|platform|qq)[_-]?ids?$/i.test(key)
+    || /^(?:target|subject|recipient|actor|owner)?(?:User|Sender|Group|Message|Conversation|Platform|Qq)Ids?$/i.test(key)
+    || /^(userId|senderId|groupId|messageId|conversationId|platformUserId|platformMessageId)$/i.test(key);
+}
+
+function containsRedactionMarker(value: string): boolean {
+  return /\[REDACTED:[^\]]+\]/.test(value);
 }

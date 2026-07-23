@@ -14,6 +14,7 @@ import type { ActorClass, InvocationContext, ToolCallResult } from '../types/too
 export interface ToolCallRecordInput {
   id?: string;
   turnId: string;
+  evaluatorDecisionId?: string;
   toolName: string;
   input: unknown;
   output?: unknown;
@@ -34,6 +35,7 @@ export interface ToolCallRecordInput {
 export interface ToolCallRecord {
   id: string;
   turnId: string;
+  evaluatorDecisionId?: string;
   toolName: string;
   input: unknown;
   output?: unknown;
@@ -54,6 +56,7 @@ export interface ToolCallRecord {
 interface ToolCallRow {
   id: string;
   turn_id: string;
+  evaluator_decision_id: string | null;
   tool_name: string;
   input: string;
   output: string | null;
@@ -73,6 +76,10 @@ export class ToolCallRepository {
   constructor(private readonly db: Database.Database) {}
 
   async create(input: ToolCallRecordInput): Promise<string> {
+    return this.createSync(input);
+  }
+
+  createSync(input: ToolCallRecordInput): string {
     const id = input.id ?? ulid();
     const createdAt = input.createdAt ?? Date.now();
     const storedInput = redactStoredToolCallValue(input.input ?? null);
@@ -88,15 +95,16 @@ export class ToolCallRepository {
     this.db
       .prepare(
         `INSERT INTO tool_calls (
-          id, turn_id, tool_name, input, output,
+          id, turn_id, evaluator_decision_id, tool_name, input, output,
           requested_by, actor_user_id, actor_class, invocation_context,
           status, error_code, error_message, execution_time_ms,
           secrets_redacted, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
         input.turnId,
+        input.evaluatorDecisionId ?? null,
         input.toolName,
         JSON.stringify(storedInput.value),
         storedOutput === undefined ? null : JSON.stringify(storedOutput.value),
@@ -134,6 +142,7 @@ export class ToolCallRepository {
     return {
       id: row.id,
       turnId: row.turn_id,
+      evaluatorDecisionId: row.evaluator_decision_id ?? undefined,
       toolName: row.tool_name,
       input: JSON.parse(row.input) as unknown,
       output,

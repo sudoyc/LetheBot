@@ -4,23 +4,20 @@
  * 风险评估器 - LLM 辅助的模糊场景判断
  */
 
-import type { ActorClass, InvocationContext, ToolCapability } from './tool';
-import type { ActionPlan, ActionType } from './action';
-import type { MemoryRecord } from './memory';
-import type { AttentionSignals } from './attention';
+import type { ActorClass, InvocationContext, ToolCapability } from './tool.js';
+import type { ActionPlan, ActionType } from './action.js';
+import type { MemoryRecord } from './memory.js';
+import type { AttentionSignals } from './attention.js';
 
 /**
  * 评估器请求基础接口
  */
-export interface EvaluatorRequest {
+interface EvaluatorRequestBase {
   /** 请求 ID (ULID) */
   requestId: string;
 
   /** 请求类型：工具/记忆/社交行动 */
   domain: 'tool' | 'memory' | 'social';
-
-  /** Agent turn ID（关联到具体对话回合） */
-  turnId: string;
 
   /** 触发评估的 actor */
   actor: {
@@ -41,10 +38,28 @@ export interface EvaluatorRequest {
   createdAt: Date;
 }
 
+type TurnEvaluatorAuthority = {
+  /** Agent turn ID（关联到具体对话回合） */
+  turnId: string;
+  jobAttemptId?: never;
+};
+
+export type MemoryEvaluationAuthority =
+  | TurnEvaluatorAuthority
+  | {
+    turnId?: never;
+    /** Durable background job attempt that owns this evaluation. */
+    jobAttemptId: string;
+  };
+
+export type EvaluatorRequest =
+  | (EvaluatorRequestBase & TurnEvaluatorAuthority)
+  | (EvaluatorRequestBase & { domain: 'memory' } & Extract<MemoryEvaluationAuthority, { jobAttemptId: string }>);
+
 /**
  * 工具调用评估请求
  */
-export interface ToolEvaluationRequest extends EvaluatorRequest {
+export interface ToolEvaluationRequest extends EvaluatorRequestBase, TurnEvaluatorAuthority {
   domain: 'tool';
 
   /** 工具名称 */
@@ -63,7 +78,7 @@ export interface ToolEvaluationRequest extends EvaluatorRequest {
 /**
  * 记忆评估请求
  */
-export interface MemoryEvaluationRequest extends EvaluatorRequest {
+interface MemoryEvaluationRequestFields extends EvaluatorRequestBase {
   domain: 'memory';
 
   /** 记忆候选 */
@@ -82,10 +97,12 @@ export interface MemoryEvaluationRequest extends EvaluatorRequest {
   initialRiskLevel: 'low' | 'medium' | 'high';
 }
 
+export type MemoryEvaluationRequest = MemoryEvaluationRequestFields & MemoryEvaluationAuthority;
+
 /**
  * 社交行动评估请求
  */
-export interface SocialEvaluationRequest extends EvaluatorRequest {
+export interface SocialEvaluationRequest extends EvaluatorRequestBase, TurnEvaluatorAuthority {
   domain: 'social';
 
   /** 提议的行动 */
@@ -125,6 +142,9 @@ export interface EvaluatorResult {
 
   /** Evaluator 版本/模型标识 */
   evaluatorVersion: string;
+
+  /** Durable model invocation evidence, assigned locally by model-backed evaluators. */
+  modelInvocationId?: string;
 }
 
 /**

@@ -39,10 +39,80 @@ describe('GovernanceCLI', () => {
       Date.now(),
       Date.now()
     );
+
+    const sourceTimestamp = Date.now();
+    for (const canonicalUserId of ['user-alice', 'user-bob']) {
+      db.prepare(
+        `INSERT INTO platform_accounts (
+          platform, platform_account_id, canonical_user_id, account_type,
+          verified_level, status, first_seen_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        'qq',
+        canonicalUserId,
+        canonicalUserId,
+        'private',
+        'observed',
+        'active',
+        sourceTimestamp,
+        sourceTimestamp,
+      );
+    }
+    db.prepare(
+      `INSERT INTO raw_events (
+        id, type, timestamp, source, platform, conversation_id, payload, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'raw-governance-source',
+      'chat.message.received',
+      sourceTimestamp,
+      'gateway',
+      'qq',
+      'private:user-alice',
+      '{}',
+      sourceTimestamp
+    );
+    db.prepare(
+      `INSERT INTO raw_events (
+        id, type, timestamp, source, platform, conversation_id, payload, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'raw-governance-group-source',
+      'chat.message.received',
+      sourceTimestamp,
+      'gateway',
+      'qq',
+      'group:group-dev',
+      '{}',
+      sourceTimestamp,
+    );
+    const insertSourceChatMessage = db.prepare(
+      `INSERT INTO chat_messages (
+        id, raw_event_id, message_id, conversation_id, conversation_type,
+        group_id, sender_id, text, has_media, has_quote, mentions_bot, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    for (const sourceId of ['msg-source-1', 'msg-source-2', 'msg-show-1']) {
+      const isGroupSource = sourceId === 'msg-source-2';
+      insertSourceChatMessage.run(
+        sourceId,
+        isGroupSource ? 'raw-governance-group-source' : 'raw-governance-source',
+        `platform-${sourceId}`,
+        isGroupSource ? 'group:group-dev' : 'private:user-alice',
+        isGroupSource ? 'group' : 'private',
+        isGroupSource ? 'group-dev' : null,
+        'user-alice',
+        'fixture source',
+        0,
+        0,
+        0,
+        sourceTimestamp
+      );
+    }
   });
 
   async function createMemory(overrides: Partial<Parameters<MemoryRepository['create']>[0]> = {}): Promise<string> {
-    return memoryRepo.create({
+    const input: Parameters<MemoryRepository['create']>[0] = {
       scope: 'user',
       visibility: 'private_only',
       sensitivity: 'normal',
@@ -56,6 +126,70 @@ describe('GovernanceCLI', () => {
       importance: 0.8,
       sourceContext: 'private_chat',
       ...overrides,
+    };
+    if (input.sources) {
+      return memoryRepo.create(input);
+    }
+
+    const sourceTimestamp = Date.now();
+    const sourceCount = db.prepare(
+      "SELECT COUNT(*) AS count FROM chat_messages WHERE id LIKE 'msg-governance-memory-source-%'"
+    ).get() as { count: number };
+    const sourceIndex = sourceCount.count + 1;
+    const rawEventId = `raw-governance-memory-source-${sourceIndex}`;
+    const chatMessageId = `msg-governance-memory-source-${sourceIndex}`;
+    const isGroupSource = input.scope === 'group'
+      || input.visibility === 'same_group_only'
+      || (input.scope === 'conversation' && input.groupId !== undefined);
+    const senderId = input.scope === 'user'
+      ? (input.canonicalUserId ?? 'user-alice')
+      : 'user-alice';
+    const conversationId = input.conversationId
+      ?? (isGroupSource
+        ? `group:${input.groupId ?? 'governance-source'}`
+        : `private:${senderId}`);
+
+    db.prepare(
+      `INSERT INTO raw_events (
+        id, type, timestamp, source, platform, conversation_id, payload, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      rawEventId,
+      'chat.message.received',
+      sourceTimestamp,
+      'gateway',
+      'qq',
+      conversationId,
+      '{}',
+      sourceTimestamp,
+    );
+    db.prepare(
+      `INSERT INTO chat_messages (
+        id, raw_event_id, message_id, conversation_id, conversation_type,
+        group_id, sender_id, text, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      chatMessageId,
+      rawEventId,
+      `platform-${chatMessageId}`,
+      conversationId,
+      isGroupSource ? 'group' : 'private',
+      isGroupSource ? (input.groupId ?? null) : null,
+      senderId,
+      'Synthetic governance memory provenance',
+      sourceTimestamp,
+    );
+
+    return memoryRepo.create({
+      ...input,
+      sources: [
+        {
+          sourceType: 'chat_message',
+          sourceId: chatMessageId,
+          sourceTimestamp,
+          extractedBy: 'evaluator',
+        },
+      ],
     });
   }
 
@@ -67,6 +201,7 @@ describe('GovernanceCLI', () => {
 
   function getAuditRows(memoryId: string): Array<{
     event_type: string;
+    actor_user_id: string | null;
     actor_class: string | null;
     invocation_context: string | null;
     summary: string;
@@ -74,13 +209,14 @@ describe('GovernanceCLI', () => {
   }> {
     return db
       .prepare(
-        `SELECT event_type, actor_class, invocation_context, summary, details
+        `SELECT event_type, actor_user_id, actor_class, invocation_context, summary, details
          FROM audit_log
          WHERE category = 'memory' AND event_id = ?
          ORDER BY timestamp ASC`
       )
       .all(memoryId) as Array<{
       event_type: string;
+      actor_user_id: string | null;
       actor_class: string | null;
       invocation_context: string | null;
       summary: string;
@@ -210,7 +346,7 @@ describe('GovernanceCLI', () => {
 
   describe('listMemory', () => {
     it('should list all active memory', async () => {
-      await memoryRepo.create({
+      await createMemory({
         scope: 'user',
         visibility: 'private_only',
         sensitivity: 'normal',
@@ -225,8 +361,9 @@ describe('GovernanceCLI', () => {
         sourceContext: 'private_chat',
       });
 
-      await memoryRepo.create({
+      await createMemory({
         scope: 'group',
+        canonicalUserId: undefined,
         visibility: 'same_group_only',
         sensitivity: 'normal',
         state: 'active',
@@ -247,7 +384,7 @@ describe('GovernanceCLI', () => {
     });
 
     it('should filter by user', async () => {
-      await memoryRepo.create({
+      await createMemory({
         scope: 'user',
         visibility: 'private_only',
         sensitivity: 'normal',
@@ -268,7 +405,7 @@ describe('GovernanceCLI', () => {
     });
 
     it('should filter by state', async () => {
-      await memoryRepo.create({
+      await createMemory({
         scope: 'user',
         visibility: 'private_only',
         sensitivity: 'normal',
@@ -283,7 +420,7 @@ describe('GovernanceCLI', () => {
         sourceContext: 'private_chat',
       });
 
-      await memoryRepo.create({
+      await createMemory({
         scope: 'user',
         visibility: 'private_only',
         sensitivity: 'normal',
@@ -363,7 +500,10 @@ describe('GovernanceCLI', () => {
       const memoryId = await createMemory();
 
       const result = await cli.deleteMemory(memoryId);
-      expect(result.success).toBe(true);
+      expect(result).toEqual({
+        success: true,
+        message: `Memory ${memoryId} deleted`,
+      });
 
       const memory = await memoryRepo.retrieve({ canonicalUserId: 'user-alice' });
       expect(memory).toHaveLength(0);
@@ -373,15 +513,19 @@ describe('GovernanceCLI', () => {
 
       const revisions = getRevisionRows(memoryId);
       expect(revisions.map((row) => row.change_type)).toEqual(['create', 'delete']);
-      expect(revisions[1]?.actor).toBe('admin');
+      expect(revisions[1]?.actor).toBe('local_admin');
       expect(revisions[1]?.reason).toBe('Governance CLI delete memory');
 
       const auditRows = getAuditRows(memoryId);
       const deleteAudit = auditRows.find((row) => row.event_type === 'memory.delete');
       expect(deleteAudit).toMatchObject({
+        actor_user_id: 'local_admin',
         actor_class: 'admin',
         invocation_context: 'admin_cli',
         summary: `Governance CLI deleted memory ${memoryId}`,
+      });
+      expect(JSON.parse(deleteAudit?.details ?? '{}')).toMatchObject({
+        governanceActor: 'local_admin',
       });
     });
 
@@ -389,6 +533,71 @@ describe('GovernanceCLI', () => {
       const result = await cli.deleteMemory('nonexistent');
       expect(result.success).toBe(false);
       expect(result.error).toContain('not found');
+    });
+
+    it('bounds and redacts caller-controlled memory IDs in command results', async () => {
+      const platformLike = await cli.deleteMemory('missing-12345');
+      const hostileId = `${'x'.repeat(129)}\n\u001b[31mqq-123456789`;
+      const hostile = await cli.deleteMemory(hostileId);
+
+      expect(platformLike).toEqual({
+        success: false,
+        error: 'Memory [redacted-id] not found',
+      });
+      expect(hostile).toEqual({
+        success: false,
+        error: 'Memory [redacted-id] not found',
+      });
+      expect(hostile.error).not.toContain('\n');
+      expect(hostile.error).not.toContain('\u001b');
+      expect(hostile.error).not.toContain('123456789');
+    });
+
+    it('redacts a successful 5-digit memory ID from display and durable audit bodies', async () => {
+      const memoryId = await createMemory({ id: '12345' });
+
+      expect(await cli.deleteMemory(memoryId)).toEqual({
+        success: true,
+        message: 'Memory [redacted-id] deleted',
+      });
+      const audit = db.prepare(
+        `SELECT event_id, summary, details
+           FROM audit_log
+          WHERE event_type = 'memory.delete' AND event_id = ?`,
+      ).get(memoryId) as { event_id: string; summary: string; details: string };
+      const auditBody = `${audit.summary}\n${audit.details}`;
+      expect(audit.event_id).toBe(memoryId);
+      expect(audit.summary).toBe('Governance CLI deleted memory [redacted-id]');
+      expect(JSON.parse(audit.details)).toMatchObject({ memoryId: '[redacted-id]' });
+      expect(auditBody).not.toContain(memoryId);
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+    });
+
+    it('projects a successful hostile memory ID out of deletion audit bodies', async () => {
+      const memoryId = `${'x'.repeat(129)}\n\u001b[31mqq-123456789`;
+      await createMemory({ id: memoryId });
+
+      expect(await cli.deleteMemory(memoryId)).toEqual({
+        success: true,
+        message: 'Memory [redacted-id] deleted',
+      });
+      const audit = db.prepare(
+        `SELECT event_id, summary, details
+           FROM audit_log
+          WHERE event_type = 'memory.delete' AND event_id = ?`,
+      ).get(memoryId) as { event_id: string; summary: string; details: string };
+      const details = JSON.parse(audit.details) as {
+        memoryId: string;
+        policyDecision: string;
+      };
+      expect(audit.event_id).toBe(memoryId);
+      expect(audit.summary).toBe('Governance CLI deleted memory [redacted-id]');
+      expect(details.memoryId).toBe('[redacted-id]');
+      expect(details.policyDecision).toMatch(/^policy:l0:deleted:sha256:[0-9a-f]{64}$/);
+      expect(audit.summary).not.toContain('\u001b');
+      expect(audit.details).not.toContain('123456789');
+      expect(audit.details).not.toContain('x'.repeat(129));
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
     });
   });
 
@@ -1130,17 +1339,46 @@ describe('GovernanceCLI', () => {
       );
 
       db.prepare(
+        `INSERT INTO jobs (
+          id, type, payload, status, attempts, max_attempts, created_at, updated_at, scheduled_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run('job-qq-123456789', 'admin_digest', '{}', 'pending', 0, 2, now, now, now);
+
+      db.prepare(
+        `INSERT INTO memory_records (
+          id, scope, visibility, sensitivity, authority, kind, title, content,
+          state, confidence, importance, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        'mem-qq-987654321',
+        'global',
+        'owner_admin_only',
+        'normal',
+        'inferred',
+        'summary',
+        'Governance action memory',
+        'Action execution created proposed memory',
+        'proposed',
+        0.8,
+        0.5,
+        now,
+        now
+      );
+
+      db.prepare(
         `INSERT INTO action_executions (
           id, action_decision_id, action_type, status,
-          executed_message_id, downgraded_from, downgraded_reason,
+          executed_message_id, executed_memory_id, executed_job_id, downgraded_from, downgraded_reason,
           error_code, error_message, audit_level, audit_entry, executed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         'execution-inspect',
         'decision-inspect',
-        'reply_full',
+        'admin_digest',
         'success',
         'msg-out-1',
+        'mem-qq-987654321',
+        'job-qq-123456789',
         null,
         null,
         null,
@@ -1196,8 +1434,12 @@ describe('GovernanceCLI', () => {
       expect(executions[0]).toMatchObject({
         id: 'execution-inspect',
         status: 'success',
+        executedMemoryId: 'mem-[REDACTED:platform_id]',
+        executedJobId: 'job-[REDACTED:platform_id]',
         auditEntry: 'audit [REDACTED:password_assignment]',
       });
+      expect(JSON.stringify(executions[0])).not.toContain('job-qq-123456789');
+      expect(JSON.stringify(executions[0])).not.toContain('mem-qq-987654321');
 
       expect(toolCallsWithoutPayload[0].input).toBeUndefined();
       expect(toolCallsWithoutPayload[0].output).toBeUndefined();
@@ -1563,6 +1805,11 @@ describe('GovernanceCLI', () => {
       expect(explanation.filtersApplied).toContain('state=active');
       expect(explanation.recentMessageIds).toContain('msg-why');
       expect(explanation.memories.map((memory) => memory.memoryId)).toContain(memoryId);
+      expect(explanation.memorySelections).toContainEqual(expect.objectContaining({
+        memoryId,
+        retrievalMethods: expect.arrayContaining(['scoped_rank', 'fts']),
+        selectionReason: 'query_match',
+      }));
     });
 
     it('should prefer stored context trace when available', async () => {
@@ -1652,6 +1899,7 @@ describe('GovernanceCLI', () => {
       ]);
       expect(explanation.recentMessageIds).toEqual(['msg-stored-why']);
       expect(explanation.tokenBudget.used).toBe(321);
+      expect(explanation.memorySelections).toBeUndefined();
       expect(explanation.memories).toEqual([
         {
           memoryId: 'mem-selected',
@@ -1661,6 +1909,148 @@ describe('GovernanceCLI', () => {
           sourceContext: 'test',
         },
       ]);
+    });
+  });
+
+  describe('platform account unlink', () => {
+    it('should atomically disable an active mapping and insert a redacted identity audit row', async () => {
+      const platformAccountId = '1234567890';
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO platform_accounts (
+          platform, platform_account_id, canonical_user_id, account_type,
+          verified_level, status, first_seen_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        'qq',
+        platformAccountId,
+        'user-alice',
+        'private',
+        'owner_verified',
+        'active',
+        now,
+        now,
+      );
+
+      const result = await cli.unlinkPlatformAccount({ platform: 'qq', platformAccountId });
+
+      expect(result).toEqual({
+        success: true,
+        message: 'Platform account mapping disabled',
+      });
+      expect(
+        db.prepare(
+          'SELECT status FROM platform_accounts WHERE platform = ? AND platform_account_id = ?'
+        ).get('qq', platformAccountId)
+      ).toEqual({ status: 'disabled' });
+
+      const audit = db
+        .prepare(
+          `SELECT * FROM audit_log
+           WHERE category = 'system' AND event_type = 'identity.platform_account.unlinked'`
+        )
+        .get() as {
+        level: string;
+        event_id: string;
+        actor_user_id: string | null;
+        actor_class: string;
+        invocation_context: string;
+        summary: string;
+        details: string;
+        redacted: number;
+        risk_level: string;
+      };
+      const details = JSON.parse(audit.details) as Record<string, unknown>;
+
+      expect(audit).toMatchObject({
+        level: 'summary',
+        actor_user_id: null,
+        actor_class: 'admin',
+        invocation_context: 'admin_cli',
+        summary: 'Governance CLI disabled one platform account mapping',
+        redacted: 1,
+        risk_level: 'medium',
+      });
+      expect(audit.event_id).toMatch(/^identity-unlink-/);
+      expect(details).toMatchObject({
+        platform: 'qq',
+        canonicalUserId: 'user-alice',
+        previousStatus: 'active',
+        newStatus: 'disabled',
+        redaction: 'no_raw_platform_account_id',
+      });
+      expect(details).not.toHaveProperty('platformAccountId');
+      expect(JSON.stringify({ audit, details })).not.toContain(platformAccountId);
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+    });
+
+    it('should fail unknown and inactive mappings without mutation or audit', async () => {
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO platform_accounts (
+          platform, platform_account_id, canonical_user_id, account_type,
+          verified_level, status, first_seen_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        'qq', '2234567890', 'user-alice', 'private', 'observed', 'disabled', now, now,
+        'qq', '3234567890', 'user-bob', 'group_member', 'observed', 'deleted', now, now,
+      );
+      const beforeMappings = db
+        .prepare('SELECT * FROM platform_accounts ORDER BY platform_account_id')
+        .all();
+      const beforeAudit = db.prepare('SELECT * FROM audit_log ORDER BY id').all();
+
+      const results = await Promise.all([
+        cli.unlinkPlatformAccount({ platform: 'qq', platformAccountId: '4234567890' }),
+        cli.unlinkPlatformAccount({ platform: 'qq', platformAccountId: '2234567890' }),
+        cli.unlinkPlatformAccount({ platform: 'qq', platformAccountId: '3234567890' }),
+      ]);
+
+      expect(results).toEqual([
+        { success: false, error: 'Platform account mapping not found or not active' },
+        { success: false, error: 'Platform account mapping not found or not active' },
+        { success: false, error: 'Platform account mapping not found or not active' },
+      ]);
+      expect(
+        db.prepare('SELECT * FROM platform_accounts ORDER BY platform_account_id').all()
+      ).toEqual(beforeMappings);
+      expect(db.prepare('SELECT * FROM audit_log ORDER BY id').all()).toEqual(beforeAudit);
+    });
+
+    it('should roll back the mapping update when the audit insert fails', async () => {
+      const platformAccountId = '5234567890';
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO platform_accounts (
+          platform, platform_account_id, canonical_user_id, account_type,
+          verified_level, status, first_seen_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        'qq', platformAccountId, 'user-alice', 'private', 'observed', 'active', now, now,
+      );
+      db.exec(
+        `CREATE TRIGGER fail_platform_account_unlink_audit
+         BEFORE INSERT ON audit_log
+         WHEN NEW.event_type = 'identity.platform_account.unlinked'
+         BEGIN
+           SELECT RAISE(ABORT, 'injected unlink audit failure');
+         END;`
+      );
+
+      const result = await cli.unlinkPlatformAccount({ platform: 'qq', platformAccountId });
+
+      expect(result).toEqual({ success: false, error: 'Platform account unlink failed' });
+      expect(
+        db.prepare(
+          'SELECT status FROM platform_accounts WHERE platform = ? AND platform_account_id = ?'
+        ).get('qq', platformAccountId)
+      ).toEqual({ status: 'active' });
+      expect(
+        db.prepare(
+          `SELECT COUNT(*) AS count FROM audit_log
+           WHERE event_type = 'identity.platform_account.unlinked'`
+        ).get()
+      ).toEqual({ count: 0 });
     });
   });
 

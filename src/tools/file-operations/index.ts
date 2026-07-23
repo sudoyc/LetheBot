@@ -4,13 +4,13 @@
  * 文件操作工具集合，提供读取、写入、列出、删除等基础文件操作
  */
 
-import type { ToolHandlerRequest, ToolRegistryEntry } from '../../types/tool';
-import type { SandboxPolicy } from '../../types/tool';
-import type { FileOperationContext } from './path-validator';
-import { ReadFileHandler } from './handlers/read-file';
-import { WriteFileHandler } from './handlers/write-file';
-import { ListDirectoryHandler } from './handlers/list-directory';
-import { DeleteFileHandler } from './handlers/delete-file';
+import type { ToolHandlerRequest, ToolRegistryEntry } from '../../types/tool.js';
+import type { SandboxPolicy } from '../../types/tool.js';
+import type { FileOperationContext } from './path-validator.js';
+import { ReadFileHandler } from './handlers/read-file.js';
+import { WriteFileHandler } from './handlers/write-file.js';
+import { ListDirectoryHandler } from './handlers/list-directory.js';
+import { DeleteFileHandler } from './handlers/delete-file.js';
 
 const readFileHandler = new ReadFileHandler();
 const writeFileHandler = new WriteFileHandler();
@@ -24,6 +24,7 @@ function buildFileOperationContext(
   return {
     toolCallId: request.toolCallId,
     turnId: request.turnId,
+    signal: request.signal,
     workspaceRoot: process.env.LETHEBOT_WORKSPACE_ROOT ?? process.cwd(),
     sandboxPolicy,
     allowedPaths: sandboxPolicy.allowedPaths,
@@ -273,5 +274,5 @@ export const fileOperationTools: ToolRegistryEntry[] = [
 ];
 
 // 导出处理器
-export * from './handlers';
-export * from './path-validator';
+export * from './handlers/index.js';
+export * from './path-validator.js';

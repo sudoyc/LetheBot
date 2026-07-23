@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type Database from 'better-sqlite3';
-import { initDatabase, runMigration, closeDatabase } from '../../src/storage/database';
+import { initDatabase, runMigrations, closeDatabase } from '../../src/storage/database';
 import { ContextBuilder } from '../../src/context/builder';
 import { MemoryRepository } from '../../src/storage/memory-repository';
 import { IdentityRepository } from '../../src/storage/identity-repository';
@@ -18,6 +18,7 @@ describe('Memory Injection Integration', () => {
   let testDir: string;
   let db: Database.Database;
   let memoryRepo: MemoryRepository;
+  let createMemory: MemoryRepository['create'];
   let identityRepo: IdentityRepository;
   let builder: ContextBuilder;
 
@@ -26,25 +27,65 @@ describe('Memory Injection Integration', () => {
     testDir = mkdtempSync(join(tmpdir(), 'lethebot-integration-'));
     const dbPath = join(testDir, 'test.db');
     db = initDatabase({ path: dbPath });
-    runMigration(db, join(__dirname, '../../migrations/001_initial_schema.sql'));
+    runMigrations(db, join(__dirname, '../../migrations'));
 
     // 初始化仓储和构建器
     memoryRepo = new MemoryRepository(db);
     identityRepo = new IdentityRepository(db);
     builder = new ContextBuilder(memoryRepo, identityRepo);
 
+    const now = Date.now();
+    createMemory = (input) => memoryRepo.create({
+      ...input,
+      sources: input.sources ?? [
+        {
+          sourceType: 'raw_event',
+          sourceId: 'raw-memory-injection-source',
+          sourceTimestamp: now,
+          extractedBy: 'user',
+        },
+      ],
+    });
+
     // 创建测试用户
     db.prepare('INSERT INTO canonical_users (id, created_at, last_seen_at) VALUES (?, ?, ?)').run(
       'user-alice',
-      Date.now(),
-      Date.now()
+      now,
+      now
     );
 
     db.prepare('INSERT INTO canonical_users (id, created_at, last_seen_at) VALUES (?, ?, ?)').run(
       'user-bob',
-      Date.now(),
-      Date.now()
+      now,
+      now
     );
+    seedActiveQqAccount(db, 'user-alice', 'qq-user-alice', now);
+    seedActiveQqAccount(db, 'user-bob', 'qq-user-bob', now);
+    seedMemoryEvidence(db, {
+      rawEventId: 'raw-memory-injection-source',
+      chatMessageId: 'msg-memory-injection-source',
+      conversationId: 'private:user-alice',
+      conversationType: 'private',
+      senderId: 'qq-user-alice',
+      timestamp: now,
+    });
+    seedMemoryEvidence(db, {
+      rawEventId: 'raw-memory-injection-bob-source',
+      chatMessageId: 'msg-memory-injection-bob-source',
+      conversationId: 'private:user-bob',
+      conversationType: 'private',
+      senderId: 'qq-user-bob',
+      timestamp: now + 1,
+    });
+    seedMemoryEvidence(db, {
+      rawEventId: 'raw-memory-injection-bob-group-source',
+      chatMessageId: 'msg-memory-injection-bob-group-source',
+      conversationId: 'group:backend-team',
+      conversationType: 'group',
+      groupId: 'group-backend-team',
+      senderId: 'qq-user-bob',
+      timestamp: now + 2,
+    });
   });
 
   afterEach(() => {
@@ -59,7 +100,7 @@ describe('Memory Injection Integration', () => {
   describe('Memory Visibility Filtering', () => {
     it('should filter out private_only memory in group chat context', async () => {
       // 创建 private_only 记忆
-      await memoryRepo.create({
+      await createMemory({
         scope: 'user',
         canonicalUserId: 'user-alice',
         visibility: 'private_only',
@@ -100,7 +141,7 @@ describe('Memory Injection Integration', () => {
 
     it('should include private_only memory in private chat context', async () => {
       // 创建 private_only 记忆
-      const memoryId = await memoryRepo.create({
+      const memoryId = await createMemory({
         scope: 'user',
         canonicalUserId: 'user-alice',
         visibility: 'private_only',
@@ -142,7 +183,7 @@ describe('Memory Injection Integration', () => {
 
     it('should filter same_group_only memory to correct group only', async () => {
       // 创建 same_group_only 记忆
-      const memoryId = await memoryRepo.create({
+      const memoryId = await createMemory({
         scope: 'user',
         canonicalUserId: 'user-bob',
         groupId: 'group-backend-team',
@@ -156,6 +197,10 @@ describe('Memory Injection Integration', () => {
         confidence: 0.85,
         importance: 0.6,
         sourceContext: 'group:backend-team conversation',
+        sources: [{
+          sourceType: 'raw_event',
+          sourceId: 'raw-memory-injection-bob-group-source',
+        }],
       });
 
       // 构建相同群组的上下文
@@ -189,7 +234,7 @@ describe('Memory Injection Integration', () => {
   describe('Memory Recall in Context', () => {
     it('should include same_user_any_context memory in both private and group contexts', async () => {
       // 创建 same_user_any_context 记忆
-      const memoryId = await memoryRepo.create({
+      const memoryId = await createMemory({
         scope: 'user',
         canonicalUserId: 'user-alice',
         visibility: 'same_user_any_context',
@@ -234,7 +279,7 @@ describe('Memory Injection Integration', () => {
 
     it('should include public memory in all contexts', async () => {
       // 创建 public 记忆
-      const memoryId = await memoryRepo.create({
+      const memoryId = await createMemory({
         scope: 'global',
         visibility: 'public',
         sensitivity: 'normal',
@@ -280,7 +325,7 @@ describe('Memory Injection Integration', () => {
 
     it('should exclude owner_admin_only memory by default', async () => {
       // 创建 owner_admin_only 记忆
-      await memoryRepo.create({
+      await createMemory({
         scope: 'user',
         canonicalUserId: 'user-bob',
         visibility: 'owner_admin_only',
@@ -293,6 +338,10 @@ describe('Memory Injection Integration', () => {
         confidence: 1.0,
         importance: 0.9,
         sourceContext: 'system audit',
+        sources: [{
+          sourceType: 'raw_event',
+          sourceId: 'raw-memory-injection-bob-source',
+        }],
       });
 
       // 构建上下文
@@ -310,7 +359,7 @@ describe('Memory Injection Integration', () => {
 
     it('should only include active state memories', async () => {
       // 创建不同状态的记忆
-      const activeId = await memoryRepo.create({
+      const activeId = await createMemory({
         scope: 'user',
         canonicalUserId: 'user-alice',
         visibility: 'same_user_any_context',
@@ -325,7 +374,7 @@ describe('Memory Injection Integration', () => {
         sourceContext: 'conversation',
       });
 
-      const disabledId = await memoryRepo.create({
+      const disabledId = await createMemory({
         scope: 'user',
         canonicalUserId: 'user-alice',
         visibility: 'same_user_any_context',
@@ -342,7 +391,7 @@ describe('Memory Injection Integration', () => {
 
       await memoryRepo.disable(disabledId);
 
-      const deletedId = await memoryRepo.create({
+      const deletedId = await createMemory({
         scope: 'user',
         canonicalUserId: 'user-alice',
         visibility: 'same_user_any_context',
@@ -380,7 +429,7 @@ describe('Memory Injection Integration', () => {
       // 场景：用户在私聊中分享敏感信息，然后在群组中交互
 
       // 1. 在私聊中创建敏感记忆
-      const privateMemoryId = await memoryRepo.create({
+      const privateMemoryId = await createMemory({
         scope: 'user',
         canonicalUserId: 'user-alice',
         visibility: 'private_only',
@@ -396,7 +445,7 @@ describe('Memory Injection Integration', () => {
       });
 
       // 2. 创建通用偏好记忆
-      const generalMemoryId = await memoryRepo.create({
+      const generalMemoryId = await createMemory({
         scope: 'user',
         canonicalUserId: 'user-alice',
         visibility: 'same_user_any_context',
@@ -477,7 +526,7 @@ describe('Memory Injection Integration', () => {
 
     it('should handle token budget calculation with memory injection', async () => {
       // 创建多个记忆
-      await memoryRepo.create({
+      await createMemory({
         scope: 'user',
         canonicalUserId: 'user-bob',
         visibility: 'same_user_any_context',
@@ -490,9 +539,13 @@ describe('Memory Injection Integration', () => {
         confidence: 0.85,
         importance: 0.7,
         sourceContext: 'code review discussions',
+        sources: [{
+          sourceType: 'raw_event',
+          sourceId: 'raw-memory-injection-bob-source',
+        }],
       });
 
-      await memoryRepo.create({
+      await createMemory({
         scope: 'user',
         canonicalUserId: 'user-bob',
         visibility: 'same_user_any_context',
@@ -505,6 +558,10 @@ describe('Memory Injection Integration', () => {
         confidence: 0.9,
         importance: 0.6,
         sourceContext: 'tech stack discussion',
+        sources: [{
+          sourceType: 'raw_event',
+          sourceId: 'raw-memory-injection-bob-source',
+        }],
       });
 
       // 构建带消息和记忆的上下文
@@ -537,3 +594,67 @@ describe('Memory Injection Integration', () => {
     });
   });
 });
+
+function seedActiveQqAccount(
+  db: Database.Database,
+  canonicalUserId: string,
+  platformAccountId: string,
+  timestamp: number,
+): void {
+  db.prepare(
+    `INSERT INTO platform_accounts (
+      platform, platform_account_id, canonical_user_id, account_type,
+      verified_level, status, first_seen_at, last_seen_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    'qq',
+    platformAccountId,
+    canonicalUserId,
+    'private',
+    'observed',
+    'active',
+    timestamp,
+    timestamp,
+  );
+}
+
+function seedMemoryEvidence(db: Database.Database, input: {
+  rawEventId: string;
+  chatMessageId: string;
+  conversationId: string;
+  conversationType: 'private' | 'group';
+  groupId?: string;
+  senderId: string;
+  timestamp: number;
+}): void {
+  db.prepare(
+    `INSERT INTO raw_events (
+      id, type, timestamp, source, platform, conversation_id, payload, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    input.rawEventId,
+    'chat.message.received',
+    input.timestamp,
+    'gateway',
+    'qq',
+    input.conversationId,
+    '{}',
+    input.timestamp,
+  );
+  db.prepare(
+    `INSERT INTO chat_messages (
+      id, raw_event_id, message_id, conversation_id, conversation_type,
+      group_id, sender_id, text, timestamp
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    input.chatMessageId,
+    input.rawEventId,
+    `platform-${input.chatMessageId}`,
+    input.conversationId,
+    input.conversationType,
+    input.groupId ?? null,
+    input.senderId,
+    'Synthetic memory provenance',
+    input.timestamp,
+  );
+}

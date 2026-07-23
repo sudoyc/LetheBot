@@ -8,8 +8,8 @@
 
 import type Database from 'better-sqlite3';
 import { ulid } from 'ulidx';
-import { redactSecretsInText } from '../memory/secret-scan';
-import type { ActorClass, InvocationContext } from '../types/tool';
+import { redactSecretsInText } from '../memory/secret-scan.js';
+import type { ActorClass, InvocationContext } from '../types/tool.js';
 
 export type PrivacyPreferenceType = 'proactive_dm' | 'memory_association';
 export type PrivacyPreferenceState = 'opted_in' | 'opted_out';
