@@ -98,9 +98,9 @@ function activationLockTempFixture(owner: {
 
 const schemaContract = {
   contractVersion: 1,
-  targetVersion: 6,
+  targetVersion: 8,
   minReadableVersion: 1,
-  maxReadableVersion: 6,
+  maxReadableVersion: 8,
   adoptsLegacyUnversioned: true,
 };
 
@@ -141,6 +141,16 @@ function writeRelease(releaseDir: string): void {
   writeFileSync(
     join(releaseDir, 'migrations/006_group_summary_policy.sql'),
     'SELECT 6;\n',
+    'utf8',
+  );
+  writeFileSync(
+    join(releaseDir, 'migrations/007_pi_turn_model_invocations.sql'),
+    'SELECT 7;\n',
+    'utf8',
+  );
+  writeFileSync(
+    join(releaseDir, 'migrations/008_memory_maintenance_proposals.sql'),
+    'SELECT 8;\n',
     'utf8',
   );
   writeFileSync(
@@ -603,7 +613,7 @@ describe('application release activation', () => {
       recordSchemaVersion(db, 4, 'Current correction-attempt schema');
       recordSchemaVersion(db, 5, 'Current delayed-attention schema');
       recordSchemaVersion(db, 6, 'Current group-summary-policy schema');
-      recordSchemaVersion(db, 7, 'Future schema');
+      recordSchemaVersion(db, 8, 'Future schema');
       db.exec(`
         CREATE TABLE release_guard_sentinel (value TEXT NOT NULL);
         INSERT INTO release_guard_sentinel (value) VALUES ('preserved');
@@ -631,7 +641,7 @@ describe('application release activation', () => {
           { version: 4 },
           { version: 5 },
           { version: 6 },
-          { version: 7 },
+          { version: 8 },
         ]);
       expect(unchanged.prepare('SELECT value FROM release_guard_sentinel').get())
         .toEqual({ value: 'preserved' });

@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync 
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type Database from 'better-sqlite3';
-import { initDatabase, runMigration, closeDatabase } from '../../src/storage/database';
+import { initDatabase, runMigration, runMigrations, closeDatabase } from '../../src/storage/database';
 import { JobRepository } from '../../src/storage/job-repository';
 import { BackgroundWorker } from '../../src/workers/background';
 
@@ -90,7 +90,7 @@ describe('ops maintenance CLI', () => {
   }
 
   it('runs documented backup, restore, retention, and metrics commands on a temp migrated DB', () => {
-    const now = Date.UTC(2026, 6, 3);
+    const now = Date.now();
     const old = now - 45 * 24 * 60 * 60 * 1000;
     const recent = now - 2 * 24 * 60 * 60 * 1000;
     seedOperationalRows(old, recent);
@@ -173,7 +173,7 @@ describe('ops maintenance CLI', () => {
     const futureMetrics = JSON.parse(expectSuccessfulOps([
       'metrics',
       `--db=${dbPath}`,
-      '--since=2026-07-04T00:00:00.000Z',
+      `--since=${new Date(now + 24 * 60 * 60 * 1000).toISOString()}`,
     ])) as {
       rawEvents: { total: number };
       jobs: { total: number };
@@ -260,6 +260,123 @@ describe('ops maintenance CLI', () => {
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 
+  it('exports ledger-aligned usage counters through JSON and Prometheus metrics', () => {
+    runMigrations(db, join(process.cwd(), 'migrations'));
+    const now = Date.UTC(2026, 6, 3);
+    db.prepare(
+      `INSERT INTO raw_events (
+        id, type, timestamp, source, platform, conversation_id, payload, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run('evt-ops-ledger', 'chat.message.received', now, 'gateway', 'qq', 'private:ops', '{}', now);
+    db.prepare(
+      `INSERT INTO agent_turns (
+        id, conversation_id, trigger_event_id, pi_model, pi_provider, status, started_at
+      ) VALUES (?, ?, ?, ?, ?, 'running', ?)`,
+    ).run('turn-ops-ledger', 'private:ops', 'evt-ops-ledger', 'ops-model', 'ops-provider', now);
+    db.prepare(
+      `INSERT INTO event_processing_admissions (
+        raw_event_id, state, accepted_at, processing_started_at, finished_at, reason_code
+      ) VALUES (?, 'completed', ?, ?, ?, NULL)`,
+    ).run('evt-ops-ledger', now - 10, now, now + 20);
+    db.prepare(
+      `INSERT INTO model_invocations (
+        id, turn_id, purpose, call_number, provider, model, status,
+        started_at, completed_at, tokens_input, tokens_output, tokens_total,
+        response_sha256, response_bytes
+      ) VALUES (?, ?, 'pi_turn', ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      'invocation-ops-ledger-known',
+      'turn-ops-ledger',
+      1,
+      'ops-provider',
+      'ops-model',
+      now,
+      now + 1,
+      2,
+      3,
+      5,
+      'a'.repeat(64),
+      5,
+    );
+    db.prepare(
+      `INSERT INTO model_invocations (
+        id, turn_id, purpose, call_number, provider, model, status,
+        started_at, completed_at, response_sha256, response_bytes
+      ) VALUES (?, ?, 'pi_turn', ?, ?, ?, 'completed', ?, ?, ?, ?)`,
+    ).run(
+      'invocation-ops-ledger-unknown',
+      'turn-ops-ledger',
+      2,
+      'ops-provider',
+      'ops-model',
+      now,
+      now + 2,
+      'b'.repeat(64),
+      0,
+    );
+    db.prepare(
+      `UPDATE agent_turns SET status = 'completed', completed_at = ? WHERE id = ?`,
+    ).run(now + 20, 'turn-ops-ledger');
+    closeDatabase(db);
+
+    const metrics = JSON.parse(expectSuccessfulOps([
+      'metrics',
+      `--db=${dbPath}`,
+      `--since=${new Date(now - 1_000).toISOString()}`,
+    ])) as {
+      agentTurns: {
+        completedKnownUsage: number;
+        completedUnknownUsage: number;
+      };
+      modelInvocations: {
+        total: number;
+        byPurpose: Record<string, number>;
+        byStatus: Record<string, number>;
+        completedKnownUsage: number;
+        completedUnknownUsage: number;
+      };
+      latency: {
+        queueWaitMs: { count: number; sumMs: number; maxMs: number };
+        providerLatencyMs: { count: number; sumMs: number; maxMs: number };
+        totalTurnLatencyMs: { count: number; sumMs: number; maxMs: number };
+      };
+    };
+    expect(metrics.agentTurns).toMatchObject({
+      completedKnownUsage: 0,
+      completedUnknownUsage: 1,
+    });
+    expect(metrics.modelInvocations).toMatchObject({
+      total: 2,
+      byPurpose: { pi_turn: 2 },
+      byStatus: { completed: 2 },
+      completedKnownUsage: 1,
+      completedUnknownUsage: 1,
+    });
+    expect(metrics.latency).toEqual({
+      queueWaitMs: { count: 1, sumMs: 10, maxMs: 10 },
+      providerLatencyMs: { count: 2, sumMs: 3, maxMs: 2 },
+      totalTurnLatencyMs: { count: 1, sumMs: 30, maxMs: 30 },
+    });
+
+    const prometheus = expectSuccessfulOps([
+      'metrics',
+      `--db=${dbPath}`,
+      '--format=prometheus',
+    ]);
+    expect(prometheus).toContain('lethebot_model_invocations_total 2');
+    expect(prometheus).toContain('lethebot_model_invocations_purpose_total{purpose="pi_turn"} 2');
+    expect(prometheus).toContain('lethebot_model_invocations_completed_known_usage_total 1');
+    expect(prometheus).toContain('lethebot_model_invocations_completed_unknown_usage_total 1');
+    expect(prometheus).toContain('lethebot_turn_queue_wait_ms_count 1');
+    expect(prometheus).toContain('lethebot_turn_queue_wait_ms_sum 10');
+    expect(prometheus).toContain('lethebot_pi_provider_latency_ms_count 2');
+    expect(prometheus).toContain('lethebot_pi_provider_latency_ms_sum 3');
+    expect(prometheus).toContain('lethebot_turn_total_latency_ms_count 1');
+    expect(prometheus).toContain('lethebot_turn_total_latency_ms_sum 30');
+    expect(prometheus).not.toContain('invocation-ops-ledger');
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
   it('runs doctor with read-only aggregate DB and configuration evidence', () => {
     const now = Date.UTC(2026, 6, 3);
     const old = now - 45 * 24 * 60 * 60 * 1000;
@@ -287,12 +404,18 @@ describe('ops maintenance CLI', () => {
       ONEBOT_WS_URL: `ws://example.invalid/${secret}/${platformId}`,
       ONEBOT_TOKEN: `token-${secret}-${platformId}`,
       LETHEBOT_BOT_QQ_ID: platformId,
+      LETHEBOT_RAW_EVENT_RETENTION_DAYS: '30',
+      LETHEBOT_CHAT_MESSAGE_RETENTION_DAYS: '90',
+      LETHEBOT_AUDIT_LOG_RETENTION_DAYS: '90',
+      LETHEBOT_DISABLED_DELETED_MEMORY_RETENTION_DAYS: '365',
+      LETHEBOT_EVENT_PROCESSING_FAILURE_RETENTION_DAYS: '90',
     });
     expect(result.status, result.stderr).toBe(0);
     expect(result.stderr).toBe('');
     expect(result.stdout).not.toBe('');
     const stdout = result.stdout;
     const doctor = JSON.parse(stdout) as {
+      generatedAt: string;
       overall: string;
       database: {
         dbPath: string;
@@ -335,8 +458,44 @@ describe('ops maintenance CLI', () => {
           metricsPathConfigured: boolean;
           eventPathConfigured: boolean;
         };
+        retentionDays: {
+          rawEvents: number;
+          chatMessages: number;
+          auditLog: number;
+          disabledDeletedMemory: number;
+          eventProcessingFailures: number;
+        };
       };
     };
+
+    expect(Object.keys(doctor)).toEqual([
+      'generatedAt',
+      'overall',
+      'database',
+      'schema',
+      'counts',
+      'configuration',
+    ]);
+    expect(doctor.generatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u);
+    expect(Object.keys(doctor.database)).toEqual([
+      'dbPath',
+      'open',
+      'readonly',
+      'integrityOk',
+      'integrityResult',
+      'foreignKeyViolations',
+    ]);
+    expect(Object.keys(doctor.schema)).toEqual([
+      'ready',
+      'requiredTablesPresent',
+      'requiredTablesTotal',
+      'missingTables',
+    ]);
+    expect(Object.keys(doctor.configuration)).toEqual([
+      'oneBot',
+      'server',
+      'retentionDays',
+    ]);
 
     expect(doctor.overall).toBe('ok');
     expect(doctor.database).toMatchObject({
@@ -376,6 +535,13 @@ describe('ops maintenance CLI', () => {
       readinessPathConfigured: true,
       metricsPathConfigured: true,
       eventPathConfigured: true,
+    });
+    expect(doctor.configuration.retentionDays).toEqual({
+      rawEvents: 30,
+      chatMessages: 90,
+      auditLog: 90,
+      disabledDeletedMemory: 365,
+      eventProcessingFailures: 90,
     });
 
     expect(stdout).not.toContain(secret);

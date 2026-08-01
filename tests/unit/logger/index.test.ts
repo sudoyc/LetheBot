@@ -63,6 +63,32 @@ describe('Logger', () => {
     expect(serialized).not.toContain('3456789012');
   });
 
+  test('redacts 5-7 digit platform identifiers in nested log values', () => {
+    const sanitized = sanitizeLogValueForOutput({
+      diagnostic: 'users=12345,234567,3456789',
+      nested: {
+        user_id: 12345,
+        senderId: 234567,
+        group_ids: [3456789],
+      },
+      processedCount: 45678,
+      shortValue: '1234',
+      longValue: '1234567890123',
+    });
+
+    expect(sanitized).toEqual({
+      diagnostic: 'users=[REDACTED:platform_id],[REDACTED:platform_id],[REDACTED:platform_id]',
+      nested: {
+        user_id: '[REDACTED:platform_id]',
+        senderId: '[REDACTED:platform_id]',
+        group_ids: ['[REDACTED:platform_id]'],
+      },
+      processedCount: 45678,
+      shortValue: '1234',
+      longValue: '1234567890123',
+    });
+  });
+
   test('sanitizeLogValueForOutput redacts numeric platform identifiers in prefixed ID fields', () => {
     const sanitized = sanitizeLogValueForOutput({
       targetUserId: 1234567890,

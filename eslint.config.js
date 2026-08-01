@@ -5,6 +5,19 @@ import tsparser from '@typescript-eslint/parser';
 export default [
   eslint.configs.recommended,
   {
+    files: ['src/http/governance-browser-assets/**/*.js'],
+    languageOptions: {
+      globals: {
+        document: 'readonly',
+        fetch: 'readonly',
+        window: 'readonly',
+      },
+    },
+    rules: {
+      'no-unused-vars': 'off',
+    },
+  },
+  {
     files: ['**/*.ts'],
     languageOptions: {
       parser: tsparser,

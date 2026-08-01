@@ -37,7 +37,7 @@ describe('NapCat Config Loader', () => {
       expect(config.token).toBeUndefined();
       expect(config.botQqId).toBeUndefined();
       expect(config.serverPort).toBe(6700);
-      expect(config.serverHost).toBe('0.0.0.0');
+      expect(config.serverHost).toBe('127.0.0.1');
       expect(config.healthCheckPath).toBe('/healthz');
       expect(config.readinessPath).toBe('/readyz');
       expect(config.metricsPath).toBe('/metrics');

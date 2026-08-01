@@ -66,6 +66,7 @@ export interface SandboxPolicy {
   maxOutputBytes?: number;
   allowedPaths?: string[];
   allowedDomains?: string[];
+  allowedOrigins?: string[];
 }
 
 /**

@@ -8,7 +8,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
-    "build": "tsc",
+    "build": "tsc && node dist/scripts/copy-governance-browser-assets.js",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src tests --ext .ts",
     "lint:fix": "eslint src tests --ext .ts --fix",
@@ -58,9 +58,9 @@
   "packageManager": "pnpm@9.0.0",
   "lethebotSchema": {
     "contractVersion": 1,
-    "targetVersion": 6,
+    "targetVersion": 8,
     "minReadableVersion": 1,
-    "maxReadableVersion": 6,
+    "maxReadableVersion": 8,
     "adoptsLegacyUnversioned": true
   },
   "dependencies": {

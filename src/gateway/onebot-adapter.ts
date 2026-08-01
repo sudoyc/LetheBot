@@ -191,6 +191,24 @@ export class OneBotAdapter extends EventEmitter {
   }
 
   /**
+   * 判断 headers 是否可在不读取 body 的前提下通过 Bearer，或提供了可供
+   * bounded-body HMAC 校验的 SnowLuma signature。
+   */
+  hasHttpEventAuthCandidate(headers: AuthHeaders): boolean {
+    const expectedToken = this.config.token;
+    if (!expectedToken) {
+      return true;
+    }
+
+    if (this.hasValidBearerToken(headers, expectedToken)) {
+      return true;
+    }
+
+    const signature = this.getHeader(headers, 'x-signature')?.trim();
+    return /^sha1=[0-9a-f]{40}$/.test(signature ?? '');
+  }
+
+  /**
    * 校验 reverse HTTP event 的访问令牌。
    *
    * 若未配置 ONEBOT_TOKEN，则允许本地/dev 流量；配置后接受：
@@ -203,9 +221,7 @@ export class OneBotAdapter extends EventEmitter {
       return true;
     }
 
-    const authorization = this.getHeader(headers, 'authorization')?.trim();
-    const [scheme, ...rest] = authorization?.split(/\s+/) ?? [];
-    if (scheme?.toLowerCase() === 'bearer' && rest.join(' ') === expectedToken) {
+    if (this.hasValidBearerToken(headers, expectedToken)) {
       return true;
     }
 
@@ -968,6 +984,12 @@ export class OneBotAdapter extends EventEmitter {
     }
 
     return value;
+  }
+
+  private hasValidBearerToken(headers: AuthHeaders, expectedToken: string): boolean {
+    const authorization = this.getHeader(headers, 'authorization')?.trim();
+    const [scheme, ...rest] = authorization?.split(/\s+/) ?? [];
+    return scheme?.toLowerCase() === 'bearer' && rest.join(' ') === expectedToken;
   }
 
   private validateSnowLumaSignature(signature: string, rawBody: string, token: string): boolean {

@@ -140,6 +140,9 @@ describe('OneBotAdapter', () => {
       token: 'event-token',
     });
 
+    expect(adapter.hasHttpEventAuthCandidate({ authorization: 'Bearer event-token' })).toBe(true);
+    expect(adapter.hasHttpEventAuthCandidate({ authorization: 'Bearer wrong-token' })).toBe(false);
+    expect(adapter.hasHttpEventAuthCandidate({})).toBe(false);
     expect(adapter.validateHttpEventAuth({ authorization: 'Bearer event-token' })).toBe(true);
     expect(adapter.validateHttpEventAuth({ authorization: 'Bearer wrong-token' })).toBe(false);
     expect(adapter.validateHttpEventAuth({})).toBe(false);
@@ -153,6 +156,8 @@ describe('OneBotAdapter', () => {
     const body = JSON.stringify({ post_type: 'message', message_type: 'private' });
     const signature = `sha1=${createHmac('sha1', 'event-token').update(body).digest('hex')}`;
 
+    expect(adapter.hasHttpEventAuthCandidate({ 'x-signature': signature })).toBe(true);
+    expect(adapter.hasHttpEventAuthCandidate({ 'x-signature': 'sha1=bad' })).toBe(false);
     expect(adapter.validateHttpEventAuth({ 'x-signature': signature }, body)).toBe(true);
     expect(adapter.validateHttpEventAuth({ 'x-signature': 'sha1=bad' }, body)).toBe(false);
   });
@@ -160,6 +165,7 @@ describe('OneBotAdapter', () => {
   it('allows reverse HTTP events when no token is configured', () => {
     const adapter = new OneBotAdapter({ httpUrl: 'http://localhost:3000' });
 
+    expect(adapter.hasHttpEventAuthCandidate({})).toBe(true);
     expect(adapter.validateHttpEventAuth({})).toBe(true);
   });
 

@@ -22,12 +22,16 @@ import {
   runMigration,
   runMigrations,
 } from '../../../src/storage/database.js';
+import { ModelInvocationRepository } from '../../../src/storage/model-invocation-repository.js';
+import { TurnRepository } from '../../../src/storage/turn-repository.js';
 import {
   applyRetentionPolicy,
   backupSqliteDatabase,
   collectOperationsMetrics,
   formatOperationsMetricsPrometheus,
+  planRetentionPolicy,
   restoreSqliteDatabase,
+  verifySqliteSnapshotIntegrity,
 } from '../../../src/operations/sqlite-maintenance.js';
 
 const migrationPath = join(process.cwd(), 'migrations/001_initial_schema.sql');
@@ -117,6 +121,45 @@ describe('SQLite operations maintenance', () => {
 
       expect(child.status).toBe(0);
       expect(statSync(backupPath).mode & 0o777).toBe(0o600);
+    } finally {
+      closeDatabase(db);
+    }
+  });
+
+  it('verifies copied WAL snapshots in memory without changing bytes or directory entries', async () => {
+    const dir = createTempDir();
+    const sourcePath = join(dir, 'snapshot-source.db');
+    const backupPath = join(dir, 'snapshot-backup.db');
+    const db = initDatabase({ path: sourcePath });
+
+    try {
+      runMigration(db, migrationPath);
+      const backup = await backupSqliteDatabase({ sourcePath, backupPath });
+      expect(backup.integrityOk).toBe(true);
+      const databaseBytes = readFileSync(backupPath);
+      const bytesBefore = Buffer.from(databaseBytes);
+      const filesBefore = readdirSync(dir).sort();
+
+      expect([databaseBytes[18], databaseBytes[19]]).toEqual([2, 2]);
+      expect(verifySqliteSnapshotIntegrity(databaseBytes)).toEqual({ ok: true, result: 'ok' });
+      expect(databaseBytes).toEqual(bytesBefore);
+      expect(readdirSync(dir).sort()).toEqual(filesBefore);
+
+      const invalidHeader = Buffer.from(databaseBytes);
+      invalidHeader[18] = 3;
+      expect(verifySqliteSnapshotIntegrity(invalidHeader)).toEqual({
+        ok: false,
+        result: 'invalid database snapshot',
+      });
+      expect(readdirSync(dir).sort()).toEqual(filesBefore);
+
+      const corrupt = Buffer.from(databaseBytes);
+      corrupt[0] = 0;
+      expect(verifySqliteSnapshotIntegrity(corrupt)).toEqual({
+        ok: false,
+        result: 'invalid database snapshot',
+      });
+      expect(readdirSync(dir).sort()).toEqual(filesBefore);
     } finally {
       closeDatabase(db);
     }
@@ -540,6 +583,54 @@ describe('SQLite operations maintenance', () => {
           'SELECT executed_memory_id FROM action_executions WHERE id = ?'
         ).get('execution-memory-retention')
       ).toEqual({ executed_memory_id: null });
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+    } finally {
+      closeDatabase(db);
+    }
+  });
+
+  it('plans rejected-memory purge before chat and raw-event deletion', () => {
+    const dir = createTempDir();
+    const db = initDatabase({ path: join(dir, 'retention-plan.db') });
+    const now = Date.UTC(2026, 6, 2);
+    const old = now - 100 * 24 * 60 * 60 * 1000;
+
+    try {
+      runMigrations(db, migrationDirectory);
+      insertRawEvent(db, 'evt-rejected-source', old);
+      insertChatMessage(db, 'msg-rejected-source', 'evt-rejected-source', old);
+      insertMemory(db, 'mem-old-rejected', 'rejected', old);
+      insertMemorySource(db, 'mem-old-rejected', 'chat_message', 'msg-rejected-source', old);
+      insertMemory(db, 'mem-old-active', 'active', old);
+
+      const policy = {
+        rawEventsDays: 90,
+        chatMessagesDays: 90,
+        auditLogDays: 365,
+        disabledDeletedMemoryDays: 90,
+        eventProcessingFailuresDays: 90,
+      };
+      const first = planRetentionPolicy(db, policy, now);
+      const second = planRetentionPolicy(db, policy, now);
+
+      expect(first.effects).toMatchObject({
+        memoriesPurged: 1,
+        memorySourcesDeleted: 1,
+        chatMessagesDeleted: 1,
+        rawEventsDeleted: 1,
+      });
+      expect(first.candidates.memoryRecordIds).toEqual(['mem-old-rejected']);
+      expect(first.candidates.chatMessageIds).toEqual(['msg-rejected-source']);
+      expect(first.candidates.rawEventIds).toEqual(['evt-rejected-source']);
+      expect(first.stateFingerprint).toBe(second.stateFingerprint);
+      expect(first.candidateFingerprints.memories).toHaveLength(1);
+      expect(first.candidateFingerprints.memories?.[0]).toMatch(/^[0-9a-f]{64}$/);
+
+      expect(applyRetentionPolicy(db, policy, now)).toEqual(first.effects);
+      expect(count(db, 'memory_records', 'id', 'mem-old-rejected')).toBe(0);
+      expect(count(db, 'memory_records', 'id', 'mem-old-active')).toBe(1);
+      expect(count(db, 'chat_messages', 'id', 'msg-rejected-source')).toBe(0);
+      expect(count(db, 'raw_events', 'id', 'evt-rejected-source')).toBe(0);
       expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
     } finally {
       closeDatabase(db);
@@ -1044,13 +1135,13 @@ describe('SQLite operations maintenance', () => {
     }
   });
 
-  it('collects operations metrics for turns, memory writes, policy audit, and tools', () => {
+  it('collects operations metrics for turns, memory writes, policy audit, and tools', async () => {
     const dir = createTempDir();
     const db = initDatabase({ path: join(dir, 'metrics.db') });
     const now = Date.UTC(2026, 6, 2);
 
     try {
-      runMigration(db, migrationPath);
+      runMigrations(db, migrationDirectory);
       insertRawEvent(db, 'evt-metrics', now);
       insertChatMessage(db, 'msg-metrics', 'evt-metrics', now);
       db.prepare(
@@ -1090,6 +1181,43 @@ describe('SQLite operations maintenance', () => {
         now,
         now,
       );
+
+      const turnRepo = new TurnRepository(db);
+      const invocationRepo = new ModelInvocationRepository(db);
+      const ledgerTurnId = await turnRepo.createPending({
+        id: 'turn-metrics-ledger',
+        conversationId: 'private:qq-1',
+        triggerEventId: 'evt-metrics',
+        piModel: 'metrics-model',
+        piProvider: 'metrics-provider',
+        startedAt: new Date(now),
+      });
+      await turnRepo.markRunning(ledgerTurnId, 'context-metrics-ledger');
+      const knownInvocationId = invocationRepo.startPiTurnInvocation({
+        id: 'invocation-metrics-known',
+        turnId: ledgerTurnId,
+        callNumber: 1,
+        provider: 'metrics-provider',
+        model: 'metrics-model',
+        rawEventIds: ['evt-metrics'],
+        startedAt: now,
+      });
+      invocationRepo.completePiTurnInvocation(
+        knownInvocationId,
+        { input: 2, output: 3, total: 5 },
+        'known response with sk-metrics-secret-should-not-persist',
+      );
+      const unknownInvocationId = invocationRepo.startPiTurnInvocation({
+        id: 'invocation-metrics-unknown',
+        turnId: ledgerTurnId,
+        callNumber: 2,
+        provider: 'metrics-provider',
+        model: 'metrics-model',
+        rawEventIds: ['evt-metrics'],
+        startedAt: now,
+      });
+      invocationRepo.completePiTurnInvocation(unknownInvocationId, undefined, 'unknown response');
+      turnRepo.markCompletedFromPiInvocations(ledgerTurnId, { responseText: 'delivered response' });
       db.prepare(
         `INSERT INTO context_traces (
           id, turn_id, conversation_id, conversation_type, group_id,
@@ -1223,9 +1351,18 @@ describe('SQLite operations maintenance', () => {
       expect(metrics.eventProcessingAdmissions.total).toBe(1);
       expect(metrics.eventProcessingAdmissions.byState.completed).toBe(1);
       expect(metrics.chatMessages.total).toBe(1);
-      expect(metrics.agentTurns.total).toBe(1);
-      expect(metrics.agentTurns.byStatus.completed).toBe(1);
+      expect(metrics.agentTurns.total).toBe(2);
+      expect(metrics.agentTurns.byStatus.completed).toBe(2);
+      expect(metrics.agentTurns.tokensInput).toBe(3);
+      expect(metrics.agentTurns.tokensOutput).toBe(4);
       expect(metrics.agentTurns.tokensTotal).toBe(7);
+      expect(metrics.agentTurns.completedKnownUsage).toBe(1);
+      expect(metrics.agentTurns.completedUnknownUsage).toBe(1);
+      expect(metrics.modelInvocations.total).toBe(2);
+      expect(metrics.modelInvocations.byPurpose.pi_turn).toBe(2);
+      expect(metrics.modelInvocations.byStatus.completed).toBe(2);
+      expect(metrics.modelInvocations.completedKnownUsage).toBe(1);
+      expect(metrics.modelInvocations.completedUnknownUsage).toBe(1);
       expect(metrics.contextTraces.total).toBe(1);
       expect(metrics.actionDecisions.total).toBe(1);
       expect(metrics.actionDecisions.byDecidedBy.evaluator).toBe(1);
@@ -1287,7 +1424,14 @@ describe('SQLite operations maintenance', () => {
       expect(prometheus).toContain('lethebot_event_ingress_receipts_disposition_total{disposition="duplicate"} 1');
       expect(prometheus).toContain('lethebot_event_processing_admissions_total 1');
       expect(prometheus).toContain('lethebot_event_processing_admissions_state_total{state="completed"} 1');
-      expect(prometheus).toContain('lethebot_agent_turns_status_total{status="completed"} 1');
+      expect(prometheus).toContain('lethebot_agent_turns_status_total{status="completed"} 2');
+      expect(prometheus).toContain('lethebot_agent_turns_completed_known_usage_total 1');
+      expect(prometheus).toContain('lethebot_agent_turns_completed_unknown_usage_total 1');
+      expect(prometheus).toContain('lethebot_model_invocations_total 2');
+      expect(prometheus).toContain('lethebot_model_invocations_purpose_total{purpose="pi_turn"} 2');
+      expect(prometheus).toContain('lethebot_model_invocations_status_total{status="completed"} 2');
+      expect(prometheus).toContain('lethebot_model_invocations_completed_known_usage_total 1');
+      expect(prometheus).toContain('lethebot_model_invocations_completed_unknown_usage_total 1');
       expect(prometheus).toContain('lethebot_jobs_type_total{type="summary"} 1');
       expect(prometheus).toContain('lethebot_jobs_type_total{type="other"} 2');
       expect(prometheus).toContain('lethebot_worker_heartbeats_type_total{worker_type="other"} 3');
@@ -1297,6 +1441,164 @@ describe('SQLite operations maintenance', () => {
       expect(prometheus).not.toContain('custom-stage-qq-87654321');
       expect(prometheus).not.toContain('private:qq-1');
       expect(prometheus).not.toContain('job-metrics');
+    } finally {
+      closeDatabase(db);
+    }
+  });
+
+  it('collects queue, Provider, and total turn latency from complete lifecycle pairs', () => {
+    const dir = createTempDir();
+    const db = initDatabase({ path: join(dir, 'latency-metrics.db') });
+    const since = Date.UTC(2026, 6, 2);
+
+    try {
+      runMigrations(db, migrationDirectory);
+      const insertAdmissionWithTimes = (
+        eventId: string,
+        acceptedAt: number,
+        processingStartedAt: number | null,
+        finishedAt: number | null,
+        state: 'accepted' | 'processing' | 'completed' | 'failed',
+      ): void => {
+        db.prepare(
+          `INSERT INTO event_processing_admissions (
+            raw_event_id, state, accepted_at, processing_started_at, finished_at, reason_code
+          ) VALUES (?, ?, ?, ?, ?, ?)`,
+        ).run(
+          eventId,
+          state,
+          acceptedAt,
+          processingStartedAt,
+          finishedAt,
+          state === 'failed' ? 'handler_failed' : null,
+        );
+      };
+      const insertTurn = (
+        turnId: string,
+        eventId: string,
+        status: 'completed' | 'failed' | 'running',
+        startedAt: number,
+        completedAt: number | null,
+      ): void => {
+        db.prepare(
+          `INSERT INTO agent_turns (
+            id, conversation_id, trigger_event_id, pi_model, pi_provider,
+            status, started_at, completed_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          turnId,
+          `private:${turnId}`,
+          eventId,
+          'latency-model',
+          'latency-provider',
+          status,
+          startedAt,
+          completedAt,
+        );
+      };
+
+      insertRawEvent(db, 'evt-latency-complete', since + 10);
+      insertAdmissionWithTimes('evt-latency-complete', since + 10, since + 25, since + 110, 'completed');
+      insertTurn('turn-latency-complete', 'evt-latency-complete', 'running', since + 25, null);
+      insertRawEvent(db, 'evt-latency-failed', since + 200);
+      insertAdmissionWithTimes('evt-latency-failed', since + 200, since + 220, since + 270, 'failed');
+      insertTurn('turn-latency-failed', 'evt-latency-failed', 'running', since + 220, null);
+      insertRawEvent(db, 'evt-latency-running', since + 300);
+      insertAdmissionWithTimes('evt-latency-running', since + 300, since + 305, null, 'processing');
+      insertTurn('turn-latency-running', 'evt-latency-running', 'running', since + 305, null);
+      insertRawEvent(db, 'evt-latency-unrelated', since + 400);
+      insertAdmissionWithTimes('evt-latency-unrelated', since + 400, since + 999, since + 1000, 'completed');
+      insertRawEvent(db, 'evt-latency-zero', since + 500);
+      insertAdmissionWithTimes('evt-latency-zero', since + 500, since + 500, since + 500, 'completed');
+      insertTurn('turn-latency-zero', 'evt-latency-zero', 'running', since + 500, null);
+
+      db.prepare(
+        `INSERT INTO model_invocations (
+          id, turn_id, purpose, call_number, provider, model, status,
+          started_at, completed_at, tokens_input, tokens_output, tokens_total,
+          response_sha256, response_bytes
+        ) VALUES (?, ?, 'pi_turn', ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        'invocation-latency-complete',
+        'turn-latency-complete',
+        1,
+        'latency-provider',
+        'latency-model',
+        since + 30,
+        since + 70,
+        1,
+        2,
+        3,
+        'a'.repeat(64),
+        3,
+      );
+      db.prepare(
+        `INSERT INTO model_invocations (
+          id, turn_id, purpose, call_number, provider, model, status,
+          started_at, completed_at, error_code
+        ) VALUES (?, ?, 'pi_turn', ?, ?, ?, 'failed', ?, ?, ?)`,
+      ).run(
+        'invocation-latency-failed',
+        'turn-latency-failed',
+        1,
+        'latency-provider',
+        'latency-model',
+        since + 230,
+        since + 245,
+        'provider_error',
+      );
+      db.prepare(
+        `INSERT INTO model_invocations (
+          id, turn_id, purpose, call_number, provider, model, status, started_at
+        ) VALUES (?, ?, 'pi_turn', ?, ?, ?, 'running', ?)`,
+      ).run(
+        'invocation-latency-running',
+        'turn-latency-running',
+        1,
+        'latency-provider',
+        'latency-model',
+        since + 310,
+      );
+      db.prepare(
+        `INSERT INTO model_invocations (
+          id, turn_id, purpose, call_number, provider, model, status,
+          started_at, completed_at, tokens_input, tokens_output, tokens_total,
+          response_sha256, response_bytes
+        ) VALUES (?, ?, 'pi_turn', ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        'invocation-latency-zero',
+        'turn-latency-zero',
+        1,
+        'latency-provider',
+        'latency-model',
+        since + 500,
+        since + 500,
+        0,
+        0,
+        0,
+        'c'.repeat(64),
+        0,
+      );
+
+      db.prepare(
+        `UPDATE agent_turns SET status = 'completed', completed_at = ? WHERE id = ?`,
+      ).run(since + 100, 'turn-latency-complete');
+      db.prepare(
+        `UPDATE agent_turns SET status = 'failed', completed_at = ? WHERE id = ?`,
+      ).run(since + 260, 'turn-latency-failed');
+      db.prepare(
+        `UPDATE agent_turns SET status = 'completed', completed_at = ? WHERE id = ?`,
+      ).run(since + 500, 'turn-latency-zero');
+
+      const metrics = collectOperationsMetrics(db, since);
+
+      expect(metrics.latency).toEqual({
+        queueWaitMs: { count: 3, sumMs: 35, maxMs: 20 },
+        providerLatencyMs: { count: 3, sumMs: 55, maxMs: 40 },
+        totalTurnLatencyMs: { count: 3, sumMs: 150, maxMs: 90 },
+      });
+      expect(metrics.latency.queueWaitMs.sumMs).not.toBe(0);
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
     } finally {
       closeDatabase(db);
     }

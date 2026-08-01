@@ -1,17 +1,20 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { request as httpRequest, type ClientRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LetheBotApp } from '../../src/index.js';
 import { AttentionEngine } from '../../src/attention/engine.js';
 import { resetConfig } from '../../src/config/index.js';
+import { getLogger } from '../../src/logger/index.js';
 import type { OneBotMessage } from '../../src/gateway/onebot-adapter.js';
 import type { PiAdapterInput, PiAdapterOutput } from '../../src/pi/pi-adapter.js';
 import type { ChatMessageReceived } from '../../src/types/events.js';
 import { EvaluatorStub } from '../../src/evaluator/evaluator-stub.js';
 import { GroupSummaryPolicyRepository } from '../../src/storage/group-summary-policy-repository.js';
 import { MemoryRepository } from '../../src/storage/memory-repository.js';
+import { ModelInvocationRepository } from '../../src/storage/model-invocation-repository.js';
 import { GroupSummaryJobService } from '../../src/workers/group-summary-job-service.js';
 import type {
   MemoryEvaluationRequest,
@@ -99,6 +102,30 @@ interface SentMessage {
     groupId?: string;
   };
   text: string;
+}
+
+interface HttpResponseResult {
+  status: number;
+  body: string;
+}
+
+function collectHttpResponse(clientRequest: ClientRequest): Promise<HttpResponseResult> {
+  return new Promise((resolve, reject) => {
+    clientRequest.once('error', reject);
+    clientRequest.once('response', (response) => {
+      const chunks: Buffer[] = [];
+      response.on('data', (chunk: Buffer | string) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      response.once('error', reject);
+      response.once('end', () => {
+        resolve({
+          status: response.statusCode ?? 0,
+          body: Buffer.concat(chunks).toString('utf8'),
+        });
+      });
+    });
+  });
 }
 
 interface PersistedEventProcessingFailureRow {
@@ -363,6 +390,17 @@ describe('E2E Conversation Flow', () => {
       .prepare(`SELECT COUNT(*) AS count FROM ${tableName}`)
       .get() as { count: number };
     return row.count;
+  }
+
+  function getIngressEffectCounts(): Record<string, number> {
+    return {
+      rawEvents: countTableRows('raw_events'),
+      chatMessages: countTableRows('chat_messages'),
+      agentTurns: countTableRows('agent_turns'),
+      contextTraces: countTableRows('context_traces'),
+      actionDecisions: countTableRows('action_decisions'),
+      actionExecutions: countTableRows('action_executions'),
+    };
   }
 
   function countBotResponseRows(conversationId: string): number {
@@ -1975,6 +2013,99 @@ describe('E2E Conversation Flow', () => {
   });
 
   describe('Private message flow', () => {
+    it('settles a ledger-backed application turn from multiple invocation rounds', async () => {
+      const db = app.getDatabase();
+      const sentMessages: SentMessage[] = [];
+      app.setPiRuntimeForTesting({
+        usesDurableInvocationLedger: true,
+        async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
+          const invocationRepo = new ModelInvocationRepository(db);
+          const rawEventIds = input.sourceEventIds ?? [];
+          const firstId = invocationRepo.startPiTurnInvocation({
+            turnId: input.turnId,
+            callNumber: 1,
+            provider: 'mock',
+            model: 'mock',
+            rawEventIds,
+          });
+          invocationRepo.completePiTurnInvocation(
+            firstId,
+            { input: 4, output: 6, total: 10 },
+            'first ledger response',
+          );
+          const secondId = invocationRepo.startPiTurnInvocation({
+            turnId: input.turnId,
+            callNumber: 2,
+            provider: 'mock',
+            model: 'mock',
+            rawEventIds,
+          });
+          invocationRepo.completePiTurnInvocation(
+            secondId,
+            { input: 2, output: 3, total: 5 },
+            'second ledger response',
+          );
+          return {
+            turnId: input.turnId,
+            responseText: '',
+            toolCallIds: [],
+            events: [],
+            tokensUsed: { input: 0, output: 0, total: 0 },
+            status: 'completed',
+          };
+        },
+      });
+      setCapturingMessageSender(sentMessages);
+
+      try {
+        const platformMessageId = 812345601;
+        const response = await postEvent({
+          post_type: 'message',
+          message_type: 'private',
+          message_id: platformMessageId,
+          user_id: 812345602,
+          message: 'ledger-backed totals',
+          raw_message: 'ledger-backed totals',
+          sender: { user_id: 812345602, nickname: 'LedgerTotals' },
+          time: Math.floor(Date.now() / 1000),
+        } satisfies OneBotMessage);
+
+        expect(response.status).toBe(200);
+        const turn = getTurnForMessage(`qq-${platformMessageId}`);
+        expect(turn).toMatchObject({
+          status: 'completed',
+          tokens_input: 6,
+          tokens_output: 9,
+          tokens_total: 15,
+        });
+        expect(db.prepare(
+          `SELECT call_number, status, tokens_input, tokens_output, tokens_total
+             FROM model_invocations
+            WHERE turn_id = ?
+            ORDER BY call_number`,
+        ).all(turn?.id)).toEqual([
+          {
+            call_number: 1,
+            status: 'completed',
+            tokens_input: 4,
+            tokens_output: 6,
+            tokens_total: 10,
+          },
+          {
+            call_number: 2,
+            status: 'completed',
+            tokens_input: 2,
+            tokens_output: 3,
+            tokens_total: 5,
+          },
+        ]);
+        expect(sentMessages).toHaveLength(0);
+        expectNoForeignKeyViolations();
+      } finally {
+        setSuccessfulPiRuntime();
+      }
+    });
+
     it('keeps accepted raw evidence but denies a disabled account before derived processing', async () => {
       const db = app.getDatabase();
       const canonicalUserId = 'user-disabled-ingress';
@@ -12483,6 +12614,217 @@ describe('E2E Conversation Flow', () => {
   });
 
   describe('Error handling', () => {
+    it('rejects an oversized declared event body before admission', async () => {
+      const beforeCounts = getIngressEffectCounts();
+      const body = 'x'.repeat(262_145);
+
+      const response = await fetch(`${baseUrl}/onebot/event`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': String(Buffer.byteLength(body)),
+          Authorization: 'Bearer test-onebot-token',
+        },
+        body,
+      });
+
+      await app.waitForIdle();
+
+      expect(response.status).toBe(413);
+      await expect(response.json()).resolves.toEqual({ error: 'Payload Too Large' });
+      expect(getIngressEffectCounts()).toEqual(beforeCounts);
+      expect(app.getEventProcessingFailures()).toHaveLength(0);
+      expectNoForeignKeyViolations();
+    });
+
+    it('rejects a streamed event body that crosses the byte limit', async () => {
+      const beforeCounts = getIngressEffectCounts();
+      const clientRequest = httpRequest({
+        host: '127.0.0.1',
+        port: testPort,
+        path: '/onebot/event',
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-onebot-token',
+          Connection: 'close',
+          'Content-Type': 'application/json',
+          'Transfer-Encoding': 'chunked',
+        },
+      });
+      const responsePromise = collectHttpResponse(clientRequest);
+
+      clientRequest.write('x'.repeat(200_000));
+      clientRequest.end('x'.repeat(100_000));
+      const response = await responsePromise;
+
+      await app.waitForIdle();
+
+      expect(response).toEqual({
+        status: 413,
+        body: JSON.stringify({ error: 'Payload Too Large' }),
+      });
+      expect(getIngressEffectCounts()).toEqual(beforeCounts);
+      expect(app.getEventProcessingFailures()).toHaveLength(0);
+      expectNoForeignKeyViolations();
+    });
+
+    it('rejects configured-token requests before reading a missing auth body', async () => {
+      const beforeCounts = getIngressEffectCounts();
+      const clientRequest = httpRequest({
+        host: '127.0.0.1',
+        port: testPort,
+        path: '/onebot/event',
+        method: 'POST',
+        headers: {
+          Connection: 'close',
+          'Content-Type': 'application/json',
+          'Content-Length': '1024',
+        },
+      });
+      const responsePromise = collectHttpResponse(clientRequest);
+
+      clientRequest.flushHeaders();
+      const response = await responsePromise;
+      clientRequest.destroy();
+
+      expect(response).toEqual({
+        status: 401,
+        body: JSON.stringify({ error: 'Unauthorized' }),
+      });
+      expect(getIngressEffectCounts()).toEqual(beforeCounts);
+      expect(app.getEventProcessingFailures()).toHaveLength(0);
+      expectNoForeignKeyViolations();
+    });
+
+    it('drops an aborted partial event body without admission effects', async () => {
+      const beforeCounts = getIngressEffectCounts();
+      const body = JSON.stringify({
+        post_type: 'message',
+        message_type: 'private',
+        message_id: 81235,
+        user_id: 81235,
+        message: 'aborted partial request',
+      });
+      const clientRequest = httpRequest({
+        host: '127.0.0.1',
+        port: testPort,
+        path: '/onebot/event',
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-onebot-token',
+          Connection: 'close',
+          'Content-Type': 'application/json',
+          'Content-Length': String(Buffer.byteLength(body)),
+        },
+      });
+      clientRequest.on('error', () => undefined);
+
+      clientRequest.write(body.slice(0, -1));
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      clientRequest.destroy();
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      await app.waitForIdle();
+
+      expect(getIngressEffectCounts()).toEqual(beforeCounts);
+      expect(app.getEventProcessingFailures()).toHaveLength(0);
+      expectNoForeignKeyViolations();
+    });
+
+    it('accepts a bounded event with a valid SnowLuma HMAC signature', async () => {
+      const event: OneBotMessage = {
+        post_type: 'message',
+        message_type: 'private',
+        message_id: 81236,
+        user_id: 81236,
+        message: 'bounded HMAC event',
+        raw_message: 'bounded HMAC event',
+        sender: { user_id: 81236 },
+        time: Math.floor(Date.now() / 1000),
+      };
+      const body = JSON.stringify(event);
+      const signature = `sha1=${createHmac('sha1', 'test-onebot-token').update(body).digest('hex')}`;
+
+      const response = await fetch(`${baseUrl}/onebot/event`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Signature': signature,
+        },
+        body,
+      });
+
+      await app.waitForIdle();
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ status: 'ok' });
+      expect(getPersistedMessage('qq-81236')).toBeDefined();
+      expectNoForeignKeyViolations();
+    });
+
+    it('logs only bounded metadata for accepted reverse HTTP events', async () => {
+      const rawSecret = 'sk-ingress-log-secret-should-not-appear';
+      const rawNickname = 'Ingress Log Nickname';
+      const rawCard = 'Ingress Log Card';
+      const rawMediaUrl = `https://media.example.invalid/image.png?token=${rawSecret}`;
+      const event: OneBotMessage = {
+        post_type: 'message',
+        message_type: 'private',
+        message_id: 76543,
+        user_id: 65432,
+        message: [
+          { type: 'text', data: { text: `private payload ${rawSecret}` } },
+          { type: 'image', data: { url: rawMediaUrl } },
+        ],
+        raw_message: `private payload ${rawSecret} [CQ:image,url=${rawMediaUrl}]`,
+        sender: {
+          user_id: 65432,
+          nickname: rawNickname,
+          card: rawCard,
+        },
+        time: Math.floor(Date.now() / 1000),
+      };
+      const body = JSON.stringify(event);
+      const debugLog = vi.spyOn(getLogger(), 'debug').mockImplementation(() => undefined);
+      setSuccessfulPiRuntime();
+
+      try {
+        const response = await fetch(`${baseUrl}/onebot/event`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer test-onebot-token',
+          },
+          body,
+        });
+
+        await app.waitForIdle();
+
+        expect(response.status).toBe(200);
+        const ingressCalls = debugLog.mock.calls.filter(
+          ([, message]) => typeof message === 'string' && message.includes('OneBot event'),
+        );
+        expect(ingressCalls).toEqual([[
+          {
+            transport: 'http',
+            disposition: 'accepted',
+            bodyBytes: Buffer.byteLength(body),
+          },
+          'Handled OneBot event',
+        ]]);
+        const serialized = JSON.stringify(ingressCalls);
+        expect(serialized).not.toContain(rawSecret);
+        expect(serialized).not.toContain(rawNickname);
+        expect(serialized).not.toContain(rawCard);
+        expect(serialized).not.toContain(rawMediaUrl);
+        expect(serialized).not.toContain('76543');
+        expect(serialized).not.toContain('65432');
+      } finally {
+        debugLog.mockRestore();
+        setSuccessfulPiRuntime();
+        restoreDecisionDefaults();
+      }
+    });
+
     it('should reject malformed JSON without chat-path side effects or secret echo', async () => {
       let piCalls = 0;
       const sentMessages: SentMessage[] = [];
@@ -12510,6 +12852,8 @@ describe('E2E Conversation Flow', () => {
         },
       });
       setCapturingMessageSender(sentMessages);
+      const malformedBody = `{"post_type":"message","message_type":"private","user_id":"${rawPlatformId}","message":"token=${rawSecret}"`;
+      const warnLog = vi.spyOn(getLogger(), 'warn').mockImplementation(() => undefined);
 
       const response = await fetch(`${baseUrl}/onebot/event`, {
         method: 'POST',
@@ -12517,7 +12861,7 @@ describe('E2E Conversation Flow', () => {
           'Content-Type': 'application/json',
           Authorization: 'Bearer test-onebot-token',
         },
-        body: `{"post_type":"message","message_type":"private","user_id":"${rawPlatformId}","message":"token=${rawSecret}"`,
+        body: malformedBody,
       });
 
       try {
@@ -12526,6 +12870,16 @@ describe('E2E Conversation Flow', () => {
         expect(data).toEqual({ error: 'Invalid JSON' });
         expect(JSON.stringify(data)).not.toContain(rawSecret);
         expect(JSON.stringify(data)).not.toContain(rawPlatformId);
+        expect(warnLog.mock.calls.filter(
+          ([, message]) => message === 'Rejected malformed OneBot event JSON',
+        )).toEqual([[
+          {
+            transport: 'http',
+            status: 'invalid_json',
+            bodyBytes: Buffer.byteLength(malformedBody),
+          },
+          'Rejected malformed OneBot event JSON',
+        ]]);
 
         expect(piCalls).toBe(0);
         expect(sentMessages).toEqual([]);
@@ -12546,6 +12900,7 @@ describe('E2E Conversation Flow', () => {
           .get(`%${rawSecret}%`, `%${rawPlatformId}%`) as { count: number };
         expect(leakedRows.count).toBe(0);
       } finally {
+        warnLog.mockRestore();
         setSuccessfulPiRuntime();
         restoreDecisionDefaults();
       }
@@ -12760,6 +13115,93 @@ describe('E2E Conversation Flow', () => {
 
       expectNoForeignKeyViolations();
     });
+  });
+});
+
+describe('Reverse HTTP event body timeout', () => {
+  it('times out an incomplete event body once without admission effects', async () => {
+    const previousEnv = process.env;
+    const testDir = mkdtempSync(join(tmpdir(), 'lethebot-event-body-timeout-'));
+    const testPort = 19700 + Math.floor(Math.random() * 1000);
+    let isolatedApp: LetheBotApp | undefined;
+    let clientRequest: ClientRequest | undefined;
+
+    try {
+      process.env = {
+        ...previousEnv,
+        LETHEBOT_TEST: 'true',
+        LETHEBOT_DB_PATH: join(testDir, 'lethebot-event-body-timeout.db'),
+        LETHEBOT_HOST: '127.0.0.1',
+        LETHEBOT_PORT: String(testPort),
+        LETHEBOT_EVENT_BODY_TIMEOUT_MS: '50',
+        ONEBOT_TRANSPORT: 'http',
+        ONEBOT_TOKEN: 'timeout-test-token',
+        PI_PROVIDER: 'mock',
+        PI_MODEL: 'mock',
+        LOG_LEVEL: 'fatal',
+      };
+      resetConfig();
+      isolatedApp = new LetheBotApp();
+      await isolatedApp.start();
+
+      const tables = [
+        'raw_events',
+        'chat_messages',
+        'agent_turns',
+        'context_traces',
+        'action_decisions',
+        'action_executions',
+      ] as const;
+      const countRows = () => Object.fromEntries(tables.map((table) => {
+        const row = isolatedApp
+          ?.getDatabase()
+          .prepare(`SELECT COUNT(*) AS count FROM ${table}`)
+          .get() as { count: number };
+        return [table, row.count];
+      }));
+      const beforeCounts = countRows();
+
+      clientRequest = httpRequest({
+        host: '127.0.0.1',
+        port: testPort,
+        path: '/onebot/event',
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer timeout-test-token',
+          Connection: 'close',
+          'Content-Type': 'application/json',
+          'Content-Length': '1024',
+        },
+      });
+      let responseCount = 0;
+      clientRequest.on('response', () => {
+        responseCount += 1;
+      });
+      const responsePromise = collectHttpResponse(clientRequest);
+
+      clientRequest.write('{');
+      const response = await responsePromise;
+      await new Promise<void>((resolve) => setTimeout(resolve, 75));
+
+      expect(response).toEqual({
+        status: 408,
+        body: JSON.stringify({ error: 'Request Timeout' }),
+      });
+      expect(responseCount).toBe(1);
+      expect(countRows()).toEqual(beforeCounts);
+      expect(isolatedApp.getEventProcessingFailures()).toHaveLength(0);
+      await expect(fetch(`http://127.0.0.1:${testPort}/healthz`)).resolves.toMatchObject({
+        status: 200,
+      });
+    } finally {
+      clientRequest?.destroy();
+      if (isolatedApp) {
+        await isolatedApp.stop();
+      }
+      rmSync(testDir, { recursive: true, force: true });
+      process.env = previousEnv;
+      resetConfig();
+    }
   });
 });
 

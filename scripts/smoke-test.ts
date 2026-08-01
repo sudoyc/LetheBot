@@ -286,7 +286,7 @@ export async function smokeTest(): Promise<void> {
 
     // 8. Governance CLI
     console.log('8️⃣  Governance CLI...');
-    const cli = new GovernanceCLI(memoryRepo);
+    const cli = new GovernanceCLI(memoryRepo, { db });
     const memories = await cli.listMemory({ userId: 'smoke-user' });
 
     if (memories.length !== 1) {

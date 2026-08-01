@@ -145,7 +145,8 @@ interface CrossVersionRehearsalResult {
   rollback: {
     candidateFailureObserved: boolean;
     candidateSchemaObserved: boolean;
-    candidateColumnObserved: boolean;
+    candidatePiSchemaObserved: boolean;
+    candidateMaintenanceSchemaObserved: boolean;
     databaseRestored: boolean;
     metadataRestored: boolean;
     pointersRestored: boolean;
@@ -168,12 +169,16 @@ interface CrossVersionRehearsalResult {
     recoveryPointRemoved: boolean;
     markerFreeRestartReady: boolean;
     candidateSchemaObserved: boolean;
-    candidateColumnObserved: boolean;
+    candidatePiSchemaObserved: boolean;
+    candidateMaintenanceSchemaObserved: boolean;
   };
   sharedDatabase: {
     priorLedgerObserved: boolean;
-    priorColumnAbsent: boolean;
+    priorPiSchemaObserved: boolean;
+    priorMaintenanceSchemaAbsent: boolean;
     candidateLedgerObserved: boolean;
+    candidatePiSchemaObserved: boolean;
+    candidateMaintenanceSchemaObserved: boolean;
     sentinelPreserved: boolean;
     integrityOk: boolean;
     foreignKeysClean: boolean;
@@ -758,7 +763,8 @@ interface RehearsalDatabaseSnapshot {
   sentinelFingerprint?: string;
   contentFingerprint: string;
   metadataFingerprint: string;
-  delayedAttentionSchema: boolean;
+  piTurnInvocationSchema: boolean;
+  memoryMaintenanceProposalSchema: boolean;
   integrityOk: boolean;
   foreignKeysClean: boolean;
 }
@@ -1156,12 +1162,20 @@ async function runCrossVersionRehearsal(
       confirmationRestartSnapshot,
     ];
     const priorLedgerObserved = priorSnapshots.every(isPriorLedger);
-    const priorColumnAbsent = priorSnapshots.every((snapshot) => !snapshot.delayedAttentionSchema);
+    const priorPiSchemaObserved = priorSnapshots.every(
+      (snapshot) => snapshot.piTurnInvocationSchema,
+    );
+    const priorMaintenanceSchemaAbsent = priorSnapshots.every(
+      (snapshot) => !snapshot.memoryMaintenanceProposalSchema,
+    );
     const candidateLedgerObserved = candidateSnapshots.every(
       (snapshot) => snapshot !== undefined && isCurrentLedger(snapshot),
     );
-    const candidateColumnObserved = candidateSnapshots.every(
-      (snapshot) => snapshot?.delayedAttentionSchema === true,
+    const candidatePiSchemaObserved = candidateSnapshots.every(
+      (snapshot) => snapshot?.piTurnInvocationSchema === true,
+    );
+    const candidateMaintenanceSchemaObserved = candidateSnapshots.every(
+      (snapshot) => snapshot?.memoryMaintenanceProposalSchema === true,
     );
     const sentinelPreserved = allSnapshots.every(
       (snapshot) => sameSentinel(rollbackPriorSnapshot, snapshot),
@@ -1192,9 +1206,11 @@ async function runCrossVersionRehearsal(
         && recoveryPointRemoved
         && markerFreeRestartReady
         && priorLedgerObserved
-        && priorColumnAbsent
+        && priorPiSchemaObserved
+        && priorMaintenanceSchemaAbsent
         && candidateLedgerObserved
-        && candidateColumnObserved
+        && candidatePiSchemaObserved
+        && candidateMaintenanceSchemaObserved
         && sentinelPreserved
         && integrityOk
         && foreignKeysClean,
@@ -1204,7 +1220,9 @@ async function runCrossVersionRehearsal(
         candidateFailureObserved,
         candidateSchemaObserved:
           rollbackCandidateSnapshot !== undefined && isCurrentLedger(rollbackCandidateSnapshot),
-        candidateColumnObserved: rollbackCandidateSnapshot?.delayedAttentionSchema === true,
+        candidatePiSchemaObserved: rollbackCandidateSnapshot?.piTurnInvocationSchema === true,
+        candidateMaintenanceSchemaObserved:
+          rollbackCandidateSnapshot?.memoryMaintenanceProposalSchema === true,
         databaseRestored: rollbackDatabaseRestored,
         metadataRestored: rollbackPriorSnapshot.metadataFingerprint
           === rollbackRestoredSnapshot.metadataFingerprint,
@@ -1229,12 +1247,17 @@ async function runCrossVersionRehearsal(
         recoveryPointRemoved,
         markerFreeRestartReady,
         candidateSchemaObserved: isCurrentLedger(confirmationRestartSnapshot),
-        candidateColumnObserved: confirmationRestartSnapshot.delayedAttentionSchema,
+        candidatePiSchemaObserved: confirmationRestartSnapshot.piTurnInvocationSchema,
+        candidateMaintenanceSchemaObserved:
+          confirmationRestartSnapshot.memoryMaintenanceProposalSchema,
       },
       sharedDatabase: {
         priorLedgerObserved,
-        priorColumnAbsent,
+        priorPiSchemaObserved,
+        priorMaintenanceSchemaAbsent,
         candidateLedgerObserved,
+        candidatePiSchemaObserved,
+        candidateMaintenanceSchemaObserved,
         sentinelPreserved,
         integrityOk,
         foreignKeysClean,
@@ -1695,7 +1718,8 @@ function inspectRehearsalDatabase(databasePath: string): RehearsalDatabaseSnapsh
         : createHash('sha256').update(JSON.stringify(sentinel)).digest('hex'),
       contentFingerprint: fingerprintRehearsalDatabase(db),
       metadataFingerprint: `${stats.mode & 0o777}:${stats.uid}:${stats.gid}`,
-      delayedAttentionSchema: hasDelayedAttentionSchema(db),
+      piTurnInvocationSchema: hasPiTurnInvocationSchema(db),
+      memoryMaintenanceProposalSchema: hasMemoryMaintenanceProposalSchema(db),
       integrityOk:
         integrityRows.length === 1 && Object.values(integrityRows[0] ?? {})[0] === 'ok',
       foreignKeysClean: db.prepare('PRAGMA foreign_key_check').all().length === 0,
@@ -1705,37 +1729,65 @@ function inspectRehearsalDatabase(databasePath: string): RehearsalDatabaseSnapsh
   }
 }
 
-function hasDelayedAttentionSchema(db: Database.Database): boolean {
-  return hasTableColumns(db, 'attention_candidates', [
-    'source_raw_event_id',
-    'source_chat_message_id',
-    'job_id',
-    'conversation_id',
-    'conversation_type',
-    'group_id',
-    'candidate_kind',
-    'policy_version',
-    'observed_at',
-    'not_before_at',
-    'expires_at',
+function hasPiTurnInvocationSchema(db: Database.Database): boolean {
+  return hasTableColumns(db, 'model_invocations', [
+    'tokens_cache_read',
+    'tokens_cache_write',
+    'tokens_reasoning',
   ])
-    && hasTableColumns(db, 'attention_decisions', [
-      'candidate_id',
-      'job_id',
-      'job_attempt_id',
-      'outcome',
-      'decided_at',
+    && db.prepare(
+      `SELECT 1 FROM sqlite_schema
+        WHERE type = 'index'
+          AND name = 'idx_model_invocations_pi_turn_call'`,
+    ).get() !== undefined;
+}
+
+function hasMemoryMaintenanceProposalSchema(db: Database.Database): boolean {
+  return hasTableColumns(db, 'memory_maintenance_proposals', [
+    'id',
+    'kind',
+    'effect_type',
+    'lifecycle_state',
+    'candidate_fingerprint',
+    'current_revision_number',
+    'created_audit_id',
+  ])
+    && hasTableColumns(db, 'memory_maintenance_proposal_candidates', [
+      'proposal_id',
+      'proposal_kind',
+      'candidate_ordinal',
+      'memory_id',
+      'record_fingerprint',
+      'source_fingerprint',
     ])
-    && hasTableColumns(db, 'attention_suppressors', [
-      'decision_id',
-      'candidate_id',
-      'decision_outcome',
-      'code',
-      'evidence_chat_message_id',
-      'observed_count',
-      'window_ms',
-      'created_at',
-    ]);
+    && hasTableColumns(db, 'memory_maintenance_proposal_reasons', [
+      'proposal_id',
+      'proposal_kind',
+      'reason_ordinal',
+      'reason_code',
+    ])
+    && hasTableColumns(db, 'memory_maintenance_proposal_revisions', [
+      'id',
+      'proposal_id',
+      'revision_number',
+      'transition',
+      'previous_state',
+      'new_state',
+      'audit_id',
+    ])
+    && hasTableColumns(db, 'memory_maintenance_proposal_revision_effects', [
+      'proposal_revision_id',
+      'proposal_id',
+      'proposal_kind',
+      'transition',
+      'memory_id',
+      'memory_revision_id',
+    ])
+    && db.prepare(
+      `SELECT 1 FROM sqlite_schema
+        WHERE type = 'trigger'
+          AND name = 'trg_validate_memory_maintenance_proposal_revision'`,
+    ).get() !== undefined;
 }
 
 function hasTableColumn(db: Database.Database, tableName: string, columnName: string): boolean {

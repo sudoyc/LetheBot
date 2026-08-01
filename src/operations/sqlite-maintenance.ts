@@ -16,6 +16,7 @@ import {
   statSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { redactSecretsInText } from '../memory/secret-scan.js';
 
 export interface SqliteBackupOptions {
@@ -69,6 +70,41 @@ export interface RetentionResult {
   memoryFtsRowsDeleted: number;
 }
 
+export interface NormalizedRetentionPolicy {
+  rawEventsDays: number;
+  chatMessagesDays: number;
+  auditLogDays: number;
+  disabledDeletedMemoryDays: number;
+  eventProcessingFailuresDays: number;
+}
+
+interface RetentionPlanCandidates {
+  memoryRecordIds: string[];
+  chatMessageIds: string[];
+  rawEventIds: string[];
+  auditLogIds: string[];
+  eventProcessingFailureIds: string[];
+  modelInvocationSources: Array<{
+    modelInvocationId: string;
+    rawEventId: string;
+  }>;
+}
+
+export interface RetentionPlan {
+  policy: NormalizedRetentionPolicy;
+  asOfMs: number;
+  effects: RetentionResult;
+  candidateFingerprints: Record<string, string[]>;
+  stateFingerprint: string;
+  candidates: RetentionPlanCandidates;
+}
+
+export interface LatencyAggregate {
+  count: number;
+  sumMs: number;
+  maxMs: number;
+}
+
 export interface OperationsMetrics {
   generatedAt: string;
   sinceMs?: number;
@@ -83,13 +119,29 @@ export interface OperationsMetrics {
     total: number;
     byState: Record<string, number>;
   };
+  latency: {
+    queueWaitMs: LatencyAggregate;
+    providerLatencyMs: LatencyAggregate;
+    totalTurnLatencyMs: LatencyAggregate;
+  };
   chatMessages: {
     total: number;
   };
   agentTurns: {
     total: number;
     byStatus: Record<string, number>;
+    tokensInput: number;
+    tokensOutput: number;
     tokensTotal: number;
+    completedKnownUsage: number;
+    completedUnknownUsage: number;
+  };
+  modelInvocations: {
+    total: number;
+    byPurpose: Record<string, number>;
+    byStatus: Record<string, number>;
+    completedKnownUsage: number;
+    completedUnknownUsage: number;
   };
   contextTraces: {
     total: number;
@@ -146,6 +198,8 @@ export interface OperationsMetrics {
 }
 
 const AGENT_TURN_STATUSES = ['pending', 'running', 'completed', 'failed', 'aborted'] as const;
+const MODEL_INVOCATION_PURPOSES = ['summary', 'evaluator', 'pi_turn'] as const;
+const MODEL_INVOCATION_STATUSES = ['running', 'completed', 'failed', 'aborted'] as const;
 const INGRESS_DISPOSITIONS = ['accepted', 'duplicate'] as const;
 const EVENT_PROCESSING_ADMISSION_STATES = [
   'accepted',
@@ -198,6 +252,8 @@ const WORKER_TYPES = [
   'consolidation',
 ] as const;
 const EVENT_PROCESSING_STAGES = [
+  'turn_admission_overloaded',
+  'turn_admission_queue_timeout',
   'raw_event_store',
   'identity_resolution',
   'display_metadata',
@@ -215,28 +271,6 @@ const EVENT_PROCESSING_STAGES = [
   'turn_complete',
 ] as const;
 const CONVERSATION_TYPES = ['private', 'group'] as const;
-
-const RAW_EVENT_RETENTION_PREDICATE = `raw_events.timestamp < ?
-  AND NOT EXISTS (
-    SELECT 1 FROM chat_messages WHERE raw_event_id = raw_events.id
-  )
-  AND NOT EXISTS (
-    SELECT 1 FROM agent_turns WHERE trigger_event_id = raw_events.id
-  )
-  AND NOT EXISTS (
-    SELECT 1
-    FROM memory_sources
-    WHERE (resolution_state = 'internal' AND raw_event_id = raw_events.id)
-       OR (resolution_state = 'legacy_unresolved'
-           AND source_type = 'raw_event'
-           AND source_id = raw_events.id)
-  )
-  AND NOT EXISTS (
-    SELECT 1
-    FROM event_processing_admissions
-    WHERE raw_event_id = raw_events.id
-      AND state IN ('accepted', 'processing')
-  )`;
 
 const ACTIVE_DELAYED_ATTENTION_CHAT_GUARD = `
   AND NOT EXISTS (
@@ -442,7 +476,41 @@ export function verifySqliteIntegrity(dbPath: string): { ok: boolean; result: st
   }
 }
 
-function countSqliteForeignKeyViolations(dbPath: string): number {
+export function verifySqliteSnapshotIntegrity(
+  databaseBytes: Uint8Array,
+): { ok: boolean; result: string } {
+  const snapshot = Buffer.from(databaseBytes);
+  if (
+    snapshot.length < 100
+    || snapshot.subarray(0, 16).toString('binary') !== 'SQLite format 3\0'
+    || (snapshot[18] !== 1 && snapshot[18] !== 2)
+    || (snapshot[19] !== 1 && snapshot[19] !== 2)
+  ) {
+    return { ok: false, result: 'invalid database snapshot' };
+  }
+
+  // Deserialized WAL-header databases still try to open sidecars. Normalize
+  // only the private copy so integrity verification stays in memory.
+  snapshot[18] = 1;
+  snapshot[19] = 1;
+
+  try {
+    const db = new Database(snapshot);
+    try {
+      const row = db.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
+      return {
+        ok: row.integrity_check === 'ok',
+        result: row.integrity_check,
+      };
+    } finally {
+      db.close();
+    }
+  } catch {
+    return { ok: false, result: 'invalid database snapshot' };
+  }
+}
+
+export function countSqliteForeignKeyViolations(dbPath: string): number {
   const db = new Database(dbPath, { readonly: true });
   try {
     return db.prepare('PRAGMA foreign_key_check').all().length;
@@ -471,12 +539,336 @@ function assertNoRestoreSidecars(targetPath: string): void {
   }
 }
 
+export function normalizeRetentionPolicy(
+  policy: RetentionPolicy,
+): NormalizedRetentionPolicy {
+  return {
+    rawEventsDays: normalizeRetentionDays(policy.rawEventsDays, 'rawEventsDays'),
+    chatMessagesDays: normalizeRetentionDays(policy.chatMessagesDays, 'chatMessagesDays'),
+    auditLogDays: normalizeRetentionDays(policy.auditLogDays, 'auditLogDays'),
+    disabledDeletedMemoryDays: normalizeRetentionDays(
+      policy.disabledDeletedMemoryDays,
+      'disabledDeletedMemoryDays',
+    ),
+    eventProcessingFailuresDays: normalizeRetentionDays(
+      policy.eventProcessingFailuresDays,
+      'eventProcessingFailuresDays',
+    ),
+  };
+}
+
+export function planRetentionPolicy(
+  db: BetterSqlite3.Database,
+  policy: RetentionPolicy,
+  asOfMs: number = Date.now(),
+): RetentionPlan {
+  if (!Number.isSafeInteger(asOfMs) || asOfMs < 0) {
+    throw new Error('Retention asOfMs must be a nonnegative safe integer');
+  }
+
+  const normalizedPolicy = normalizeRetentionPolicy(policy);
+  const hasDelayedAttentionSchema = hasTable(db, 'attention_candidates');
+  const hasMaintenanceProposalSchema = hasTable(db, 'memory_maintenance_proposals');
+  const memoryCutoff = cutoffMs(normalizedPolicy.disabledDeletedMemoryDays, asOfMs);
+  const chatCutoff = cutoffMs(normalizedPolicy.chatMessagesDays, asOfMs);
+  const rawCutoff = cutoffMs(normalizedPolicy.rawEventsDays, asOfMs);
+  const auditCutoff = cutoffMs(normalizedPolicy.auditLogDays, asOfMs);
+  const failureCutoff = cutoffMs(normalizedPolicy.eventProcessingFailuresDays, asOfMs);
+  const memoryCandidatePredicate = memoryCutoff === undefined
+    ? undefined
+    : `memory_records.state IN ('rejected', 'disabled', 'deleted')
+       AND memory_records.updated_at < ?${hasMaintenanceProposalSchema ? `
+       AND NOT EXISTS (
+         SELECT 1 FROM memory_maintenance_proposals AS proposal
+         WHERE proposal.effect_memory_id = memory_records.id
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM memory_maintenance_proposal_candidates AS candidate
+         WHERE candidate.memory_id = memory_records.id
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM memory_maintenance_proposal_revision_effects AS effect
+         WHERE effect.memory_id = memory_records.id
+       )` : ''}`;
+  const memoryRecordIds = memoryCandidatePredicate === undefined
+    ? []
+    : selectStringColumn(
+      db,
+      `SELECT memory_records.id AS value
+       FROM memory_records
+       WHERE ${memoryCandidatePredicate}
+       ORDER BY memory_records.id`,
+      [memoryCutoff],
+    );
+
+  const memorySourceChatGuard = buildMemorySourceGuard({
+    target: 'chat',
+    memoryCutoff,
+    hasMaintenanceProposalSchema,
+  });
+  const activeAttentionChatGuard = hasDelayedAttentionSchema
+    ? ACTIVE_DELAYED_ATTENTION_CHAT_GUARD
+    : '';
+  const chatMessageIds = chatCutoff === undefined
+    ? []
+    : selectStringColumn(
+      db,
+      `SELECT chat_messages.id AS value
+       FROM chat_messages
+       WHERE chat_messages.timestamp < ?
+         AND ${memorySourceChatGuard.sql}
+         AND NOT EXISTS (
+           SELECT 1
+           FROM jobs
+           WHERE type = 'extraction'
+             AND status IN ('pending', 'running')
+             AND CASE
+               WHEN json_valid(payload) THEN json_extract(payload, '$.sourceChatMessageId')
+               ELSE NULL
+             END = chat_messages.id
+         )
+         ${ACTIVE_GROUP_SUMMARY_CHAT_GUARD}
+         ${activeAttentionChatGuard}
+       ORDER BY chat_messages.id`,
+      [chatCutoff, ...memorySourceChatGuard.params],
+    );
+  const plannedChatIds = new Set(chatMessageIds);
+
+  const memorySourceRawGuard = buildMemorySourceGuard({
+    target: 'raw',
+    memoryCutoff,
+    hasMaintenanceProposalSchema,
+  });
+  const activeAttentionRawGuard = hasDelayedAttentionSchema
+    ? ACTIVE_DELAYED_ATTENTION_RAW_GUARD
+    : '';
+  const potentialRawEventIds = rawCutoff === undefined
+    ? []
+    : selectStringColumn(
+      db,
+      `SELECT raw_events.id AS value
+       FROM raw_events
+       WHERE raw_events.timestamp < ?
+         AND NOT EXISTS (
+           SELECT 1 FROM agent_turns WHERE trigger_event_id = raw_events.id
+         )
+         AND ${memorySourceRawGuard.sql}
+         AND NOT EXISTS (
+           SELECT 1
+           FROM event_processing_admissions
+           WHERE raw_event_id = raw_events.id
+             AND state IN ('accepted', 'processing')
+         )
+         ${ACTIVE_GROUP_SUMMARY_RAW_GUARD}
+         ${activeAttentionRawGuard}
+       ORDER BY raw_events.id`,
+      [rawCutoff, ...memorySourceRawGuard.params],
+    );
+  const linkedChatStatement = db.prepare(
+    'SELECT id AS value FROM chat_messages WHERE raw_event_id = ? ORDER BY id',
+  );
+  const rawEventIds = potentialRawEventIds.filter((rawEventId) => {
+    const linkedChatIds = (linkedChatStatement.all(rawEventId) as Array<{ value: string }>)
+      .map((row) => row.value);
+    return linkedChatIds.every((chatMessageId) => plannedChatIds.has(chatMessageId));
+  });
+
+  const auditLogIds = auditCutoff === undefined
+    ? []
+    : selectStringColumn(
+      db,
+      'SELECT id AS value FROM audit_log WHERE timestamp < ? ORDER BY id',
+      [auditCutoff],
+    );
+  const eventProcessingFailureIds = failureCutoff === undefined
+    ? []
+    : selectStringColumn(
+      db,
+      `SELECT id AS value
+       FROM event_processing_failures
+       WHERE occurred_at < ?
+       ORDER BY id`,
+      [failureCutoff],
+    );
+
+  const modelInvocationSources: RetentionPlanCandidates['modelInvocationSources'] = [];
+  const invocationSourceStatement = db.prepare(
+    `SELECT model_invocation_id AS modelInvocationId, raw_event_id AS rawEventId
+     FROM model_invocation_sources
+     WHERE raw_event_id = ?
+     ORDER BY model_invocation_id, raw_event_id`,
+  );
+  for (const rawEventId of rawEventIds) {
+    modelInvocationSources.push(
+      ...(invocationSourceStatement.all(rawEventId) as RetentionPlanCandidates['modelInvocationSources']),
+    );
+  }
+
+  const memoryDependentKeys = memoryCandidatePredicate === undefined
+    ? { actionLinks: [], sources: [], revisions: [] }
+    : {
+      actionLinks: selectStringColumn(
+        db,
+        `SELECT action_executions.id || char(0) || action_executions.executed_memory_id AS value
+         FROM action_executions
+         JOIN memory_records ON memory_records.id = action_executions.executed_memory_id
+         WHERE ${memoryCandidatePredicate}
+         ORDER BY action_executions.id`,
+        [memoryCutoff],
+      ),
+      sources: selectStringColumn(
+        db,
+        `SELECT memory_sources.memory_id || char(0) || memory_sources.source_id AS value
+         FROM memory_sources
+         JOIN memory_records ON memory_records.id = memory_sources.memory_id
+         WHERE ${memoryCandidatePredicate}
+         ORDER BY memory_sources.memory_id, memory_sources.source_id`,
+        [memoryCutoff],
+      ),
+      revisions: selectStringColumn(
+        db,
+        `SELECT memory_revisions.id AS value
+         FROM memory_revisions
+         JOIN memory_records ON memory_records.id = memory_revisions.memory_id
+         WHERE ${memoryCandidatePredicate}
+         ORDER BY memory_revisions.id`,
+        [memoryCutoff],
+      ),
+    };
+
+  const effects: RetentionResult = {
+    rawEventsDeleted: rawEventIds.length,
+    modelInvocationSourcesDeleted: modelInvocationSources.length,
+    chatMessagesDeleted: chatMessageIds.length,
+    auditLogDeleted: auditLogIds.length,
+    eventProcessingFailuresDeleted: eventProcessingFailureIds.length,
+    memoriesPurged: memoryRecordIds.length,
+    actionMemoryLinksCleared: memoryDependentKeys.actionLinks.length,
+    memorySourcesDeleted: memoryDependentKeys.sources.length,
+    memoryRevisionsDeleted: memoryDependentKeys.revisions.length,
+    memoryFtsRowsDeleted: 0,
+  };
+  const rawCandidateKeys = rawEventIds;
+  const candidateKeys: Record<string, string[]> = {
+    actionMemoryLinks: memoryDependentKeys.actionLinks,
+    auditLog: auditLogIds,
+    chatMessages: chatMessageIds,
+    eventProcessingFailures: eventProcessingFailureIds,
+    memories: memoryRecordIds,
+    memoryRevisions: memoryDependentKeys.revisions,
+    memorySources: memoryDependentKeys.sources,
+    modelInvocationSources: modelInvocationSources.map(
+      (source) => `${source.modelInvocationId}\0${source.rawEventId}`,
+    ),
+    rawEvents: rawCandidateKeys,
+  };
+  const candidateFingerprints = Object.fromEntries(
+    Object.entries(candidateKeys).map(([category, keys]) => [
+      category,
+      keys.map((key) => retentionCandidateFingerprint(category, key)),
+    ]),
+  );
+  const stateFingerprint = createHash('sha256')
+    .update('lethebot.retention.plan.state.v1')
+    .update('\0')
+    .update(JSON.stringify(candidateFingerprints))
+    .digest('hex');
+
+  return {
+    policy: normalizedPolicy,
+    asOfMs,
+    effects,
+    candidateFingerprints,
+    stateFingerprint,
+    candidates: {
+      memoryRecordIds,
+      chatMessageIds,
+      rawEventIds,
+      auditLogIds,
+      eventProcessingFailureIds,
+      modelInvocationSources,
+    },
+  };
+}
+
+export function applyRetentionPlanInCurrentTransaction(
+  db: BetterSqlite3.Database,
+  plan: RetentionPlan,
+): RetentionResult {
+  const result = emptyRetentionResult();
+  const clearActionMemoryLink = db.prepare(
+    'UPDATE action_executions SET executed_memory_id = NULL WHERE executed_memory_id = ?',
+  );
+  const deleteMemorySources = db.prepare('DELETE FROM memory_sources WHERE memory_id = ?');
+  const deleteMemoryRevisions = db.prepare('DELETE FROM memory_revisions WHERE memory_id = ?');
+  const deleteMemory = db.prepare('DELETE FROM memory_records WHERE id = ?');
+  for (const memoryId of plan.candidates.memoryRecordIds) {
+    result.actionMemoryLinksCleared += clearActionMemoryLink.run(memoryId).changes;
+    result.memorySourcesDeleted += deleteMemorySources.run(memoryId).changes;
+    result.memoryRevisionsDeleted += deleteMemoryRevisions.run(memoryId).changes;
+    result.memoriesPurged += deleteMemory.run(memoryId).changes;
+  }
+  if (plan.candidates.memoryRecordIds.length > 0) {
+    db.prepare("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')").run();
+  }
+
+  const deleteChatMessage = db.prepare('DELETE FROM chat_messages WHERE id = ?');
+  for (const chatMessageId of plan.candidates.chatMessageIds) {
+    result.chatMessagesDeleted += deleteChatMessage.run(chatMessageId).changes;
+  }
+
+  const deleteInvocationSource = db.prepare(
+    `DELETE FROM model_invocation_sources
+     WHERE model_invocation_id = ? AND raw_event_id = ?`,
+  );
+  for (const source of plan.candidates.modelInvocationSources) {
+    result.modelInvocationSourcesDeleted += deleteInvocationSource.run(
+      source.modelInvocationId,
+      source.rawEventId,
+    ).changes;
+  }
+  const deleteRawEvent = db.prepare('DELETE FROM raw_events WHERE id = ?');
+  for (const rawEventId of plan.candidates.rawEventIds) {
+    result.rawEventsDeleted += deleteRawEvent.run(rawEventId).changes;
+  }
+
+  const deleteAudit = db.prepare('DELETE FROM audit_log WHERE id = ?');
+  for (const auditId of plan.candidates.auditLogIds) {
+    result.auditLogDeleted += deleteAudit.run(auditId).changes;
+  }
+  const deleteFailure = db.prepare('DELETE FROM event_processing_failures WHERE id = ?');
+  for (const failureId of plan.candidates.eventProcessingFailureIds) {
+    result.eventProcessingFailuresDeleted += deleteFailure.run(failureId).changes;
+  }
+
+  if (!retentionResultsEqual(result, plan.effects)) {
+    throw new Error('Retention apply result did not match the planned effects');
+  }
+  return result;
+}
+
+export function retentionResultsEqual(
+  left: RetentionResult,
+  right: RetentionResult,
+): boolean {
+  return Object.keys(emptyRetentionResult()).every(
+    (key) => left[key as keyof RetentionResult] === right[key as keyof RetentionResult],
+  );
+}
+
 export function applyRetentionPolicy(
   db: BetterSqlite3.Database,
   policy: RetentionPolicy,
   nowMs: number = Date.now(),
 ): RetentionResult {
-  const result: RetentionResult = {
+  return db.transaction(() => {
+    const plan = planRetentionPolicy(db, policy, nowMs);
+    return applyRetentionPlanInCurrentTransaction(db, plan);
+  }).immediate();
+}
+
+function emptyRetentionResult(): RetentionResult {
+  return {
     rawEventsDeleted: 0,
     modelInvocationSourcesDeleted: 0,
     chatMessagesDeleted: 0,
@@ -488,121 +880,96 @@ export function applyRetentionPolicy(
     memoryRevisionsDeleted: 0,
     memoryFtsRowsDeleted: 0,
   };
-  const hasDelayedAttentionSchema = db.prepare(
-    `SELECT 1
-     FROM sqlite_schema
-     WHERE type = 'table' AND name = 'attention_candidates'`,
-  ).get() !== undefined;
-  const activeAttentionChatGuard = hasDelayedAttentionSchema
-    ? ACTIVE_DELAYED_ATTENTION_CHAT_GUARD
+}
+
+function normalizeRetentionDays(value: number | undefined, field: string): number {
+  if (value === undefined) {
+    return 0;
+  }
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Retention policy ${field} must be a nonnegative safe integer`);
+  }
+  return value;
+}
+
+function hasTable(db: BetterSqlite3.Database, table: string): boolean {
+  return db.prepare(
+    `SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?`,
+  ).get(table) !== undefined;
+}
+
+function buildMemorySourceGuard(options: {
+  target: 'chat' | 'raw';
+  memoryCutoff: number | undefined;
+  hasMaintenanceProposalSchema: boolean;
+}): { sql: string; params: unknown[] } {
+  const targetPredicate = options.target === 'chat'
+    ? `(memory_sources.resolution_state = 'internal'
+        AND (memory_sources.chat_message_id = chat_messages.id
+             OR memory_sources.raw_event_id = chat_messages.raw_event_id))
+       OR (memory_sources.resolution_state = 'legacy_unresolved'
+           AND ((memory_sources.source_type = 'chat_message'
+                 AND (memory_sources.source_id = chat_messages.id
+                      OR memory_sources.source_id = chat_messages.message_id))
+                OR (memory_sources.source_type = 'raw_event'
+                    AND memory_sources.source_id = chat_messages.raw_event_id)))`
+    : `(memory_sources.resolution_state = 'internal'
+        AND memory_sources.raw_event_id = raw_events.id)
+       OR (memory_sources.resolution_state = 'legacy_unresolved'
+           AND memory_sources.source_type = 'raw_event'
+           AND memory_sources.source_id = raw_events.id)`;
+  if (options.memoryCutoff === undefined) {
+    return {
+      sql: `NOT EXISTS (SELECT 1 FROM memory_sources WHERE ${targetPredicate})`,
+      params: [],
+    };
+  }
+  const proposalPins = options.hasMaintenanceProposalSchema
+    ? `OR EXISTS (
+         SELECT 1 FROM memory_maintenance_proposals AS proposal
+         WHERE proposal.effect_memory_id = memory_records.id
+       )
+       OR EXISTS (
+         SELECT 1 FROM memory_maintenance_proposal_candidates AS candidate
+         WHERE candidate.memory_id = memory_records.id
+       )
+       OR EXISTS (
+         SELECT 1 FROM memory_maintenance_proposal_revision_effects AS effect
+         WHERE effect.memory_id = memory_records.id
+       )`
     : '';
-  const rawEventRetentionPredicate = `${RAW_EVENT_RETENTION_PREDICATE}${ACTIVE_GROUP_SUMMARY_RAW_GUARD}${
-    hasDelayedAttentionSchema ? ACTIVE_DELAYED_ATTENTION_RAW_GUARD : ''
-  }`;
-
-  db.transaction(() => {
-    const memoryCutoff = cutoffMs(policy.disabledDeletedMemoryDays, nowMs);
-    if (memoryCutoff !== undefined) {
-      const memories = db
-        .prepare(
-          `SELECT id
-           FROM memory_records
-           WHERE state IN ('disabled', 'deleted') AND updated_at < ?`
+  return {
+    sql: `NOT EXISTS (
+      SELECT 1
+      FROM memory_sources
+      JOIN memory_records ON memory_records.id = memory_sources.memory_id
+      WHERE (${targetPredicate})
+        AND (
+          memory_records.state NOT IN ('rejected', 'disabled', 'deleted')
+          OR memory_records.updated_at >= ?
+          ${proposalPins}
         )
-        .all(memoryCutoff) as Array<{ id: string }>;
+    )`,
+    params: [options.memoryCutoff],
+  };
+}
 
-      for (const memory of memories) {
-        result.actionMemoryLinksCleared += db
-          .prepare('UPDATE action_executions SET executed_memory_id = NULL WHERE executed_memory_id = ?')
-          .run(memory.id).changes;
-        result.memorySourcesDeleted += db
-          .prepare('DELETE FROM memory_sources WHERE memory_id = ?')
-          .run(memory.id).changes;
-        result.memoryRevisionsDeleted += db
-          .prepare('DELETE FROM memory_revisions WHERE memory_id = ?')
-          .run(memory.id).changes;
-        result.memoriesPurged += db
-          .prepare('DELETE FROM memory_records WHERE id = ?')
-          .run(memory.id).changes;
-      }
+function selectStringColumn(
+  db: BetterSqlite3.Database,
+  sql: string,
+  params: unknown[],
+): string[] {
+  return (db.prepare(sql).all(...params) as Array<{ value: string }>).map((row) => row.value);
+}
 
-      if (memories.length > 0) {
-        db.prepare("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')").run();
-      }
-    }
-
-    const chatCutoff = cutoffMs(policy.chatMessagesDays, nowMs);
-    if (chatCutoff !== undefined) {
-      result.chatMessagesDeleted = db
-        .prepare(
-          `DELETE FROM chat_messages
-           WHERE timestamp < ?
-             AND NOT EXISTS (
-               SELECT 1
-               FROM memory_sources
-               WHERE (resolution_state = 'internal'
-                      AND (chat_message_id = chat_messages.id
-                           OR raw_event_id = chat_messages.raw_event_id))
-                  OR (resolution_state = 'legacy_unresolved'
-                      AND ((source_type = 'chat_message'
-                            AND (source_id = chat_messages.id
-                                 OR source_id = chat_messages.message_id))
-                           OR (source_type = 'raw_event'
-                               AND source_id = chat_messages.raw_event_id)))
-             )
-             AND NOT EXISTS (
-               SELECT 1
-               FROM jobs
-               WHERE type = 'extraction'
-                 AND status IN ('pending', 'running')
-                 AND CASE
-                   WHEN json_valid(payload) THEN json_extract(payload, '$.sourceChatMessageId')
-                   ELSE NULL
-                 END = chat_messages.id
-             )
-             ${ACTIVE_GROUP_SUMMARY_CHAT_GUARD}
-             ${activeAttentionChatGuard}`
-        )
-        .run(chatCutoff).changes;
-    }
-
-    const rawCutoff = cutoffMs(policy.rawEventsDays, nowMs);
-    if (rawCutoff !== undefined) {
-      result.modelInvocationSourcesDeleted = db
-        .prepare(
-          `DELETE FROM model_invocation_sources
-           WHERE raw_event_id IN (
-             SELECT raw_events.id
-             FROM raw_events
-             WHERE ${rawEventRetentionPredicate}
-           )`
-        )
-        .run(rawCutoff).changes;
-      result.rawEventsDeleted = db
-        .prepare(
-          `DELETE FROM raw_events
-           WHERE ${rawEventRetentionPredicate}`
-        )
-        .run(rawCutoff).changes;
-    }
-
-    const auditCutoff = cutoffMs(policy.auditLogDays, nowMs);
-    if (auditCutoff !== undefined) {
-      result.auditLogDeleted = db
-        .prepare('DELETE FROM audit_log WHERE timestamp < ?')
-        .run(auditCutoff).changes;
-    }
-
-    const eventFailureCutoff = cutoffMs(policy.eventProcessingFailuresDays, nowMs);
-    if (eventFailureCutoff !== undefined) {
-      result.eventProcessingFailuresDeleted = db
-        .prepare('DELETE FROM event_processing_failures WHERE occurred_at < ?')
-        .run(eventFailureCutoff).changes;
-    }
-
-  })();
-
-  return result;
+function retentionCandidateFingerprint(category: string, key: string): string {
+  return createHash('sha256')
+    .update('lethebot.retention.candidate.v1')
+    .update('\0')
+    .update(category)
+    .update('\0')
+    .update(key)
+    .digest('hex');
 }
 
 export function collectOperationsMetrics(
@@ -624,13 +991,51 @@ export function collectOperationsMetrics(
       total: countRows(db, 'event_processing_admissions', 'accepted_at', sinceMs),
       byState: countBy(db, 'event_processing_admissions', 'state', 'accepted_at', sinceMs),
     },
+    latency: {
+      queueWaitMs: collectQueueWaitLatency(db, sinceMs),
+      providerLatencyMs: collectModelInvocationLatency(db, {
+        purpose: 'pi_turn',
+        sinceMs,
+      }),
+      totalTurnLatencyMs: collectTotalTurnLatency(db, sinceMs),
+    },
     chatMessages: {
       total: countRows(db, 'chat_messages', 'timestamp', sinceMs),
     },
     agentTurns: {
       total: countRows(db, 'agent_turns', 'started_at', sinceMs),
-      byStatus: countBy(db, 'agent_turns', 'status', 'started_at', sinceMs),
+      byStatus: countByBounded(
+        db,
+        'agent_turns',
+        'status',
+        'started_at',
+        AGENT_TURN_STATUSES,
+        sinceMs,
+      ),
+      tokensInput: sumColumn(db, 'agent_turns', 'tokens_input', 'started_at', sinceMs),
+      tokensOutput: sumColumn(db, 'agent_turns', 'tokens_output', 'started_at', sinceMs),
       tokensTotal: sumColumn(db, 'agent_turns', 'tokens_total', 'started_at', sinceMs),
+      ...completedUsageCounts(db, 'agent_turns', 'started_at', sinceMs),
+    },
+    modelInvocations: {
+      total: countRows(db, 'model_invocations', 'started_at', sinceMs),
+      byPurpose: countByBounded(
+        db,
+        'model_invocations',
+        'purpose',
+        'started_at',
+        MODEL_INVOCATION_PURPOSES,
+        sinceMs,
+      ),
+      byStatus: countByBounded(
+        db,
+        'model_invocations',
+        'status',
+        'started_at',
+        MODEL_INVOCATION_STATUSES,
+        sinceMs,
+      ),
+      ...completedUsageCounts(db, 'model_invocations', 'started_at', sinceMs),
     },
     contextTraces: {
       total: countRows(db, 'context_traces', 'created_at', sinceMs),
@@ -694,6 +1099,102 @@ export function collectOperationsMetrics(
   };
 }
 
+export function collectModelInvocationLatency(
+  db: BetterSqlite3.Database,
+  options: {
+    purpose?: string;
+    status?: string;
+    sinceMs?: number;
+  } = {},
+): LatencyAggregate {
+  const predicates = [
+    `status IN ('completed', 'failed', 'aborted')`,
+  ];
+  const params: unknown[] = [];
+  if (options.purpose !== undefined) {
+    predicates.push('purpose = ?');
+    params.push(options.purpose);
+  }
+  if (options.status !== undefined) {
+    predicates.push('status = ?');
+    params.push(options.status);
+  }
+  if (options.sinceMs !== undefined) {
+    predicates.push('started_at >= ?');
+    params.push(options.sinceMs);
+  }
+
+  const rows = db.prepare(
+    `SELECT started_at AS start_at, completed_at AS end_at
+       FROM model_invocations
+      WHERE ${predicates.join(' AND ')}
+        AND completed_at IS NOT NULL`,
+  ).all(...params) as Array<{ start_at: unknown; end_at: unknown }>;
+  return aggregateLatencyRows(rows);
+}
+
+function collectQueueWaitLatency(
+  db: BetterSqlite3.Database,
+  sinceMs?: number,
+): LatencyAggregate {
+  const sinceClause = sinceMs === undefined ? '' : ' AND a.accepted_at >= ?';
+  const params = sinceMs === undefined ? [] : [sinceMs];
+  const rows = db.prepare(
+    `SELECT a.accepted_at AS start_at, a.processing_started_at AS end_at
+       FROM event_processing_admissions AS a
+      WHERE a.processing_started_at IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM agent_turns AS t
+           WHERE t.trigger_event_id = a.raw_event_id
+             AND t.status IN ('completed', 'failed', 'aborted')
+        )${sinceClause}`,
+  ).all(...params) as Array<{ start_at: unknown; end_at: unknown }>;
+  return aggregateLatencyRows(rows);
+}
+
+function collectTotalTurnLatency(
+  db: BetterSqlite3.Database,
+  sinceMs?: number,
+): LatencyAggregate {
+  const sinceClause = sinceMs === undefined ? '' : ' AND a.accepted_at >= ?';
+  const params = sinceMs === undefined ? [] : [sinceMs];
+  const rows = db.prepare(
+    `SELECT a.accepted_at AS start_at, t.completed_at AS end_at
+       FROM event_processing_admissions AS a
+       JOIN agent_turns AS t ON t.trigger_event_id = a.raw_event_id
+      WHERE t.status IN ('completed', 'failed', 'aborted')
+        AND t.completed_at IS NOT NULL${sinceClause}`,
+  ).all(...params) as Array<{ start_at: unknown; end_at: unknown }>;
+  return aggregateLatencyRows(rows);
+}
+
+function aggregateLatencyRows(
+  rows: Array<{ start_at: unknown; end_at: unknown }>,
+): LatencyAggregate {
+  let count = 0;
+  let sumMs = 0;
+  let maxMs = 0;
+
+  for (const row of rows) {
+    if (!Number.isSafeInteger(row.start_at) || !Number.isSafeInteger(row.end_at)) {
+      continue;
+    }
+    const durationMs = (row.end_at as number) - (row.start_at as number);
+    if (!Number.isSafeInteger(durationMs) || durationMs < 0) {
+      continue;
+    }
+    const nextSum = sumMs + durationMs;
+    if (!Number.isSafeInteger(nextSum)) {
+      continue;
+    }
+    count += 1;
+    sumMs = nextSum;
+    maxMs = Math.max(maxMs, durationMs);
+  }
+
+  return { count, sumMs, maxMs };
+}
+
 export function formatOperationsMetricsPrometheus(metrics: OperationsMetrics): string {
   const lines: string[] = [
     '# HELP lethebot_metrics_snapshot_info Count-only LetheBot operations metrics snapshot.',
@@ -730,10 +1231,22 @@ export function formatOperationsMetricsPrometheus(metrics: OperationsMetrics): s
     metrics.eventProcessingAdmissions.byState,
     EVENT_PROCESSING_ADMISSION_STATES,
   );
+  appendLatencyAggregate(lines, 'lethebot_turn_queue_wait_ms', 'Turn admission queue wait in milliseconds.', metrics.latency.queueWaitMs);
+  appendLatencyAggregate(lines, 'lethebot_pi_provider_latency_ms', 'Terminal Pi Provider invocation latency in milliseconds.', metrics.latency.providerLatencyMs);
+  appendLatencyAggregate(lines, 'lethebot_turn_total_latency_ms', 'Terminal turn latency from admission to completion in milliseconds.', metrics.latency.totalTurnLatencyMs);
   appendGauge(lines, 'lethebot_chat_messages_total', 'Chat messages stored.', metrics.chatMessages.total);
   appendGauge(lines, 'lethebot_agent_turns_total', 'Agent turns stored.', metrics.agentTurns.total);
+  appendGauge(lines, 'lethebot_agent_turn_input_tokens_total', 'Input tokens recorded on agent turns.', metrics.agentTurns.tokensInput);
+  appendGauge(lines, 'lethebot_agent_turn_output_tokens_total', 'Output tokens recorded on agent turns.', metrics.agentTurns.tokensOutput);
   appendGauge(lines, 'lethebot_agent_turn_tokens_total', 'Total tokens recorded on agent turns.', metrics.agentTurns.tokensTotal);
+  appendGauge(lines, 'lethebot_agent_turns_completed_known_usage_total', 'Completed agent turns with known usage.', metrics.agentTurns.completedKnownUsage);
+  appendGauge(lines, 'lethebot_agent_turns_completed_unknown_usage_total', 'Completed agent turns with unknown usage.', metrics.agentTurns.completedUnknownUsage);
   appendLabelCounts(lines, 'lethebot_agent_turns_status_total', 'Agent turns by status.', 'status', metrics.agentTurns.byStatus, AGENT_TURN_STATUSES);
+  appendGauge(lines, 'lethebot_model_invocations_total', 'Model invocation ledger rows stored.', metrics.modelInvocations.total);
+  appendGauge(lines, 'lethebot_model_invocations_completed_known_usage_total', 'Completed model invocations with known usage.', metrics.modelInvocations.completedKnownUsage);
+  appendGauge(lines, 'lethebot_model_invocations_completed_unknown_usage_total', 'Completed model invocations with unknown usage.', metrics.modelInvocations.completedUnknownUsage);
+  appendLabelCounts(lines, 'lethebot_model_invocations_purpose_total', 'Model invocations by bounded purpose.', 'purpose', metrics.modelInvocations.byPurpose, MODEL_INVOCATION_PURPOSES);
+  appendLabelCounts(lines, 'lethebot_model_invocations_status_total', 'Model invocations by bounded status.', 'status', metrics.modelInvocations.byStatus, MODEL_INVOCATION_STATUSES);
   appendGauge(lines, 'lethebot_context_traces_total', 'Context traces stored.', metrics.contextTraces.total);
   appendGauge(lines, 'lethebot_action_decisions_total', 'Action decisions stored.', metrics.actionDecisions.total);
   appendGauge(lines, 'lethebot_action_decisions_evaluator_required_total', 'Action decisions requiring evaluator review.', metrics.actionDecisions.evaluatorRequired);
@@ -817,6 +1330,56 @@ function countBy(
   return counts;
 }
 
+function countByBounded(
+  db: BetterSqlite3.Database,
+  table: string,
+  groupColumn: string,
+  timestampColumn: string,
+  allowedValues: readonly string[],
+  sinceMs?: number,
+): Record<string, number> {
+  const where = sinceMs === undefined
+    ? `${groupColumn} IS NOT NULL`
+    : `${groupColumn} IS NOT NULL AND ${timestampColumn} >= ?`;
+  const rows = sinceMs === undefined
+    ? db.prepare(`SELECT ${groupColumn} AS key, COUNT(*) AS count FROM ${table} WHERE ${where} GROUP BY ${groupColumn}`).all()
+    : db.prepare(`SELECT ${groupColumn} AS key, COUNT(*) AS count FROM ${table} WHERE ${where} GROUP BY ${groupColumn}`).all(sinceMs);
+  const allowed = new Set(allowedValues);
+  const counts: Record<string, number> = {};
+  for (const row of rows as Array<{ key: unknown; count: number }>) {
+    const key = typeof row.key === 'string' && allowed.has(row.key) ? row.key : 'other';
+    counts[key] = (counts[key] ?? 0) + row.count;
+  }
+  return counts;
+}
+
+function completedUsageCounts(
+  db: BetterSqlite3.Database,
+  table: string,
+  timestampColumn: string,
+  sinceMs?: number,
+): { completedKnownUsage: number; completedUnknownUsage: number } {
+  const where = sinceMs === undefined ? '' : ` AND ${timestampColumn} >= ?`;
+  const params = sinceMs === undefined ? [] : [sinceMs];
+  const row = db.prepare(
+    `SELECT
+       COALESCE(SUM(CASE WHEN status = 'completed'
+         AND tokens_input IS NOT NULL
+         AND tokens_output IS NOT NULL
+         AND tokens_total IS NOT NULL THEN 1 ELSE 0 END), 0) AS known,
+       COALESCE(SUM(CASE WHEN status = 'completed'
+         AND (tokens_input IS NULL OR tokens_output IS NULL OR tokens_total IS NULL)
+         THEN 1 ELSE 0 END), 0) AS unknown
+       FROM ${table}
+      WHERE 1 = 1${where}`,
+  ).get(...params);
+  const values = row as { known?: unknown; unknown?: unknown };
+  return {
+    completedKnownUsage: typeof values.known === 'number' ? values.known : 0,
+    completedUnknownUsage: typeof values.unknown === 'number' ? values.unknown : 0,
+  };
+}
+
 function redactMetricKey(value: string): string {
   const platformRedacted = redactPlatformIdentifiers(value);
   const redacted = redactPlatformIdentifiers(redactSecretsInText(platformRedacted).text);
@@ -875,6 +1438,17 @@ function appendGauge(lines: string[], name: string, help: string, value: number)
   lines.push(`# HELP ${name} ${help}`);
   lines.push(`# TYPE ${name} gauge`);
   lines.push(`${name} ${formatMetricNumber(value)}`);
+}
+
+function appendLatencyAggregate(
+  lines: string[],
+  name: string,
+  help: string,
+  aggregate: LatencyAggregate,
+): void {
+  appendGauge(lines, `${name}_count`, `${help} Observation count.`, aggregate.count);
+  appendGauge(lines, `${name}_sum`, `${help} Sum.`, aggregate.sumMs);
+  appendGauge(lines, `${name}_max`, `${help} Maximum.`, aggregate.maxMs);
 }
 
 function appendLabelCounts(
