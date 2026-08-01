@@ -16301,4 +16301,92 @@ describe('CLI main command parser', () => {
     expect(afterRows).toEqual(beforeRows);
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
+
+  it('summarizes model invocations without exposing row payloads or private identifiers', () => {
+    const sourceId = 'raw-cli-invocation-source';
+    const turnId = 'turn-cli-invocation';
+    const secretProvider = 'provider-sk-cli-summary-secret-qq-123456789';
+    const responseHash = 'a'.repeat(64);
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO raw_events (
+        id, type, timestamp, source, platform, conversation_id, payload, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(sourceId, 'chat.message.received', now, 'gateway', 'qq', 'private:cli', '{}', now);
+    db.prepare(
+      `INSERT INTO agent_turns (
+        id, conversation_id, trigger_event_id, pi_model, pi_provider,
+        status, started_at
+      ) VALUES (?, ?, ?, ?, ?, 'running', ?)`,
+    ).run(turnId, 'private:cli', sourceId, 'model-cli-summary', secretProvider, now);
+    db.prepare(
+      `INSERT INTO event_processing_admissions (
+        raw_event_id, state, accepted_at, processing_started_at, finished_at, reason_code
+      ) VALUES (?, 'completed', ?, ?, ?, NULL)`,
+    ).run(sourceId, now - 20, now - 10, now + 20);
+    db.prepare(
+      `INSERT INTO model_invocations (
+        id, turn_id, purpose, call_number, provider, model, status,
+        started_at, completed_at, tokens_input, tokens_output, tokens_total,
+        response_sha256, response_bytes
+      ) VALUES (?, ?, 'pi_turn', ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      'invocation-cli-known', turnId, 1, secretProvider, 'model-cli-summary',
+      now, now + 1, 2, 3, 5, responseHash, 12,
+    );
+    db.prepare(
+      `INSERT INTO model_invocations (
+        id, turn_id, purpose, call_number, provider, model, status,
+        started_at, completed_at, response_sha256, response_bytes
+      ) VALUES (?, ?, 'pi_turn', ?, ?, ?, 'completed', ?, ?, ?, ?)`,
+    ).run(
+      'invocation-cli-unknown', turnId, 2, secretProvider, 'model-cli-summary',
+      now, now + 2, 'b'.repeat(64), 14,
+    );
+    db.prepare(
+      `INSERT INTO model_invocation_sources (model_invocation_id, raw_event_id, source_ordinal)
+       VALUES (?, ?, 0), (?, ?, 0)`,
+    ).run('invocation-cli-known', sourceId, 'invocation-cli-unknown', sourceId);
+    db.prepare(
+      `UPDATE agent_turns SET status = 'completed', completed_at = ? WHERE id = ?`,
+    ).run(now + 20, turnId);
+
+    const output = JSON.parse(expectSuccessfulCli([
+      'summarize-model-invocations',
+      '--purpose',
+      'pi_turn',
+      '--status',
+      'completed',
+    ])) as {
+      total: number;
+      byPurpose: Record<string, number>;
+      byStatus: Record<string, number>;
+      completedKnownUsage: number;
+      completedUnknownUsage: number;
+      providerLatencyMs: { count: number; sumMs: number; maxMs: number };
+    };
+    expect(output.total).toBe(2);
+    expect(output.byPurpose).toEqual({ pi_turn: 2 });
+    expect(output.byStatus).toEqual({ completed: 2 });
+    expect(output.completedKnownUsage).toBe(1);
+    expect(output.completedUnknownUsage).toBe(1);
+    expect(output.providerLatencyMs).toEqual({ count: 2, sumMs: 3, maxMs: 2 });
+    const serialized = JSON.stringify(output);
+    expect(serialized).not.toContain(secretProvider);
+    expect(serialized).not.toContain(sourceId);
+    expect(serialized).not.toContain('invocation-cli');
+    expect(serialized).not.toContain(responseHash);
+
+    expectFailedCli(
+      ['summarize-model-invocations', '--purpose', 'private-purpose'],
+      'Invalid model invocation purpose',
+    );
+    expectFailedCli(
+      ['summarize-model-invocations', '--status', 'private-status'],
+      'Invalid model invocation status',
+    );
+    reopenDb();
+    expect(db.prepare('SELECT COUNT(*) AS count FROM model_invocations').get()).toEqual({ count: 2 });
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
 });

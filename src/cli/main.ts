@@ -10,6 +10,7 @@ import {
   formatGovernanceMemoryIdForDisplay,
   GovernanceService,
 } from '../governance/service.js';
+import { GovernanceQueryService } from '../governance/query-service.js';
 import { initDatabase, closeDatabase } from '../storage/database.js';
 import { MemoryRepository } from '../storage/memory-repository.js';
 import { IdentityRepository } from '../storage/identity-repository.js';
@@ -20,6 +21,8 @@ import {
   type GovernanceHealthSummaryInspectionRecord,
   type MemoryReviewAuditEventType,
   type MemoryReviewResolutionStatus,
+  type ModelInvocationPurpose,
+  type ModelInvocationStatus,
 } from './governance.js';
 import { loadConfig } from '../config/index.js';
 import { redactSecretsInText } from '../memory/secret-scan.js';
@@ -56,6 +59,9 @@ const EVENT_PROCESSING_FAILURE_STAGES = [
   'memory_extraction',
   'turn_complete',
 ] as const;
+
+const MODEL_INVOCATION_PURPOSES = ['summary', 'evaluator', 'pi_turn'] as const;
+const MODEL_INVOCATION_STATUSES = ['running', 'completed', 'failed', 'aborted'] as const;
 
 type EventProcessingFailureStage = typeof EVENT_PROCESSING_FAILURE_STAGES[number];
 type MemorySummaryAction = 'status' | 'enable' | 'disable';
@@ -259,6 +265,30 @@ function parseMemoryReviewStatus(value: string | undefined): MemoryReviewResolut
     default:
       throw new Error(`Invalid memory review status ${status}; expected all, resolved, or unresolved`);
   }
+}
+
+function parseModelInvocationPurpose(value: string | undefined): ModelInvocationPurpose | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if ((MODEL_INVOCATION_PURPOSES as readonly string[]).includes(value)) {
+    return value as ModelInvocationPurpose;
+  }
+  throw new Error(
+    `Invalid model invocation purpose ${value}; expected ${MODEL_INVOCATION_PURPOSES.join(', ')}`,
+  );
+}
+
+function parseModelInvocationStatus(value: string | undefined): ModelInvocationStatus | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if ((MODEL_INVOCATION_STATUSES as readonly string[]).includes(value)) {
+    return value as ModelInvocationStatus;
+  }
+  throw new Error(
+    `Invalid model invocation status ${value}; expected ${MODEL_INVOCATION_STATUSES.join(', ')}`,
+  );
 }
 
 function parseEventProcessingFailureStage(value: string | undefined): EventProcessingFailureStage | undefined {
@@ -771,15 +801,21 @@ program
     'Exact group ID',
     parseMemorySummaryGroupId,
   )
-  .action((action: MemorySummaryAction, options: { group: string }) => {
+  .action(async (action: MemorySummaryAction, options: { group: string }) => {
     const db = initDatabase({ path: getDbPath() });
     const governance = new GovernanceService(db);
 
     try {
       if (action === 'status') {
-        const policy = governance.getGroupSummaryPolicyAsLocalAdmin(options.group);
+        const policy = await new GovernanceQueryService(db).getGroupSummaryPolicyForScope({
+          kind: 'group',
+          groupId: options.group,
+        });
+        if (policy === null) {
+          throw new Error('Exact group summary policy scope is invalid');
+        }
         printMemorySummaryPolicy({
-          state: policy?.state ?? 'disabled',
+          state: policy.state,
           changed: false,
           canceledJobCount: 0,
         });
@@ -1079,6 +1115,25 @@ program
           eventType: parseMemoryReviewEventType(options.eventType),
           memoryId: options.memory,
           status: parseMemoryReviewStatus(options.status),
+        });
+        printJson(summary);
+      } catch (error) {
+        printError(error);
+      }
+    });
+  });
+
+program
+  .command('summarize-model-invocations')
+  .description('Summarize model invocation ledger counts without exposing invocation details')
+  .option('--purpose <purpose>', 'Filter by summary, evaluator, or pi_turn')
+  .option('--status <status>', 'Filter by running, completed, failed, or aborted')
+  .action(async (options) => {
+    await withGovernanceCli(async (cli) => {
+      try {
+        const summary = await cli.summarizeModelInvocations({
+          purpose: parseModelInvocationPurpose(options.purpose),
+          status: parseModelInvocationStatus(options.status),
         });
         printJson(summary);
       } catch (error) {

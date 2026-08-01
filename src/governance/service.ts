@@ -1,15 +1,47 @@
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
+import { ulid } from 'ulidx';
 import { redactSecretsInText } from '../memory/secret-scan.js';
 import { parseStoredChatMessageReceived } from '../ingestion/stored-chat-event.js';
 import {
   GroupSummaryPolicyRepository,
   type GroupSummaryAuthorityKind,
+  type GroupSummaryPolicyExpectedVersion,
   type GroupSummaryPolicy,
   type SetGroupSummaryPolicyResult,
+  type SetGroupSummaryPolicyExpectedResult,
 } from '../storage/group-summary-policy-repository.js';
+import { AuditRepository } from '../storage/audit-repository.js';
+import {
+  MemoryMaintenanceProposalRepository,
+  type MemoryMaintenanceProposalAccess,
+  type MemoryMaintenanceProposalExactScope,
+  type MemoryMaintenanceProposalLifecycleState,
+  type MemoryMaintenanceProposalRecord,
+  type MemoryMaintenanceApplyInput,
+  type MemoryMaintenanceRollbackInput,
+  type MemoryMaintenanceReviewInput,
+  type MemoryMaintenanceReviewTransition,
+} from '../storage/memory-maintenance-proposal-repository.js';
 import { MemoryRepository } from '../storage/memory-repository.js';
+import {
+  PrivacyPreferenceRepository,
+  type PrivacyPreferenceExpectedVersion,
+  type PrivacyPreferenceState,
+  type PrivacyPreferenceType,
+  type SetPrivacyPreferenceExpectedResult,
+} from '../storage/privacy-preference-repository.js';
+import type { MemoryRecord } from '../types/memory.js';
 import type { ActorClass, InvocationContext } from '../types/tool.js';
+import {
+  deriveDisplayProfileTargetResourceId,
+  readDisplayProfileRedactionSnapshot,
+  readPlatformAccountUnlinkSnapshot,
+  redactGovernanceDisplayString,
+  redactGovernanceStructuredValue,
+  type DisplayProfileRedactionSnapshot,
+  type PlatformAccountUnlinkSnapshot,
+} from './query-service.js';
 import {
   parseQqGovernanceCommand,
   type QqGovernanceCommand,
@@ -22,6 +54,34 @@ const QQ_ID_PATTERN = /^[1-9][0-9]{4,11}$/;
 const NORMALIZED_QQ_ID_PATTERN = /^qq-([1-9][0-9]{4,11})$/;
 const NORMALIZED_QQ_GROUP_ID_PATTERN = /^qq-group-[1-9][0-9]{4,11}$/;
 const DISPLAYABLE_MEMORY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const GOVERNANCE_REASON_CODE_PATTERN = /^[a-z][a-z0-9_:-]{0,127}$/u;
+const MAX_JAVASCRIPT_DATE_MS = 8_640_000_000_000_000;
+export const DISPLAY_PROFILE_REDACTION_REASON_CODE =
+  'governance_http_display_profile_redaction_confirmed';
+export const PLATFORM_ACCOUNT_UNLINK_REASON_CODE =
+  'governance_http_platform_account_unlink_confirmed';
+const DISPLAY_PROFILE_REDACTION_COUNT_MISMATCH = Symbol(
+  'display_profile_redaction_count_mismatch',
+);
+const PLATFORM_ACCOUNT_UNLINK_COUNT_MISMATCH = Symbol(
+  'platform_account_unlink_count_mismatch',
+);
+type RestorableMemoryState = Extract<
+  MemoryRecord['state'],
+  'disabled' | 'rejected' | 'deleted'
+>;
+const FORGETTABLE_MEMORY_STATES: ReadonlyArray<Exclude<MemoryRecord['state'], 'deleted'>> = [
+  'proposed',
+  'active',
+  'rejected',
+  'superseded',
+  'disabled',
+];
+const RESTORABLE_MEMORY_STATES: ReadonlyArray<RestorableMemoryState> = [
+  'disabled',
+  'rejected',
+  'deleted',
+];
 
 const DENIED_RESPONSE = 'Governance command denied.';
 const INVALID_SOURCE_RESPONSE = 'Governance command could not be verified.';
@@ -76,10 +136,151 @@ export interface LocalAdminForgetResult {
   outcome: 'forgotten' | 'not_found';
 }
 
+export interface LocalAdminExpectedForgetInput {
+  memoryId: string;
+  scope: MemoryMaintenanceProposalExactScope;
+  expectedState: Exclude<MemoryRecord['state'], 'deleted'>;
+  expectedRevisionNumber: number;
+  reasonCode: string;
+}
+
+export type LocalAdminExpectedForgetResult =
+  | { outcome: 'forgotten'; revisionNumber: number }
+  | { outcome: 'not_found' | 'stale' };
+
+export interface LocalAdminRestoreResult {
+  outcome: 'restored' | 'not_found';
+}
+
+export interface LocalAdminExpectedRestoreInput {
+  memoryId: string;
+  scope: MemoryMaintenanceProposalExactScope;
+  expectedState: RestorableMemoryState;
+  expectedRevisionNumber: number;
+  reasonCode: string;
+}
+
+export type LocalAdminExpectedRestoreResult =
+  | { outcome: 'restored'; revisionNumber: number }
+  | { outcome: 'not_found' | 'stale' };
+
+export interface RedactDisplayProfileAsLocalAdminInput {
+  canonicalUserId: string;
+  groupId?: string;
+}
+
+export interface RedactDisplayProfileAsLocalAdminExpectedInput
+  extends RedactDisplayProfileAsLocalAdminInput {
+  targetId: string;
+  expectedSnapshot: DisplayProfileRedactionSnapshot;
+  reasonCode: typeof DISPLAY_PROFILE_REDACTION_REASON_CODE;
+  now?: number;
+}
+
+export type RedactDisplayProfileAsLocalAdminExpectedResult =
+  | {
+    outcome: 'redacted';
+    displayProfilesUpdated: number;
+    nicknameHistoryUpdated: number;
+    openNicknameHistoryRowsClosed: number;
+    redactedAt: number;
+  }
+  | { outcome: 'not_found' | 'stale' };
+
+export interface UnlinkPlatformAccountAsLocalAdminInput {
+  platform: 'qq';
+  platformAccountId: string;
+}
+
+export type UnlinkPlatformAccountAsLocalAdminResult =
+  | { outcome: 'unlinked' }
+  | { outcome: 'not_found' };
+
+export interface UnlinkPlatformAccountAsLocalAdminExpectedInput
+  extends UnlinkPlatformAccountAsLocalAdminInput {
+  expectedSnapshot: PlatformAccountUnlinkSnapshot;
+  reasonCode: typeof PLATFORM_ACCOUNT_UNLINK_REASON_CODE;
+  now?: number;
+}
+
+export type UnlinkPlatformAccountAsLocalAdminExpectedResult =
+  | { outcome: 'unlinked'; disabledAt: number }
+  | { outcome: 'not_found' | 'stale' };
+
+export interface SetPrivacyPreferenceAsLocalAdminInput {
+  canonicalUserId: string;
+  preferenceType: PrivacyPreferenceType;
+  state: PrivacyPreferenceState;
+  reason: string;
+  now?: number;
+}
+
+export interface SetPrivacyPreferenceAsLocalAdminResult {
+  outcome: 'updated';
+}
+
+export interface SetPrivacyPreferenceAsLocalAdminExpectedInput {
+  canonicalUserId: string;
+  preferenceType: PrivacyPreferenceType;
+  state: PrivacyPreferenceState;
+  expectedState: PrivacyPreferenceState;
+  expectedVersion: PrivacyPreferenceExpectedVersion;
+  reasonCode: string;
+  now?: number;
+}
+
+export type SetPrivacyPreferenceAsLocalAdminExpectedResult =
+  SetPrivacyPreferenceExpectedResult;
+
 export interface SetGroupSummaryPolicyAsLocalAdminInput {
   groupId: string;
   enabled: boolean;
   now?: number;
+}
+
+export interface SetGroupSummaryPolicyAsLocalAdminExpectedInput
+  extends SetGroupSummaryPolicyAsLocalAdminInput {
+  expectedState: GroupSummaryPolicy['state'];
+  expectedVersion: GroupSummaryPolicyExpectedVersion;
+  reasonCode: string;
+}
+
+export type SetGroupSummaryPolicyAsLocalAdminExpectedResult =
+  SetGroupSummaryPolicyExpectedResult;
+
+export interface MemoryMaintenanceReviewAuthority {
+  kind: 'local_admin' | 'bot_owner' | 'user' | 'group_owner' | 'group_admin';
+  canonicalUserId?: string;
+  invocationContext?: Extract<InvocationContext, 'private_chat' | 'group_chat'>;
+  groupId?: string;
+  conversationId?: string;
+}
+
+export type MemoryMaintenanceGovernanceReviewResult =
+  | {
+    outcome: 'transitioned' | 'unchanged' | 'stale';
+    proposal: MemoryMaintenanceProposalRecord;
+  }
+  | { outcome: 'not_found_or_denied' };
+
+export type MemoryMaintenanceGovernanceApplyResult =
+  | {
+    outcome: 'transitioned' | 'unchanged' | 'stale';
+    proposal: MemoryMaintenanceProposalRecord;
+  }
+  | { outcome: 'not_found_or_denied' };
+
+export type MemoryMaintenanceGovernanceRollbackResult =
+  | {
+    outcome: 'transitioned' | 'unchanged' | 'stale';
+    proposal: MemoryMaintenanceProposalRecord;
+  }
+  | { outcome: 'not_found_or_denied' };
+
+interface ResolvedMemoryMaintenanceAuthority {
+  access: MemoryMaintenanceProposalAccess;
+  actor: MemoryMaintenanceReviewInput['actor'];
+  authorityKind: MemoryMaintenanceReviewInput['authorityKind'];
 }
 
 interface QqCommandSourceRow {
@@ -139,7 +340,8 @@ interface MemoryGovernanceRow {
   conversation_id: string | null;
   visibility: string;
   sensitivity: string;
-  state: string;
+  state: MemoryRecord['state'];
+  current_revision_number: number | null;
 }
 
 interface WhyTurnRow {
@@ -158,6 +360,11 @@ export class GovernanceService {
     private readonly db: Database.Database,
     private readonly memories = new MemoryRepository(db),
     private readonly summaryPolicies = new GroupSummaryPolicyRepository(db),
+    private readonly maintenanceProposals = new MemoryMaintenanceProposalRepository(
+      db,
+      new AuditRepository(db),
+    ),
+    private readonly privacyPreferences = new PrivacyPreferenceRepository(db),
   ) {}
 
   async handleQqCommand(
@@ -197,9 +404,40 @@ export class GovernanceService {
     return this.executeQqCommand(source, authority, parsed.command);
   }
 
-  forgetMemoryAsLocalAdmin(memoryId: string): LocalAdminForgetResult {
+  forgetMemoryAsLocalAdmin(memoryId: string): LocalAdminForgetResult;
+  forgetMemoryAsLocalAdmin(input: LocalAdminExpectedForgetInput): LocalAdminExpectedForgetResult;
+  forgetMemoryAsLocalAdmin(
+    input: string | LocalAdminExpectedForgetInput,
+  ): LocalAdminForgetResult | LocalAdminExpectedForgetResult {
+    if (typeof input !== 'string') {
+      if (!this.isValidExpectedForgetInput(input)) {
+        return { outcome: 'stale' };
+      }
+      const displayId = formatGovernanceMemoryIdForDisplay(input.memoryId);
+      return this.forgetMemory({
+        memoryId: input.memoryId,
+        actorUserId: 'local_admin',
+        actorClass: 'admin',
+        invocationContext: 'admin_cli',
+        reason: 'Governance HTTP confirmed memory forget',
+        auditSummary: `Governance HTTP deleted memory ${displayId}`,
+        auditDetails: {
+          governanceActor: 'local_admin',
+          memoryId: displayId,
+          reasonCode: input.reasonCode,
+        },
+        canGovern: () => true,
+        expected: {
+          scope: input.scope,
+          state: input.expectedState,
+          revisionNumber: input.expectedRevisionNumber,
+        },
+      });
+    }
+
+    const memoryId = input;
     const displayId = formatGovernanceMemoryIdForDisplay(memoryId);
-    return this.forgetMemory({
+    const result = this.forgetMemory({
       memoryId,
       actorUserId: 'local_admin',
       actorClass: 'admin',
@@ -212,6 +450,565 @@ export class GovernanceService {
       },
       canGovern: () => true,
     });
+    return result.outcome === 'forgotten'
+      ? { outcome: 'forgotten' }
+      : { outcome: 'not_found' };
+  }
+
+  restoreMemoryAsLocalAdmin(memoryId: string): LocalAdminRestoreResult;
+  restoreMemoryAsLocalAdmin(input: LocalAdminExpectedRestoreInput): LocalAdminExpectedRestoreResult;
+  restoreMemoryAsLocalAdmin(
+    input: string | LocalAdminExpectedRestoreInput,
+  ): LocalAdminRestoreResult | LocalAdminExpectedRestoreResult {
+    if (typeof input !== 'string') {
+      if (!this.isValidExpectedRestoreInput(input)) {
+        return { outcome: 'stale' };
+      }
+      const displayId = formatGovernanceMemoryIdForDisplay(input.memoryId);
+      return this.restoreMemory({
+        memoryId: input.memoryId,
+        actorUserId: 'local_admin',
+        reason: 'Governance HTTP confirmed memory restore',
+        auditSummary: `Governance HTTP restored memory ${displayId}`,
+        auditDetails: {
+          governanceActor: 'local_admin',
+          memoryId: displayId,
+          reasonCode: input.reasonCode,
+        },
+        expected: {
+          scope: input.scope,
+          state: input.expectedState,
+          revisionNumber: input.expectedRevisionNumber,
+        },
+      });
+    }
+
+    const result = this.restoreMemory({
+      memoryId: input,
+      actorUserId: 'admin',
+      reason: 'Governance CLI restore memory',
+      auditSummary: `Governance CLI enabled memory ${input}`,
+    });
+    return result.outcome === 'restored'
+      ? { outcome: 'restored' }
+      : { outcome: 'not_found' };
+  }
+
+  redactDisplayProfileAsLocalAdmin(
+    input: RedactDisplayProfileAsLocalAdminExpectedInput,
+  ): RedactDisplayProfileAsLocalAdminExpectedResult;
+  redactDisplayProfileAsLocalAdmin(
+    input: RedactDisplayProfileAsLocalAdminInput,
+  ): number;
+  redactDisplayProfileAsLocalAdmin(
+    input: RedactDisplayProfileAsLocalAdminInput
+    | RedactDisplayProfileAsLocalAdminExpectedInput,
+  ): number | RedactDisplayProfileAsLocalAdminExpectedResult {
+    if (
+      'targetId' in input
+      || 'expectedSnapshot' in input
+      || 'reasonCode' in input
+      || 'now' in input
+    ) {
+      return this.redactDisplayProfileAtExpectedSnapshot(
+        input as RedactDisplayProfileAsLocalAdminExpectedInput,
+      );
+    }
+
+    const now = Date.now();
+    const groupId = input.groupId ?? '';
+    const transaction = this.db.transaction(() => {
+      const displayResult = this.db.prepare(
+        `UPDATE display_profiles
+            SET current_display_name = ?, observed_at = ?, trust = ?
+          WHERE canonical_user_id = ?
+            AND source_group_id = ?`,
+      ).run('[redacted]', now, 'user_set', input.canonicalUserId, groupId);
+      const historyResult = this.db.prepare(
+        `UPDATE nickname_history
+            SET display_name = ?, observed_until = COALESCE(observed_until, ?)
+          WHERE canonical_user_id = ?
+            AND source_group_id = ?`,
+      ).run('[redacted]', now, input.canonicalUserId, groupId);
+      const summary = redactGovernanceDisplayString(
+        `Governance CLI redacted display profile for ${input.canonicalUserId}`,
+      ).text;
+      const details = redactGovernanceStructuredValue({
+        canonicalUserId: input.canonicalUserId,
+        groupId: groupId || undefined,
+        displayProfilesUpdated: displayResult.changes,
+        nicknameHistoryUpdated: historyResult.changes,
+      }).value;
+
+      this.db.prepare(
+        `INSERT INTO audit_log (
+           id, timestamp, category, level, event_type, event_id,
+           actor_user_id, actor_class, invocation_context,
+           summary, details, redacted, risk_level, evaluator_decision_id
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        ulid(),
+        Date.now(),
+        'system',
+        'summary',
+        'display_profile.redact',
+        `${input.canonicalUserId}:${groupId}`,
+        null,
+        'admin',
+        'admin_cli',
+        summary,
+        JSON.stringify(details),
+        1,
+        'medium',
+        null,
+      );
+
+      return displayResult.changes + historyResult.changes;
+    });
+
+    return transaction();
+  }
+
+  private redactDisplayProfileAtExpectedSnapshot(
+    input: RedactDisplayProfileAsLocalAdminExpectedInput,
+  ): RedactDisplayProfileAsLocalAdminExpectedResult {
+    if (!this.isValidExpectedDisplayProfileRedactionInput(input)) {
+      return { outcome: 'stale' };
+    }
+
+    const redactedAt = input.now ?? Date.now();
+    const sourceGroupId = input.groupId ?? '';
+    const scope = { kind: 'user' as const, canonicalUserId: input.canonicalUserId };
+    const transaction = this.db.transaction((): RedactDisplayProfileAsLocalAdminExpectedResult => {
+      const snapshotResult = readDisplayProfileRedactionSnapshot(this.db, {
+        scope,
+        sourceGroupId,
+        targetId: input.targetId,
+      });
+      if (snapshotResult.outcome !== 'found') {
+        return snapshotResult.outcome === 'not_found'
+          ? { outcome: 'not_found' }
+          : { outcome: 'stale' };
+      }
+
+      const snapshot = snapshotResult.snapshot;
+      if (
+        snapshot.displayProfileRows !== input.expectedSnapshot.displayProfileRows
+        || snapshot.nicknameHistoryRows !== input.expectedSnapshot.nicknameHistoryRows
+        || snapshot.openNicknameHistoryRows
+          !== input.expectedSnapshot.openNicknameHistoryRows
+        || snapshot.snapshotFingerprint !== input.expectedSnapshot.snapshotFingerprint
+      ) {
+        return { outcome: 'stale' };
+      }
+
+      const displayResult = this.db.prepare(
+        `UPDATE display_profiles
+            SET current_display_name = ?, observed_at = ?, trust = ?
+          WHERE canonical_user_id = ?
+            AND source_group_id = ?`,
+      ).run(
+        '[redacted]',
+        redactedAt,
+        'user_set',
+        input.canonicalUserId,
+        sourceGroupId,
+      );
+      if (displayResult.changes !== snapshot.displayProfileRows) {
+        throw DISPLAY_PROFILE_REDACTION_COUNT_MISMATCH;
+      }
+
+      const historyResult = this.db.prepare(
+        `UPDATE nickname_history
+            SET display_name = ?, observed_until = COALESCE(observed_until, ?)
+          WHERE canonical_user_id = ?
+            AND source_group_id = ?`,
+      ).run('[redacted]', redactedAt, input.canonicalUserId, sourceGroupId);
+      if (historyResult.changes !== snapshot.nicknameHistoryRows) {
+        throw DISPLAY_PROFILE_REDACTION_COUNT_MISMATCH;
+      }
+
+      const summary = redactGovernanceDisplayString(
+        `Governance HTTP redacted display profile for ${input.canonicalUserId}`,
+      ).text;
+      const details = redactGovernanceStructuredValue({
+        canonicalUserId: input.canonicalUserId,
+        groupId: sourceGroupId || undefined,
+        reasonCode: input.reasonCode,
+        displayProfilesUpdated: displayResult.changes,
+        nicknameHistoryUpdated: historyResult.changes,
+        openNicknameHistoryRowsClosed: snapshot.openNicknameHistoryRows,
+      }).value;
+      this.db.prepare(
+        `INSERT INTO audit_log (
+           id, timestamp, category, level, event_type, event_id,
+           actor_user_id, actor_class, invocation_context,
+           summary, details, redacted, risk_level, evaluator_decision_id
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        ulid(),
+        redactedAt,
+        'system',
+        'summary',
+        'display_profile.redact',
+        `${input.canonicalUserId}:${sourceGroupId}`,
+        null,
+        'admin',
+        'admin_cli',
+        summary,
+        JSON.stringify(details),
+        1,
+        'medium',
+        null,
+      );
+
+      return {
+        outcome: 'redacted',
+        displayProfilesUpdated: displayResult.changes,
+        nicknameHistoryUpdated: historyResult.changes,
+        openNicknameHistoryRowsClosed: snapshot.openNicknameHistoryRows,
+        redactedAt,
+      };
+    });
+
+    try {
+      return transaction.immediate();
+    } catch (error: unknown) {
+      if (error === DISPLAY_PROFILE_REDACTION_COUNT_MISMATCH) {
+        return { outcome: 'stale' };
+      }
+      throw error;
+    }
+  }
+
+  private isValidExpectedDisplayProfileRedactionInput(
+    input: RedactDisplayProfileAsLocalAdminExpectedInput,
+  ): boolean {
+    const keys = Object.keys(input);
+    const requiredKeys = [
+      'canonicalUserId',
+      'targetId',
+      'expectedSnapshot',
+      'reasonCode',
+    ];
+    const allowedKeys = new Set([...requiredKeys, 'groupId', 'now']);
+    if (
+      requiredKeys.some((key) => !keys.includes(key))
+      || keys.some((key) => !allowedKeys.has(key))
+      || typeof input.canonicalUserId !== 'string'
+      || !this.isCleanGovernanceIdentifier(input.canonicalUserId)
+      || (input.groupId !== undefined && (
+        typeof input.groupId !== 'string'
+        || !this.isCleanGovernanceIdentifier(input.groupId)
+      ))
+      || typeof input.targetId !== 'string'
+      || !/^[0-9a-f]{64}$/u.test(input.targetId)
+      || input.reasonCode !== DISPLAY_PROFILE_REDACTION_REASON_CODE
+      || (input.now !== undefined && (
+        typeof input.now !== 'number'
+        || !Number.isSafeInteger(input.now)
+        || input.now < 0
+        || input.now > MAX_JAVASCRIPT_DATE_MS
+      ))
+      || !this.isValidDisplayProfileRedactionSnapshot(input.expectedSnapshot)
+    ) {
+      return false;
+    }
+
+    return input.targetId === deriveDisplayProfileTargetResourceId(
+      { kind: 'user', canonicalUserId: input.canonicalUserId },
+      input.groupId ?? '',
+    );
+  }
+
+  private isValidDisplayProfileRedactionSnapshot(
+    value: unknown,
+  ): value is DisplayProfileRedactionSnapshot {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return false;
+    }
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record);
+    if (
+      keys.length !== 4
+      || !keys.includes('displayProfileRows')
+      || !keys.includes('nicknameHistoryRows')
+      || !keys.includes('openNicknameHistoryRows')
+      || !keys.includes('snapshotFingerprint')
+    ) {
+      return false;
+    }
+    const displayProfileRows = record.displayProfileRows;
+    const nicknameHistoryRows = record.nicknameHistoryRows;
+    const openNicknameHistoryRows = record.openNicknameHistoryRows;
+    if (
+      typeof displayProfileRows !== 'number'
+      || !Number.isSafeInteger(displayProfileRows)
+      || displayProfileRows < 0
+      || typeof nicknameHistoryRows !== 'number'
+      || !Number.isSafeInteger(nicknameHistoryRows)
+      || nicknameHistoryRows < 0
+      || typeof openNicknameHistoryRows !== 'number'
+      || !Number.isSafeInteger(openNicknameHistoryRows)
+      || openNicknameHistoryRows < 0
+      || openNicknameHistoryRows > nicknameHistoryRows
+      || typeof record.snapshotFingerprint !== 'string'
+      || !/^[0-9a-f]{64}$/u.test(record.snapshotFingerprint)
+    ) {
+      return false;
+    }
+    const total = displayProfileRows + nicknameHistoryRows;
+    return Number.isSafeInteger(total) && total >= 1;
+  }
+
+  unlinkPlatformAccountAsLocalAdmin(
+    input: UnlinkPlatformAccountAsLocalAdminExpectedInput,
+  ): UnlinkPlatformAccountAsLocalAdminExpectedResult;
+  unlinkPlatformAccountAsLocalAdmin(
+    input: UnlinkPlatformAccountAsLocalAdminInput,
+  ): UnlinkPlatformAccountAsLocalAdminResult;
+  unlinkPlatformAccountAsLocalAdmin(
+    input: UnlinkPlatformAccountAsLocalAdminInput
+    | UnlinkPlatformAccountAsLocalAdminExpectedInput,
+  ): UnlinkPlatformAccountAsLocalAdminResult
+    | UnlinkPlatformAccountAsLocalAdminExpectedResult {
+    if (
+      'expectedSnapshot' in input
+      || 'reasonCode' in input
+      || 'now' in input
+    ) {
+      return this.unlinkPlatformAccountAtExpectedSnapshot(
+        input as UnlinkPlatformAccountAsLocalAdminExpectedInput,
+      );
+    }
+
+    const transaction = this.db.transaction((): UnlinkPlatformAccountAsLocalAdminResult => {
+      const mapping = this.db.prepare(
+        `SELECT canonical_user_id, status
+           FROM platform_accounts
+          WHERE platform = ? AND platform_account_id = ?`,
+      ).get(input.platform, input.platformAccountId) as
+        | { canonical_user_id: string; status: string }
+        | undefined;
+
+      if (!mapping || mapping.status !== 'active') {
+        return { outcome: 'not_found' };
+      }
+
+      const update = this.db.prepare(
+        `UPDATE platform_accounts
+            SET status = 'disabled'
+          WHERE platform = ? AND platform_account_id = ? AND status = 'active'`,
+      ).run(input.platform, input.platformAccountId);
+      if (update.changes !== 1) {
+        return { outcome: 'not_found' };
+      }
+
+      const eventId = `identity-unlink-${ulid()}`;
+      const summary = redactGovernanceDisplayString(
+        'Governance CLI disabled one platform account mapping',
+      ).text;
+      const details = redactGovernanceStructuredValue({
+        platform: input.platform,
+        canonicalUserId: mapping.canonical_user_id,
+        previousStatus: 'active',
+        newStatus: 'disabled',
+        redaction: 'no_raw_platform_account_id',
+      }).value;
+      this.db.prepare(
+        `INSERT INTO audit_log (
+           id, timestamp, category, level, event_type, event_id,
+           actor_user_id, actor_class, invocation_context,
+           summary, details, redacted, risk_level, evaluator_decision_id
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        ulid(),
+        Date.now(),
+        'system',
+        'summary',
+        'identity.platform_account.unlinked',
+        eventId,
+        null,
+        'admin',
+        'admin_cli',
+        summary,
+        JSON.stringify(details),
+        1,
+        'medium',
+        null,
+      );
+
+      return { outcome: 'unlinked' };
+    });
+
+    return transaction();
+  }
+
+  private unlinkPlatformAccountAtExpectedSnapshot(
+    input: UnlinkPlatformAccountAsLocalAdminExpectedInput,
+  ): UnlinkPlatformAccountAsLocalAdminExpectedResult {
+    if (!this.isValidExpectedPlatformAccountUnlinkInput(input)) {
+      return { outcome: 'stale' };
+    }
+
+    const disabledAt = input.now ?? Date.now();
+    const transaction = this.db.transaction(():
+      UnlinkPlatformAccountAsLocalAdminExpectedResult => {
+      const snapshotResult = readPlatformAccountUnlinkSnapshot(this.db, input);
+      if (snapshotResult.outcome !== 'found') {
+        return snapshotResult.outcome === 'not_found'
+          ? { outcome: 'not_found' }
+          : { outcome: 'stale' };
+      }
+      if (
+        snapshotResult.snapshot.snapshotFingerprint
+        !== input.expectedSnapshot.snapshotFingerprint
+      ) {
+        return { outcome: 'stale' };
+      }
+
+      const update = this.db.prepare(
+        `UPDATE platform_accounts
+            SET status = 'disabled'
+          WHERE platform = ? AND platform_account_id = ? AND status = 'active'`,
+      ).run(input.platform, input.platformAccountId);
+      if (update.changes !== 1) {
+        throw PLATFORM_ACCOUNT_UNLINK_COUNT_MISMATCH;
+      }
+
+      const eventId = `identity-unlink-${ulid()}`;
+      const summary = redactGovernanceDisplayString(
+        'Governance HTTP disabled one platform account mapping',
+      ).text;
+      const details = redactGovernanceStructuredValue({
+        platform: input.platform,
+        canonicalUserId: snapshotResult.canonicalUserId,
+        previousStatus: 'active',
+        newStatus: 'disabled',
+        reasonCode: input.reasonCode,
+        redaction: 'no_raw_platform_account_id',
+      }).value;
+      this.db.prepare(
+        `INSERT INTO audit_log (
+           id, timestamp, category, level, event_type, event_id,
+           actor_user_id, actor_class, invocation_context,
+           summary, details, redacted, risk_level, evaluator_decision_id
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        ulid(),
+        disabledAt,
+        'system',
+        'summary',
+        'identity.platform_account.unlinked',
+        eventId,
+        null,
+        'admin',
+        'admin_cli',
+        summary,
+        JSON.stringify(details),
+        1,
+        'medium',
+        null,
+      );
+
+      return { outcome: 'unlinked', disabledAt };
+    });
+
+    try {
+      return transaction.immediate();
+    } catch (error: unknown) {
+      if (error === PLATFORM_ACCOUNT_UNLINK_COUNT_MISMATCH) {
+        return { outcome: 'stale' };
+      }
+      throw error;
+    }
+  }
+
+  private isValidExpectedPlatformAccountUnlinkInput(
+    input: UnlinkPlatformAccountAsLocalAdminExpectedInput,
+  ): boolean {
+    const keys = Object.keys(input);
+    const requiredKeys = [
+      'platform',
+      'platformAccountId',
+      'expectedSnapshot',
+      'reasonCode',
+    ];
+    const allowedKeys = new Set([...requiredKeys, 'now']);
+    if (
+      requiredKeys.some((key) => !keys.includes(key))
+      || keys.some((key) => !allowedKeys.has(key))
+      || input.platform !== 'qq'
+      || typeof input.platformAccountId !== 'string'
+      || !QQ_ID_PATTERN.test(input.platformAccountId)
+      || input.reasonCode !== PLATFORM_ACCOUNT_UNLINK_REASON_CODE
+      || (input.now !== undefined && (
+        typeof input.now !== 'number'
+        || !Number.isSafeInteger(input.now)
+        || input.now < 0
+        || input.now > MAX_JAVASCRIPT_DATE_MS
+      ))
+    ) {
+      return false;
+    }
+
+    const snapshot = input.expectedSnapshot;
+    return typeof snapshot === 'object'
+      && snapshot !== null
+      && !Array.isArray(snapshot)
+      && Object.keys(snapshot).length === 1
+      && Object.keys(snapshot).includes('snapshotFingerprint')
+      && typeof snapshot.snapshotFingerprint === 'string'
+      && /^[0-9a-f]{64}$/u.test(snapshot.snapshotFingerprint);
+  }
+
+  setPrivacyPreferenceAsLocalAdmin(
+    input: SetPrivacyPreferenceAsLocalAdminExpectedInput,
+  ): SetPrivacyPreferenceAsLocalAdminExpectedResult;
+  setPrivacyPreferenceAsLocalAdmin(
+    input: SetPrivacyPreferenceAsLocalAdminInput,
+  ): SetPrivacyPreferenceAsLocalAdminResult;
+  setPrivacyPreferenceAsLocalAdmin(
+    input: SetPrivacyPreferenceAsLocalAdminInput | SetPrivacyPreferenceAsLocalAdminExpectedInput,
+  ): SetPrivacyPreferenceAsLocalAdminResult | SetPrivacyPreferenceAsLocalAdminExpectedResult {
+    if (
+      'expectedState' in input
+      || 'expectedVersion' in input
+      || 'reasonCode' in input
+    ) {
+      const expectedInput = input as SetPrivacyPreferenceAsLocalAdminExpectedInput;
+      if (!this.isValidExpectedPrivacyPreferenceInput(expectedInput)) {
+        return { outcome: 'stale' };
+      }
+      return this.privacyPreferences.setPreference({
+        canonicalUserId: expectedInput.canonicalUserId,
+        preferenceType: expectedInput.preferenceType,
+        state: expectedInput.state,
+        expectedState: expectedInput.expectedState,
+        expectedVersion: expectedInput.expectedVersion,
+        reason: expectedInput.reasonCode,
+        actor: {
+          canonicalUserId: 'admin',
+          actorClass: 'admin',
+          context: 'admin_cli',
+        },
+        ...(expectedInput.now === undefined ? {} : { now: expectedInput.now }),
+      });
+    }
+
+    this.privacyPreferences.setPreference({
+      canonicalUserId: input.canonicalUserId,
+      preferenceType: input.preferenceType,
+      state: input.state,
+      reason: input.reason,
+      actor: {
+        canonicalUserId: 'admin',
+        actorClass: 'admin',
+        context: 'admin_cli',
+      },
+      ...(input.now === undefined ? {} : { now: input.now }),
+    });
+    return { outcome: 'updated' };
   }
 
   getGroupSummaryPolicyAsLocalAdmin(groupId: string): GroupSummaryPolicy | null {
@@ -219,8 +1016,38 @@ export class GovernanceService {
   }
 
   setGroupSummaryPolicyAsLocalAdmin(
+    input: SetGroupSummaryPolicyAsLocalAdminExpectedInput,
+  ): SetGroupSummaryPolicyAsLocalAdminExpectedResult;
+  setGroupSummaryPolicyAsLocalAdmin(
     input: SetGroupSummaryPolicyAsLocalAdminInput,
-  ): SetGroupSummaryPolicyResult {
+  ): SetGroupSummaryPolicyResult;
+  setGroupSummaryPolicyAsLocalAdmin(
+    input: SetGroupSummaryPolicyAsLocalAdminInput
+    | SetGroupSummaryPolicyAsLocalAdminExpectedInput,
+  ): SetGroupSummaryPolicyResult | SetGroupSummaryPolicyAsLocalAdminExpectedResult {
+    if (
+      'expectedState' in input
+      || 'expectedVersion' in input
+      || 'reasonCode' in input
+    ) {
+      const expectedInput = input as SetGroupSummaryPolicyAsLocalAdminExpectedInput;
+      if (!this.isValidExpectedGroupSummaryPolicyInput(expectedInput)) {
+        return { outcome: 'stale' };
+      }
+      return this.summaryPolicies.setEnabled({
+        groupId: expectedInput.groupId,
+        enabled: expectedInput.enabled,
+        expectedState: expectedInput.expectedState,
+        expectedVersion: expectedInput.expectedVersion,
+        reasonCode: expectedInput.reasonCode,
+        ...(expectedInput.now === undefined ? {} : { now: expectedInput.now }),
+        authority: {
+          kind: 'local_admin',
+          actorUserId: 'local_admin',
+          invocationContext: 'admin_cli',
+        },
+      });
+    }
     return this.summaryPolicies.setEnabled({
       groupId: input.groupId,
       enabled: input.enabled,
@@ -231,6 +1058,125 @@ export class GovernanceService {
         invocationContext: 'admin_cli',
       },
     });
+  }
+
+  listMemoryMaintenanceProposals(input: {
+    authority: MemoryMaintenanceReviewAuthority;
+    states?: MemoryMaintenanceProposalLifecycleState[];
+    limit?: number;
+  }): MemoryMaintenanceProposalRecord[] {
+    const authority = this.resolveMemoryMaintenanceAuthority(input.authority);
+    if (!authority) {
+      return [];
+    }
+    return this.maintenanceProposals.listForReview({
+      access: authority.access,
+      ...(input.states === undefined ? {} : { states: input.states }),
+      ...(input.limit === undefined ? {} : { limit: input.limit }),
+    });
+  }
+
+  getMemoryMaintenanceProposal(input: {
+    authority: MemoryMaintenanceReviewAuthority;
+    proposalId: string;
+  }): MemoryMaintenanceProposalRecord | null {
+    const authority = this.resolveMemoryMaintenanceAuthority(input.authority);
+    if (!authority) {
+      return null;
+    }
+    return this.maintenanceProposals.findForReview({
+      proposalId: input.proposalId,
+      access: authority.access,
+    });
+  }
+
+  reviewMemoryMaintenanceProposal(input: {
+    authority: MemoryMaintenanceReviewAuthority;
+    proposalId: string;
+    expectedState: Extract<MemoryMaintenanceProposalLifecycleState, 'pending_review' | 'approved'>;
+    expectedRevisionNumber: number;
+    transition: MemoryMaintenanceReviewTransition;
+    reasonCode: string;
+    nowMs?: number;
+  }): MemoryMaintenanceGovernanceReviewResult {
+    const authority = this.resolveMemoryMaintenanceAuthority(input.authority);
+    if (!authority) {
+      return { outcome: 'not_found_or_denied' };
+    }
+    const result = this.maintenanceProposals.transitionReview({
+      proposalId: input.proposalId,
+      access: authority.access,
+      expectedState: input.expectedState,
+      expectedRevisionNumber: input.expectedRevisionNumber,
+      transition: input.transition,
+      actor: authority.actor,
+      authorityKind: authority.authorityKind,
+      reasonCode: input.reasonCode,
+      nowMs: input.nowMs ?? Date.now(),
+    });
+    return result.outcome === 'not_found'
+      ? { outcome: 'not_found_or_denied' }
+      : result;
+  }
+
+  applyMemoryMaintenanceProposal(input: {
+    authority: MemoryMaintenanceReviewAuthority;
+    proposalId: string;
+    expectedState: 'approved';
+    expectedRevisionNumber: number;
+    reasonCode: string;
+    retainedMemoryId?: string;
+    nowMs?: number;
+  }): MemoryMaintenanceGovernanceApplyResult {
+    const authority = this.resolveMemoryMaintenanceAuthority(input.authority);
+    if (!authority) {
+      return { outcome: 'not_found_or_denied' };
+    }
+    const applyInput: MemoryMaintenanceApplyInput = {
+      proposalId: input.proposalId,
+      access: authority.access,
+      expectedState: input.expectedState,
+      expectedRevisionNumber: input.expectedRevisionNumber,
+      actor: authority.actor,
+      authorityKind: authority.authorityKind,
+      reasonCode: input.reasonCode,
+      nowMs: input.nowMs ?? Date.now(),
+      ...(input.retainedMemoryId === undefined
+        ? {}
+        : { retainedMemoryId: input.retainedMemoryId }),
+    };
+    const result = this.maintenanceProposals.applyApproved(applyInput);
+    return result.outcome === 'not_found'
+      ? { outcome: 'not_found_or_denied' }
+      : result;
+  }
+
+  rollbackMemoryMaintenanceProposal(input: {
+    authority: MemoryMaintenanceReviewAuthority;
+    proposalId: string;
+    expectedState: 'applied';
+    expectedRevisionNumber: number;
+    reasonCode: string;
+    nowMs?: number;
+  }): MemoryMaintenanceGovernanceRollbackResult {
+    const authority = this.resolveMemoryMaintenanceAuthority(input.authority);
+    if (!authority) {
+      return { outcome: 'not_found_or_denied' };
+    }
+    const rollbackInput: MemoryMaintenanceRollbackInput = {
+      proposalId: input.proposalId,
+      access: authority.access,
+      expectedState: input.expectedState,
+      expectedRevisionNumber: input.expectedRevisionNumber,
+      actor: authority.actor,
+      authorityKind: authority.authorityKind,
+      reasonCode: input.reasonCode,
+      nowMs: input.nowMs ?? Date.now(),
+    };
+    const result = this.maintenanceProposals.rollbackApplied(rollbackInput);
+    return result.outcome === 'not_found'
+      ? { outcome: 'not_found_or_denied' }
+      : result;
   }
 
   private executeQqCommand(
@@ -341,16 +1287,42 @@ export class GovernanceService {
     auditSummary: string;
     auditDetails: Record<string, unknown>;
     canGovern(memory: MemoryGovernanceRow): boolean;
-  }): LocalAdminForgetResult {
-    const transaction = this.db.transaction((): LocalAdminForgetResult => {
+    expected?: {
+      scope: MemoryMaintenanceProposalExactScope;
+      state: Exclude<MemoryRecord['state'], 'deleted'>;
+      revisionNumber: number;
+    };
+  }): LocalAdminForgetResult | LocalAdminExpectedForgetResult {
+    const transaction = this.db.transaction(():
+      LocalAdminForgetResult | LocalAdminExpectedForgetResult => {
       const row = this.db.prepare(
         `SELECT id, scope, canonical_user_id, group_id, conversation_id,
-                visibility, sensitivity, state
+                visibility, sensitivity, state,
+                (
+                  SELECT MAX(revisions.revision_number)
+                    FROM memory_revisions revisions
+                   WHERE revisions.memory_id = memory_records.id
+                ) AS current_revision_number
            FROM memory_records
           WHERE id = ?`,
       ).get(input.memoryId) as MemoryGovernanceRow | undefined;
       if (!row || row.state === 'deleted' || !input.canGovern(row)) {
         return { outcome: 'not_found' };
+      }
+      if (input.expected) {
+        if (!this.memoryMatchesExactScope(row, input.expected.scope)) {
+          return { outcome: 'not_found' };
+        }
+        if (
+          row.state !== input.expected.state
+          || typeof row.current_revision_number !== 'number'
+          || !Number.isSafeInteger(row.current_revision_number)
+          || row.current_revision_number < 1
+          || row.current_revision_number >= Number.MAX_SAFE_INTEGER
+          || row.current_revision_number !== input.expected.revisionNumber
+        ) {
+          return { outcome: 'stale' };
+        }
       }
 
       this.memories.updateStateSync(row.id, 'deleted', {
@@ -364,9 +1336,234 @@ export class GovernanceService {
         auditDetails: input.auditDetails,
         evaluatorDecisionId: this.memoryDeleteDecisionId(row.id),
       });
-      return { outcome: 'forgotten' };
+      return input.expected
+        ? { outcome: 'forgotten', revisionNumber: input.expected.revisionNumber + 1 }
+        : { outcome: 'forgotten' };
     });
     return transaction.immediate();
+  }
+
+  private isValidExpectedForgetInput(input: LocalAdminExpectedForgetInput): boolean {
+    return this.isCleanGovernanceIdentifier(input.memoryId)
+      && this.isValidMemoryRecordScope(input.scope)
+      && FORGETTABLE_MEMORY_STATES.some((state) => state === input.expectedState)
+      && Number.isSafeInteger(input.expectedRevisionNumber)
+      && input.expectedRevisionNumber >= 1
+      && input.expectedRevisionNumber < Number.MAX_SAFE_INTEGER
+      && GOVERNANCE_REASON_CODE_PATTERN.test(input.reasonCode);
+  }
+
+  private restoreMemory(input: {
+    memoryId: string;
+    actorUserId: 'admin' | 'local_admin';
+    reason: string;
+    auditSummary: string;
+    auditDetails?: Record<string, unknown>;
+    expected?: {
+      scope: MemoryMaintenanceProposalExactScope;
+      state: LocalAdminExpectedRestoreInput['expectedState'];
+      revisionNumber: number;
+    };
+  }): LocalAdminRestoreResult | LocalAdminExpectedRestoreResult {
+    const transaction = this.db.transaction(():
+      LocalAdminRestoreResult | LocalAdminExpectedRestoreResult => {
+      const row = this.db.prepare(
+        `SELECT id, scope, canonical_user_id, group_id, conversation_id,
+                visibility, sensitivity, state,
+                (
+                  SELECT MAX(revisions.revision_number)
+                    FROM memory_revisions revisions
+                   WHERE revisions.memory_id = memory_records.id
+                ) AS current_revision_number
+           FROM memory_records
+          WHERE id = ?`,
+      ).get(input.memoryId) as MemoryGovernanceRow | undefined;
+      if (!row || !RESTORABLE_MEMORY_STATES.some((state) => state === row.state)) {
+        return { outcome: 'not_found' };
+      }
+      if (input.expected) {
+        if (!this.memoryMatchesExactScope(row, input.expected.scope)) {
+          return { outcome: 'not_found' };
+        }
+        if (
+          row.state !== input.expected.state
+          || typeof row.current_revision_number !== 'number'
+          || !Number.isSafeInteger(row.current_revision_number)
+          || row.current_revision_number < 1
+          || row.current_revision_number >= Number.MAX_SAFE_INTEGER
+          || row.current_revision_number !== input.expected.revisionNumber
+        ) {
+          return { outcome: 'stale' };
+        }
+      }
+
+      this.memories.updateStateSync(row.id, 'active', {
+        actor: {
+          canonicalUserId: input.actorUserId,
+          actorClass: 'admin',
+          context: 'admin_cli',
+        },
+        reason: input.reason,
+        auditSummary: input.auditSummary,
+        auditDetails: input.auditDetails,
+      });
+      return input.expected
+        ? { outcome: 'restored', revisionNumber: input.expected.revisionNumber + 1 }
+        : { outcome: 'restored' };
+    });
+    return transaction.immediate();
+  }
+
+  private isValidExpectedRestoreInput(input: LocalAdminExpectedRestoreInput): boolean {
+    return this.isCleanGovernanceIdentifier(input.memoryId)
+      && this.isValidMemoryRecordScope(input.scope)
+      && RESTORABLE_MEMORY_STATES.some((state) => state === input.expectedState)
+      && Number.isSafeInteger(input.expectedRevisionNumber)
+      && input.expectedRevisionNumber >= 1
+      && input.expectedRevisionNumber < Number.MAX_SAFE_INTEGER
+      && GOVERNANCE_REASON_CODE_PATTERN.test(input.reasonCode);
+  }
+
+  private isValidExpectedPrivacyPreferenceInput(
+    input: SetPrivacyPreferenceAsLocalAdminExpectedInput,
+  ): boolean {
+    return this.isCleanGovernanceIdentifier(input.canonicalUserId)
+      && (input.preferenceType === 'proactive_dm'
+        || input.preferenceType === 'memory_association')
+      && (input.state === 'opted_in' || input.state === 'opted_out')
+      && (input.expectedState === 'opted_in' || input.expectedState === 'opted_out')
+      && input.state !== input.expectedState
+      && this.isValidPrivacyPreferenceExpectedVersion(input.expectedVersion)
+      && GOVERNANCE_REASON_CODE_PATTERN.test(input.reasonCode)
+      && (input.now === undefined || (
+        Number.isSafeInteger(input.now)
+        && input.now >= 0
+        && input.now <= MAX_JAVASCRIPT_DATE_MS
+      ));
+  }
+
+  private isValidPrivacyPreferenceExpectedVersion(
+    value: unknown,
+  ): value is PrivacyPreferenceExpectedVersion {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return false;
+    }
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record);
+    if (
+      keys.length !== 2
+      || !keys.includes('source')
+      || !keys.includes('updatedAt')
+    ) {
+      return false;
+    }
+    if (record.source === 'implicit_default') {
+      return record.updatedAt === null;
+    }
+    return record.source === 'stored_preference'
+      && typeof record.updatedAt === 'number'
+      && Number.isSafeInteger(record.updatedAt)
+      && record.updatedAt >= 0
+      && record.updatedAt <= MAX_JAVASCRIPT_DATE_MS;
+  }
+
+  private isValidExpectedGroupSummaryPolicyInput(
+    input: SetGroupSummaryPolicyAsLocalAdminExpectedInput,
+  ): boolean {
+    return NORMALIZED_QQ_GROUP_ID_PATTERN.test(input.groupId)
+      && typeof input.enabled === 'boolean'
+      && (input.expectedState === 'enabled' || input.expectedState === 'disabled')
+      && input.enabled !== (input.expectedState === 'enabled')
+      && this.isValidGroupSummaryPolicyExpectedVersion(input.expectedVersion)
+      && GOVERNANCE_REASON_CODE_PATTERN.test(input.reasonCode)
+      && (input.now === undefined || (
+        Number.isSafeInteger(input.now)
+        && input.now >= 0
+        && input.now <= MAX_JAVASCRIPT_DATE_MS
+      ));
+  }
+
+  private isValidGroupSummaryPolicyExpectedVersion(
+    value: unknown,
+  ): value is GroupSummaryPolicyExpectedVersion {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return false;
+    }
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record);
+    if (
+      keys.length !== 3
+      || !keys.includes('source')
+      || !keys.includes('generation')
+      || !keys.includes('updatedAt')
+    ) {
+      return false;
+    }
+    if (record.source === 'implicit_default') {
+      return record.generation === null && record.updatedAt === null;
+    }
+    return record.source === 'stored_policy'
+      && typeof record.generation === 'number'
+      && Number.isSafeInteger(record.generation)
+      && record.generation >= 1
+      && typeof record.updatedAt === 'number'
+      && Number.isSafeInteger(record.updatedAt)
+      && record.updatedAt >= 0
+      && record.updatedAt <= MAX_JAVASCRIPT_DATE_MS;
+  }
+
+  private isValidMemoryRecordScope(scope: MemoryMaintenanceProposalExactScope): boolean {
+    switch (scope.kind) {
+      case 'global':
+      case 'system':
+        return true;
+      case 'user':
+        return this.isCleanGovernanceIdentifier(scope.canonicalUserId);
+      case 'group':
+        return this.isCleanGovernanceIdentifier(scope.groupId);
+      case 'conversation':
+        return this.isCleanGovernanceIdentifier(scope.conversationId)
+          && (scope.conversationType === 'private'
+            ? scope.groupId === undefined
+            : scope.groupId !== undefined
+              && this.isCleanGovernanceIdentifier(scope.groupId));
+    }
+  }
+
+  private isCleanGovernanceIdentifier(value: string): boolean {
+    const characters = Array.from(value);
+    return value.trim() === value
+      && characters.length >= 1
+      && characters.length <= 256
+      && characters.every((character) => {
+        const codePoint = character.codePointAt(0);
+        return codePoint !== undefined && codePoint > 31 && codePoint !== 127;
+      });
+  }
+
+  private memoryMatchesExactScope(
+    memory: MemoryGovernanceRow,
+    scope: MemoryMaintenanceProposalExactScope,
+  ): boolean {
+    switch (scope.kind) {
+      case 'global':
+      case 'system':
+        return memory.scope === scope.kind
+          && memory.canonical_user_id === null
+          && memory.group_id === null
+          && memory.conversation_id === null;
+      case 'user':
+        return memory.scope === 'user'
+          && memory.canonical_user_id === scope.canonicalUserId;
+      case 'group':
+        return memory.scope === 'group' && memory.group_id === scope.groupId;
+      case 'conversation':
+        return memory.scope === 'conversation'
+          && memory.conversation_id === scope.conversationId
+          && (scope.conversationType === 'private'
+            ? memory.group_id === null
+            : memory.group_id === scope.groupId);
+    }
   }
 
   private handleQqSummary(
@@ -620,6 +1817,107 @@ export class GovernanceService {
       .update(memoryId)
       .digest('hex');
     return `policy:l0:deleted:sha256:${digest}`;
+  }
+
+  private resolveMemoryMaintenanceAuthority(
+    authority: MemoryMaintenanceReviewAuthority,
+  ): ResolvedMemoryMaintenanceAuthority | null {
+    if (authority.kind === 'local_admin') {
+      return {
+        access: { kind: 'all' },
+        actor: {
+          actorClass: 'admin',
+          invocationContext: 'admin_cli',
+        },
+        authorityKind: 'local_admin',
+      };
+    }
+
+    const canonicalUserId = authority.canonicalUserId;
+    const conversationId = authority.conversationId;
+    if (
+      !canonicalUserId
+      || canonicalUserId.trim() !== canonicalUserId
+      || !conversationId
+      || conversationId.trim() !== conversationId
+    ) {
+      return null;
+    }
+
+    if (authority.invocationContext === 'private_chat') {
+      if (authority.groupId !== undefined) {
+        return null;
+      }
+      if (authority.kind === 'bot_owner') {
+        return {
+          access: { kind: 'all' },
+          actor: {
+            canonicalUserId,
+            actorClass: 'owner',
+            invocationContext: 'private_chat',
+          },
+          authorityKind: 'bot_owner',
+        };
+      }
+      if (authority.kind === 'user') {
+        return {
+          access: {
+            kind: 'private_user',
+            canonicalUserId,
+            conversationId,
+          },
+          actor: {
+            canonicalUserId,
+            actorClass: 'user',
+            invocationContext: 'private_chat',
+          },
+          authorityKind: 'user',
+        };
+      }
+      return null;
+    }
+
+    const groupId = authority.groupId;
+    if (
+      authority.invocationContext !== 'group_chat'
+      || !groupId
+      || !NORMALIZED_QQ_GROUP_ID_PATTERN.test(groupId)
+      || conversationId !== groupId
+    ) {
+      return null;
+    }
+    if (authority.kind === 'user') {
+      return {
+        access: {
+          kind: 'group_user',
+          canonicalUserId,
+          groupId,
+          conversationId,
+        },
+        actor: {
+          canonicalUserId,
+          actorClass: 'user',
+          invocationContext: 'group_chat',
+        },
+        authorityKind: 'user',
+      };
+    }
+    if (
+      authority.kind !== 'bot_owner'
+      && authority.kind !== 'group_owner'
+      && authority.kind !== 'group_admin'
+    ) {
+      return null;
+    }
+    return {
+      access: { kind: 'exact_group', groupId, conversationId },
+      actor: {
+        canonicalUserId,
+        actorClass: authority.kind === 'group_admin' ? 'group_admin' : 'owner',
+        invocationContext: 'group_chat',
+      },
+      authorityKind: authority.kind,
+    };
   }
 
   private isWithinCurrentGroupMemoryScope(

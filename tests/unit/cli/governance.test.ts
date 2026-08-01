@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +9,8 @@ import { IdentityRepository } from '../../../src/storage/identity-repository';
 import { JobRepository } from '../../../src/storage/job-repository';
 import { ContextBuilder } from '../../../src/context/builder';
 import { GovernanceCLI } from '../../../src/cli/governance';
+import { GovernanceQueryService } from '../../../src/governance/query-service.js';
+import { GovernanceService } from '../../../src/governance/service.js';
 
 describe('GovernanceCLI', () => {
   let testDir: string;
@@ -336,6 +338,7 @@ describe('GovernanceCLI', () => {
   }
 
   afterEach(() => {
+    vi.restoreAllMocks();
     if (db) {
       closeDatabase(db);
     }
@@ -492,6 +495,72 @@ describe('GovernanceCLI', () => {
 
       const sourceContextMatched = await cli.listMemory({ sourceContext: 'group_chat' });
       expect(sourceContextMatched.map((memory) => memory.id)).toEqual([groupMemoryId]);
+    });
+
+    it('should delegate the database-backed memory list to the shared query service without reshaping', async () => {
+      const expected = [
+        {
+          id: 'memory-shared-list',
+          scope: 'system',
+          visibility: 'owner_admin_only',
+          sensitivity: 'normal',
+          authority: 'system',
+          kind: 'fact',
+          title: 'Shared list memory',
+          content: 'Shared list content',
+          state: 'active',
+          confidence: 0.8,
+          importance: 0.7,
+          sourceContext: 'admin_cli',
+          sourceEventIds: ['source-shared-list'],
+          createdAt: new Date(100),
+          updatedAt: new Date(200),
+        },
+      ];
+      const sharedRead = vi.spyOn(GovernanceQueryService.prototype, 'listMemory')
+        .mockResolvedValue(expected);
+
+      const options = {
+        userId: 'user-shared-list',
+        groupId: 'group-shared-list',
+        conversationId: 'conversation-shared-list',
+        state: 'disabled' as const,
+        scope: 'user' as const,
+        sensitivity: 'sensitive' as const,
+        sourceContext: 'admin_cli:list',
+        sourceType: 'user_command' as const,
+        sourceId: 'source-shared-list',
+        limit: 7,
+      };
+      const result = await cli.listMemory(options);
+
+      expect(sharedRead).toHaveBeenCalledTimes(1);
+      expect(sharedRead).toHaveBeenCalledWith(options);
+      expect(result).toBe(expected);
+
+      const retrieve = vi.spyOn(memoryRepo, 'retrieve').mockResolvedValue(expected);
+      const fallbackResult = await new GovernanceCLI(memoryRepo).listMemory({
+        userId: options.userId,
+        groupId: options.groupId,
+        conversationId: options.conversationId,
+        scope: options.scope,
+        sensitivity: options.sensitivity,
+        sourceContext: options.sourceContext,
+        sourceType: options.sourceType,
+        sourceId: options.sourceId,
+        limit: options.limit,
+      });
+
+      expect(sharedRead).toHaveBeenCalledTimes(1);
+      expect(retrieve).toHaveBeenCalledWith({
+        state: 'active',
+        limit: 7,
+        canonicalUserId: 'user-shared-list',
+        groupId: 'group-shared-list',
+        conversationId: 'conversation-shared-list',
+        scope: 'user',
+      });
+      expect(fallbackResult).toBe(expected);
     });
   });
 
@@ -692,9 +761,15 @@ describe('GovernanceCLI', () => {
       const memoryId = await createMemory();
 
       await cli.disableMemory(memoryId);
+      const restoreMemory = vi.spyOn(
+        GovernanceService.prototype,
+        'restoreMemoryAsLocalAdmin',
+      );
 
       const result = await cli.enableMemory(memoryId);
       expect(result.success).toBe(true);
+      expect(restoreMemory).toHaveBeenCalledOnce();
+      expect(restoreMemory).toHaveBeenCalledWith(memoryId);
 
       const memory = await memoryRepo.retrieve({ canonicalUserId: 'user-alice', state: 'active' });
       expect(memory).toHaveLength(1);
@@ -1234,6 +1309,39 @@ describe('GovernanceCLI', () => {
       ]);
     });
 
+    it('should delegate memory provenance detail to the shared query service without reshaping', async () => {
+      const expected = {
+        record: {
+          id: 'memory-shared',
+          scope: 'system',
+          visibility: 'owner_admin_only',
+          sensitivity: 'normal',
+          authority: 'system',
+          kind: 'fact',
+          title: 'Shared memory',
+          content: 'Shared content',
+          state: 'active',
+          confidence: 0.8,
+          importance: 0.7,
+          sourceContext: 'admin_cli',
+          sourceEventIds: ['source-shared'],
+          createdAt: new Date(100),
+          updatedAt: new Date(200),
+        },
+        sources: [],
+        revisions: [],
+        audit: [],
+      };
+      const sharedRead = vi.spyOn(GovernanceQueryService.prototype, 'showMemory')
+        .mockResolvedValue(expected);
+
+      const result = await cli.showMemory('memory-shared');
+
+      expect(sharedRead).toHaveBeenCalledTimes(1);
+      expect(sharedRead).toHaveBeenCalledWith('memory-shared');
+      expect(result).toBe(expected);
+    });
+
     it('should export only visible active memory by default', async () => {
       const activeId = await createMemory({
         id: 'mem-export-active',
@@ -1261,6 +1369,77 @@ describe('GovernanceCLI', () => {
         sensitivity: 'normal',
         content: 'Alice prefers TypeScript',
       });
+    });
+
+    it('should delegate database-backed memory export without reshaping and preserve repository fallback', async () => {
+      const expected = [{
+        id: 'memory-shared-export',
+        scope: 'user',
+        canonicalUserId: 'user-shared-export',
+        visibility: 'private_only',
+        sensitivity: 'normal',
+        authority: 'user_stated',
+        kind: 'preference',
+        title: 'Shared export',
+        content: 'Shared export content',
+        state: 'active',
+        confidence: 0.8,
+        importance: 0.7,
+        sourceContext: 'admin_cli',
+        sourceEventIds: ['source-shared-export'],
+        createdAt: new Date(100).toISOString(),
+        updatedAt: new Date(200).toISOString(),
+      }];
+      const sharedRead = vi.spyOn(GovernanceQueryService.prototype, 'exportMemory')
+        .mockResolvedValue(expected);
+      const options = {
+        userId: 'user-shared-export',
+        state: 'disabled' as const,
+        sourceType: 'user_command' as const,
+        sourceId: 'source-shared-export',
+        limit: 7,
+      };
+
+      const result = await cli.exportMemory(options);
+
+      expect(sharedRead).toHaveBeenCalledTimes(1);
+      expect(sharedRead).toHaveBeenCalledWith(options);
+      expect(result).toBe(expected);
+
+      const fallbackMemoryId = await createMemory({
+        id: 'memory-fallback-export',
+        title: 'Fallback export',
+        content: 'Fallback export content',
+      });
+      db.prepare('UPDATE memory_records SET title = ?, content = ? WHERE id = ?').run(
+        'Fallback token sk-abcdefghijklmnopqrstuvwxyz123456',
+        'Fallback api_key=abcdefghijklmnop',
+        fallbackMemoryId,
+      );
+      const fallbackMemory = await memoryRepo.findById(fallbackMemoryId);
+      expect(fallbackMemory).not.toBeNull();
+      const retrieve = vi.spyOn(memoryRepo, 'retrieve')
+        .mockResolvedValue(fallbackMemory ? [fallbackMemory] : []);
+      const fallbackResult = await new GovernanceCLI(memoryRepo).exportMemory({
+        userId: 'user-alice',
+        limit: 4,
+      });
+
+      expect(sharedRead).toHaveBeenCalledTimes(1);
+      expect(retrieve).toHaveBeenCalledWith({
+        state: 'active',
+        limit: 4,
+        canonicalUserId: 'user-alice',
+      });
+      expect(fallbackResult).toEqual([
+        expect.objectContaining({
+          id: fallbackMemoryId,
+          title: 'Fallback token [REDACTED:openai_like_api_key]',
+          content: 'Fallback [REDACTED:api_key_assignment]',
+          createdAt: expect.any(String),
+          updatedAt: expect.any(String),
+        }),
+      ]);
     });
 
     it('should inspect audit rows with details hidden by default and redacted when included', async () => {
@@ -1304,6 +1483,303 @@ describe('GovernanceCLI', () => {
       expect(serialized).toContain('[REDACTED:token_assignment]');
       expect(serialized).not.toContain('abcdefghijklmnop');
       expect(serialized).not.toContain('supersecret');
+    });
+
+    it('should delegate audit inspection to the shared query service without reshaping', async () => {
+      const options = {
+        category: 'tool' as const,
+        level: 'full' as const,
+        eventType: 'tool.execute',
+        eventId: 'event-shared',
+        userId: 'user-shared',
+        riskLevel: 'high' as const,
+        startTime: new Date(100),
+        endTime: new Date(200),
+        includeDetails: true,
+        limit: 7,
+      };
+      const expected = [{
+        id: 'audit-shared',
+        timestamp: new Date(150),
+        category: 'tool',
+        level: 'full',
+        eventType: 'tool.execute',
+        eventId: 'event-shared',
+        actor: {
+          canonicalUserId: 'user-shared',
+          actorClass: 'admin',
+          context: 'admin_cli',
+        },
+        summary: 'Shared audit',
+        details: { visible: true },
+        detailsRedacted: false,
+        redacted: false,
+        riskLevel: 'high',
+        evaluatorDecisionId: 'decision-shared',
+      }];
+      const sharedRead = vi.spyOn(GovernanceQueryService.prototype, 'listAudit')
+        .mockResolvedValue(expected);
+
+      const result = await cli.listAudit(options);
+
+      expect(sharedRead).toHaveBeenCalledTimes(1);
+      expect(sharedRead).toHaveBeenCalledWith(options);
+      expect(result).toBe(expected);
+    });
+
+    it('should delegate model invocation summaries to the shared query service without reshaping', async () => {
+      const options = {
+        purpose: 'pi_turn' as const,
+        status: 'completed' as const,
+      };
+      const expected = {
+        generatedAt: new Date(100),
+        filters: options,
+        total: 2,
+        byPurpose: { pi_turn: 2 },
+        byStatus: { completed: 2 },
+        completedKnownUsage: 1,
+        completedUnknownUsage: 1,
+        providerLatencyMs: { count: 2, sumMs: 30, maxMs: 20 },
+      };
+      const sharedRead = vi.spyOn(GovernanceQueryService.prototype, 'summarizeModelInvocations')
+        .mockResolvedValue(expected);
+
+      const result = await cli.summarizeModelInvocations(options);
+
+      expect(sharedRead).toHaveBeenCalledTimes(1);
+      expect(sharedRead).toHaveBeenCalledWith(options);
+      expect(result).toBe(expected);
+    });
+
+    it('should delegate tool-call inspection to the shared query service without reshaping', async () => {
+      const options = {
+        turnId: 'turn-shared-tool-call',
+        toolName: 'workspace.read_text',
+        status: 'success' as const,
+        includePayload: true,
+        limit: 7,
+      };
+      const expected = [{
+        id: 'tool-shared',
+        turnId: options.turnId,
+        toolName: options.toolName,
+        requestedBy: 'pi',
+        actor: {
+          canonicalUserId: 'user-shared',
+          actorClass: 'user',
+        },
+        context: 'private_chat',
+        status: 'success',
+        executionTimeMs: 12,
+        secretsRedacted: true,
+        createdAt: new Date(100),
+        input: { path: 'README.md' },
+        output: { text: 'bounded' },
+      }];
+      const sharedRead = vi.spyOn(GovernanceQueryService.prototype, 'listToolCalls')
+        .mockResolvedValue(expected);
+
+      const result = await cli.listToolCalls(options);
+
+      expect(sharedRead).toHaveBeenCalledTimes(1);
+      expect(sharedRead).toHaveBeenCalledWith(options);
+      expect(result).toBe(expected);
+    });
+
+    it('should delegate action-decision inspection to the shared query service without reshaping', async () => {
+      const options = {
+        turnId: 'turn-shared-action-decision',
+        decidedBy: 'evaluator' as const,
+        riskLevel: 'high' as const,
+        includeActions: true,
+        limit: 7,
+      };
+      const expected = [{
+        id: 'decision-shared',
+        turnId: options.turnId,
+        createdAt: new Date(100),
+        decidedBy: 'evaluator',
+        riskLevel: 'high',
+        confidence: 0.9,
+        evaluatorRequired: true,
+        evaluatorPassed: true,
+        actionCount: 1,
+        actions: [{
+          type: 'reply_full' as const,
+          priority: 1,
+          constraints: { redactionLevel: 'strict' as const },
+          reason: 'Shared decision',
+        }],
+        reasons: ['Shared reason'],
+        suppressors: [],
+      }];
+      const sharedRead = vi.spyOn(GovernanceQueryService.prototype, 'listActionDecisions')
+        .mockResolvedValue(expected);
+
+      const result = await cli.listActionDecisions(options);
+
+      expect(sharedRead).toHaveBeenCalledTimes(1);
+      expect(sharedRead).toHaveBeenCalledWith(options);
+      expect(result).toBe(expected);
+    });
+
+    it('should delegate action-execution inspection to the shared query service without reshaping', async () => {
+      const options = {
+        actionDecisionId: 'decision-shared-action-execution',
+        actionType: 'reply_full' as const,
+        status: 'failed' as const,
+        includeAuditEntry: true,
+        limit: 7,
+      };
+      const expected = [{
+        id: 'execution-shared',
+        actionDecisionId: options.actionDecisionId,
+        actionType: options.actionType,
+        status: options.status,
+        executedMessageId: 'message-shared',
+        downgradedFrom: 'reply_short',
+        downgradedReason: 'Shared downgrade',
+        errorCode: 'shared_failure',
+        errorMessage: 'Shared failure',
+        auditLevel: 'redacted_full',
+        auditEntry: 'Shared audit entry',
+        executedAt: new Date(100),
+      }];
+      const sharedRead = vi.spyOn(GovernanceQueryService.prototype, 'listActionExecutions')
+        .mockResolvedValue(expected);
+
+      const result = await cli.listActionExecutions(options);
+
+      expect(sharedRead).toHaveBeenCalledTimes(1);
+      expect(sharedRead).toHaveBeenCalledWith(options);
+      expect(result).toBe(expected);
+    });
+
+    it('should delegate job inspection to the shared query service without reshaping', async () => {
+      const options = {
+        status: 'failed' as const,
+        type: 'summary',
+        includePayload: true,
+        limit: 7,
+      };
+      const expected = [{
+        id: 'job-shared',
+        type: options.type,
+        status: options.status,
+        attempts: 2,
+        maxAttempts: 4,
+        idempotencyKey: 'summary:shared',
+        leaseOwner: 'worker-shared',
+        leaseExpiresAt: new Date(100),
+        heartbeatAt: new Date(90),
+        createdAt: new Date(10),
+        updatedAt: new Date(80),
+        scheduledAt: new Date(20),
+        startedAt: new Date(30),
+        completedAt: new Date(70),
+        error: 'Shared failure',
+        payload: { input: 'shared' },
+        result: { output: 'shared' },
+      }];
+      const sharedRead = vi.spyOn(GovernanceQueryService.prototype, 'listJobs')
+        .mockResolvedValue(expected);
+
+      const result = await cli.listJobs(options);
+
+      expect(sharedRead).toHaveBeenCalledTimes(1);
+      expect(sharedRead).toHaveBeenCalledWith(options);
+      expect(result).toBe(expected);
+    });
+
+    it('should delegate job-attempt inspection to the shared query service without reshaping', async () => {
+      const options = {
+        jobId: 'job-shared-attempt',
+        workerId: 'worker-shared-attempt',
+        status: 'failed' as const,
+        includeResult: true,
+        limit: 7,
+      };
+      const expected = [{
+        id: 'attempt-shared',
+        jobId: options.jobId,
+        attemptNumber: 2,
+        workerId: options.workerId,
+        status: options.status,
+        startedAt: new Date(10),
+        completedAt: new Date(30),
+        heartbeatAt: new Date(20),
+        error: 'Shared failure',
+        result: { output: 'shared' },
+      }];
+      const sharedRead = vi.spyOn(GovernanceQueryService.prototype, 'listJobAttempts')
+        .mockResolvedValue(expected);
+
+      const result = await cli.listJobAttempts(options);
+
+      expect(sharedRead).toHaveBeenCalledTimes(1);
+      expect(sharedRead).toHaveBeenCalledWith(options);
+      expect(result).toBe(expected);
+    });
+
+    it('should delegate worker-heartbeat inspection to the shared query service without reshaping', async () => {
+      const options = {
+        workerId: 'worker-shared-heartbeat',
+        workerType: 'background',
+        status: 'error' as const,
+        includeDetails: true,
+        limit: 7,
+      };
+      const expected = [{
+        workerId: options.workerId,
+        workerType: options.workerType,
+        status: options.status,
+        currentJobId: 'job-shared-heartbeat',
+        heartbeatAt: new Date(20),
+        details: { output: 'shared' },
+      }];
+      const sharedRead = vi.spyOn(GovernanceQueryService.prototype, 'listWorkerHeartbeats')
+        .mockResolvedValue(expected);
+
+      const result = await cli.listWorkerHeartbeats(options);
+
+      expect(sharedRead).toHaveBeenCalledTimes(1);
+      expect(sharedRead).toHaveBeenCalledWith(options);
+      expect(result).toBe(expected);
+    });
+
+    it('should delegate event-failure inspection to the shared query service without reshaping', async () => {
+      const options = {
+        stage: 'provider',
+        rawEventId: 'raw-event-shared-failure',
+        turnId: 'turn-shared-failure',
+        includeDetails: true,
+        limit: 7,
+      };
+      const expected = [{
+        id: 'event-failure-shared',
+        rawEventId: options.rawEventId,
+        turnId: options.turnId,
+        occurredAt: new Date(20),
+        stage: options.stage,
+        conversationType: 'private' as const,
+        errorName: 'ProviderFailure',
+        errorMessageHash: 'hash-shared',
+        messageIdHash: 'message-hash-shared',
+        senderIdHash: 'sender-hash-shared',
+        conversationIdHash: 'conversation-hash-shared',
+        details: { output: 'shared' },
+      }];
+      const sharedRead = vi.spyOn(
+        GovernanceQueryService.prototype,
+        'listEventProcessingFailures',
+      ).mockResolvedValue(expected);
+
+      const result = await cli.listEventProcessingFailures(options);
+
+      expect(sharedRead).toHaveBeenCalledTimes(1);
+      expect(sharedRead).toHaveBeenCalledWith(options);
+      expect(result).toBe(expected);
     });
 
     it('should inspect action decisions, executions, and tool calls with redacted payloads', async () => {
@@ -1749,6 +2225,211 @@ describe('GovernanceCLI', () => {
   });
 
   describe('explainContext', () => {
+    it('delegates stored Explain lookup to the shared query service without rebuilding', async () => {
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO raw_events (
+          id, type, timestamp, source, platform, conversation_id, payload, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        'raw-shared-explain',
+        'chat.message.received',
+        now,
+        'gateway',
+        'qq',
+        'private:shared-explain',
+        '{}',
+        now,
+      );
+      db.prepare(
+        `INSERT INTO agent_turns (
+          id, conversation_id, trigger_event_id, context_pack_id,
+          pi_model, pi_provider, status, started_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        'turn-shared-explain',
+        'private:shared-explain',
+        'raw-shared-explain',
+        'ctx-shared-explain',
+        'mock-model',
+        'mock-provider',
+        'completed',
+        now,
+      );
+      const expected = {
+        turnId: 'turn-shared-explain',
+        contextPackId: 'ctx-shared-explain',
+        traceSource: 'stored' as const,
+        conversation: {
+          conversationId: 'private:shared-explain',
+          conversationType: 'private' as const,
+        },
+        selectedMemoryIds: ['memory-selected'],
+        candidateMemoryIds: ['memory-candidate'],
+        rejectedMemories: [],
+        filtersApplied: ['state=active'],
+        injectedIdentityFields: [],
+        recentMessageIds: ['message-shared-explain'],
+        tokenBudget: {
+          max: 8000,
+          used: 12,
+          breakdown: { recentMessages: 1, memory: 2, identity: 3, system: 6 },
+        },
+        memories: [],
+      };
+      const sharedRead = vi.spyOn(
+        GovernanceQueryService.prototype,
+        'explainStoredContext',
+      ).mockResolvedValue(expected);
+      const rebuild = vi.spyOn(contextBuilder, 'build');
+
+      const result = await cli.explainContext({
+        turnId: expected.turnId,
+        conversationType: 'private',
+      });
+
+      expect(sharedRead).toHaveBeenCalledTimes(1);
+      expect(sharedRead).toHaveBeenCalledWith(expected.turnId);
+      expect(rebuild).not.toHaveBeenCalled();
+      expect(result).toMatchObject(expected);
+    });
+
+    it('delegates Explain action and tool evidence to the shared query service without reshaping', async () => {
+      const turnId = insertTurnForInspection('turn-shared-explain-evidence');
+      const expectedStored = {
+        turnId,
+        contextPackId: 'ctx-shared-explain-evidence',
+        traceSource: 'stored' as const,
+        conversation: {
+          conversationId: `conv-${turnId}`,
+          conversationType: 'private' as const,
+        },
+        selectedMemoryIds: [],
+        candidateMemoryIds: [],
+        rejectedMemories: [],
+        filtersApplied: [],
+        injectedIdentityFields: [],
+        recentMessageIds: [],
+        tokenBudget: {
+          max: 8000,
+          used: 0,
+          breakdown: { recentMessages: 0, memory: 0, identity: 0, system: 0 },
+        },
+        memories: [],
+      };
+      const expectedAction = {
+        id: 'decision-shared-explain-evidence',
+        decidedBy: 'evaluator',
+        riskLevel: 'high',
+        actionTypes: ['reply_full'],
+        reasons: ['shared reason'],
+        suppressors: [],
+        executions: [],
+      };
+      const expectedTools = [{
+        id: 'tool-shared-explain-evidence',
+        toolName: 'runtime.status',
+        requestedBy: 'pi',
+        status: 'success',
+        executionTimeMs: 4,
+      }];
+      const actionRead = vi.spyOn(
+        GovernanceQueryService.prototype,
+        'explainActionDecision',
+      ).mockResolvedValue(expectedAction);
+      const toolRead = vi.spyOn(
+        GovernanceQueryService.prototype,
+        'explainToolCalls',
+      ).mockResolvedValue(expectedTools);
+      vi.spyOn(
+        GovernanceQueryService.prototype,
+        'explainStoredContext',
+      ).mockResolvedValue(expectedStored);
+      const rebuild = vi.spyOn(contextBuilder, 'build');
+
+      const result = await cli.explainContext({ turnId, conversationType: 'private' });
+
+      expect(actionRead).toHaveBeenCalledTimes(1);
+      expect(actionRead).toHaveBeenCalledWith(turnId);
+      expect(toolRead).toHaveBeenCalledTimes(1);
+      expect(toolRead).toHaveBeenCalledWith(turnId);
+      expect(rebuild).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        ...expectedStored,
+        actionDecision: expectedAction,
+        toolCalls: expectedTools,
+      });
+    });
+
+    it('delegates Explain turn resolution and preserves private/group rebuild inputs', async () => {
+      const exactResolution = {
+        turnId: 'turn-shared-resolution-exact',
+        contextPackId: 'context-shared-resolution-exact',
+        conversationId: 'group:shared-resolution',
+        conversationType: 'group' as const,
+        groupId: 'group-shared-resolution',
+        senderId: 'user-alice',
+      };
+      const latestResolution = {
+        turnId: 'turn-shared-resolution-latest',
+        contextPackId: 'context-shared-resolution-latest',
+        conversationId: 'private:shared-resolution',
+        conversationType: 'private' as const,
+        groupId: null,
+        senderId: 'user-bob',
+      };
+      const turnRead = vi.spyOn(GovernanceQueryService.prototype, 'resolveExplainTurn')
+        .mockResolvedValueOnce(exactResolution)
+        .mockResolvedValueOnce(latestResolution);
+      vi.spyOn(GovernanceQueryService.prototype, 'explainStoredContext').mockResolvedValue(null);
+      const rebuild = vi.spyOn(contextBuilder, 'build').mockResolvedValue({
+        id: 'context-rebuilt-shared-resolution',
+        turnId: 'turn-rebuilt-shared-resolution',
+        createdAt: new Date(100),
+        conversation: {
+          conversationId: 'rebuilt-conversation',
+          conversationType: 'private',
+        },
+        recentMessages: [],
+        memory: {
+          retrievedFacts: [],
+          selectedMemoryIds: [],
+        },
+        participants: [],
+        injectedIdentityFields: [],
+        tokenBudget: {
+          max: 8000,
+          used: 0,
+          breakdown: { recentMessages: 0, memory: 0, identity: 0, system: 0 },
+        },
+      } as ContextPack);
+
+      await cli.explainContext({
+        turnId: exactResolution.turnId,
+        conversationType: 'group',
+      });
+      await cli.explainContext({});
+
+      expect(turnRead).toHaveBeenCalledTimes(2);
+      expect(turnRead).toHaveBeenNthCalledWith(1, exactResolution.turnId);
+      expect(turnRead).toHaveBeenNthCalledWith(2, undefined);
+      expect(rebuild).toHaveBeenCalledTimes(2);
+      expect(rebuild).toHaveBeenNthCalledWith(1, expect.objectContaining({
+        turnId: exactResolution.turnId,
+        conversationId: exactResolution.conversationId,
+        conversationType: 'group',
+        groupId: exactResolution.groupId,
+        canonicalUserId: exactResolution.senderId,
+      }));
+      expect(rebuild).toHaveBeenNthCalledWith(2, expect.objectContaining({
+        turnId: latestResolution.turnId,
+        conversationId: latestResolution.conversationId,
+        conversationType: 'private',
+        groupId: undefined,
+        canonicalUserId: latestResolution.senderId,
+      }));
+    });
+
     it('should rebuild context trace for a stored turn', async () => {
       const memoryId = await createMemory({
         visibility: 'same_user_any_context',
@@ -1913,6 +2594,39 @@ describe('GovernanceCLI', () => {
   });
 
   describe('platform account unlink', () => {
+    it('should delegate platform account unlink to the shared service without reshaping outcomes', async () => {
+      const options = {
+        platform: 'qq' as const,
+        platformAccountId: 'shared-unlink-account',
+      };
+      const sharedWrite = vi.spyOn(
+        GovernanceService.prototype,
+        'unlinkPlatformAccountAsLocalAdmin',
+      )
+        .mockReturnValueOnce({ outcome: 'unlinked' })
+        .mockReturnValueOnce({ outcome: 'not_found' })
+        .mockImplementationOnce(() => {
+          throw new Error('synthetic shared unlink failure');
+        });
+
+      await expect(cli.unlinkPlatformAccount(options)).resolves.toEqual({
+        success: true,
+        message: 'Platform account mapping disabled',
+      });
+      await expect(cli.unlinkPlatformAccount(options)).resolves.toEqual({
+        success: false,
+        error: 'Platform account mapping not found or not active',
+      });
+      await expect(cli.unlinkPlatformAccount(options)).resolves.toEqual({
+        success: false,
+        error: 'Platform account unlink failed',
+      });
+      expect(sharedWrite).toHaveBeenCalledTimes(3);
+      expect(sharedWrite).toHaveBeenNthCalledWith(1, options);
+      expect(sharedWrite).toHaveBeenNthCalledWith(2, options);
+      expect(sharedWrite).toHaveBeenNthCalledWith(3, options);
+    });
+
     it('should atomically disable an active mapping and insert a redacted identity audit row', async () => {
       const platformAccountId = '1234567890';
       const now = Date.now();
@@ -2055,6 +2769,26 @@ describe('GovernanceCLI', () => {
   });
 
   describe('redactDisplayProfile', () => {
+    it('should delegate display profile redaction to the shared service without reshaping output', async () => {
+      const options = {
+        canonicalUserId: 'user-shared-profile',
+        groupId: 'group-shared-profile',
+      };
+      const sharedWrite = vi.spyOn(
+        GovernanceService.prototype,
+        'redactDisplayProfileAsLocalAdmin',
+      ).mockReturnValue(7);
+
+      const result = await cli.redactDisplayProfile(options);
+
+      expect(sharedWrite).toHaveBeenCalledTimes(1);
+      expect(sharedWrite).toHaveBeenCalledWith(options);
+      expect(result).toEqual({
+        success: true,
+        message: 'Redacted 7 display profile/nickname rows for user-shared-profile',
+      });
+    });
+
     it('should redact display profile and nickname history with audit', async () => {
       const now = Date.now();
       db.prepare(
@@ -2100,7 +2834,43 @@ describe('GovernanceCLI', () => {
   });
 
   describe('privacy preference commands', () => {
+    it('should delegate privacy-preference inspection to the shared query service without reshaping', async () => {
+      const options = {
+        canonicalUserId: 'user-shared-privacy',
+        preferenceType: 'memory_association' as const,
+        state: 'opted_out' as const,
+        limit: 7,
+      };
+      const expected = [{
+        canonicalUserId: options.canonicalUserId,
+        preferenceType: options.preferenceType,
+        state: options.state,
+        reason: 'Shared reason',
+        updatedBy: {
+          canonicalUserId: 'admin-shared-privacy',
+          actorClass: 'admin',
+          context: 'admin_cli',
+        },
+        createdAt: new Date(10),
+        updatedAt: new Date(20),
+      }];
+      const sharedRead = vi.spyOn(
+        GovernanceQueryService.prototype,
+        'listPrivacyPreferences',
+      ).mockResolvedValue(expected);
+
+      const result = await cli.listPrivacyPreferences(options);
+
+      expect(sharedRead).toHaveBeenCalledTimes(1);
+      expect(sharedRead).toHaveBeenCalledWith(options);
+      expect(result).toBe(expected);
+    });
+
     it('should set, list, and clear privacy opt-outs with audit rows', async () => {
+      const sharedWrite = vi.spyOn(
+        GovernanceService.prototype,
+        'setPrivacyPreferenceAsLocalAdmin',
+      );
       const setResult = await cli.setPrivacyOptOut({
         canonicalUserId: 'user-alice',
         preferenceType: 'proactive_dm',
@@ -2139,6 +2909,19 @@ describe('GovernanceCLI', () => {
         state: 'opted_in',
         reason: 'Allow proactive reminders again',
       });
+      expect(sharedWrite).toHaveBeenCalledTimes(2);
+      expect(sharedWrite).toHaveBeenNthCalledWith(1, {
+        canonicalUserId: 'user-alice',
+        preferenceType: 'proactive_dm',
+        state: 'opted_out',
+        reason: 'No proactive reminders',
+      });
+      expect(sharedWrite).toHaveBeenNthCalledWith(2, {
+        canonicalUserId: 'user-alice',
+        preferenceType: 'proactive_dm',
+        state: 'opted_in',
+        reason: 'Allow proactive reminders again',
+      });
 
       const auditRows = db
         .prepare(
@@ -2159,6 +2942,34 @@ describe('GovernanceCLI', () => {
         event_type: 'privacy.preference_set',
         actor_class: 'admin',
         invocation_context: 'admin_cli',
+      });
+
+      expect(await cli.setPrivacyOptOut({
+        canonicalUserId: 'user-alice',
+        preferenceType: 'memory_association',
+      })).toEqual({
+        success: true,
+        message: 'user-alice opted out of memory_association',
+      });
+      expect(await cli.clearPrivacyOptOut({
+        canonicalUserId: 'user-alice',
+        preferenceType: 'memory_association',
+      })).toEqual({
+        success: true,
+        message: 'user-alice opted back into memory_association',
+      });
+      expect(sharedWrite).toHaveBeenCalledTimes(4);
+      expect(sharedWrite).toHaveBeenNthCalledWith(3, {
+        canonicalUserId: 'user-alice',
+        preferenceType: 'memory_association',
+        state: 'opted_out',
+        reason: 'Governance CLI set privacy opt-out',
+      });
+      expect(sharedWrite).toHaveBeenNthCalledWith(4, {
+        canonicalUserId: 'user-alice',
+        preferenceType: 'memory_association',
+        state: 'opted_in',
+        reason: 'Governance CLI clear privacy opt-out',
       });
     });
   });
