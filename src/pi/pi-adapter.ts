@@ -384,9 +384,11 @@ export class PiAdapter {
       if (deadlineReached) {
         await agent.waitForIdle().catch(() => undefined);
       }
-      let failure = deadlineReached
+      let failure = deadlineReached || session.providerAbortCode === 'turn_timeout'
         ? new Error(timeoutMessage)
-        : error;
+        : session.providerAbortCode === 'provider_aborted'
+          ? new Error('Pi turn aborted')
+          : error;
       try {
         await this.waitForInvocationFinalizations(session);
       } catch (finalizationError) {
@@ -399,7 +401,7 @@ export class PiAdapter {
         toolCallIds: session.recordedToolCallIds,
         events: session.events,
         tokensUsed: { input: 0, output: 0, total: 0 },
-        status: 'failed',
+        status: session.providerAbortCode === 'provider_aborted' ? 'aborted' : 'failed',
         errorMessage: extractRuntimeFailureMessage(failure),
       };
     } finally {
@@ -1033,7 +1035,10 @@ export class PiAdapter {
     let status: 'completed' | 'failed' | 'aborted' = 'completed';
     let errorMessage: string | undefined;
 
-    if (agent.state.errorMessage) {
+    if (session.providerAbortCode === 'provider_aborted') {
+      status = 'aborted';
+      errorMessage = 'Pi turn aborted';
+    } else if (agent.state.errorMessage) {
       status = 'failed';
       errorMessage = redactRuntimeDiagnosticText(agent.state.errorMessage);
     }
@@ -1646,6 +1651,18 @@ export class PiAdapter {
         this.terminalizeProviderResult(session, invocationId, message);
       })
       .catch((error: unknown) => {
+        const abortCode = session.providerAbortCode;
+        if (abortCode) {
+          try {
+            this.writeInvocationTerminal(invocationId, () => {
+              this.modelInvocationRepository?.failInvocation(invocationId, abortCode, 'aborted');
+            });
+          } catch (terminalizationError) {
+            session.invocationFinalizationError ??= terminalizationError;
+          }
+          return;
+        }
+
         try {
           this.writeInvocationTerminal(invocationId, () => {
             this.modelInvocationRepository?.failInvocation(

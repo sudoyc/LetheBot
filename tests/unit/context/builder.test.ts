@@ -5,9 +5,18 @@ import { join } from 'node:path';
 import type Database from 'better-sqlite3';
 import { initDatabase, runMigrations, closeDatabase } from '../../../src/storage/database';
 import { ContextBuilder } from '../../../src/context/builder';
-import { MemoryRepository } from '../../../src/storage/memory-repository';
+import { MemoryRepository, type MemoryFilters } from '../../../src/storage/memory-repository';
 import { IdentityRepository } from '../../../src/storage/identity-repository';
 import { GroupSummaryPolicyRepository } from '../../../src/storage/group-summary-policy-repository';
+
+interface ContextBuilderMemoryRouteProbe {
+  buildMemoryFilterRoutes(
+    userId: string | undefined,
+    conversationType: 'private' | 'group',
+    groupId: string | undefined,
+    conversationId: string,
+  ): MemoryFilters[];
+}
 
 describe('ContextBuilder', () => {
   let testDir: string;
@@ -128,6 +137,73 @@ describe('ContextBuilder', () => {
       expect(context.tokenBudget.max).toBeGreaterThan(0);
     });
 
+    it('rejects private input carrying a group ID before public group-summary retrieval regardless of policy state', async () => {
+      const groupId = 'group-1';
+      await createMemory({
+        scope: 'group',
+        groupId,
+        visibility: 'public',
+        sensitivity: 'normal',
+        authority: 'tool_derived',
+        kind: 'summary',
+        title: 'Public group summary',
+        content: 'This group summary must never reach a private context',
+        state: 'active',
+        confidence: 0.9,
+        importance: 0.8,
+        sourceContext: 'background_worker:summary',
+        sources: [{
+          sourceType: 'raw_event',
+          sourceId: 'raw-context-builder-group-1-source',
+        }],
+      });
+
+      for (const enabled of [true, false]) {
+        groupSummaryPolicies.setEnabled({
+          groupId,
+          enabled,
+          authority: {
+            kind: 'bot_owner',
+            actorUserId: 'user-alice',
+            invocationContext: 'admin_cli',
+          },
+        });
+
+        await expect(builder.buildContext({
+          turnId: `turn-private-group-summary-${enabled}`,
+          conversationId: 'private:user-alice',
+          conversationType: 'private',
+          groupId,
+          recentMessages: [],
+          targetUserId: 'user-alice',
+        })).rejects.toThrow('Group ID is not allowed when conversation type is private');
+      }
+    });
+
+    it('fails closed when a group input omits its group ID', async () => {
+      await expect(builder.buildContext({
+        turnId: 'turn-group-missing-group-id',
+        conversationId: 'qq-group-100012',
+        conversationType: 'group',
+        recentMessages: [],
+      })).rejects.toThrow('Group ID is required when conversation type is group');
+    });
+
+    it('does not route private contexts through group memory retrieval', () => {
+      const groupId = 'group-1';
+      // The private helper is probed to cover its defense-in-depth contract.
+      const routeProbe = builder as unknown as ContextBuilderMemoryRouteProbe;
+      const routes = routeProbe.buildMemoryFilterRoutes(
+        'user-alice',
+        'private',
+        groupId,
+        'private:user-alice',
+      );
+
+      expect(routes).not.toContainEqual(expect.objectContaining({ groupId }));
+      expect(routes).not.toContainEqual(expect.objectContaining({ scope: 'group' }));
+    });
+
     it('should retrieve user memory with private_only visibility', async () => {
       // Create user memory
       await createMemory({
@@ -143,7 +219,6 @@ describe('ContextBuilder', () => {
         confidence: 0.9,
         importance: 0.5,
         sourceContext: 'private chat',
-        sourceEventIds: [],
       });
 
       const context = await builder.buildContext({
@@ -238,13 +313,13 @@ describe('ContextBuilder', () => {
         confidence: 0.9,
         importance: 0.5,
         sourceContext: 'private chat',
-        sourceEventIds: [],
       });
 
       const context = await builder.buildContext({
         turnId: 'turn-003',
         conversationId: 'group:tech-chat',
         conversationType: 'group',
+        groupId: 'group-tech-chat',
         recentMessages: [],
         targetUserId: 'user-alice',
       });
@@ -329,7 +404,6 @@ describe('ContextBuilder', () => {
         confidence: 0.8,
         importance: 0.5,
         sourceContext: 'conversation',
-        sourceEventIds: [],
         sources: [{
           sourceType: 'raw_event',
           sourceId: 'raw-context-builder-bob-source',
@@ -352,6 +426,7 @@ describe('ContextBuilder', () => {
         turnId: 'turn-005',
         conversationId: 'group:dev-team',
         conversationType: 'group',
+        groupId: 'group-dev-team',
         recentMessages: [],
         targetUserId: 'user-bob',
       });
@@ -373,7 +448,6 @@ describe('ContextBuilder', () => {
         confidence: 0.9,
         importance: 0.5,
         sourceContext: 'chat',
-        sourceEventIds: [],
         sources: [{
           sourceType: 'raw_event',
           sourceId: 'raw-context-builder-charlie-source',

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { beforeEach, describe, it, expect } from 'vitest';
 import { ToolRegistry } from '../../../src/tools/registry';
 import { MIN_TOOL_OUTPUT_BYTES } from '../../../src/tools/output-limit';
 import type { SandboxPolicy, ToolRegistryEntry } from '../../../src/types/tool';
@@ -43,6 +43,122 @@ describe('ToolRegistry', () => {
       const tool = registry.get('echo');
       expect(tool).toBeDefined();
       expect(tool?.name).toBe('echo');
+    });
+
+    it('should retain a deeply frozen metadata snapshot while preserving its handler', async () => {
+      const snapshotRegistry = new ToolRegistry();
+      const handler: ToolRegistryEntry['handler'] = async () => ({ handled: true });
+      const entry: ToolRegistryEntry = {
+        name: 'registered-snapshot',
+        version: '1.0.0',
+        description: 'Metadata snapshot regression',
+        capabilities: ['platform_admin'],
+        permissions: {
+          allowedActors: ['owner'],
+          allowedContexts: ['admin_cli'],
+        },
+        evaluatorPolicy: 'required',
+        auditLevel: 'full',
+        sandboxPolicy: {
+          filesystem: 'none',
+          network: 'none',
+          execution: 'in_process',
+          maxRuntimeMs: 1000,
+          maxOutputBytes: MIN_TOOL_OUTPUT_BYTES,
+        },
+        outputSensitivity: 'sensitive',
+        piSchema: {
+          input: {
+            type: 'object',
+            properties: { command: { type: 'string' } },
+            required: ['command'],
+          },
+          output: { type: 'object', properties: { handled: { type: 'boolean' } } },
+        },
+        handler,
+      };
+
+      snapshotRegistry.register(entry);
+
+      entry.permissions.allowedActors.push('user');
+      entry.permissions.allowedContexts.push('private_chat');
+      entry.evaluatorPolicy = 'bypass';
+      entry.sandboxPolicy.execution = 'docker';
+      entry.sandboxPolicy.maxRuntimeMs = undefined;
+      entry.sandboxPolicy.maxOutputBytes = undefined;
+      entry.capabilities.push('network');
+      const originalInputSchema = entry.piSchema.input as {
+        properties: { command: { type: string } };
+      };
+      originalInputSchema.properties.command.type = 'number';
+
+      const retrieved = snapshotRegistry.get('registered-snapshot');
+      const listed = snapshotRegistry.list()[0];
+      const all = snapshotRegistry.getAll()[0];
+      if (!retrieved || !listed || !all) {
+        throw new Error('Expected registered-snapshot metadata');
+      }
+
+      expect(Object.isFrozen(retrieved)).toBe(true);
+      expect(Object.isFrozen(retrieved.permissions.allowedActors)).toBe(true);
+      expect(Object.isFrozen(retrieved.sandboxPolicy)).toBe(true);
+      expect(Object.isFrozen(retrieved.piSchema.input)).toBe(true);
+
+      expect(Reflect.set(retrieved.permissions.allowedActors, 1, 'user')).toBe(false);
+      expect(Reflect.set(retrieved.permissions.allowedContexts, 1, 'private_chat')).toBe(false);
+      expect(Reflect.set(listed, 'evaluatorPolicy', 'bypass')).toBe(false);
+      expect(Reflect.set(listed.sandboxPolicy, 'execution', 'docker')).toBe(false);
+      expect(Reflect.set(listed.sandboxPolicy, 'maxRuntimeMs', undefined)).toBe(false);
+      expect(Reflect.set(listed.sandboxPolicy, 'maxOutputBytes', undefined)).toBe(false);
+      expect(Reflect.set(all.capabilities, 1, 'network')).toBe(false);
+      const listedInputSchema = all.piSchema.input as {
+        properties: { command: { type: string } };
+      };
+      expect(Reflect.set(listedInputSchema.properties.command, 'type', 'number')).toBe(false);
+
+      expect(snapshotRegistry.checkPermission(
+        'registered-snapshot',
+        { actorClass: 'owner' },
+        'admin_cli',
+      )).toBe(true);
+      expect(snapshotRegistry.checkPermission(
+        'registered-snapshot',
+        { actorClass: 'user' },
+        'admin_cli',
+      )).toBe(false);
+      expect(snapshotRegistry.checkPermission(
+        'registered-snapshot',
+        { actorClass: 'owner' },
+        'private_chat',
+      )).toBe(false);
+      expect(snapshotRegistry.requiresEvaluator('registered-snapshot')).toBe(true);
+      expect(snapshotRegistry.get('registered-snapshot')).toMatchObject({
+        capabilities: ['platform_admin'],
+        sandboxPolicy: {
+          execution: 'in_process',
+          maxRuntimeMs: 1000,
+          maxOutputBytes: MIN_TOOL_OUTPUT_BYTES,
+        },
+        piSchema: {
+          input: {
+            properties: { command: { type: 'string' } },
+          },
+        },
+      });
+      const registeredHandler = snapshotRegistry.getHandler('registered-snapshot');
+      expect(registeredHandler).toBe(handler);
+      if (!registeredHandler) {
+        throw new Error('Expected registered-snapshot handler');
+      }
+      await expect(registeredHandler({
+        toolCallId: 'tool-call-snapshot',
+        turnId: 'turn-snapshot',
+        toolName: 'registered-snapshot',
+        signal: new AbortController().signal,
+        input: {},
+        actor: { actorClass: 'owner' },
+        context: 'admin_cli',
+      })).resolves.toEqual({ handled: true });
     });
 
     it('should throw on duplicate registration', () => {
@@ -140,7 +256,7 @@ describe('ToolRegistry', () => {
       ['maxOutputBytes', MIN_TOOL_OUTPUT_BYTES - 1],
     ] as const)('should reject invalid sandbox limit metadata for %s=%s', (field, value) => {
       const invalidRegistry = new ToolRegistry();
-      const sandboxPolicy = {
+      const sandboxPolicy: SandboxPolicy = {
         filesystem: 'none',
         network: 'none',
         execution: 'in_process',

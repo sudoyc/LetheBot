@@ -35,19 +35,24 @@ export class ToolRegistry {
       throw new Error(`Tool "${entry.name}" must be registered with a resolved function handler`);
     }
 
-    assertKnownToolExecution(entry.name, entry.sandboxPolicy?.execution);
-    validateSandboxLimit('maxRuntimeMs', entry.sandboxPolicy.maxRuntimeMs);
-    validateSandboxLimit('maxOutputBytes', entry.sandboxPolicy.maxOutputBytes);
+    const registeredEntry = cloneAndFreezeToolEntry(entry);
+
+    assertKnownToolExecution(
+      registeredEntry.name,
+      registeredEntry.sandboxPolicy?.execution,
+    );
+    validateSandboxLimit('maxRuntimeMs', registeredEntry.sandboxPolicy.maxRuntimeMs);
+    validateSandboxLimit('maxOutputBytes', registeredEntry.sandboxPolicy.maxOutputBytes);
     if (
-      entry.sandboxPolicy.maxOutputBytes !== undefined
-      && entry.sandboxPolicy.maxOutputBytes < MIN_TOOL_OUTPUT_BYTES
+      registeredEntry.sandboxPolicy.maxOutputBytes !== undefined
+      && registeredEntry.sandboxPolicy.maxOutputBytes < MIN_TOOL_OUTPUT_BYTES
     ) {
       throw new Error(
-        `Tool "${entry.name}" maxOutputBytes must be at least ${MIN_TOOL_OUTPUT_BYTES}`
+        `Tool "${registeredEntry.name}" maxOutputBytes must be at least ${MIN_TOOL_OUTPUT_BYTES}`
       );
     }
 
-    this.tools.set(entry.name, entry);
+    this.tools.set(registeredEntry.name, registeredEntry);
   }
 
   /**
@@ -140,6 +145,32 @@ export class ToolRegistry {
     const tool = this.tools.get(toolName);
     return tool?.evaluatorPolicy === 'required';
   }
+}
+
+function cloneAndFreezeToolEntry(entry: ToolRegistryEntry): ToolRegistryEntry {
+  const { handler, ...metadata } = entry;
+
+  return deepFreeze({
+    ...structuredClone(metadata),
+    handler,
+  });
+}
+
+function deepFreeze<T extends object>(value: T, seen = new WeakSet<object>()): T {
+  if (seen.has(value)) {
+    return value;
+  }
+
+  seen.add(value);
+  for (const key of Reflect.ownKeys(value)) {
+    const nestedValue = Object.getOwnPropertyDescriptor(value, key)?.value;
+    if (nestedValue !== null && typeof nestedValue === 'object') {
+      deepFreeze(nestedValue, seen);
+    }
+  }
+
+  Object.freeze(value);
+  return value;
 }
 
 function validateSandboxLimit(

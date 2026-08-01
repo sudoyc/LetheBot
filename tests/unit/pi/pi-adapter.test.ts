@@ -545,11 +545,55 @@ describe('PiAdapter', () => {
       consoleError.mockRestore();
     });
 
-    it('marks an in-flight provider request aborted with turn_timeout', async () => {
-      vi.useFakeTimers();
+    it('terminalizes a rejected stream result as runtime_exception without a local abort', async () => {
       const invocationRepository = createInvocationRepository();
       createLedgerAdapter(invocationRepository);
       const deferred = createDeferredAssistantStream();
+      const rawFailure = 'provider-result-rejection api_key=sk-stream-result-runtime-secret-qq-1234567890';
+      mockStreamSimple.mockReturnValueOnce(deferred.stream);
+      mockAgent.prompt.mockImplementationOnce(async () => {
+        const stream = await mockAgent._mockOptions.streamFn(
+          mockAgent.state.model,
+          { messages: [] },
+          { maxRetries: 3 },
+        );
+        await stream.result();
+      });
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+      try {
+        const turnPromise = adapter.runTurn({
+          contextPack: createMinimalContextPack(),
+          systemPrompt: 'Test system prompt',
+          actor: { actorClass: 'user' },
+          invocationContext: 'private_chat',
+          turnId: 'turn-ledger-result-runtime-error',
+          sourceEventIds: ['raw-ledger-result-runtime-error'],
+        });
+        await Promise.resolve();
+        deferred.reject(new Error(rawFailure));
+        const output = await turnPromise;
+
+        expect(output.status).toBe('failed');
+        expect(output.errorMessage).toContain('provider-result-rejection');
+        expect(invocationRepository.failInvocation).toHaveBeenCalledWith(
+          'invocation:turn-ledger-result-runtime-error:1',
+          'runtime_exception',
+          'failed',
+        );
+        expect(invocationRepository.failInvocation).toHaveBeenCalledTimes(1);
+        expect(JSON.stringify(invocationRepository.failInvocation.mock.calls)).not.toContain(rawFailure);
+        expect(JSON.stringify(output)).not.toContain(rawFailure);
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
+    it('terminalizes a rejected stream result after explicit abort without leaking it', async () => {
+      const invocationRepository = createInvocationRepository();
+      createLedgerAdapter(invocationRepository);
+      const deferred = createDeferredAssistantStream();
+      const rawFailure = 'provider-result-rejection api_key=sk-stream-result-abort-secret-qq-1234567890';
       mockStreamSimple.mockReturnValueOnce(deferred.stream);
       mockAgent.prompt.mockImplementationOnce(async () => {
         const stream = await mockAgent._mockOptions.streamFn(
@@ -560,7 +604,58 @@ describe('PiAdapter', () => {
         await stream.result();
       });
       mockAgent.abort.mockImplementationOnce(() => {
-        deferred.resolve(createAssistantMessage({ stopReason: 'aborted' }));
+        deferred.reject(new Error(rawFailure));
+      });
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+      try {
+        const turnPromise = adapter.runTurn({
+          contextPack: createMinimalContextPack(),
+          systemPrompt: 'Test system prompt',
+          actor: { actorClass: 'user' },
+          invocationContext: 'private_chat',
+          turnId: 'turn-ledger-explicit-abort',
+          sourceEventIds: ['raw-ledger-explicit-abort'],
+        });
+        await Promise.resolve();
+        adapter.abort();
+        const output = await turnPromise;
+
+        expect(output).toMatchObject({ status: 'aborted', errorMessage: 'Pi turn aborted' });
+        expect(invocationRepository.failInvocation).toHaveBeenCalledWith(
+          'invocation:turn-ledger-explicit-abort:1',
+          'provider_aborted',
+          'aborted',
+        );
+        expect(invocationRepository.failInvocation).toHaveBeenCalledTimes(1);
+        expect(output.errorMessage).not.toContain(rawFailure);
+        expect(output.errorMessage).not.toContain('provider-result-rejection');
+        const diagnostic = JSON.stringify(consoleError.mock.calls);
+        expect(diagnostic).toContain('Pi turn aborted');
+        expect(diagnostic).not.toContain('provider-result-rejection');
+        expect(diagnostic).not.toContain(rawFailure);
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
+    it('marks an in-flight provider request aborted with turn_timeout', async () => {
+      vi.useFakeTimers();
+      const invocationRepository = createInvocationRepository();
+      createLedgerAdapter(invocationRepository);
+      const deferred = createDeferredAssistantStream();
+      const rawFailure = 'provider-result-rejection api_key=sk-stream-result-timeout-secret-qq-1234567890';
+      mockStreamSimple.mockReturnValueOnce(deferred.stream);
+      mockAgent.prompt.mockImplementationOnce(async () => {
+        const stream = await mockAgent._mockOptions.streamFn(
+          mockAgent.state.model,
+          { messages: [] },
+          { maxRetries: 3 },
+        );
+        await stream.result();
+      });
+      mockAgent.abort.mockImplementationOnce(() => {
+        deferred.reject(new Error(rawFailure));
       });
       const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 
@@ -583,7 +678,14 @@ describe('PiAdapter', () => {
           'turn_timeout',
           'aborted',
         );
+        expect(invocationRepository.failInvocation).toHaveBeenCalledTimes(1);
         expect(mockStreamSimple.mock.calls[0]?.[2]).toEqual(expect.objectContaining({ maxRetries: 0 }));
+        expect(output.errorMessage).not.toContain(rawFailure);
+        expect(output.errorMessage).not.toContain('provider-result-rejection');
+        const diagnostic = JSON.stringify(consoleError.mock.calls);
+        expect(diagnostic).toContain('Pi turn deadline exceeded');
+        expect(diagnostic).not.toContain('provider-result-rejection');
+        expect(diagnostic).not.toContain(rawFailure);
       } finally {
         consoleError.mockRestore();
         vi.useRealTimers();
@@ -1204,12 +1306,7 @@ describe('PiAdapter', () => {
     });
 
     it('clears stale safe-name aliases and blocks unknown provider names before registry or policy', async () => {
-      const entry = toolRegistry.get('test_tool');
-      if (!entry) {
-        throw new Error('Expected test_tool to be registered');
-      }
-      const handler = vi.fn(entry.handler);
-      entry.handler = handler;
+      const handlerLookup = vi.spyOn(toolRegistry, 'getHandler');
       await adapter.runTurn({
         contextPack: createMinimalContextPack(),
         systemPrompt: 'Test system prompt',
@@ -1222,7 +1319,7 @@ describe('PiAdapter', () => {
         (tool: { name: string }) => tool.name === 'test_tool'
       );
 
-      entry.permissions.allowedActors = ['owner'];
+      const permissionCheck = vi.spyOn(toolRegistry, 'checkPermission').mockReturnValue(false);
       await adapter.runTurn({
         contextPack: createMinimalContextPack(),
         systemPrompt: 'Test system prompt',
@@ -1231,12 +1328,14 @@ describe('PiAdapter', () => {
         turnId: 'turn-stale-alias-second',
       });
       expect(mockAgent.state.tools).toEqual([]);
+      permissionCheck.mockRestore();
+      handlerLookup.mockClear();
 
       const registryGet = vi.spyOn(toolRegistry, 'get');
       const policyCheck = vi.spyOn(policyGate, 'checkToolCall');
       await expect(staleTool.execute('tc-stale-tool-reference', {}))
         .rejects.toThrow(/not available for the current turn/i);
-      expect(handler).not.toHaveBeenCalled();
+      expect(handlerLookup).not.toHaveBeenCalled();
       expect(registryGet).not.toHaveBeenCalled();
       expect(policyCheck).not.toHaveBeenCalled();
 
@@ -3832,12 +3931,11 @@ describe('PiAdapter', () => {
 
         await groupTool.execute('tc-group-audit-success', {});
 
-        const registeredTool = toolRegistry.get('group_audit_tool');
-        expect(registeredTool).toBeDefined();
-        if (!registeredTool) {
-          throw new Error('Expected group_audit_tool to be registered');
-        }
-        registeredTool.permissions.allowedGroupIds = ['group-audit-other'];
+        vi.spyOn(policyGate, 'checkToolCall').mockReturnValue({
+          allowed: false,
+          requiresEvaluator: false,
+          reason: 'Permission denied by changed group policy',
+        });
 
         await expect(groupTool.execute('tc-group-audit-rejected', {}))
           .rejects.toThrow(/Permission denied/);
@@ -3927,12 +4025,11 @@ describe('PiAdapter', () => {
         });
 
         const deniedTool = mockAgent.state.tools.find((tool: any) => tool.name === 'policy_test_tool');
-        const registeredTool = toolRegistry.get('policy_test_tool');
-        expect(registeredTool).toBeDefined();
-        if (!registeredTool) {
-          throw new Error('Expected policy_test_tool to be registered');
-        }
-        registeredTool.permissions.allowedActors = ['owner'];
+        vi.spyOn(policyGate, 'checkToolCall').mockReturnValueOnce({
+          allowed: false,
+          requiresEvaluator: false,
+          reason: 'Permission denied by changed actor policy',
+        });
 
         await expect(deniedTool.execute('tc-persist-rejected', { action: 'test' }))
           .rejects.toThrow(/Permission denied/);
@@ -5527,12 +5624,11 @@ describe('PiAdapter', () => {
 
       await adapter.runTurn(input);
       const piTool = mockAgent.state.tools[0];
-      const registeredTool = toolRegistry.get('policy_test_tool');
-      expect(registeredTool).toBeDefined();
-      if (!registeredTool) {
-        throw new Error('Expected policy_test_tool to be registered');
-      }
-      registeredTool.permissions.allowedActors = ['owner'];
+      vi.spyOn(policyGate, 'checkToolCall').mockReturnValue({
+        allowed: false,
+        requiresEvaluator: false,
+        reason: 'Permission denied by changed actor policy',
+      });
 
       await expect(piTool.execute('tc-policy-denied', { action: 'test' }))
         .rejects.toThrow(/Permission denied/);
@@ -5554,7 +5650,24 @@ describe('PiAdapter', () => {
       if (!registeredTool) {
         throw new Error('Expected policy_test_tool to be registered');
       }
-      registeredTool.sandboxPolicy.execution = 'subprocess';
+      const unsupportedRegistry = new ToolRegistry();
+      unsupportedRegistry.register({
+        ...registeredTool,
+        sandboxPolicy: {
+          ...registeredTool.sandboxPolicy,
+          execution: 'subprocess',
+        },
+      });
+      const unsupportedPolicyGate = new PolicyGate(unsupportedRegistry);
+      adapter = new PiAdapter({
+        toolRegistry: unsupportedRegistry,
+        policyGate: unsupportedPolicyGate,
+        provider: 'openai',
+        model: 'gpt-4',
+        apiKey: 'test-api-key',
+        auditRepository: mockAuditRepository,
+      });
+      mockAgent = getLatestMockAgent();
 
       await adapter.runTurn({
         contextPack: createMinimalContextPack(),
@@ -5570,7 +5683,7 @@ describe('PiAdapter', () => {
       expect(mockToolHandler).not.toHaveBeenCalled();
     });
 
-    it('should recheck execution metadata and audit denial before a handler runs', async () => {
+    it('should keep exposed execution metadata immutable until the handler runs', async () => {
       await adapter.runTurn({
         contextPack: createMinimalContextPack(),
         systemPrompt: 'Test system prompt',
@@ -5585,16 +5698,19 @@ describe('PiAdapter', () => {
       if (!piTool || !registeredTool) {
         throw new Error('Expected exposed policy_test_tool');
       }
-      registeredTool.sandboxPolicy.execution = 'docker';
+      expect(() => {
+        registeredTool.sandboxPolicy.execution = 'docker';
+      }).toThrow(TypeError);
+      expect(registeredTool.sandboxPolicy.execution).toBe('in_process');
 
       await expect(piTool.execute('tc-execution-changed-after-exposure', { action: 'test' }))
-        .rejects.toThrow(/execution backend/i);
+        .resolves.toBeDefined();
 
-      expect(mockToolHandler).not.toHaveBeenCalled();
+      expect(mockToolHandler).toHaveBeenCalledOnce();
       expect(mockAuditRepository.create).toHaveBeenCalledWith(
         expect.objectContaining({
           category: 'tool',
-          eventType: 'tool.rejected',
+          eventType: 'tool.executed',
           eventId: 'tc-execution-changed-after-exposure',
           redacted: false,
         })
@@ -7519,18 +7635,18 @@ function createAssistantStream(message: AssistantMessage): TestAssistantStream {
 
 function createDeferredAssistantStream(): {
   stream: TestAssistantStream;
-  resolve(message: AssistantMessage): void;
+  reject(error: unknown): void;
 } {
-  let resolveResult: (message: AssistantMessage) => void = () => undefined;
-  const result = new Promise<AssistantMessage>((resolve) => {
-    resolveResult = resolve;
+  let rejectResult: (error: unknown) => void = () => undefined;
+  const result = new Promise<AssistantMessage>((_resolve, reject) => {
+    rejectResult = reject;
   });
   return {
     stream: {
       result: vi.fn(() => result),
       async *[Symbol.asyncIterator](): AsyncGenerator<never> {},
     },
-    resolve: resolveResult,
+    reject: rejectResult,
   };
 }
 

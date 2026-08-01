@@ -267,6 +267,17 @@ export class ContextBuilder {
       groupId,
       messageLimit = 20,
     } = input;
+    if (conversationType === 'private' && groupId !== undefined) {
+      throw new Error('Group ID is not allowed when conversation type is private');
+    }
+    if (conversationType === 'group') {
+      if (typeof groupId !== 'string' || groupId.length === 0) {
+        throw new Error('Group ID is required when conversation type is group');
+      }
+      if (groupId.trim() !== groupId) {
+        throw new Error('Group ID must be a non-empty trimmed value');
+      }
+    }
     const turnId = input.turnId ?? ulid();
     const targetUserId = input.targetUserId ?? input.canonicalUserId;
     const participants = input.participants ?? [];
@@ -695,10 +706,12 @@ export class ContextBuilder {
     conversationId: string,
   ): MemoryFilters[] {
     const routes: MemoryFilters[] = [];
+    const groupContext = conversationType === 'group' && groupId !== undefined;
 
     if (userId) {
       routes.push({ canonicalUserId: userId, state: 'active', contextType: conversationType });
-      if (groupId) {
+
+      if (groupContext) {
         routes.push({
           canonicalUserId: userId,
           state: 'active',
@@ -724,7 +737,7 @@ export class ContextBuilder {
         contextType: conversationType,
       });
     }
-    if (groupId) {
+    if (groupContext) {
       routes.push({
         scope: 'group',
         groupId,
@@ -734,7 +747,7 @@ export class ContextBuilder {
     }
 
     routes.push({ scope: 'global', state: 'active', contextType: conversationType });
-    if (groupId) {
+    if (groupContext) {
       routes.push({
         scope: 'global',
         state: 'active',
