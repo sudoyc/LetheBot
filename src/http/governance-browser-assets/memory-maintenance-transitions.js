@@ -272,6 +272,7 @@ const button = append(header, 'button', {
 id: 'memory-review-' + config.key + '-preview-button',
 class: 'button button-primary',
 type: 'button',
+'aria-controls': 'memory-review-' + config.key + '-preview-populated',
 disabled: '',
 }, 'Preview ' + config.noun);
 const unrequested = state(section, 'memory-review-' + config.key + '-preview-unrequested', 'empty-band', 'status', config.title + ' preview not requested', 'No current ' + config.noun + ' preview is loaded.');
@@ -312,10 +313,9 @@ succeeded,
 }
 
 function appendRows(table, rows) {
+const row = append(table, 'tr');
 for (const [label, values] of rows) {
-const row = append(table, 'div');
-append(row, 'dt', {}, label);
-const value = append(row, 'dd');
+const value = append(row, 'td', { 'data-label': label });
 for (const [className, text] of values) append(value, 'span', { class: className }, text);
 }
 }

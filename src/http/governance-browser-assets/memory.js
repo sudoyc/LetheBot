@@ -534,12 +534,7 @@ append(approvalPreviewTitle, 'p', { class: 'eyebrow' }, 'Write-free operation');
 append(approvalPreviewTitle, 'h3', {
 id: 'memory-review-approval-preview-title',
 }, 'Approval preview');
-const approvalPreviewButton = append(approvalPreviewHeader, 'button', {
-id: 'memory-review-approval-preview-button',
-class: 'button button-primary',
-type: 'button',
-disabled: '',
-}, 'Preview approval');
+const approvalPreviewButton = append(approvalPreviewHeader, 'button', { id: 'memory-review-approval-preview-button', class: 'button button-primary', type: 'button', 'aria-controls': 'memory-review-approval-preview-populated', disabled: '' }, 'Preview approval');
 const approvalPreviewUnrequested = createState(
 approvalPreview,
 'memory-review-approval-preview-unrequested',
@@ -620,12 +615,7 @@ append(rejectionPreviewTitle, 'p', { class: 'eyebrow' }, 'Write-free operation')
 append(rejectionPreviewTitle, 'h3', {
 id: 'memory-review-rejection-preview-title',
 }, 'Rejection preview');
-const rejectionPreviewButton = append(rejectionPreviewHeader, 'button', {
-id: 'memory-review-rejection-preview-button',
-class: 'button button-secondary',
-type: 'button',
-disabled: '',
-}, 'Preview rejection');
+const rejectionPreviewButton = append(rejectionPreviewHeader, 'button', { id: 'memory-review-rejection-preview-button', class: 'button button-secondary', type: 'button', 'aria-controls': 'memory-review-rejection-preview-populated', disabled: '' }, 'Preview rejection');
 const rejectionPreviewUnrequested = createState(
 rejectionPreview,
 'memory-review-rejection-preview-unrequested',
@@ -964,6 +954,7 @@ scopeFingerprint: scope.fingerprint,
 scopeExpiresAt: scope.expiresAt,
 } : null;
 }
+function setExpanded(p, b) { for (const c of p.children) c.setAttribute('aria-expanded', c === b ? 'true' : 'false'); }
 
 function selectRecord(target) {
 const button = target?.closest?.('[data-record-index]');
@@ -974,9 +965,7 @@ const scope = selectedScope();
 if (!record || !scope) return null;
 if (record.recordRef !== selectedRecordRef) clearRecordDetailContent();
 selectedRecordRef = record.recordRef;
-for (const control of list.querySelectorAll('[data-record-index]')) {
-control.setAttribute('aria-expanded', control === button ? 'true' : 'false');
-}
+setExpanded(list, button);
 return {
 ...record,
 scopeHandle: scope.handle,
@@ -1250,6 +1239,7 @@ scopeFingerprint: scope.fingerprint,
 scopeExpiresAt: scope.expiresAt,
 } : null;
 }
+function setReviewExpanded(button = null) { setExpanded(reviewsList, button); }
 
 function selectReview(target) {
 const button = target?.closest?.('[data-review-index]');
@@ -1260,9 +1250,7 @@ const scope = selectedReviewScope();
 if (!review || !scope) return null;
 if (review.proposalRef !== selectedReviewRef) clearReviewDetailContent();
 selectedReviewRef = review.proposalRef;
-for (const control of reviewsList.querySelectorAll('[data-review-index]')) {
-control.setAttribute('aria-expanded', control === button ? 'true' : 'false');
-}
+setReviewExpanded(button);
 return {
 ...review,
 scopeHandle: scope.handle,
@@ -1367,7 +1355,7 @@ const placeholder = createElement('option', { value: '' }, 'Select a scope');
 scopeSelect.replaceChildren(placeholder);
 catalog.forEach((entry, index) => {
 const option = createElement('option', { value: String(index + 1) },
-entry.label + ' - ' + entry.fingerprint);
+entry.label + ' — scope ' + String(index + 1));
 scopeSelect.append(option);
 if (entry.fingerprint === retainedFingerprint) {
 scopeSelect.value = String(index + 1);
@@ -1462,9 +1450,9 @@ showRecordDetailState('loading');
 }
 
 function showRecordDetailError(status) {
+setExpanded(list);
 return showRecordDetailState(status === 404 ? 'not-found' : 'error');
 }
-
 function renderRecordDetail(body, record) {
 const state = renderMemoryRecordDetail(body, record, {
 record: recordDetailRecord,
@@ -1485,6 +1473,7 @@ restoreWorkflow.showUnrequested();
 selectedRecordDetail = null;
 forgetWorkflow.clear();
 restoreWorkflow.clear();
+setExpanded(list);
 }
 updateRecordMutationControls();
 return showRecordDetailState(state);
@@ -1550,7 +1539,7 @@ const placeholder = createElement('option', { value: '' }, 'Select a scope');
 reviewScopeSelect.replaceChildren(placeholder);
 reviewCatalog.forEach((entry, index) => {
 const option = createElement('option', { value: String(index + 1) },
-entry.label + ' - ' + entry.fingerprint);
+entry.label + ' — scope ' + String(index + 1));
 reviewScopeSelect.append(option);
 if (entry.fingerprint === retainedFingerprint) {
 reviewScopeSelect.value = String(index + 1);
@@ -1652,6 +1641,7 @@ showReviewDetailState('loading');
 }
 
 function showReviewDetailError(status) {
+setReviewExpanded();
 return showReviewDetailState(status === 404 ? 'not-found' : 'error');
 }
 
@@ -1684,6 +1674,7 @@ expirationWorkflow.showUnrequested();
 showApprovalPreviewState('unrequested');
 showRejectionPreviewState('unrequested');
 }
+if (state !== 'content') setReviewExpanded();
 return state;
 }
 

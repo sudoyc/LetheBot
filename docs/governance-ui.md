@@ -15,6 +15,12 @@ storage. Refresh, navigation, logout/session expiry, replacement preview, and
 timer expiry clear authority; confirm consumes it before dispatch and requires a
 fresh preview after every failure.
 
+All browser-bound free-text projections use the server-owned governance display
+boundary. POSIX, Windows/UNC filesystem paths and SQL statements are replaced by
+fixed category markers before JSON reaches the DOM, including memory text,
+revision reasons, audit summaries, action reasons, and job/tool diagnostics.
+The projection does not rewrite durable source evidence.
+
 The configured defaults are raw/chat/event-processing-failure 90 days, audit 365
 days, and terminal memory 90 days; `0` means forever. Active memory is excluded.
 A verified backup is recommended but is not a confirmation prerequisite.
@@ -311,28 +317,33 @@ service, close SQLite, restore, verify, and restart it.
 
 ## Information Architecture
 
-The primary navigation has five destinations:
+The primary navigation has nine destinations:
 
 | Destination | Default view | Secondary views |
 |---|---|---|
-| Overview | Aggregate health and pending attention | Recent bounded failures |
+| Overview | Aggregate health and pending attention | None |
 | Memory | Records | Review queue, record/source/revision detail |
-| Explain | Turn or conversation lookup | Context, action, and tool evidence |
+| Explain | Stored turns | Context, action, and tool evidence |
+| Privacy | Privacy preferences | Preview and confirmation |
+| Group policy | Summary-policy status | Preview and confirmation |
+| Display data | Redacted targets | Detail, redaction preview, and confirmation |
+| Identity | Exact-account unlink | Preview and confirmation |
+| Operations | Integrity and backup status | Backup, restore handoff, and configured retention |
 | Activity | Model invocations | Tools/actions, jobs/workers, audit/failures |
-| Privacy & Operations | Privacy preferences | Summary policy, retention, backup/restore |
 
 The current scope selector is persistent above page content. It always shows a
-scope kind plus a redacted label/fingerprint; an unlabeled broad `all` scope is
-not available. Filters, cursor position, and scroll position survive navigation
+scope kind plus a redacted label and session-local ordinal; raw identifiers and
+fingerprints are not rendered. An unlabeled broad `all` scope is not available.
+Filters, cursor position, and scroll position survive navigation
 back to a list. Detail and review pages have stable deep links that use opaque
 session-bound handles rather than raw local or platform identifiers.
 
 On viewports at least 1024px wide, primary navigation is a compact left sidebar
 and content uses dense tables or definition lists. On smaller viewports,
-navigation becomes one labelled menu and tables reflow into labelled rows; the
-page must not require horizontal scrolling. Page sections are unframed. Cards
-are reserved for repeated review items and modal confirmation content, never
-nested inside other cards.
+navigation becomes one labelled wrapping menu and tables reflow into labelled
+rows; the page must not require horizontal scrolling. Page sections are
+unframed. Cards are reserved for repeated review items and modal confirmation
+content; cards are never nested inside other cards.
 
 ## Shared Application Services
 
@@ -2852,12 +2863,14 @@ separate `git diff --check` against the current working tree was also clean.
 This evidence is local and synthetic; it does not broaden the live authorization
 boundary below.
 
-Retention remains a prerequisite, not an omitted browser button. No complete
-browser-facing retention policy/snapshot/audit/preview/confirmation contract is
-currently registered, so the browser does not invent irreversible cleanup
-semantics. Real Provider/QQ use, deployment/restart, stopped-service restore
-execution, soak, production screenshots, and live accessibility sign-off remain
-outside this local deterministic checkpoint and require separate authorization.
+Configured retention is available in Operations as the authenticated,
+system-scoped preview-confirm workflow defined at the beginning of this
+document. It renders only configured policy days, aggregate effects, terminal
+memory states, and the irreversible hard-delete/no-rollback boundary; it never
+accepts a browser path or renders candidate authority.
+Real Provider/QQ use, deployment/restart, stopped-service restore execution,
+soak, production screenshots, and live accessibility sign-off remain outside
+this local deterministic checkpoint and require separate authorization.
 
 ## Slice And Verification Order
 
@@ -3175,9 +3188,9 @@ outside this local deterministic checkpoint and require separate authorization.
     including rollback, expiration, record forget/restore, Privacy, Group-
     summary, Display-profile, platform-account unlink, verified backup, and
     restore-handoff, while preserving each independent authority boundary.
-115. Retention remains a backend prerequisite until a fixed policy, snapshot,
-    audit, preview/confirmation, and irreversible/rollback contract exists; do
-    not infer that contract in browser code.
+115. Completed locally: add configured-retention preview/confirmation with a
+    fixed policy snapshot, aggregate effects, short-lived single-use authority,
+    and an explicit irreversible hard-delete/no-rollback boundary.
 116. Run live Provider/QQ, deployment/restart, stopped-service restore, soak,
     screenshot, and production accessibility acceptance only after fresh
     explicit authorization.

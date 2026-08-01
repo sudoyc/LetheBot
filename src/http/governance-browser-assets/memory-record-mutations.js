@@ -110,10 +110,9 @@ return element;
 }
 
 function appendRows(table, rows) {
+const row = append(table, 'tr');
 for (const [label, primary, secondary] of rows) {
-const row = append(table, 'div');
-append(row, 'dt', {}, label);
-const value = append(row, 'dd');
+const value = append(row, 'td', { 'data-label': label });
 append(value, 'span', { class: 'worker-heartbeat-primary' }, primary);
 append(value, 'span', { class: 'worker-heartbeat-secondary' }, secondary);
 }
@@ -132,6 +131,7 @@ const previewButton = append(header, 'button', {
 id: 'memory-record-' + config.key + '-preview-button',
 class: 'button button-primary',
 type: 'button',
+'aria-controls': 'memory-record-' + config.key + '-populated',
 disabled: '',
 }, 'Preview ' + config.noun);
 const unrequested = state(section, 'memory-record-' + config.key + '-unrequested', 'empty-band', 'status', config.title + ' not requested', 'No current preview is loaded.');

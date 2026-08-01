@@ -201,10 +201,9 @@ return value;
 
 function appendRows(table, rows) {
 table.replaceChildren();
+const row = append(table, 'tr');
 for (const [label, primary, secondary] of rows) {
-const row = append(table, 'div');
-append(row, 'dt', {}, label);
-const value = append(row, 'dd');
+const value = append(row, 'td', { 'data-label': label });
 append(value, 'span', { class: 'worker-heartbeat-primary' }, primary);
 append(value, 'span', { class: 'worker-heartbeat-secondary' }, secondary);
 }
@@ -260,7 +259,6 @@ const detailContent = append(detail, 'div', { id: 'explain-detail-content', clas
 const turnTable = detailTable(detailContent, 'Turn', ['Status', 'Context', 'Decision', 'Tools']);
 let scopes = [];
 let turns = [];
-let selectedFingerprint = null;
 let catalogSequence = 0;
 let turnsSequence = 0;
 let detailSequence = 0;
@@ -275,9 +273,12 @@ function selectedScope() {
 const index = Number(select.value) - 1;
 return Number.isInteger(index) && scopes[index] ? scopes[index] : null;
 }
+function setTurnExpanded(button = null) {
+for (const control of list.querySelectorAll('[data-explain-index]')) control.setAttribute('aria-expanded', control === button ? 'true' : 'false');
+}
 function resetDetail() {
 detailSequence += 1;
-selectedFingerprint = null;
+setTurnExpanded();
 turnTable.replaceChildren();
 hideDetail();
 setHidden(detailUnselected, false);
@@ -288,9 +289,9 @@ list.replaceChildren();
 for (const [index, turn] of turns.entries()) {
 const button = append(list, 'button', {
 class: 'memory-record-row',type: 'button','data-explain-index': String(index),
-'aria-expanded': 'false',
+'aria-controls': 'explain-detail','aria-expanded': 'false',
 });
-append(button, 'span', { class: 'memory-record-primary' }, turn.label + ' - ' + turn.status);
+append(button, 'span', { class: 'memory-record-primary' }, turn.label + ' ' + String(index + 1) + ' — ' + turn.status);
 append(button, 'span', { class: 'memory-record-secondary' }, turn.startedAt);
 }
 count.textContent = 'Showing ' + turns.length + (turns.length === 1 ? ' turn' : ' turns')
@@ -300,6 +301,7 @@ setHidden(turns.length ? content : empty, false);
 resetDetail();
 }
 async function loadTurns() {
+resetDetail();
 const scope = selectedScope();
 if (!scope) {
 turns = [];
@@ -345,7 +347,7 @@ scopes = catalog.entries;
 select.replaceChildren(createElement('option', { value: '' }, 'Select a scope'));
 for (const [index, scope] of scopes.entries()) append(select, 'option', {
 value: String(index + 1),
-}, scope.label + ' - ' + scope.conversationType);
+}, scope.label + ' — scope ' + String(index + 1));
 select.disabled = scopes.length === 0;
 hideMain();setHidden(empty, false);
 announce(scopes.length ? 'Explain scopes updated.' : 'No Explain scopes.');
@@ -361,12 +363,12 @@ headers: { 'X-LetheBot-Scope': scope.handle },
 if (sequence !== detailSequence) return;
 if (response.status === 401) return showSessionExpired();
 if (response.status !== 200) {
-hideDetail();setHidden(response.status === 404 ? detailStale : detailUnavailable, false);
+hideDetail();setTurnExpanded();setHidden(response.status === 404 ? detailStale : detailUnavailable, false);
 announce('Turn evidence unavailable.');return;
 }
 const normalized = normalizeDetail(response.body, turn);
 if (!normalized) {
-hideDetail();setHidden(detailStale, false);announce('Turn evidence malformed.');return;
+hideDetail();setTurnExpanded();setHidden(detailStale, false);announce('Turn evidence malformed.');return;
 }
 const context = normalized.context;
 const decision = normalized.actionDecision;
@@ -386,10 +388,7 @@ const button = event.target?.closest?.('[data-explain-index]');
 if (!button || !list.contains(button)) return;
 const turn = turns[Number(button.getAttribute('data-explain-index'))];
 if (!turn) return;
-selectedFingerprint = turn.fingerprint;
-for (const control of list.querySelectorAll('[data-explain-index]')) {
-control.setAttribute('aria-expanded', control === button ? 'true' : 'false');
-}
+setTurnExpanded(button);
 void loadDetail(turn);
 });
 resetDetail();
@@ -400,7 +399,7 @@ view,
 load: loadCatalog,
 reset: () => {
 catalogSequence += 1;turnsSequence += 1;detailSequence += 1;
-scopes = [];turns = [];selectedFingerprint = null;
+scopes = [];turns = [];
 select.replaceChildren(createElement('option', { value: '' }, 'Select a scope'));
 select.disabled = true;list.replaceChildren();turnTable.replaceChildren();
 hideMain();hideDetail();setHidden(view, true);

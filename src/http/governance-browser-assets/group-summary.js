@@ -10,6 +10,7 @@ const ENABLE_EFFECTS = ['group_summary_policy_upsert', 'audit_event_append'];
 const DISABLE_EFFECTS = ['group_summary_policy_upsert', 'pending_group_summary_jobs_terminalized', 'audit_event_append'];
 const ENABLE_CONSEQUENCES = ['policy_generation_advanced', 'pre_enable_sources_excluded', 'group_summary_generation_and_retrieval_enabled'];
 const DISABLE_CONSEQUENCES = ['policy_generation_advanced', 'group_summary_generation_and_retrieval_disabled', 'pending_group_summary_jobs_canceled'];
+const STATE_LABELS = { enabled: 'Enabled', disabled: 'Disabled' };
 
 function exact(value, required) {
 return Boolean(value && typeof value === 'object' && !Array.isArray(value)
@@ -95,8 +96,8 @@ return exact(value, ['action', 'outcome', 'current', 'durableEffects', 'enforcem
 && value.rollback.boundary === 'separate_group_summary_policy_change_confirmation_required' ? value : null;
 }
 function rows(table, values) {
-table.replaceChildren();for (const [label, primary, secondary] of values) {
-const row = append(table, 'div');append(row, 'dt', {}, label);const cell = append(row, 'dd');
+table.replaceChildren();const row = append(table, 'tr');for (const [label, primary, secondary] of values) {
+const cell = append(row, 'td', { 'data-label': label });
 append(cell, 'span', { class: 'worker-heartbeat-primary' }, primary);
 append(cell, 'span', { class: 'worker-heartbeat-secondary' }, secondary);
 }}
@@ -109,14 +110,17 @@ elements.main?.insertBefore(view, elements.activityView);
 const toolbar = append(view, 'header', { class: 'view-toolbar' });const heading = append(toolbar, 'div');
 append(heading, 'p', { class: 'eyebrow' }, 'Generation and retrieval');append(heading, 'h1', { id: 'group-summary-title' }, 'Group summary policy');
 const refresh = append(toolbar, 'button', { class: 'button button-secondary', type: 'button' }, 'Refresh');
-const controls = append(view, 'section', { class: 'memory-scope-band', 'aria-labelledby': 'group-summary-controls-title' });
+const controls = append(view, 'section', { class: 'memory-scope-band governance-control-grid', 'aria-labelledby': 'group-summary-controls-title' });
 append(controls, 'h2', { id: 'group-summary-controls-title' }, 'Exact group scope');
-const select = append(controls, 'select', { id: 'group-summary-scope-select', disabled: '' });append(select, 'option', { value: '' }, 'Select a group scope');
-const target = append(controls, 'select', { id: 'group-summary-target-select' });
-for (const value of STATES) append(target, 'option', { value }, value);
-const previewButton = append(controls, 'button', { id: 'group-summary-preview-button', class: 'button button-primary', type: 'button', disabled: '' }, 'Preview change');
+const scopeControl = append(controls, 'div');append(scopeControl, 'label', { for: 'group-summary-scope-select' }, 'Group scope');
+const select = append(scopeControl, 'select', { id: 'group-summary-scope-select', disabled: '' });append(select, 'option', { value: '' }, 'Select a group scope');
+const targetControl = append(controls, 'div');append(targetControl, 'label', { for: 'group-summary-target-select' }, 'Target state');
+const target = append(targetControl, 'select', { id: 'group-summary-target-select' });
+for (const value of STATES) append(target, 'option', { value }, STATE_LABELS[value]);
+const previewButton = append(controls, 'button', { id: 'group-summary-preview-button', class: 'button button-primary', type: 'button', disabled: '', 'aria-controls': 'group-summary-preview' }, 'Preview change');
 const loading = state(view, 'group-summary-loading', 'empty-band', 'status', 'Loading group policy', 'Policy evidence is being refreshed.');
 const unavailable = state(view, 'group-summary-unavailable', 'error-band', 'alert', 'Group policy unavailable', 'Refresh before continuing.');
+const empty = state(view, 'group-summary-empty', 'empty-band', 'status', 'No governed group scopes', 'Refresh after a governed group scope becomes available.');
 const current = append(view, 'div', { class: 'worker-heartbeats-content', hidden: '' });const currentTable = detailTable(current, 'Current policy', ['State', 'Generation', 'Eligibility']);
 const previewSurface = append(view, 'div', { id: 'group-summary-preview', class: 'worker-heartbeats-content', hidden: '' });
 const previewTable = detailTable(previewSurface, 'Policy change preview', ['Transition', 'Generation', 'Effects', 'Boundary']);
@@ -127,38 +131,39 @@ let scopes = [];let authority = null;let catalogSequence = 0;let readSequence = 
 function selected() { return scopes[Number(select.value) - 1] || null; }
 function clear() { previewSequence += 1;confirmSequence += 1;if (timer !== null) window.clearTimeout(timer);timer = null;authority = null;confirmButton.disabled = true;previewTable.replaceChildren();setHidden(previewSurface, true); }
 function update() { previewButton.disabled = !selected() || authority !== null; }
+function clearChoice() { clear();setHidden(success, true);setHidden(unavailable, true);update(); }
 async function loadPolicy() {
-const scope = selected();clear();if (!scope) { setHidden(current, true);update();return; }
+const scope = selected();clear();setHidden(empty, true);setHidden(unavailable, true);setHidden(current, true);if (!scope) { update();return; }
 const sequence = ++readSequence;setHidden(loading, false);const response = await requestJson(POLICY_ENDPOINT, { headers: { 'X-LetheBot-Scope': scope.handle } });
 if (sequence !== readSequence) return;setHidden(loading, true);if (response.status === 401) return expired();const normalized = response.status === 200 ? policy(response.body) : null;
 if (!normalized) { setHidden(unavailable, false);announce('Group policy unavailable.');return; }
-rows(currentTable, [['State', normalized.state, normalized.stored ? 'Stored policy' : 'Implicit default'], ['Generation', String(normalized.generation ?? 0), String(normalized.updatedAt ?? 'Never')], ['Eligibility', String(normalized.eligibleAfter ?? 'Not eligible'), 'Bounded group policy']]);
+rows(currentTable, [['State', STATE_LABELS[normalized.state], normalized.stored ? 'Stored policy' : 'Implicit default'], ['Generation', String(normalized.generation ?? 0), String(normalized.updatedAt ?? 'Never')], ['Eligibility', String(normalized.eligibleAfter ?? 'Not eligible'), 'Bounded group policy']]);
 setHidden(unavailable, true);setHidden(current, false);update();announce('Group policy updated.');
 }
 async function loadCatalog() {
-const sequence = ++catalogSequence;readSequence += 1;clear();refresh.disabled = true;select.disabled = true;setHidden(loading, false);const response = await requestJson(SCOPES_ENDPOINT);
+const sequence = ++catalogSequence;readSequence += 1;clear();setHidden(success, true);setHidden(empty, true);setHidden(unavailable, true);setHidden(current, true);refresh.disabled = true;select.disabled = true;setHidden(loading, false);const response = await requestJson(SCOPES_ENDPOINT);
 if (sequence !== catalogSequence) return;refresh.disabled = false;setHidden(loading, true);if (response.status === 401) return expired();const normalized = response.status === 200 ? catalog(response.body, Date.now()) : null;
 if (!normalized) { setHidden(unavailable, false);announce('Group policy scopes unavailable.');return; }
 scopes = normalized.entries;select.replaceChildren(createElement('option', { value: '' }, 'Select a group scope'));
-for (const [index, entry] of scopes.entries()) append(select, 'option', { value: String(index + 1) }, entry.label);
-select.disabled = scopes.length === 0;setHidden(unavailable, true);setHidden(current, true);update();announce('Group policy scopes updated.');
+for (const [index, entry] of scopes.entries()) append(select, 'option', { value: String(index + 1) }, entry.label + ' — scope ' + String(index + 1));
+select.disabled = scopes.length === 0;setHidden(empty, scopes.length !== 0);setHidden(unavailable, true);setHidden(current, true);update();announce(scopes.length ? 'Group policy scopes updated.' : 'No group policy scopes.');
 }
 async function loadPreview() {
-const scope = selected();if (!scope || previewButton.disabled) return;clear();const sequence = ++previewSequence;const targetState = target.value;previewButton.disabled = true;
+const scope = selected();if (!scope || previewButton.disabled) return;clear();setHidden(success, true);setHidden(unavailable, true);const sequence = ++previewSequence;const targetState = target.value;previewButton.disabled = true;
 const response = await mutate(POLICY_ENDPOINT, scope.handle, { action: 'change', targetState });if (sequence !== previewSequence) return;if (response.status === 401) return expired();
-const normalized = response.status === 201 ? preview(response.body, scope, targetState, Date.now()) : null;if (!normalized) { previewButton.disabled = false;announce('Group policy preview unavailable.');return; }
-rows(previewTable, [['Transition', normalized.current.state, normalized.expected.state], ['Generation', String(normalized.expected.generation), String(normalized.current.version.generation ?? 0)], ['Effects', normalized.expected.enforcementConsequences.join(', '), normalized.expected.durableEffects.join(', ')], ['Boundary', normalized.rollback.boundary, 'Separate confirmation required']]);
+const normalized = response.status === 201 ? preview(response.body, scope, targetState, Date.now()) : null;if (!normalized) { previewButton.disabled = false;setHidden(unavailable, false);announce('Group policy preview unavailable.');return; }
+rows(previewTable, [['Transition', STATE_LABELS[normalized.current.state], STATE_LABELS[normalized.expected.state]], ['Generation', String(normalized.expected.generation), String(normalized.current.version.generation ?? 0)], ['Effects', normalized.expected.enforcementConsequences.join(', '), normalized.expected.durableEffects.join(', ')], ['Boundary', 'Rollback requires a new policy preview and confirmation', 'Confirm this change before preview expiry']]);
 authority = { scope: { ...scope }, target: targetState, handle: normalized.handle, expiresAt: normalized.expiresAt };setHidden(previewSurface, false);confirmButton.disabled = false;
-timer = window.setTimeout(() => { authority = null;confirmButton.disabled = true;setHidden(previewSurface, true);announce('Group policy preview expired.'); }, Math.min(normalized.expiresAt - Date.now(), 2_147_483_647));announce('Group policy preview ready.');
+timer = window.setTimeout(() => { authority = null;confirmButton.disabled = true;setHidden(previewSurface, true);update();announce('Group policy preview expired. Request a fresh preview.'); }, Math.min(normalized.expiresAt - Date.now(), 2_147_483_647));announce('Group policy preview ready. Confirmation is available until the preview expires.');
 }
 async function confirm() {
 const retained = authority;const scope = selected();if (!retained || confirmButton.disabled || !scope || scope.handle !== retained.scope.handle || retained.expiresAt <= Date.now()) { clear();return; }
 authority = null;confirmButton.disabled = true;if (timer !== null) window.clearTimeout(timer);timer = null;const sequence = ++confirmSequence;
 const response = await mutate(POLICY_ENDPOINT + '/confirm', scope.handle, { confirm: true, previewHandle: retained.handle, targetState: retained.target });if (sequence !== confirmSequence) return;if (response.status === 401) return expired();
-const normalized = response.status === 200 ? result(response.body, retained.target) : null;if (!normalized) { setHidden(previewSurface, true);announce('Group policy confirmation unavailable.');return; }
-rows(resultTable, [['State', normalized.current.state, normalized.outcome], ['Generation', String(normalized.current.version.generation), String(normalized.current.version.updatedAt)], ['Evidence', normalized.evidence.auditEvent, String(normalized.evidence.canceledJobCount) + ' jobs canceled'], ['Boundary', normalized.rollback.boundary, normalized.enforcementConsequences.join(', ')]]);
+const normalized = response.status === 200 ? result(response.body, retained.target) : null;if (!normalized) { setHidden(previewSurface, true);setHidden(unavailable, false);update();announce('Group policy confirmation unavailable. Request a fresh preview.');return; }
+rows(resultTable, [['State', STATE_LABELS[normalized.current.state], normalized.outcome], ['Generation', String(normalized.current.version.generation), String(normalized.current.version.updatedAt)], ['Evidence', normalized.evidence.auditEvent, String(normalized.evidence.canceledJobCount) + ' jobs canceled'], ['Boundary', 'Rollback requires a new policy preview and confirmation', 'Rollback is a separate governed change']]);
 setHidden(previewSurface, true);setHidden(success, false);announce('Group policy updated.');void loadPolicy();
 }
-select.addEventListener('change', () => void loadPolicy());refresh.addEventListener('click', () => void loadCatalog());previewButton.addEventListener('click', () => void loadPreview());confirmButton.addEventListener('click', () => void confirm());setHidden(loading, true);setHidden(unavailable, true);setHidden(success, true);update();
-return { nav, view, load: loadCatalog, reset: () => { catalogSequence += 1;readSequence += 1;clear();scopes = [];select.replaceChildren(createElement('option', { value: '' }, 'Select a group scope'));select.disabled = true;currentTable.replaceChildren();resultTable.replaceChildren();setHidden(current, true);setHidden(success, true);setHidden(view, true); } };
+select.addEventListener('change', () => { clearChoice();void loadPolicy(); });refresh.addEventListener('click', () => void loadCatalog());target.addEventListener('change', clearChoice);previewButton.addEventListener('click', () => void loadPreview());confirmButton.addEventListener('click', () => void confirm());setHidden(loading, true);setHidden(unavailable, true);setHidden(empty, true);setHidden(success, true);update();
+return { nav, view, load: loadCatalog, reset: () => { catalogSequence += 1;readSequence += 1;clear();scopes = [];select.replaceChildren(createElement('option', { value: '' }, 'Select a group scope'));select.disabled = true;currentTable.replaceChildren();resultTable.replaceChildren();setHidden(current, true);setHidden(empty, true);setHidden(success, true);setHidden(view, true); } };
 }

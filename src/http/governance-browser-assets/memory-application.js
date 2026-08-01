@@ -335,10 +335,9 @@ const rows = [
 ['Evidence', [['worker-heartbeat-primary', 'Revision ' + result.evidence.revisionRef], ['worker-heartbeat-secondary', 'Audit ' + result.evidence.auditRef]]],
 ['Rollback', [['worker-heartbeat-primary', 'Supported'], ['worker-heartbeat-secondary', result.rollback.boundary]]],
 ];
+const row = append(resultEvidence, 'tr');
 for (const [label, values] of rows) {
-const row = append(resultEvidence, 'div');
-append(row, 'dt', {}, label);
-const value = append(row, 'dd');
+const value = append(row, 'td', { 'data-label': label });
 for (const [className, text] of values) append(value, 'span', { class: className }, text);
 }
 showConfirmation('succeeded');

@@ -1211,7 +1211,6 @@ valueLabel(review.lifecycleState)],
 const candidates = append(row, 'td', { 'data-label': 'Candidates' });
 lines(candidates, [
 [PRIMARY_NUMBER, 'Count: ' + review.candidateCount],
-[SECONDARY, 'Fingerprint: ' + review.candidateFingerprint],
 [SECONDARY, review.reasonCodes.length
 ? 'Reasons: ' + review.reasonCodes.map(valueLabel).join(' / ')
 : 'No reason codes'],
@@ -1267,7 +1266,6 @@ const evidence = append(row, 'td', { 'data-label': 'Evidence' });
 lines(evidence, [
 [PRIMARY_NUMBER,
 'Confidence: ' + Math.round(detail.confidence * 100) + '%'],
-[SECONDARY, 'Fingerprint: ' + detail.candidateFingerprint],
 [SECONDARY, detail.reasonCodes.length
 ? 'Reasons: ' + detail.reasonCodes.map(valueLabel).join(' / ')
 : 'No reason codes'],
@@ -1296,12 +1294,12 @@ lines(role, [
 const record = append(candidateRow, 'td', { 'data-label': 'Record evidence' });
 lines(record, [[
 SECONDARY,
-'Fingerprint: ' + candidate.recordFingerprint,
+'Record evidence validated',
 ]]);
 const source = append(candidateRow, 'td', { 'data-label': 'Source evidence' });
 lines(source, [
 [PRIMARY_NUMBER, 'Sources: ' + candidate.sourceCount],
-[SECONDARY, 'Fingerprint: ' + candidate.sourceFingerprint],
+[SECONDARY, 'Source evidence bounded'],
 ]);
 }
 for (const revision of detail.revisions) {
@@ -1350,7 +1348,6 @@ detailRow(elements.evidence, [
 ['Effect', [
 [PRIMARY, valueLabel(preview.proposedEffect)],
 [SECONDARY_NUMBER, 'Affected records: ' + preview.affectedRecords.count],
-[SECONDARY, 'Fingerprint: ' + preview.affectedRecords.fingerprint],
 ]],
 ['Transition', [
 [PRIMARY, valueLabel(preview.current.lifecycleState)
@@ -1384,7 +1381,6 @@ detailRow(elements.evidence, [
 ['Effect', [
 [PRIMARY, valueLabel(preview.proposedEffect)],
 [SECONDARY_NUMBER, 'Affected records: ' + preview.affectedRecords.count],
-[SECONDARY, 'Fingerprint: ' + preview.affectedRecords.fingerprint],
 ]],
 ['Transition', [
 [PRIMARY, valueLabel(preview.current.lifecycleState)
@@ -1414,7 +1410,7 @@ const title = append(header, 'div');
 append(title, 'p', { class: 'eyebrow' }, 'Write-free operation');
 append(title, 'h3', { id: 'memory-review-application-preview-title' }, 'Application preview');
 const button = append(header, 'button', {
-id: 'memory-review-application-preview-button', class: 'button button-primary', type: 'button', disabled: '',
+id: 'memory-review-application-preview-button', class: 'button button-primary', type: 'button', disabled: '', 'aria-controls': 'memory-review-application-preview-populated',
 }, 'Preview application');
 const selection = append(section, 'div', { id: 'memory-review-application-selection', hidden: '' });
 append(selection, 'label', { for: 'memory-review-retained-memory-select' }, 'Retained conflict candidate');

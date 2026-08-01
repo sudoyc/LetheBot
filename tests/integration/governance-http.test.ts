@@ -1444,9 +1444,9 @@ describe('governance HTTP security boundary', () => {
       sha256(activity.body),
     ]).toEqual([
       'b623c37588ef24fd14f501ce2451c44f04c4f7ea835703d591f2a509af5853cb',
-      '381d7e04d6512a830f6d535080baf756f22add8e91a44238908f5bbd2bda8c65',
+      'e1cc9b82e1acfbe49457da468db816c510fb213035f6bf26cd8302fd9450d3d9',
       'fe973f6b55d903823c09a7bada49850751014ed8048411a164a3a6f0d35a281f',
-      '33a528afba5b31998778d6ac2b58c299cd62592364e4d069e1f29eea95300218',
+      'b7730264d7a3a65e9e457f0662dd46036de6531b0c4b97001df0903513eca443',
     ]);
 
     let definitionUnion = memory.body;
@@ -1472,9 +1472,9 @@ describe('governance HTTP security boundary', () => {
     } else {
       expect(presentation.status).toBe(404);
     }
-    expect(Buffer.byteLength(definitionUnion, 'utf8')).toBe(174_252);
+    expect(Buffer.byteLength(definitionUnion, 'utf8')).toBe(174_340);
     expect(sha256(definitionUnion)).toBe(
-      '1ef460c6dfa1f74d17e47d25d0393ea541fb4d8976a7a5c97bb5181dd5e1861b',
+      '78dc8f7910428af2018549968ea437cb39ab2f084cb63b2ac8269217162d2013',
     );
     expect(harness.resolveScopeHandle).not.toHaveBeenCalled();
     expect(harness.resolveResourceHandle).not.toHaveBeenCalled();
@@ -1915,7 +1915,7 @@ describe('governance HTTP security boundary', () => {
       "const UNLINK_ENDPOINT = '/governance/api/v1/identity/platform-accounts/unlink'",
       "const OPERATIONS_ENDPOINT = '/governance/api/v1/operations'",
       "{ action: 'unlink', platform: 'qq', platformAccountId }",
-      "{ confirm: true, resourceHandle: retained.resource, previewHandle: retained.preview }",
+      "{ confirm: true, resourceHandle: retained.resourceHandle, previewHandle: retained.previewHandle }",
       "{ action: 'create_verified_backup' }",
       "{ action: 'prepare_restore_handoff', backupRef }",
       "'stopped_service_only'",

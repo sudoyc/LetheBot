@@ -806,9 +806,9 @@ function createActionExecutionRow(record) {
       activityValueLabel(record.actionType),
     ]], ['tool-call-status', record.status]],
     ['Effects', [
-      [SECONDARY, 'Message: ' + (record.executedMessageId ?? 'None')],
-      [SECONDARY, 'Memory: ' + (record.executedMemoryId ?? 'None')],
-      [SECONDARY, 'Job: ' + (record.executedJobId ?? 'None')],
+      [SECONDARY, record.executedMessageId === undefined ? 'Message: Not sent' : 'Message: Sent'],
+      [SECONDARY, record.executedMemoryId === undefined ? 'Memory: Not changed' : 'Memory: Changed'],
+      [SECONDARY, record.executedJobId === undefined ? 'Job: Not scheduled' : 'Job: Scheduled'],
     ]],
     ['Evidence and audit', [
       [
@@ -883,10 +883,7 @@ function createEventProcessingFailureRow(record) {
     ]],
     ['Error evidence', [
       [DIAGNOSTIC, record.errorName],
-      line('Error hash', record.errorMessageHash),
-      line('Message ID hash', record.messageIdHash),
-      line('Sender ID hash', record.senderIdHash),
-      line('Conversation ID hash', record.conversationIdHash),
+      [SECONDARY, 'Identifiers and hashes withheld from browser'],
     ]],
   ]);
 }
