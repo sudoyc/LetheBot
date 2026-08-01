@@ -1189,7 +1189,7 @@ export class OneBotAdapter extends EventEmitter {
   private redactPlatformIdentifiers(value: string): string {
     return value
       .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
-      .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
+      .replace(/(?<![A-Za-z0-9])\d{5,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
   }
 
   private buildCapabilities(): GatewayCapabilities {

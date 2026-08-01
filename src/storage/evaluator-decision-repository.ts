@@ -685,7 +685,7 @@ function redactEvaluatorText(text: string): string {
 function redactPlatformIdentifiers(text: string): string {
   return text
     .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
-    .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
+    .replace(/(?<![A-Za-z0-9])\d{5,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
 }
 
 function isNonEmptyString(value: unknown): value is string {

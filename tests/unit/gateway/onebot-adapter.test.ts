@@ -427,7 +427,7 @@ describe('OneBotAdapter', () => {
 
   it('redacts event-handler failure diagnostics before direct console output', () => {
     const rawSecret = 'sk-onebot-handler-console-secret-should-not-leak';
-    const rawPlatformId = 'qq-1234567890';
+    const rawPlatformId = '13579';
     const adapter = new OneBotAdapter({
       httpUrl: 'http://localhost:3000',
       botId: '3889000770',

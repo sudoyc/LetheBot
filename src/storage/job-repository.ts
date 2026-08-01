@@ -550,7 +550,7 @@ function redactJobDiagnosticText(text: string): string {
 function redactPlatformIdentifiers(text: string): string {
   return text
     .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
-    .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
+    .replace(/(?<![A-Za-z0-9])\d{5,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
 }
 
 function redactStructuredDiagnostics(value: unknown): unknown {
@@ -606,7 +606,7 @@ function redactStructuredDiagnosticValue(value: unknown, path: string[]): unknow
 function shouldRedactNumericPlatformId(path: string[], value: number): boolean {
   return Number.isInteger(value)
     && isPlatformIdField(path)
-    && /^\d{8,12}$/.test(String(Math.abs(value)));
+    && /^\d{5,12}$/.test(String(Math.abs(value)));
 }
 
 function isPlatformIdField(path: string[]): boolean {

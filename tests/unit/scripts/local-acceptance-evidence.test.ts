@@ -4236,6 +4236,21 @@ raw message text: hello from the private chat
     expect(JSON.stringify(result)).not.toContain('hello from the private chat');
   });
 
+  it('flags and redacts minimum-length platform identifiers', () => {
+    const privateQqId = '13579';
+    const result = validateLocalAcceptanceEvidence(`
+# Unsafe minimum-length platform identifier evidence
+
+private QQ ID: ${privateQqId}
+`);
+
+    expect(result.valid).toBe(false);
+    expect(result.findings.map((finding) => finding.ruleId)).toContain(
+      'platform-id-like-number',
+    );
+    expect(JSON.stringify(result)).not.toContain(privateQqId);
+  });
+
   it('flags embedded API-key-like tokens in legacy identifiers without echoing values', () => {
     const secretToken = 'sk-local-acceptance-embedded-secret-should-not-leak';
     const privateQqId = '12345678901';

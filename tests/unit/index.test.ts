@@ -102,6 +102,17 @@ describe('top-level fatal diagnostics', () => {
     expect(diagnostic).not.toContain('    at ');
   });
 
+  it('redacts minimum-length bare and structured platform identifiers', () => {
+    const rawPlatformId = '13579';
+    const diagnostic = formatFatalErrorForConsole({
+      message: `startup failed target=${rawPlatformId}`,
+      sender_id: Number(rawPlatformId),
+    });
+
+    expect(diagnostic).toContain('[REDACTED:platform_id]');
+    expect(diagnostic).not.toContain(rawPlatformId);
+  });
+
   it('preserves both markers for adjacent secret/platform fatal diagnostics', () => {
     const rawAdjacent = 'sk-index-fatal-adjacent-secret-qq-1234567890';
     const rawPlatformId = 'qq-1234567890';

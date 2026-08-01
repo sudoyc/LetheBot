@@ -262,7 +262,7 @@ export class AuditRepository {
   private redactPlatformIdentifiers(text: string): string {
     return text
       .replace(/(?<![A-Za-z0-9])qq-(?:group-)?\d{5,12}(?![A-Za-z0-9])/gi, '[REDACTED:platform_id]')
-      .replace(/(?<![A-Za-z0-9])\d{8,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
+      .replace(/(?<![A-Za-z0-9])\d{5,12}(?![A-Za-z0-9])/g, '[REDACTED:platform_id]');
   }
 
   private redactStructuredValue(value: unknown, path: string[] = []): { value: unknown; redacted: boolean } {
@@ -305,7 +305,7 @@ export class AuditRepository {
   private shouldRedactNumericPlatformId(path: string[], value: number): boolean {
     return Number.isInteger(value)
       && this.isPlatformIdField(path)
-      && /^\d{8,12}$/.test(String(Math.abs(value)));
+      && /^\d{5,12}$/.test(String(Math.abs(value)));
   }
 
   private isPlatformIdField(path: string[]): boolean {
