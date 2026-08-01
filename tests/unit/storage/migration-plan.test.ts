@@ -103,7 +103,7 @@ describe('runMigrations', () => {
 
       runMigrations(db, migrationDirectory);
 
-      expect(getSchemaVersion(db)).toBe(6);
+      expect(getSchemaVersion(db)).toBe(8);
       expect(db.prepare(
         "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'event_processing_admissions'",
       ).get()).toEqual({ name: 'event_processing_admissions' });

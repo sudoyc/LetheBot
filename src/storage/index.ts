@@ -14,3 +14,4 @@ export * from './job-repository.js';
 export * from './group-summary-policy-repository.js';
 export * from './privacy-preference-repository.js';
 export * from './model-invocation-repository.js';
+export * from './memory-maintenance-proposal-repository.js';

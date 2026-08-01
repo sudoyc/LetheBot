@@ -6,7 +6,7 @@ import type { ContextPack } from '../types/context.js';
 import type { EvaluatorRequest, EvaluatorResult } from '../types/evaluator.js';
 import { hasActiveJobAttemptAuthority } from './job-repository.js';
 
-export type ModelInvocationPurpose = 'summary' | 'evaluator';
+export type ModelInvocationPurpose = 'summary' | 'evaluator' | 'pi_turn';
 export type ModelInvocationStatus = 'running' | 'completed' | 'failed' | 'aborted';
 export type ModelInvocationFailureStatus = 'failed' | 'aborted';
 export type EvaluatorInvocationDomain = 'tool' | 'memory' | 'social';
@@ -15,6 +15,9 @@ export interface ModelInvocationTokens {
   input: number;
   output: number;
   total: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  reasoning?: number;
 }
 
 export interface StartModelInvocationInput {
@@ -40,6 +43,16 @@ export interface StartEvaluatorInvocationInput {
   provider: string;
   model: string;
   promptVersion: string;
+  rawEventIds: string[];
+  startedAt?: number;
+}
+
+export interface StartPiTurnInvocationInput {
+  id?: string;
+  turnId: string;
+  callNumber: number;
+  provider: string;
+  model: string;
   rawEventIds: string[];
   startedAt?: number;
 }
@@ -126,6 +139,9 @@ interface ModelInvocationRow {
   tokens_input: number | null;
   tokens_output: number | null;
   tokens_total: number | null;
+  tokens_cache_read: number | null;
+  tokens_cache_write: number | null;
+  tokens_reasoning: number | null;
   response_sha256: string | null;
   response_bytes: number | null;
   error_code: string | null;
@@ -321,6 +337,80 @@ export class ModelInvocationRepository {
     return id;
   }
 
+  startPiTurnInvocation(input: StartPiTurnInvocationInput): string {
+    const id = input.id ?? ulid();
+    assertIdentifier(id, 'Invocation id');
+    assertIdentifier(input.turnId, 'Turn id');
+    assertPositiveInteger(input.callNumber, 'Call number');
+    const startedAt = input.startedAt ?? this.now();
+    assertTimestamp(startedAt, 'Started timestamp');
+    const provider = validateEvaluatorIdentityMetadata(
+      input.provider,
+      MAX_PROVIDER_LENGTH,
+      'Provider',
+    );
+    const model = validateEvaluatorIdentityMetadata(input.model, MAX_MODEL_LENGTH, 'Model');
+    const rawEventIds = validateSourceEventIds(input.rawEventIds);
+
+    const insert = this.db.transaction(() => {
+      const turn = this.db.prepare(
+        `SELECT trigger_event_id, pi_provider, pi_model, status
+           FROM agent_turns
+          WHERE id = ?`,
+      ).get(input.turnId) as {
+        trigger_event_id: string;
+        pi_provider: string;
+        pi_model: string;
+        status: string;
+      } | undefined;
+      if (!turn || turn.status !== 'running' || !rawEventIds.includes(turn.trigger_event_id)) {
+        throw new Error('Pi turn invocation requires a running source-bound turn');
+      }
+      if (turn.pi_provider !== provider || turn.pi_model !== model) {
+        throw new Error('Pi turn invocation provider or model does not match its turn');
+      }
+      assertRawEventsExist(
+        this.db,
+        rawEventIds,
+        'Pi turn invocation source event does not exist',
+      );
+
+      const ordinal = this.db.prepare(
+        `SELECT COALESCE(MAX(call_number), 0) + 1 AS next_call_number
+           FROM model_invocations
+          WHERE turn_id = ? AND purpose = 'pi_turn'`,
+      ).get(input.turnId) as { next_call_number: number };
+      if (ordinal.next_call_number !== input.callNumber) {
+        throw new Error('Pi turn invocation call number is not the next ordinal');
+      }
+
+      this.db.prepare(
+        `INSERT INTO model_invocations (
+          id, turn_id, purpose, call_number, provider, model, status, started_at
+        ) VALUES (?, ?, 'pi_turn', ?, ?, ?, 'running', ?)`,
+      ).run(
+        id,
+        input.turnId,
+        input.callNumber,
+        provider,
+        model,
+        startedAt,
+      );
+
+      const insertSource = this.db.prepare(
+        `INSERT INTO model_invocation_sources (
+          model_invocation_id, raw_event_id, source_ordinal
+        ) VALUES (?, ?, ?)`,
+      );
+      rawEventIds.forEach((rawEventId, index) => {
+        insertSource.run(id, rawEventId, index);
+      });
+    });
+
+    insert.immediate();
+    return id;
+  }
+
   startEvaluatorInvocation(input: StartEvaluatorInvocationInput): string {
     const id = input.id ?? ulid();
     assertIdentifier(id, 'Invocation id');
@@ -418,6 +508,9 @@ export class ModelInvocationRepository {
       const completedAt = this.now();
       assertTimestamp(completedAt, 'Completed timestamp');
       const invocation = readRunningInvocationOwner(this.db, id);
+      if (invocation.purpose === 'pi_turn') {
+        throw new Error('Pi turn invocation requires Pi completion evidence');
+      }
       assertInvocationCanComplete(this.db, invocation, completedAt);
       const result = this.db.prepare(
         `UPDATE model_invocations
@@ -430,6 +523,57 @@ export class ModelInvocationRepository {
         tokens.input,
         tokens.output,
         tokens.total,
+        responseSha256,
+        responseBytes,
+        id,
+      );
+
+      if (result.changes !== 1) {
+        throw new Error('Invocation is not running');
+      }
+    });
+
+    complete.immediate();
+  }
+
+  completePiTurnInvocation(
+    id: string,
+    tokens: ModelInvocationTokens | undefined,
+    responseText: string,
+  ): void {
+    assertIdentifier(id, 'Invocation id');
+    if (tokens !== undefined) {
+      validatePiTurnTokens(tokens);
+    }
+    if (typeof responseText !== 'string') {
+      throw new Error('Response text is invalid');
+    }
+
+    const responseSha256 = createHash('sha256').update(responseText, 'utf8').digest('hex');
+    const responseBytes = Buffer.byteLength(responseText, 'utf8');
+    const complete = this.db.transaction(() => {
+      const completedAt = this.now();
+      assertTimestamp(completedAt, 'Completed timestamp');
+      const invocation = readRunningInvocationOwner(this.db, id);
+      if (invocation.purpose !== 'pi_turn') {
+        throw new Error('Invocation is not a Pi turn invocation');
+      }
+      assertInvocationCanComplete(this.db, invocation, completedAt);
+      const result = this.db.prepare(
+        `UPDATE model_invocations
+         SET status = 'completed', completed_at = MAX(?, started_at),
+             tokens_input = ?, tokens_output = ?, tokens_total = ?,
+             tokens_cache_read = ?, tokens_cache_write = ?, tokens_reasoning = ?,
+             response_sha256 = ?, response_bytes = ?
+         WHERE id = ? AND status = 'running'`,
+      ).run(
+        completedAt,
+        tokens?.input ?? null,
+        tokens?.output ?? null,
+        tokens?.total ?? null,
+        tokens?.cacheRead ?? null,
+        tokens?.cacheWrite ?? null,
+        tokens?.reasoning ?? null,
         responseSha256,
         responseBytes,
         id,
@@ -489,6 +633,15 @@ export class ModelInvocationRepository {
        WHERE job_attempt_id = ?
        ORDER BY call_number ASC`,
     ).all(jobAttemptId) as ModelInvocationRow[];
+    return rows.map(rowToInvocation);
+  }
+
+  listInvocationsForTurn(turnId: string): ModelInvocationRecord[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM model_invocations
+       WHERE turn_id = ? AND purpose = 'pi_turn'
+       ORDER BY call_number ASC`,
+    ).all(turnId) as ModelInvocationRow[];
     return rows.map(rowToInvocation);
   }
 
@@ -755,11 +908,15 @@ function assertEvaluatorBindingOwnerActive(
   }
 }
 
-function assertRawEventsExist(db: Database.Database, rawEventIds: string[]): void {
+function assertRawEventsExist(
+  db: Database.Database,
+  rawEventIds: string[],
+  failureMessage = 'Evaluator invocation source event does not exist',
+): void {
   const sourceExists = db.prepare('SELECT 1 FROM raw_events WHERE id = ?');
   for (const rawEventId of rawEventIds) {
     if (!sourceExists.get(rawEventId)) {
-      throw new Error('Evaluator invocation source event does not exist');
+      throw new Error(failureMessage);
     }
   }
 }
@@ -1022,6 +1179,9 @@ function rowToInvocation(row: ModelInvocationRow): ModelInvocationRecord {
       input: row.tokens_input,
       output: row.tokens_output,
       total: row.tokens_total,
+      ...(row.tokens_cache_read === null ? {} : { cacheRead: row.tokens_cache_read }),
+      ...(row.tokens_cache_write === null ? {} : { cacheWrite: row.tokens_cache_write }),
+      ...(row.tokens_reasoning === null ? {} : { reasoning: row.tokens_reasoning }),
     };
   }
   return {
@@ -1053,6 +1213,19 @@ function validateTokens(tokens: ModelInvocationTokens): void {
   assertNonNegativeInteger(tokens.input, 'Input token count');
   assertNonNegativeInteger(tokens.output, 'Output token count');
   assertNonNegativeInteger(tokens.total, 'Total token count');
+}
+
+function validatePiTurnTokens(tokens: ModelInvocationTokens): void {
+  validateTokens(tokens);
+  if (tokens.cacheRead !== undefined) {
+    assertNonNegativeInteger(tokens.cacheRead, 'Cache-read token count');
+  }
+  if (tokens.cacheWrite !== undefined) {
+    assertNonNegativeInteger(tokens.cacheWrite, 'Cache-write token count');
+  }
+  if (tokens.reasoning !== undefined) {
+    assertNonNegativeInteger(tokens.reasoning, 'Reasoning token count');
+  }
 }
 
 function validateSourceEventIds(rawEventIds: string[]): string[] {

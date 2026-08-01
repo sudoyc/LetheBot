@@ -45,7 +45,7 @@ describe('schema v6 group summary policy migration', () => {
 
       runMigrations(db, migrationDirectory);
 
-      expect(getSchemaVersion(db)).toBe(6);
+      expect(getSchemaVersion(db)).toBe(8);
       expect(db.prepare(
         'SELECT version, description FROM schema_version ORDER BY version',
       ).all()).toEqual([
@@ -55,6 +55,8 @@ describe('schema v6 group summary policy migration', () => {
         { version: 4, description: 'Evaluator correction attempts' },
         { version: 5, description: 'Delayed attention' },
         { version: 6, description: 'Group summary policy' },
+        { version: 7, description: 'Pi turn model invocations' },
+        { version: 8, description: 'Memory maintenance proposals' },
       ]);
       expect(db.prepare('SELECT COUNT(*) FROM group_summary_policies').pluck().get()).toBe(0);
       expect(db.prepare('SELECT COUNT(*) FROM group_summary_job_bindings').pluck().get()).toBe(0);
@@ -193,7 +195,7 @@ describe('schema v6 group summary policy migration', () => {
       runMigrations(db, migrationDirectory);
 
       expect(db.prepare('SELECT total_changes()').pluck().get()).toBe(changesBefore);
-      expect(getSchemaVersion(db)).toBe(6);
+      expect(getSchemaVersion(db)).toBe(8);
       expect(db.prepare('PRAGMA integrity_check').pluck().get()).toBe('ok');
       expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
     } finally {
@@ -255,7 +257,7 @@ describe('schema v6 group summary policy migration', () => {
       try {
         const restoredPolicies = new GroupSummaryPolicyRepository(restored);
         const restoredJobs = new JobRepository(restored);
-        expect(getSchemaVersion(restored)).toBe(6);
+        expect(getSchemaVersion(restored)).toBe(8);
         expect(restoredPolicies.get('group-backup-alpha')).toEqual({
           groupId: 'group-backup-alpha',
           state: 'enabled',
@@ -347,7 +349,7 @@ describe('schema v6 group summary policy migration', () => {
       candidate.prepare(
         `UPDATE jobs SET payload = ?, updated_at = ? WHERE id = 'job-pre-v6-sentinel'`,
       ).run(JSON.stringify({ marker: 'candidate-v6' }), BASE_TIME + 60);
-      expect(getSchemaVersion(candidate)).toBe(6);
+      expect(getSchemaVersion(candidate)).toBe(8);
       expect(policies.getBinding('job-pre-v6-sentinel')).not.toBeNull();
     } finally {
       closeDatabase(candidate);

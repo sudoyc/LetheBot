@@ -279,7 +279,7 @@ describe('schema v5 delayed attention migration', () => {
       runMigrations(db, migrationDirectory);
 
       expect(db.prepare('SELECT total_changes()').pluck().get()).toBe(changesBefore);
-      expect(getSchemaVersion(db)).toBe(6);
+      expect(getSchemaVersion(db)).toBe(8);
       expect(db.prepare('PRAGMA integrity_check').pluck().get()).toBe('ok');
       expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
     } finally {

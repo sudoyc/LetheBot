@@ -53,7 +53,8 @@ export interface ClaimJobOptions {
   workerId: string;
   now?: number;
   leaseMs?: number;
-  types?: string[];
+  types?: readonly string[];
+  excludedTypes?: readonly string[];
 }
 
 export interface CompleteJobOptions {
@@ -211,7 +212,7 @@ export class JobRepository {
   claimNext(options: ClaimJobOptions): ClaimedJob | null {
     const now = options.now ?? Date.now();
     const leaseMs = options.leaseMs ?? 60_000;
-    const typeFilter = this.buildTypeFilter(options.types);
+    const typeFilter = this.buildTypeFilter(options.types, options.excludedTypes);
 
     const transaction = this.db.transaction((): ClaimedJob | null => {
       this.failExpiredMaxAttemptLeases(typeFilter, now);
@@ -483,15 +484,29 @@ export class JobRepository {
     return transaction.immediate();
   }
 
-  private buildTypeFilter(types: string[] | undefined): { sql: string; params: unknown[] } {
-    if (!types || types.length === 0) {
-      return { sql: '1=1', params: [] };
+  private buildTypeFilter(
+    types: readonly string[] | undefined,
+    excludedTypes: readonly string[] | undefined,
+  ): { sql: string; params: unknown[] } {
+    if (types?.length && excludedTypes?.length) {
+      throw new Error('Job claim types and excluded types are mutually exclusive');
     }
 
-    return {
-      sql: `type IN (${types.map(() => '?').join(', ')})`,
-      params: types,
-    };
+    if (types?.length) {
+      return {
+        sql: `type IN (${types.map(() => '?').join(', ')})`,
+        params: [...types],
+      };
+    }
+
+    if (excludedTypes?.length) {
+      return {
+        sql: `type NOT IN (${excludedTypes.map(() => '?').join(', ')})`,
+        params: [...excludedTypes],
+      };
+    }
+
+    return { sql: '1=1', params: [] };
   }
 
   private toMillis(value: number | Date): number {

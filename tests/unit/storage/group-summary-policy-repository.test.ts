@@ -716,6 +716,415 @@ describe('GroupSummaryPolicyRepository', () => {
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 
+  it('atomically applies exact expected group-summary policy snapshots', () => {
+    const localAdmin = {
+      kind: 'local_admin' as const,
+      actorUserId: 'local_admin',
+      invocationContext: 'admin_cli' as const,
+    };
+    const reasonCode = 'governance_http_group_summary_policy_change_confirmed';
+    const implicitGroupId = 'qq-group-94001';
+    const implicitEnable = policies.setEnabled({
+      groupId: implicitGroupId,
+      enabled: true,
+      expectedState: 'disabled',
+      expectedVersion: {
+        source: 'implicit_default',
+        generation: null,
+        updatedAt: null,
+      },
+      reasonCode,
+      now: BASE_TIME + 10_000,
+      authority: localAdmin,
+    });
+    expect(implicitEnable).toEqual({
+      outcome: 'updated',
+      state: 'enabled',
+      generation: 1,
+      eligibleAfter: BASE_TIME + 10_001,
+      updatedAt: BASE_TIME + 10_001,
+      canceledJobCount: 0,
+      auditId: expect.stringMatching(/^[0-9A-HJKMNP-TV-Z]{26}$/u),
+    });
+    if (implicitEnable.outcome !== 'updated') {
+      throw new Error('Expected implicit group-summary policy transition');
+    }
+    expect(policies.get(implicitGroupId)).toMatchObject({
+      state: 'enabled',
+      generation: 1,
+      eligibleAfter: BASE_TIME + 10_001,
+      createdAt: new Date(BASE_TIME + 10_001),
+      updatedAt: new Date(BASE_TIME + 10_001),
+    });
+    expect(JSON.parse((db.prepare(
+      `SELECT details FROM audit_log
+        WHERE event_type = 'group.summary_policy_changed'
+          AND event_id = ?`,
+    ).pluck().get(implicitEnable.auditId) as string))).toMatchObject({
+      oldState: 'disabled',
+      newState: 'enabled',
+      generation: 1,
+      reasonCode,
+      canceledJobCount: 0,
+    });
+
+    const contenderDb = initDatabase({ path: join(root, 'test.db') });
+    const contenderPolicies = new GroupSummaryPolicyRepository(contenderDb);
+    expect(contenderPolicies.setEnabled({
+      groupId: implicitGroupId,
+      enabled: true,
+      expectedState: 'disabled',
+      expectedVersion: {
+        source: 'implicit_default',
+        generation: null,
+        updatedAt: null,
+      },
+      reasonCode,
+      now: BASE_TIME + 10_002,
+      authority: localAdmin,
+    })).toEqual({ outcome: 'stale' });
+    closeDatabase(contenderDb);
+    expect(db.prepare(
+      `SELECT COUNT(*) FROM audit_log
+        WHERE event_type = 'group.summary_policy_changed'`,
+    ).pluck().get()).toBe(1);
+
+    const changesBeforeRetry = db.prepare('SELECT total_changes()').pluck().get();
+    expect(policies.setEnabled({
+      groupId: implicitGroupId,
+      enabled: true,
+      expectedState: 'disabled',
+      expectedVersion: {
+        source: 'implicit_default',
+        generation: null,
+        updatedAt: null,
+      },
+      reasonCode,
+      now: BASE_TIME + 10_002,
+      authority: localAdmin,
+    })).toEqual({ outcome: 'stale' });
+    expect(db.prepare('SELECT total_changes()').pluck().get()).toBe(changesBeforeRetry);
+
+    const storedGroupId = 'qq-group-94002';
+    policies.setEnabled({
+      groupId: storedGroupId,
+      enabled: true,
+      now: BASE_TIME + 20_000,
+      authority: localAdmin,
+    });
+    policies.setEnabled({
+      groupId: storedGroupId,
+      enabled: false,
+      now: BASE_TIME + 20_010,
+      authority: localAdmin,
+    });
+    const storedDisabled = policies.get(storedGroupId);
+    expect(storedDisabled).toMatchObject({ state: 'disabled', generation: 2 });
+    const storedUpdatedAt = storedDisabled?.updatedAt.getTime() ?? -1;
+    expect(policies.setEnabled({
+      groupId: storedGroupId,
+      enabled: true,
+      expectedState: 'disabled',
+      expectedVersion: {
+        source: 'implicit_default',
+        generation: null,
+        updatedAt: null,
+      },
+      reasonCode,
+      now: BASE_TIME + 20_020,
+      authority: localAdmin,
+    })).toEqual({ outcome: 'stale' });
+    const storedEnable = policies.setEnabled({
+      groupId: storedGroupId,
+      enabled: true,
+      expectedState: 'disabled',
+      expectedVersion: {
+        source: 'stored_policy',
+        generation: 2,
+        updatedAt: storedUpdatedAt,
+      },
+      reasonCode,
+      now: BASE_TIME,
+      authority: localAdmin,
+    });
+    expect(storedEnable).toMatchObject({
+      outcome: 'updated',
+      state: 'enabled',
+      generation: 3,
+      eligibleAfter: storedUpdatedAt + 1,
+      updatedAt: storedUpdatedAt + 1,
+      canceledJobCount: 0,
+    });
+
+    const pendingJobId = enqueueBound(
+      'expected-policy-pending',
+      storedGroupId,
+      'group:expected-policy-pending',
+      storedUpdatedAt + 10,
+      storedUpdatedAt + 1_000,
+    );
+    const otherGroupId = 'qq-group-94003';
+    enable(otherGroupId, storedUpdatedAt + 11);
+    const otherPendingJobId = enqueueBound(
+      'expected-policy-other-pending',
+      otherGroupId,
+      'group:expected-policy-other',
+      storedUpdatedAt + 12,
+      storedUpdatedAt + 1_000,
+    );
+    const enabledSnapshot = policies.get(storedGroupId);
+    const disabled = policies.setEnabled({
+      groupId: storedGroupId,
+      enabled: false,
+      expectedState: 'enabled',
+      expectedVersion: {
+        source: 'stored_policy',
+        generation: enabledSnapshot?.generation ?? -1,
+        updatedAt: enabledSnapshot?.updatedAt.getTime() ?? -1,
+      },
+      reasonCode,
+      now: BASE_TIME,
+      authority: localAdmin,
+    });
+    expect(disabled).toMatchObject({
+      outcome: 'updated',
+      state: 'disabled',
+      generation: 4,
+      eligibleAfter: null,
+      canceledJobCount: 1,
+    });
+    if (disabled.outcome !== 'updated') {
+      throw new Error('Expected stored group-summary policy transition');
+    }
+    expect(jobs.findById(pendingJobId)).toMatchObject({
+      status: 'failed',
+      error: 'group_summary_policy_disabled',
+    });
+    expect(policies.getBinding(pendingJobId)).toMatchObject({
+      cancellationCode: 'group_summary_policy_disabled',
+    });
+    expect(jobs.findById(otherPendingJobId)).toMatchObject({ status: 'pending' });
+    expect(policies.getBinding(otherPendingJobId)).not.toHaveProperty('canceledAt');
+
+    const validStoredInput = {
+      groupId: storedGroupId,
+      enabled: true,
+      expectedState: 'disabled' as const,
+      expectedVersion: {
+        source: 'stored_policy' as const,
+        generation: 4,
+        updatedAt: disabled.updatedAt,
+      },
+      reasonCode,
+      now: BASE_TIME + 30_000,
+      authority: localAdmin,
+    };
+    const invalidInputs: unknown[] = [
+      { ...validStoredInput, groupId: ` ${storedGroupId}` },
+      { ...validStoredInput, enabled: 'true' },
+      { ...validStoredInput, expectedState: 'enabled' },
+      { ...validStoredInput, expectedState: 'unknown' },
+      { ...validStoredInput, reasonCode: 'Invalid reason code' },
+      { ...validStoredInput, now: -1 },
+      { ...validStoredInput, now: 1.5 },
+      { ...validStoredInput, now: 8_640_000_000_000_001 },
+      {
+        ...validStoredInput,
+        authority: {
+          ...localAdmin,
+          actorUserId: 'different-local-admin',
+        },
+      },
+      {
+        ...validStoredInput,
+        expectedVersion: { source: 'implicit_default', generation: 0, updatedAt: null },
+      },
+      {
+        ...validStoredInput,
+        expectedVersion: { source: 'stored_policy', generation: null, updatedAt: 1 },
+      },
+      {
+        ...validStoredInput,
+        expectedVersion: { source: 'stored_policy', generation: 0, updatedAt: 1 },
+      },
+      {
+        ...validStoredInput,
+        expectedVersion: { source: 'stored_policy', generation: 4, updatedAt: -1 },
+      },
+      {
+        ...validStoredInput,
+        expectedVersion: { ...validStoredInput.expectedVersion, extra: true },
+      },
+    ];
+    const changesBeforeInvalid = db.prepare('SELECT total_changes()').pluck().get();
+    for (const input of invalidInputs) {
+      expect(policies.setEnabled(input as never)).toEqual({ outcome: 'stale' });
+    }
+    expect(db.prepare('SELECT total_changes()').pluck().get()).toBe(changesBeforeInvalid);
+
+    const disappearedGroupId = 'qq-group-94006';
+    enable(disappearedGroupId, BASE_TIME + 35_000);
+    const disappearedSnapshot = policies.get(disappearedGroupId);
+    db.prepare('DELETE FROM group_summary_policies WHERE group_id = ?').run(disappearedGroupId);
+    const changesAfterDisappearance = db.prepare('SELECT total_changes()').pluck().get();
+    expect(policies.setEnabled({
+      groupId: disappearedGroupId,
+      enabled: false,
+      expectedState: 'enabled',
+      expectedVersion: {
+        source: 'stored_policy',
+        generation: disappearedSnapshot?.generation ?? -1,
+        updatedAt: disappearedSnapshot?.updatedAt.getTime() ?? -1,
+      },
+      reasonCode,
+      now: BASE_TIME + 35_010,
+      authority: localAdmin,
+    })).toEqual({ outcome: 'stale' });
+    expect(db.prepare('SELECT total_changes()').pluck().get()).toBe(changesAfterDisappearance);
+
+    expect(policies.setEnabled({
+      ...validStoredInput,
+      enabled: false,
+      expectedState: 'enabled',
+    })).toEqual({ outcome: 'stale' });
+    expect(db.prepare('SELECT total_changes()').pluck().get()).toBe(changesAfterDisappearance);
+
+    for (const expectedVersion of [
+      { ...validStoredInput.expectedVersion, generation: 3 },
+      { ...validStoredInput.expectedVersion, generation: 5 },
+      { ...validStoredInput.expectedVersion, updatedAt: validStoredInput.expectedVersion.updatedAt - 1 },
+      { ...validStoredInput.expectedVersion, updatedAt: validStoredInput.expectedVersion.updatedAt + 1 },
+    ]) {
+      expect(policies.setEnabled({ ...validStoredInput, expectedVersion } as never))
+        .toEqual({ outcome: 'stale' });
+    }
+    expect(db.prepare('SELECT total_changes()').pluck().get()).toBe(changesAfterDisappearance);
+
+    const ingressFencedGroupId = 'qq-group-94007';
+    insertGroupIngress('expected-policy-future-ingress', ingressFencedGroupId, BASE_TIME + 39_000);
+    expect(policies.setEnabled({
+      groupId: ingressFencedGroupId,
+      enabled: true,
+      expectedState: 'disabled',
+      expectedVersion: {
+        source: 'implicit_default',
+        generation: null,
+        updatedAt: null,
+      },
+      reasonCode,
+      now: BASE_TIME + 38_000,
+      authority: localAdmin,
+    })).toMatchObject({
+      outcome: 'updated',
+      state: 'enabled',
+      generation: 1,
+      eligibleAfter: BASE_TIME + 39_001,
+      updatedAt: BASE_TIME + 39_001,
+    });
+
+    const unsafeFenceGroupId = 'qq-group-94008';
+    insertGroupIngress(
+      'expected-policy-unsafe-ingress',
+      unsafeFenceGroupId,
+      8_640_000_000_000_000,
+    );
+    const changesBeforeUnsafeFence = db.prepare('SELECT total_changes()').pluck().get();
+    expect(policies.setEnabled({
+      groupId: unsafeFenceGroupId,
+      enabled: true,
+      expectedState: 'disabled',
+      expectedVersion: {
+        source: 'implicit_default',
+        generation: null,
+        updatedAt: null,
+      },
+      reasonCode,
+      now: BASE_TIME + 39_500,
+      authority: localAdmin,
+    })).toEqual({ outcome: 'stale' });
+    expect(db.prepare('SELECT total_changes()').pluck().get()).toBe(changesBeforeUnsafeFence);
+    expect(policies.get(unsafeFenceGroupId)).toBeNull();
+
+    const exhaustedGroupId = 'qq-group-94004';
+    enable(exhaustedGroupId, BASE_TIME + 40_000);
+    db.prepare(
+      `UPDATE group_summary_policies
+          SET state = 'disabled', generation = ?, eligible_after = NULL
+        WHERE group_id = ?`,
+    ).run(Number.MAX_SAFE_INTEGER, exhaustedGroupId);
+    const exhausted = policies.get(exhaustedGroupId);
+    const changesBeforeExhausted = db.prepare('SELECT total_changes()').pluck().get();
+    expect(policies.setEnabled({
+      groupId: exhaustedGroupId,
+      enabled: true,
+      expectedState: 'disabled',
+      expectedVersion: {
+        source: 'stored_policy',
+        generation: Number.MAX_SAFE_INTEGER,
+        updatedAt: exhausted?.updatedAt.getTime() ?? -1,
+      },
+      reasonCode,
+      now: BASE_TIME + 40_001,
+      authority: localAdmin,
+    })).toEqual({ outcome: 'stale' });
+    expect(db.prepare('SELECT total_changes()').pluck().get()).toBe(changesBeforeExhausted);
+
+    const rollbackGroupId = 'qq-group-94005';
+    enable(rollbackGroupId, BASE_TIME + 50_000);
+    const rollbackPendingJobId = enqueueBound(
+      'expected-policy-rollback-pending',
+      rollbackGroupId,
+      'group:expected-policy-rollback',
+      BASE_TIME + 50_010,
+    );
+    const rollbackSnapshot = policies.get(rollbackGroupId);
+    db.exec(
+      `CREATE TRIGGER fail_expected_group_summary_policy_audit
+       BEFORE INSERT ON audit_log
+       WHEN NEW.event_type = 'group.summary_policy_changed'
+       BEGIN
+         SELECT RAISE(ABORT, 'synthetic expected policy audit failure');
+       END`,
+    );
+    expect(() => policies.setEnabled({
+      groupId: rollbackGroupId,
+      enabled: false,
+      expectedState: 'enabled',
+      expectedVersion: {
+        source: 'stored_policy',
+        generation: rollbackSnapshot?.generation ?? -1,
+        updatedAt: rollbackSnapshot?.updatedAt.getTime() ?? -1,
+      },
+      reasonCode,
+      now: BASE_TIME + 50_020,
+      authority: localAdmin,
+    })).toThrow('synthetic expected policy audit failure');
+    db.exec('DROP TRIGGER fail_expected_group_summary_policy_audit');
+    expect(policies.get(rollbackGroupId)).toEqual(rollbackSnapshot);
+    expect(jobs.findById(rollbackPendingJobId)).toMatchObject({ status: 'pending' });
+    expect(policies.getBinding(rollbackPendingJobId)).not.toHaveProperty('canceledAt');
+
+    const path = join(root, 'test.db');
+    closeDatabase(db);
+    db = initDatabase({ path });
+    policies = new GroupSummaryPolicyRepository(db);
+    jobs = new JobRepository(db);
+    expect(policies.get(storedGroupId)).toMatchObject({
+      state: 'disabled',
+      generation: 4,
+      updatedAt: new Date(disabled.updatedAt),
+    });
+    expect(jobs.findById(pendingJobId)).toMatchObject({
+      status: 'failed',
+      error: 'group_summary_policy_disabled',
+    });
+    expect(policies.getBinding(pendingJobId)).toMatchObject({
+      cancellationCode: 'group_summary_policy_disabled',
+    });
+    expect(db.prepare('PRAGMA integrity_check').pluck().get()).toBe('ok');
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
   function enable(groupId: string, now: number): void {
     policies.setEnabled({
       groupId,

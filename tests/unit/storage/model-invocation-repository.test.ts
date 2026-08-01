@@ -323,6 +323,172 @@ describe('ModelInvocationRepository', () => {
     expect(invocation?.errorCode?.length).toBeLessThanOrEqual(256);
   });
 
+  it('persists ordered Pi provider rounds with exact known and unknown usage', () => {
+    insertRawEvent('raw-pi-trigger');
+    insertRawEvent('raw-pi-related');
+    insertRunningTurn('turn-pi-ledger', 'raw-pi-trigger', 1_700_000_010_000);
+
+    const firstId = repo.startPiTurnInvocation({
+      id: 'invocation-pi-ledger-1',
+      turnId: 'turn-pi-ledger',
+      callNumber: 1,
+      provider: 'test-provider',
+      model: 'test-model',
+      rawEventIds: ['raw-pi-trigger', 'raw-pi-related'],
+      startedAt: 1_700_000_010_001,
+    });
+    const firstResponse = JSON.stringify([{ type: 'text', text: 'first response' }]);
+    repo.completePiTurnInvocation(firstId, {
+      input: 21,
+      output: 8,
+      total: 34,
+      cacheRead: 4,
+      cacheWrite: 1,
+      reasoning: 3,
+    }, firstResponse);
+
+    const secondId = repo.startPiTurnInvocation({
+      id: 'invocation-pi-ledger-2',
+      turnId: 'turn-pi-ledger',
+      callNumber: 2,
+      provider: 'test-provider',
+      model: 'test-model',
+      rawEventIds: ['raw-pi-trigger', 'raw-pi-related'],
+      startedAt: 1_700_000_010_002,
+    });
+    const secondResponse = JSON.stringify([{ type: 'text', text: 'usage unavailable' }]);
+    repo.completePiTurnInvocation(secondId, undefined, secondResponse);
+
+    expect(repo.listInvocationsForTurn('turn-pi-ledger')).toEqual([
+      expect.objectContaining({
+        id: firstId,
+        turnId: 'turn-pi-ledger',
+        purpose: 'pi_turn',
+        callNumber: 1,
+        provider: 'test-provider',
+        model: 'test-model',
+        status: 'completed',
+        tokens: {
+          input: 21,
+          output: 8,
+          total: 34,
+          cacheRead: 4,
+          cacheWrite: 1,
+          reasoning: 3,
+        },
+        responseSha256: createHash('sha256').update(firstResponse, 'utf8').digest('hex'),
+        responseBytes: Buffer.byteLength(firstResponse, 'utf8'),
+      }),
+      expect.objectContaining({
+        id: secondId,
+        turnId: 'turn-pi-ledger',
+        purpose: 'pi_turn',
+        callNumber: 2,
+        status: 'completed',
+        tokens: undefined,
+        responseSha256: createHash('sha256').update(secondResponse, 'utf8').digest('hex'),
+        responseBytes: Buffer.byteLength(secondResponse, 'utf8'),
+      }),
+    ]);
+    expect(repo.listSourceEventIds(firstId)).toEqual(['raw-pi-trigger', 'raw-pi-related']);
+    expect(repo.listSourceEventIds(secondId)).toEqual(['raw-pi-trigger', 'raw-pi-related']);
+
+    const rawRows = JSON.stringify(db.prepare(
+      "SELECT * FROM model_invocations WHERE purpose = 'pi_turn' ORDER BY call_number"
+    ).all());
+    expect(rawRows).not.toContain('first response');
+    expect(rawRows).not.toContain('usage unavailable');
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('rejects unbound Pi sources, identity drift, and ordinal gaps without partial writes', () => {
+    insertRawEvent('raw-pi-owner-trigger');
+    insertRawEvent('raw-pi-owner-related');
+    insertRunningTurn('turn-pi-owner', 'raw-pi-owner-trigger', Date.now() - 10);
+
+    const invalidStarts = [
+      {
+        name: 'missing trigger source',
+        input: {
+          callNumber: 1,
+          provider: 'test-provider',
+          model: 'test-model',
+          rawEventIds: ['raw-pi-owner-related'],
+        },
+      },
+      {
+        name: 'provider drift',
+        input: {
+          callNumber: 1,
+          provider: 'different-provider',
+          model: 'test-model',
+          rawEventIds: ['raw-pi-owner-trigger'],
+        },
+      },
+      {
+        name: 'model drift',
+        input: {
+          callNumber: 1,
+          provider: 'test-provider',
+          model: 'different-model',
+          rawEventIds: ['raw-pi-owner-trigger'],
+        },
+      },
+      {
+        name: 'first ordinal gap',
+        input: {
+          callNumber: 2,
+          provider: 'test-provider',
+          model: 'test-model',
+          rawEventIds: ['raw-pi-owner-trigger'],
+        },
+      },
+    ];
+    for (const testCase of invalidStarts) {
+      expect(() => repo.startPiTurnInvocation({
+        id: `invocation-pi-invalid-${testCase.name.replaceAll(' ', '-')}`,
+        turnId: 'turn-pi-owner',
+        ...testCase.input,
+      }), testCase.name).toThrow();
+    }
+    expect(repo.listInvocationsForTurn('turn-pi-owner')).toEqual([]);
+
+    repo.startPiTurnInvocation({
+      id: 'invocation-pi-owner-1',
+      turnId: 'turn-pi-owner',
+      callNumber: 1,
+      provider: 'test-provider',
+      model: 'test-model',
+      rawEventIds: ['raw-pi-owner-trigger'],
+    });
+    expect(() => repo.startPiTurnInvocation({
+      id: 'invocation-pi-owner-3',
+      turnId: 'turn-pi-owner',
+      callNumber: 3,
+      provider: 'test-provider',
+      model: 'test-model',
+      rawEventIds: ['raw-pi-owner-trigger'],
+    })).toThrow();
+    expect(repo.listInvocationsForTurn('turn-pi-owner')).toHaveLength(1);
+
+    db.prepare(
+      "UPDATE agent_turns SET status = 'completed', completed_at = ? WHERE id = ?"
+    ).run(Date.now(), 'turn-pi-owner');
+    expect(() => repo.startPiTurnInvocation({
+      id: 'invocation-pi-after-turn',
+      turnId: 'turn-pi-owner',
+      callNumber: 2,
+      provider: 'test-provider',
+      model: 'test-model',
+      rawEventIds: ['raw-pi-owner-trigger'],
+    })).toThrow();
+    expect(repo.findInvocationById('invocation-pi-owner-1')).toMatchObject({
+      status: 'aborted',
+      errorCode: 'turn_ended',
+    });
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
   it('persists and validates one completed turn-owned evaluator invocation without content', () => {
     const requestCreatedAt = Date.now() - 1_000;
     insertRawEvent('raw-evaluator-trigger');

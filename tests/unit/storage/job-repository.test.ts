@@ -332,6 +332,43 @@ describe('JobRepository', () => {
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 
+  it('claims noninteractive work without mutating an older excluded interactive job', () => {
+    const interactiveJobId = repo.enqueue({
+      type: 'attention_recheck',
+      payload: { candidateId: 'candidate-excluded-claim' },
+      now: 1000,
+    });
+    const maintenanceJobId = repo.enqueue({
+      type: 'retention',
+      payload: { rawEventsDays: 30 },
+      now: 1001,
+    });
+
+    const claimed = repo.claimNext({
+      workerId: 'worker-maintenance-exclusion',
+      now: 1001,
+      excludedTypes: ['attention_recheck'],
+    });
+
+    expect(claimed?.job.id).toBe(maintenanceJobId);
+    expect(repo.findById(interactiveJobId)).toMatchObject({
+      status: 'pending',
+      attempts: 0,
+    });
+    expect(repo.findById(maintenanceJobId)).toMatchObject({
+      status: 'running',
+      attempts: 1,
+      leaseOwner: 'worker-maintenance-exclusion',
+    });
+    expect(() => repo.claimNext({
+      workerId: 'worker-invalid-filter',
+      now: 1002,
+      types: ['summary'],
+      excludedTypes: ['attention_recheck'],
+    })).toThrow('Job claim types and excluded types are mutually exclusive');
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
   it('complete records result on job and attempt', () => {
     const jobId = repo.enqueue({ type: 'summary', payload: { conversationId: 'conv-3' }, now: 1000 });
     const claimed = repo.claimNext({ workerId: 'worker-a', now: 1000 });

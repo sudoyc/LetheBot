@@ -328,6 +328,191 @@ describe('PrivacyPreferenceRepository', () => {
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 
+  it('atomically applies expected Privacy preference snapshots without changing legacy writes', async () => {
+    const actor = {
+      canonicalUserId: 'admin',
+      actorClass: 'admin' as const,
+      context: 'admin_cli' as const,
+    };
+    db.prepare(
+      `INSERT INTO canonical_users (id, created_at, last_seen_at)
+       VALUES (?, ?, ?), (?, ?, ?), (?, ?, ?)`,
+    ).run(
+      'user-stored-one', 1, 1,
+      'user-expected-rollback', 1, 1,
+      'user-disappeared', 1, 1,
+    );
+
+    const secret = 'sk-abcdefghijklmnopqrstuvwxyz123456';
+    const implicit = repo.setPreference({
+      canonicalUserId: 'user-alice',
+      preferenceType: 'proactive_dm',
+      state: 'opted_out',
+      reason: `governance_http_change_${secret}_qq-123456789`,
+      actor,
+      now: 6_000,
+      expectedState: 'opted_in',
+      expectedVersion: { source: 'implicit_default', updatedAt: null },
+    });
+    expect(implicit).toEqual({ outcome: 'updated', updatedAt: 6_000 });
+    expect(await repo.isOptedOut('user-alice', 'proactive_dm')).toBe(true);
+    const implicitRow = db.prepare(
+      `SELECT state, reason, created_at, updated_at
+         FROM privacy_preferences
+        WHERE canonical_user_id = ? AND preference_type = ?`,
+    ).get('user-alice', 'proactive_dm') as {
+      state: string;
+      reason: string;
+      created_at: number;
+      updated_at: number;
+    };
+    expect(implicitRow).toMatchObject({
+      state: 'opted_out',
+      created_at: 6_000,
+      updated_at: 6_000,
+    });
+    expect(implicitRow.reason).toContain('[REDACTED:openai_like_api_key]');
+    expect(implicitRow.reason).toContain('[REDACTED:platform_id]');
+    expect(implicitRow.reason).not.toContain(secret);
+    expect(implicitRow.reason).not.toContain('123456789');
+    const implicitAudit = db.prepare(
+      `SELECT timestamp, details
+         FROM audit_log
+        WHERE event_id = ? AND event_type = 'privacy.preference_set'`,
+    ).get('user-alice:proactive_dm') as { timestamp: number; details: string };
+    expect(implicitAudit.timestamp).toBe(6_000);
+    expect(implicitAudit.details).toContain('[REDACTED:openai_like_api_key]');
+    expect(implicitAudit.details).toContain('[REDACTED:platform_id]');
+
+    const changesAfterImplicit = db.prepare('SELECT total_changes()').pluck().get();
+    expect(repo.setPreference({
+      canonicalUserId: 'user-alice',
+      preferenceType: 'proactive_dm',
+      state: 'opted_out',
+      reason: 'stale implicit retry',
+      actor,
+      now: 6_001,
+      expectedState: 'opted_in',
+      expectedVersion: { source: 'implicit_default', updatedAt: null },
+    })).toEqual({ outcome: 'stale' });
+    expect(repo.setPreference({
+      canonicalUserId: 'user-alice',
+      preferenceType: 'proactive_dm',
+      state: 'opted_out',
+      reason: 'no-op target',
+      actor,
+      now: 6_001,
+      expectedState: 'opted_out',
+      expectedVersion: { source: 'stored_preference', updatedAt: 6_000 },
+    })).toEqual({ outcome: 'stale' });
+    expect(db.prepare('SELECT total_changes()').pluck().get()).toBe(changesAfterImplicit);
+
+    expect(repo.setPreference({
+      canonicalUserId: 'user-stored-one',
+      preferenceType: 'memory_association',
+      state: 'opted_in',
+      reason: 'legacy stored opt-in',
+      actor,
+      now: 1,
+    })).toBeUndefined();
+    const changesBeforeSourceMismatch = db.prepare('SELECT total_changes()').pluck().get();
+    expect(repo.setPreference({
+      canonicalUserId: 'user-stored-one',
+      preferenceType: 'memory_association',
+      state: 'opted_out',
+      reason: 'stored row is not an implicit default',
+      actor,
+      now: 1,
+      expectedState: 'opted_in',
+      expectedVersion: { source: 'implicit_default', updatedAt: null },
+    })).toEqual({ outcome: 'stale' });
+    expect(db.prepare('SELECT total_changes()').pluck().get()).toBe(changesBeforeSourceMismatch);
+
+    expect(repo.setPreference({
+      canonicalUserId: 'user-stored-one',
+      preferenceType: 'memory_association',
+      state: 'opted_out',
+      reason: 'expected stored opt-out',
+      actor,
+      now: 0,
+      expectedState: 'opted_in',
+      expectedVersion: { source: 'stored_preference', updatedAt: 1 },
+    })).toEqual({ outcome: 'updated', updatedAt: 2 });
+    expect(repo.find('user-stored-one', 'memory_association')).toMatchObject({
+      state: 'opted_out',
+      createdAt: new Date(1),
+      updatedAt: new Date(2),
+    });
+    expect(repo.setPreference({
+      canonicalUserId: 'user-stored-one',
+      preferenceType: 'memory_association',
+      state: 'opted_in',
+      reason: 'expected stored opt-in',
+      actor,
+      now: 2,
+      expectedState: 'opted_out',
+      expectedVersion: { source: 'stored_preference', updatedAt: 2 },
+    })).toEqual({ outcome: 'updated', updatedAt: 3 });
+    expect(await repo.isOptedOut('user-stored-one', 'memory_association')).toBe(false);
+
+    repo.setPreference({
+      canonicalUserId: 'user-disappeared',
+      preferenceType: 'proactive_dm',
+      state: 'opted_out',
+      actor,
+      now: 10,
+    });
+    db.prepare(
+      `DELETE FROM privacy_preferences
+        WHERE canonical_user_id = ? AND preference_type = ?`,
+    ).run('user-disappeared', 'proactive_dm');
+    const changesBeforeMissingSnapshots = db.prepare('SELECT total_changes()').pluck().get();
+    expect(repo.setPreference({
+      canonicalUserId: 'user-disappeared',
+      preferenceType: 'proactive_dm',
+      state: 'opted_in',
+      actor,
+      now: 11,
+      expectedState: 'opted_out',
+      expectedVersion: { source: 'stored_preference', updatedAt: 10 },
+    })).toEqual({ outcome: 'stale' });
+    expect(repo.setPreference({
+      canonicalUserId: 'user-missing',
+      preferenceType: 'proactive_dm',
+      state: 'opted_out',
+      actor,
+      now: 11,
+      expectedState: 'opted_in',
+      expectedVersion: { source: 'implicit_default', updatedAt: null },
+    })).toEqual({ outcome: 'not_found' });
+    expect(db.prepare('SELECT total_changes()').pluck().get()).toBe(changesBeforeMissingSnapshots);
+
+    db.exec(
+      `CREATE TRIGGER fail_expected_privacy_audit
+       BEFORE INSERT ON audit_log
+       BEGIN
+         SELECT RAISE(ABORT, 'synthetic expected privacy audit failure');
+       END`,
+    );
+    expect(() => repo.setPreference({
+      canonicalUserId: 'user-expected-rollback',
+      preferenceType: 'proactive_dm',
+      state: 'opted_out',
+      reason: 'must roll back',
+      actor,
+      now: 20,
+      expectedState: 'opted_in',
+      expectedVersion: { source: 'implicit_default', updatedAt: null },
+    })).toThrow('synthetic expected privacy audit failure');
+    db.exec('DROP TRIGGER fail_expected_privacy_audit');
+    expect(repo.find('user-expected-rollback', 'proactive_dm')).toBeNull();
+    expect(db.prepare(
+      `SELECT COUNT(*) FROM audit_log WHERE event_id = ?`,
+    ).pluck().get('user-expected-rollback:proactive_dm')).toBe(0);
+    expect(db.prepare('PRAGMA integrity_check').pluck().get()).toBe('ok');
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
   it('requires a valid canonical user FK', () => {
     expect(() => repo.setOptOut({
       canonicalUserId: 'user-missing',

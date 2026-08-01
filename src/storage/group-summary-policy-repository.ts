@@ -67,6 +67,40 @@ export interface SetGroupSummaryPolicyResult {
   auditId?: string;
 }
 
+export type GroupSummaryPolicyExpectedVersion =
+  | {
+    source: 'implicit_default';
+    generation: null;
+    updatedAt: null;
+  }
+  | {
+    source: 'stored_policy';
+    generation: number;
+    updatedAt: number;
+  };
+
+export interface SetGroupSummaryPolicyExpectedInput {
+  groupId: string;
+  enabled: boolean;
+  expectedState: GroupSummaryPolicyState;
+  expectedVersion: GroupSummaryPolicyExpectedVersion;
+  reasonCode: string;
+  authority: GroupSummaryAuthorityProof;
+  now?: number;
+}
+
+export type SetGroupSummaryPolicyExpectedResult =
+  | {
+    outcome: 'updated';
+    state: GroupSummaryPolicyState;
+    generation: number;
+    eligibleAfter: number | null;
+    updatedAt: number;
+    canceledJobCount: number;
+    auditId: string;
+  }
+  | { outcome: 'stale' };
+
 interface PolicyRow {
   group_id: string;
   state: GroupSummaryPolicyState;
@@ -86,6 +120,10 @@ interface BindingRow {
   canceled_at: number | null;
   cancellation_code: 'group_summary_policy_disabled' | null;
 }
+
+const NORMALIZED_QQ_GROUP_ID_PATTERN = /^qq-group-[1-9][0-9]{4,11}$/u;
+const GOVERNANCE_REASON_CODE_PATTERN = /^[a-z][a-z0-9_:-]{0,127}$/u;
+const MAX_JAVASCRIPT_DATE_MS = 8_640_000_000_000_000;
 
 export class GroupSummaryPolicyRepository {
   constructor(private readonly db: Database.Database) {}
@@ -114,7 +152,31 @@ export class GroupSummaryPolicyRepository {
     return policy as GroupSummaryPolicy & { state: 'enabled'; eligibleAfter: number };
   }
 
+  setEnabled(input: SetGroupSummaryPolicyExpectedInput): SetGroupSummaryPolicyExpectedResult;
   setEnabled(input: {
+    groupId: string;
+    enabled: boolean;
+    authority: GroupSummaryAuthorityProof;
+    now?: number;
+  }): SetGroupSummaryPolicyResult;
+  setEnabled(input: {
+    groupId: string;
+    enabled: boolean;
+    authority: GroupSummaryAuthorityProof;
+    now?: number;
+  } | SetGroupSummaryPolicyExpectedInput):
+  SetGroupSummaryPolicyResult | SetGroupSummaryPolicyExpectedResult {
+    if (
+      'expectedState' in input
+      || 'expectedVersion' in input
+      || 'reasonCode' in input
+    ) {
+      return this.setEnabledAtExpectedSnapshot(input as SetGroupSummaryPolicyExpectedInput);
+    }
+    return this.setEnabledLegacy(input);
+  }
+
+  private setEnabledLegacy(input: {
     groupId: string;
     enabled: boolean;
     authority: GroupSummaryAuthorityProof;
@@ -201,6 +263,108 @@ export class GroupSummaryPolicyRepository {
       };
     });
 
+    return transaction.immediate();
+  }
+
+  private setEnabledAtExpectedSnapshot(
+    input: SetGroupSummaryPolicyExpectedInput,
+  ): SetGroupSummaryPolicyExpectedResult {
+    const now = input.now ?? Date.now();
+    if (!this.isValidExpectedInput(input, now)) {
+      return { outcome: 'stale' };
+    }
+
+    const transaction = this.db.transaction((): SetGroupSummaryPolicyExpectedResult => {
+      const previousRow = this.readPolicyRow(input.groupId);
+      if (input.expectedVersion.source === 'implicit_default') {
+        if (previousRow !== undefined || input.expectedState !== 'disabled') {
+          return { outcome: 'stale' };
+        }
+      } else {
+        if (
+          !previousRow
+          || !this.isValidPolicyRow(previousRow)
+          || previousRow.state !== input.expectedState
+          || previousRow.generation !== input.expectedVersion.generation
+          || previousRow.updated_at !== input.expectedVersion.updatedAt
+        ) {
+          return { outcome: 'stale' };
+        }
+      }
+
+      const previousGeneration = previousRow?.generation ?? 0;
+      if (previousGeneration >= Number.MAX_SAFE_INTEGER) {
+        return { outcome: 'stale' };
+      }
+
+      let transitionFloor = previousRow
+        ? Math.max(now, previousRow.updated_at)
+        : now;
+      let durableCeiling: number | null;
+      try {
+        durableCeiling = input.enabled
+          ? this.getExactGroupIngressCeiling(input.groupId)
+          : this.getPendingCancellationCeiling(input.groupId);
+      } catch (error) {
+        if (error instanceof GroupSummaryPolicyError && error.code === 'invalid_input') {
+          return { outcome: 'stale' };
+        }
+        throw error;
+      }
+      if (durableCeiling !== null) {
+        transitionFloor = Math.max(transitionFloor, durableCeiling);
+      }
+      if (transitionFloor >= MAX_JAVASCRIPT_DATE_MS) {
+        return { outcome: 'stale' };
+      }
+      const transitionNow = transitionFloor + 1;
+      const generation = previousGeneration + 1;
+      const state: GroupSummaryPolicyState = input.enabled ? 'enabled' : 'disabled';
+      const eligibleAfter = input.enabled ? transitionNow : null;
+      this.db.prepare(
+        `INSERT INTO group_summary_policies (
+           group_id, state, generation, eligible_after, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(group_id) DO UPDATE SET
+           state = excluded.state,
+           generation = excluded.generation,
+           eligible_after = excluded.eligible_after,
+           updated_at = excluded.updated_at`,
+      ).run(
+        input.groupId,
+        state,
+        generation,
+        eligibleAfter,
+        previousRow?.created_at ?? transitionNow,
+        transitionNow,
+      );
+
+      const canceledJobCount = input.enabled
+        ? 0
+        : this.cancelPendingJobs(input.groupId, transitionNow);
+      const auditId = ulid();
+      this.insertAudit({
+        auditId,
+        groupId: input.groupId,
+        oldState: previousRow?.state ?? 'disabled',
+        newState: state,
+        generation,
+        eligibleAfter,
+        canceledJobCount,
+        authority: input.authority,
+        reasonCode: input.reasonCode,
+        now: transitionNow,
+      });
+      return {
+        outcome: 'updated',
+        state,
+        generation,
+        eligibleAfter,
+        updatedAt: transitionNow,
+        canceledJobCount,
+        auditId,
+      };
+    });
     return transaction.immediate();
   }
 
@@ -407,6 +571,7 @@ export class GroupSummaryPolicyRepository {
     eligibleAfter: number | null;
     canceledJobCount: number;
     authority: GroupSummaryAuthorityProof;
+    reasonCode?: string;
     now: number;
   }): void {
     const actorClass = input.authority.kind === 'group_admin'
@@ -440,9 +605,79 @@ export class GroupSummaryPolicyRepository {
         ...(input.authority.sourceEventId === undefined
           ? {}
           : { sourceEventId: this.redactAuditText(input.authority.sourceEventId) }),
+        ...(input.reasonCode === undefined ? {} : { reasonCode: input.reasonCode }),
         canceledJobCount: input.canceledJobCount,
       }),
     );
+  }
+
+  private isValidExpectedInput(
+    input: SetGroupSummaryPolicyExpectedInput,
+    now: number,
+  ): boolean {
+    if (
+      !NORMALIZED_QQ_GROUP_ID_PATTERN.test(input.groupId)
+      || typeof input.enabled !== 'boolean'
+      || (input.expectedState !== 'enabled' && input.expectedState !== 'disabled')
+      || input.enabled === (input.expectedState === 'enabled')
+      || !this.isValidExpectedVersion(input.expectedVersion)
+      || !GOVERNANCE_REASON_CODE_PATTERN.test(input.reasonCode)
+      || !this.isValidTimestamp(now)
+      || typeof input.authority !== 'object'
+      || input.authority === null
+    ) {
+      return false;
+    }
+    try {
+      this.assertAuthority(input.groupId, input.authority);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private isValidExpectedVersion(value: unknown): value is GroupSummaryPolicyExpectedVersion {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return false;
+    }
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record);
+    if (
+      keys.length !== 3
+      || !keys.includes('source')
+      || !keys.includes('generation')
+      || !keys.includes('updatedAt')
+    ) {
+      return false;
+    }
+    if (record.source === 'implicit_default') {
+      return record.generation === null && record.updatedAt === null;
+    }
+    return record.source === 'stored_policy'
+      && typeof record.generation === 'number'
+      && Number.isSafeInteger(record.generation)
+      && record.generation >= 1
+      && typeof record.updatedAt === 'number'
+      && this.isValidTimestamp(record.updatedAt);
+  }
+
+  private isValidPolicyRow(row: PolicyRow): boolean {
+    return (row.state === 'enabled' || row.state === 'disabled')
+      && Number.isSafeInteger(row.generation)
+      && row.generation >= 1
+      && this.isValidTimestamp(row.created_at)
+      && this.isValidTimestamp(row.updated_at)
+      && row.updated_at >= row.created_at
+      && (row.state === 'enabled'
+        ? row.eligible_after !== null && this.isValidTimestamp(row.eligible_after)
+        : row.eligible_after === null);
+  }
+
+  private isValidTimestamp(value: unknown): value is number {
+    return typeof value === 'number'
+      && Number.isSafeInteger(value)
+      && value >= 0
+      && value <= MAX_JAVASCRIPT_DATE_MS;
   }
 
   private getExactGroupIngressCeiling(groupId: string): number | null {

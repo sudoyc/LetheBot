@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type Database from 'better-sqlite3';
-import { initDatabase, runMigration, closeDatabase } from '../../../src/storage/database';
+import { initDatabase, runMigrations, closeDatabase } from '../../../src/storage/database';
+import { ModelInvocationRepository } from '../../../src/storage/model-invocation-repository';
 import { TurnRepository } from '../../../src/storage/turn-repository';
 
 describe('TurnRepository', () => {
@@ -14,7 +15,7 @@ describe('TurnRepository', () => {
   beforeEach(() => {
     testDir = mkdtempSync(join(tmpdir(), 'lethebot-turn-repo-'));
     db = initDatabase({ path: join(testDir, 'test.db') });
-    runMigration(db, join(__dirname, '../../../migrations/001_initial_schema.sql'));
+    runMigrations(db, join(__dirname, '../../../migrations'));
     repo = new TurnRepository(db);
 
     db.prepare(
@@ -244,5 +245,220 @@ describe('TurnRepository', () => {
       'SELECT completed_at FROM agent_turns WHERE id = ?'
     ).get('turn-running')).toEqual({ completed_at: 2000 });
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('aggregates known usage from every ordered Pi invocation round', async () => {
+    const invocationRepo = new ModelInvocationRepository(db);
+    const turnId = await repo.createPending({
+      id: 'turn-ledger-known',
+      conversationId: 'private:test',
+      triggerEventId: 'evt-turn-redaction',
+      piModel: 'ledger-model',
+      piProvider: 'ledger-provider',
+      startedAt: new Date(1000),
+    });
+    await repo.markRunning(turnId, 'context-ledger-known');
+
+    const firstId = invocationRepo.startPiTurnInvocation({
+      id: 'invocation-ledger-known-1',
+      turnId,
+      callNumber: 1,
+      provider: 'ledger-provider',
+      model: 'ledger-model',
+      rawEventIds: ['evt-turn-redaction'],
+      startedAt: 1100,
+    });
+    invocationRepo.completePiTurnInvocation(firstId, { input: 4, output: 6, total: 10 }, 'first');
+    const secondId = invocationRepo.startPiTurnInvocation({
+      id: 'invocation-ledger-known-2',
+      turnId,
+      callNumber: 2,
+      provider: 'ledger-provider',
+      model: 'ledger-model',
+      rawEventIds: ['evt-turn-redaction'],
+      startedAt: 1200,
+    });
+    invocationRepo.completePiTurnInvocation(secondId, { input: 2, output: 3, total: 5 }, 'second');
+
+    repo.markCompletedFromPiInvocations(turnId, { responseText: 'final response', completedAt: new Date(2000) });
+
+    expect(db.prepare(
+      `SELECT status, response_text, tokens_input, tokens_output, tokens_total, completed_at
+         FROM agent_turns WHERE id = ?`,
+    ).get(turnId)).toEqual({
+      status: 'completed',
+      response_text: 'final response',
+      tokens_input: 6,
+      tokens_output: 9,
+      tokens_total: 15,
+      completed_at: 2000,
+    });
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('persists unknown totals when any completed Pi round lacks usage', async () => {
+    const invocationRepo = new ModelInvocationRepository(db);
+    const turnId = await repo.createPending({
+      id: 'turn-ledger-unknown',
+      conversationId: 'private:test',
+      triggerEventId: 'evt-turn-redaction',
+      piModel: 'ledger-model',
+      piProvider: 'ledger-provider',
+      startedAt: new Date(1000),
+    });
+    await repo.markRunning(turnId, 'context-ledger-unknown');
+
+    const firstId = invocationRepo.startPiTurnInvocation({
+      id: 'invocation-ledger-unknown-1',
+      turnId,
+      callNumber: 1,
+      provider: 'ledger-provider',
+      model: 'ledger-model',
+      rawEventIds: ['evt-turn-redaction'],
+    });
+    invocationRepo.completePiTurnInvocation(firstId, { input: 4, output: 6, total: 10 }, 'known');
+    const secondId = invocationRepo.startPiTurnInvocation({
+      id: 'invocation-ledger-unknown-2',
+      turnId,
+      callNumber: 2,
+      provider: 'ledger-provider',
+      model: 'ledger-model',
+      rawEventIds: ['evt-turn-redaction'],
+    });
+    invocationRepo.completePiTurnInvocation(secondId, undefined, 'unknown');
+
+    repo.markCompletedFromPiInvocations(turnId, { responseText: 'unknown aggregate' });
+
+    expect(db.prepare(
+      `SELECT status, tokens_input, tokens_output, tokens_total
+         FROM agent_turns WHERE id = ?`,
+    ).get(turnId)).toEqual({
+      status: 'completed',
+      tokens_input: null,
+      tokens_output: null,
+      tokens_total: null,
+    });
+  });
+
+  it('does not fabricate totals for missing, running, failed, or aborted ledgers', async () => {
+    const invocationRepo = new ModelInvocationRepository(db);
+    const cases = [
+      { id: 'turn-ledger-missing', prepare: () => undefined },
+      {
+        id: 'turn-ledger-running',
+        prepare: () => {
+          invocationRepo.startPiTurnInvocation({
+            id: 'invocation-ledger-running',
+            turnId: 'turn-ledger-running',
+            callNumber: 1,
+            provider: 'ledger-provider',
+            model: 'ledger-model',
+            rawEventIds: ['evt-turn-redaction'],
+          });
+        },
+      },
+      {
+        id: 'turn-ledger-failed',
+        prepare: () => {
+          const id = invocationRepo.startPiTurnInvocation({
+            id: 'invocation-ledger-failed',
+            turnId: 'turn-ledger-failed',
+            callNumber: 1,
+            provider: 'ledger-provider',
+            model: 'ledger-model',
+            rawEventIds: ['evt-turn-redaction'],
+          });
+          invocationRepo.failInvocation(id, 'provider_error', 'failed');
+        },
+      },
+      {
+        id: 'turn-ledger-aborted',
+        prepare: () => {
+          const id = invocationRepo.startPiTurnInvocation({
+            id: 'invocation-ledger-aborted',
+            turnId: 'turn-ledger-aborted',
+            callNumber: 1,
+            provider: 'ledger-provider',
+            model: 'ledger-model',
+            rawEventIds: ['evt-turn-redaction'],
+          });
+          invocationRepo.failInvocation(id, 'turn_ended', 'aborted');
+        },
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const turnId = await repo.createPending({
+        id: testCase.id,
+        conversationId: 'private:test',
+        triggerEventId: 'evt-turn-redaction',
+        piModel: 'ledger-model',
+        piProvider: 'ledger-provider',
+        startedAt: new Date(1000),
+      });
+      await repo.markRunning(turnId, `context-${turnId}`);
+      testCase.prepare();
+
+      expect(() => repo.markCompletedFromPiInvocations(turnId, { responseText: 'must not complete' }))
+        .toThrow();
+      expect(db.prepare(
+        `SELECT status, tokens_input, tokens_output, tokens_total
+           FROM agent_turns WHERE id = ?`,
+      ).get(turnId)).toEqual({
+        status: 'running',
+        tokens_input: null,
+        tokens_output: null,
+        tokens_total: null,
+      });
+    }
+  });
+
+  it('makes ledger completion idempotent and preserves local known-zero completion', async () => {
+    const invocationRepo = new ModelInvocationRepository(db);
+    const turnId = await repo.createPending({
+      id: 'turn-ledger-repeat',
+      conversationId: 'private:test',
+      triggerEventId: 'evt-turn-redaction',
+      piModel: 'ledger-model',
+      piProvider: 'ledger-provider',
+      startedAt: new Date(1000),
+    });
+    await repo.markRunning(turnId, 'context-ledger-repeat');
+    const invocationId = invocationRepo.startPiTurnInvocation({
+      id: 'invocation-ledger-repeat',
+      turnId,
+      callNumber: 1,
+      provider: 'ledger-provider',
+      model: 'ledger-model',
+      rawEventIds: ['evt-turn-redaction'],
+    });
+    invocationRepo.completePiTurnInvocation(invocationId, { input: 1, output: 2, total: 3 }, 'round');
+
+    repo.markCompletedFromPiInvocations(turnId, { responseText: 'first', completedAt: new Date(2000) });
+    const first = db.prepare('SELECT * FROM agent_turns WHERE id = ?').get(turnId);
+    repo.markCompletedFromPiInvocations(turnId, { responseText: 'second', completedAt: new Date(3000) });
+    expect(db.prepare('SELECT * FROM agent_turns WHERE id = ?').get(turnId)).toEqual(first);
+
+    const localTurnId = await repo.createPending({
+      id: 'turn-local-zero',
+      conversationId: 'private:test',
+      triggerEventId: 'evt-turn-redaction',
+      piModel: 'mock',
+      piProvider: 'mock',
+      startedAt: new Date(1000),
+    });
+    repo.markCompleted(localTurnId, {
+      responseText: 'local',
+      tokensUsed: { input: 0, output: 0, total: 0 },
+      completedAt: new Date(2000),
+    });
+    expect(db.prepare(
+      `SELECT status, tokens_input, tokens_output, tokens_total FROM agent_turns WHERE id = ?`,
+    ).get(localTurnId)).toEqual({
+      status: 'completed',
+      tokens_input: 0,
+      tokens_output: 0,
+      tokens_total: 0,
+    });
   });
 });

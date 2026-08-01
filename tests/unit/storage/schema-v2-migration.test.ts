@@ -63,6 +63,14 @@ function createSyntheticMigrationDirectory(secondMigration: string): string {
     join(migrationDirectory, '006_group_summary_policy.sql'),
     join(directory, '006_group_summary_policy.sql'),
   );
+  copyFileSync(
+    join(migrationDirectory, '007_pi_turn_model_invocations.sql'),
+    join(directory, '007_pi_turn_model_invocations.sql'),
+  );
+  copyFileSync(
+    join(migrationDirectory, '008_memory_maintenance_proposals.sql'),
+    join(directory, '008_memory_maintenance_proposals.sql'),
+  );
   return directory;
 }
 
@@ -144,7 +152,7 @@ describe('schema v2 evaluator authority migration', () => {
 
       runMigrations(db, migrationDirectory);
 
-      expect(getSchemaVersion(db)).toBe(6);
+      expect(getSchemaVersion(db)).toBe(8);
       expect(db.prepare(
         'SELECT version, description FROM schema_version ORDER BY version',
       ).all()).toEqual([
@@ -154,6 +162,8 @@ describe('schema v2 evaluator authority migration', () => {
         { version: 4, description: 'Evaluator correction attempts' },
         { version: 5, description: 'Delayed attention' },
         { version: 6, description: 'Group summary policy' },
+        { version: 7, description: 'Pi turn model invocations' },
+        { version: 8, description: 'Memory maintenance proposals' },
       ]);
       expect(db.prepare('SELECT value FROM legacy_sentinel').pluck().get()).toBe('preserved');
       expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
@@ -435,7 +445,7 @@ ${ownerCheck}`;
       expect(() => runMigrations(db, migrationDirectory)).toThrow();
 
       expect(schemaSnapshot(db)).toEqual(before);
-      expect(getSchemaVersion(db)).toBe(6);
+      expect(getSchemaVersion(db)).toBe(8);
       expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
     } finally {
       closeDatabase(db);
