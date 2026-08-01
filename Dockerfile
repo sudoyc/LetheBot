@@ -14,12 +14,14 @@ RUN pnpm install --frozen-lockfile --prod=false
 
 # Copy only build inputs
 COPY tsconfig.json ./
+COPY LICENSE README.md ./
 COPY src ./src
 COPY migrations ./migrations
 
 # Build and validate the runtime layout
 RUN pnpm build
 RUN pnpm release:preflight
+RUN pnpm release:pack-check
 
 # Keep only runtime dependencies for the final image
 RUN pnpm prune --prod
@@ -35,6 +37,8 @@ COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/migrations ./migrations
+COPY --from=build /app/LICENSE ./LICENSE
+COPY --from=build /app/README.md ./README.md
 
 # Create a private data directory for the image default runtime identity.
 RUN mkdir -p /app/data \

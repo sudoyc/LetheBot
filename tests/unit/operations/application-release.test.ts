@@ -116,7 +116,8 @@ function writeRelease(releaseDir: string): void {
   mkdirSync(join(releaseDir, 'dist'), { recursive: true });
   mkdirSync(join(releaseDir, 'migrations'), { recursive: true });
   mkdirSync(join(releaseDir, 'node_modules'), { recursive: true });
-  writeFileSync(join(releaseDir, 'dist/index.js'), 'export {};\n', 'utf8');
+  writeFileSync(join(releaseDir, 'dist/index.js'), "export const VERSION = '0.1.0';\n", 'utf8');
+  writeFileSync(join(releaseDir, 'LICENSE'), 'MIT License\n', 'utf8');
   writeFileSync(join(releaseDir, 'migrations/001_initial_schema.sql'), 'SELECT 1;\n', 'utf8');
   writeFileSync(
     join(releaseDir, 'migrations/002_evaluator_authority_ownership.sql'),
@@ -156,6 +157,8 @@ function writeRelease(releaseDir: string): void {
   writeFileSync(
     join(releaseDir, 'package.json'),
     `${JSON.stringify({
+      type: 'module',
+      version: '0.1.0',
       packageManager: 'pnpm@9.0.0',
       lethebotSchema: schemaContract,
     })}\n`,
@@ -594,7 +597,7 @@ describe('application release activation', () => {
       activateApplicationRelease({ rootDir, releaseId: 'B', supervisor, probe }),
     ).rejects.toMatchObject({
       code: 'preflight-failed',
-      diagnostics: ['unloadable-dist-entrypoint', 'invalid-package-json'],
+      diagnostics: ['invalid-package-json', 'unloadable-dist-entrypoint'],
     });
 
     expect(events).toEqual([]);

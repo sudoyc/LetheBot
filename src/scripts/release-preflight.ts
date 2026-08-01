@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { readMigrationPlan } from '../storage/migration-plan.js';
 import { CURRENT_SCHEMA_VERSION } from '../storage/schema-version.js';
+import { isSemanticVersion } from '../version.js';
 
 export type ReleasePreflightDiagnosticCode =
   | 'missing-dist-entrypoint'
@@ -11,12 +12,15 @@ export type ReleasePreflightDiagnosticCode =
   | 'missing-initial-migration'
   | 'invalid-migration-set'
   | 'missing-package-manifest'
+  | 'missing-license'
   | 'missing-lockfile'
   | 'unreadable-package-manifest'
   | 'unreadable-lockfile'
   | 'invalid-package-json'
   | 'invalid-package-manager'
+  | 'invalid-package-version'
   | 'invalid-schema-contract'
+  | 'dist-version-mismatch'
   | 'invalid-lockfile-version'
   | 'package-lock-major-mismatch';
 
@@ -46,11 +50,14 @@ const DIAGNOSTIC_MESSAGES: Record<ReleasePreflightDiagnosticCode, string> = {
   'missing-initial-migration': 'Required initial migration is missing.',
   'invalid-migration-set': 'Migration files do not match the schema target.',
   'missing-package-manifest': 'Required package manifest is missing.',
+  'missing-license': 'Required license file is missing.',
   'missing-lockfile': 'Required pnpm lockfile is missing.',
   'unreadable-package-manifest': 'Package manifest could not be read.',
   'unreadable-lockfile': 'Pnpm lockfile could not be read.',
   'invalid-package-json': 'Package manifest is not valid JSON metadata.',
   'invalid-package-manager': 'Package manager must be an exact pnpm semantic version.',
+  'invalid-package-version': 'Package manifest version is not a valid semantic version.',
+  'dist-version-mismatch': 'Built entrypoint version does not match the package manifest.',
   'invalid-schema-contract': 'Package manifest schema compatibility contract is invalid.',
   'invalid-lockfile-version': 'Pnpm lockfile version is missing or invalid.',
   'package-lock-major-mismatch': 'Pnpm and lockfile major versions do not match.',
@@ -92,13 +99,21 @@ function readRequiredTextFile(path: string): string | undefined {
   }
 }
 
-function isLoadableEntrypoint(projectRoot: string, entrypointPath: string): boolean {
+function inspectEntrypoint(
+  projectRoot: string,
+  entrypointPath: string,
+  expectedVersion: string | undefined,
+): 'loadable' | 'unloadable' | 'version-mismatch' {
+  const versionCheck = expectedVersion === undefined
+    ? ''
+    : `if (entrypoint.VERSION !== ${JSON.stringify(expectedVersion)}) process.exit(42);`;
+  // The candidate release root is runtime-selected, so a static import cannot inspect it.
   const result = spawnSync(
     process.execPath,
     [
       '--input-type=module',
       '--eval',
-      `await import(${JSON.stringify(pathToFileURL(entrypointPath).href)})`,
+      `const entrypoint = await import(${JSON.stringify(pathToFileURL(entrypointPath).href)}); ${versionCheck}`,
     ],
     {
       cwd: projectRoot,
@@ -107,7 +122,13 @@ function isLoadableEntrypoint(projectRoot: string, entrypointPath: string): bool
     },
   );
 
-  return result.status === 0 && result.error === undefined;
+  if (result.error !== undefined) {
+    return 'unloadable';
+  }
+  if (result.status === 42) {
+    return 'version-mismatch';
+  }
+  return result.status === 0 ? 'loadable' : 'unloadable';
 }
 
 function packageManagerMajor(content: string): string | undefined {
@@ -190,6 +211,7 @@ export function runReleasePreflight(projectRoot: string): ReleasePreflightResult
     migrations: join(projectRoot, 'migrations'),
     manifest: join(projectRoot, 'package.json'),
     lockfile: join(projectRoot, 'pnpm-lock.yaml'),
+    license: join(projectRoot, 'LICENSE'),
   };
   const diagnostics: ReleasePreflightDiagnostic[] = [];
   const migrationDirectoryExists = isDirectory(paths.migrations);
@@ -207,12 +229,11 @@ export function runReleasePreflight(projectRoot: string): ReleasePreflightResult
     migration: migrationSetValid,
     manifest: isRegularFile(paths.manifest),
     lockfile: isRegularFile(paths.lockfile),
+    license: isRegularFile(paths.license),
   };
 
   if (!existing.entrypoint) {
     addDiagnostic(diagnostics, 'missing-dist-entrypoint');
-  } else if (!isLoadableEntrypoint(projectRoot, paths.entrypoint)) {
-    addDiagnostic(diagnostics, 'unloadable-dist-entrypoint');
   }
   if (!migrationDirectoryExists) {
     addDiagnostic(diagnostics, 'missing-initial-migration');
@@ -223,9 +244,13 @@ export function runReleasePreflight(projectRoot: string): ReleasePreflightResult
   if (!existing.lockfile) {
     addDiagnostic(diagnostics, 'missing-lockfile');
   }
+  if (!existing.license) {
+    addDiagnostic(diagnostics, 'missing-license');
+  }
 
   let pnpmMajor: string | undefined;
   let schemaContract: ReleaseSchemaContract | undefined;
+  let packageVersion: string | undefined;
   if (existing.manifest) {
     const content = readRequiredTextFile(paths.manifest);
     if (content === undefined) {
@@ -238,11 +263,26 @@ export function runReleasePreflight(projectRoot: string): ReleasePreflightResult
         addDiagnostic(diagnostics, 'invalid-package-manager');
       }
       if (pnpmMajor !== undefined) {
+        const parsedPackage = JSON.parse(content) as Record<string, unknown>;
+        if (!isSemanticVersion(parsedPackage.version)) {
+          addDiagnostic(diagnostics, 'invalid-package-version');
+        } else {
+          packageVersion = parsedPackage.version;
+        }
         schemaContract = parseReleaseSchemaContract(content);
         if (schemaContract === undefined) {
           addDiagnostic(diagnostics, 'invalid-schema-contract');
         }
       }
+    }
+  }
+
+  if (existing.entrypoint) {
+    const entrypointStatus = inspectEntrypoint(projectRoot, paths.entrypoint, packageVersion);
+    if (entrypointStatus === 'unloadable') {
+      addDiagnostic(diagnostics, 'unloadable-dist-entrypoint');
+    } else if (entrypointStatus === 'version-mismatch') {
+      addDiagnostic(diagnostics, 'dist-version-mismatch');
     }
   }
 
@@ -281,7 +321,7 @@ function main(): void {
   const result = runReleasePreflight(process.cwd());
   if (result.ok) {
     process.stdout.write(
-      'Release preflight passed: 4 required files; pnpm/lockfile and schema contract valid.\n',
+      'Release preflight passed: 5 required files; pnpm/lockfile, version, license, and schema contract valid.\n',
     );
     return;
   }

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  readFileSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
@@ -11,9 +12,22 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   formatFatalErrorForConsole,
+  hello,
   isMainModuleInvocation,
   resolvePiApiKey,
+  VERSION,
 } from '../../src/index';
+
+describe('runtime version metadata', () => {
+  it('derives the public version from package.json', () => {
+    const manifest = JSON.parse(
+      readFileSync(new URL('../../package.json', import.meta.url), 'utf8'),
+    ) as { version: string };
+
+    expect(VERSION).toBe(manifest.version);
+    expect(hello()).toBe(`LetheBot v${manifest.version}`);
+  });
+});
 
 describe('main module invocation', () => {
   it('recognizes an entrypoint invoked through a managed release symlink', () => {

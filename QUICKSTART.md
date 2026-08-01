@@ -15,7 +15,7 @@
 
 ```bash
 cd ~/projects/LetheBot
-pnpm install
+pnpm install --frozen-lockfile
 ```
 
 ## 配置
@@ -63,14 +63,14 @@ pnpm exec vitest run tests/e2e/pi-real-api.test.ts --silent
 ### 开发模式
 
 ```bash
-pnpm dev
+pnpm dev:env
 ```
 
 ### 生产模式
 
 ```bash
 pnpm build
-pnpm start
+pnpm start:env
 ```
 
 ## 验证
@@ -83,7 +83,7 @@ curl http://localhost:6700/healthz
 
 预期响应：
 ```json
-{"status":"ok","version":"0.1.0"}
+{"status":"ok","version":"<package-version>"}
 ```
 
 ### 2. 发送测试事件

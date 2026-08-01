@@ -5,17 +5,39 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "lethebot-cli": "dist/cli/main.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "migrations",
+    "LICENSE",
+    "package.json",
+    "README.md"
+  ],
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "dev:env": "node --env-file=.env --import tsx --watch src/index.ts",
     "start": "node dist/index.js",
+    "start:env": "node --env-file=.env dist/index.js",
+    "ci:check": "pnpm typecheck && pnpm typecheck:test && pnpm lint && pnpm build && pnpm release:preflight && pnpm release:pack-check && pnpm smoke && pnpm test:coverage && git diff --check",
     "build": "tsc && node dist/scripts/copy-governance-browser-assets.js",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src tests --ext .ts",
-    "lint:fix": "eslint src tests --ext .ts --fix",
+    "typecheck:test": "tsc -p tsconfig.test.json --noEmit",
+    "lint": "eslint src tests scripts --ext .ts && eslint src/http/governance-browser-assets/*.js",
+    "lint:fix": "eslint src tests scripts --ext .ts --fix && eslint src/http/governance-browser-assets/*.js --fix",
     "release:preflight": "tsx src/scripts/release-preflight.ts",
-    "release:check": "pnpm typecheck && pnpm lint && pnpm build && pnpm release:preflight && pnpm test:run && git diff --check",
+    "release:pack-check": "tsx src/scripts/release-pack-check.ts",
+    "release:check": "pnpm typecheck && pnpm typecheck:test && pnpm lint && pnpm build && pnpm release:preflight && pnpm release:pack-check && pnpm test:run && git diff --check",
     "test": "vitest",
     "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "test:ui": "vitest --ui",
     "smoke": "tsx scripts/smoke-test.ts",
     "cli": "tsx src/cli/main.ts",
@@ -50,8 +72,16 @@
     "ai",
     "pi"
   ],
-  "author": "",
+  "author": "LetheBot contributors",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sudoyc/LetheBot.git"
+  },
+  "homepage": "https://github.com/sudoyc/LetheBot#readme",
+  "bugs": {
+    "url": "https://github.com/sudoyc/LetheBot/issues"
+  },
   "engines": {
     "node": ">=22.0.0"
   },
@@ -80,6 +110,7 @@
     "@types/node": "^22.10.2",
     "@typescript-eslint/eslint-plugin": "^8.18.2",
     "@typescript-eslint/parser": "^8.18.2",
+    "@vitest/coverage-v8": "^2.1.8",
     "@vitest/ui": "^2.1.8",
     "eslint": "^9.17.0",
     "tsx": "^4.19.2",

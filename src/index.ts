@@ -112,6 +112,7 @@ import type { IEvaluator } from './types/evaluator.js';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname } from 'node:path';
+import { VERSION } from './version.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -252,7 +253,7 @@ const GOVERNANCE_HTTP_PRIVACY_PREFERENCE_CHANGE_REASON =
 const GOVERNANCE_HTTP_GROUP_SUMMARY_POLICY_CHANGE_REASON =
   'governance_http_group_summary_policy_change_confirmed';
 
-export const VERSION = '0.1.0';
+export { VERSION };
 
 export function resolvePiApiKey(
   env: NodeJS.ProcessEnv = process.env,

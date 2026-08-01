@@ -21,19 +21,16 @@ Development mode uses MockPi and FakeOneBot for testing without real API keys or
 
 ```bash
 # 1. Install dependencies
-pnpm install
+pnpm install --frozen-lockfile
 
-# 2. Create environment file
+# 2. Run the deterministic CI-equivalent gate
+pnpm ci:check
+
+# 3. Create a local runtime environment file when needed
 cp .env.example .env
 
-# 3. Run tests
-pnpm test:run
-
-# 4. Type check
-pnpm typecheck
-
-# 5. Lint
-pnpm lint
+# 4. Start the configured development runtime
+pnpm dev:env
 ```
 
 ### Production Deployment
@@ -177,4 +174,4 @@ See [Tech Stack](docs/tech-stack.md) for details.
 
 ## License
 
-(To be determined)
+MIT. See [LICENSE](LICENSE).

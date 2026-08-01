@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Quality and runtime gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      LETHEBOT_BROWSER_TESTS: '1'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.0.0
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.18.0
+          cache: pnpm
+
+      - name: Resolve Chrome
+        shell: bash
+        run: |
+          browser_path="$(command -v google-chrome || command -v google-chrome-stable)"
+          test -n "$browser_path"
+          echo "LETHEBOT_BROWSER_EXECUTABLE_PATH=$browser_path" >> "$GITHUB_ENV"
+          "$browser_path" --version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run deterministic CI gate
+        run: pnpm ci:check
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.sha }}
+          path: coverage/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  image:
+    name: Build ${{ matrix.name }} image
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: runtime
+            dockerfile: Dockerfile
+          - name: local-acceptance
+            dockerfile: docker/local-acceptance/lethebot.Dockerfile
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build --file "${{ matrix.dockerfile }}" --tag "lethebot-ci:${{ matrix.name }}-${{ github.sha }}" .

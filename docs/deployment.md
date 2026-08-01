@@ -15,19 +15,19 @@
 开发模式使用本地数据库、Mock Pi runtime 和 FakeOneBot / HTTP fake tests，无需真实 API 密钥或真实 OneBot 运行时。
 
 ```bash
-pnpm install
+pnpm install --frozen-lockfile
+pnpm ci:check
 cp .env.example .env
-pnpm typecheck
-pnpm lint
-pnpm test:run
+pnpm dev:env
 ```
 
-LetheBot does not load `.env` implicitly. The deterministic checks above do not
-need it; pass the file explicitly only when starting a configured local runtime.
+The deterministic gate does not need `.env`. `dev:env` and `start:env` load the
+file explicitly; systemd and Docker Compose continue to inject a reviewed
+process environment directly.
 
 ## 生产 / 受控试运行配置
 
-创建 `.env` 文件并配置以下变量。变量名应和当前 `src/config/index.ts` / `src/index.ts` 保持一致。应用本身不会自动读取该文件；由 systemd、Docker Compose 或显式的 `node --env-file=.env` 启动参数注入。
+创建 `.env` 文件并配置以下变量。变量名应和当前 `src/config/index.ts` / `src/index.ts` 保持一致。应用本身不会隐式读取该文件；使用 `pnpm start:env`、systemd、Docker Compose 或显式的 `node --env-file=.env` 启动参数注入。
 
 ```bash
 # 基础配置

@@ -1,4 +1,4 @@
-#!/usr/bin/env tsx
+#!/usr/bin/env node
 /**
  * CLI Main Entry
  *
@@ -39,6 +39,7 @@ import type { ActionDecision, ActionExecutionResult, ActionType } from '../types
 import type { AuditEntry } from '../types/audit.js';
 import type { MemoryRecord, MemorySource } from '../types/memory.js';
 import type { ToolCallResult } from '../types/tool.js';
+import { VERSION } from '../version.js';
 
 const program = new Command();
 
@@ -655,7 +656,7 @@ program
   })
   .name('lethebot-cli')
   .description('LetheBot governance CLI')
-  .version('0.1.0')
+  .version(VERSION)
   .hook('preAction', (_thisCommand, actionCommand) => {
     rejectEmptyStringOptionValues(actionCommand);
   });

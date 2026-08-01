@@ -20,7 +20,7 @@
 
 - **Node.js**: >= 22.0.0
 - **包管理器**: pnpm 9.0.0
-- **TypeScript**: 5.7.2
+- **TypeScript**: 由 `pnpm-lock.yaml` 锁定；用 `pnpm exec tsc --version` 查看当前版本
 
 ### 快速启动
 
@@ -30,19 +30,13 @@ git clone <repository-url>
 cd LetheBot
 
 # 安装依赖
-pnpm install
+pnpm install --frozen-lockfile
 
-# 复制环境配置
+# 复制环境配置（仅本地运行需要）
 cp .env.example .env
 
-# 运行类型检查
-pnpm typecheck
-
-# 运行 Linter
-pnpm lint
-
-# 运行测试
-pnpm test
+# 运行与 CI 相同的确定性门禁
+pnpm ci:check
 ```
 
 ---
@@ -392,9 +386,8 @@ Reviewer 应检查：
 
 ### 合并要求
 
-- ✅ 所有测试通过（`pnpm test:run`）
-- ✅ 类型检查通过（`pnpm typecheck`）
-- ✅ Linter 检查通过（`pnpm lint`）
+- ✅ 完整 CI 门禁通过（`pnpm ci:check`）
+- ✅ 发布门禁通过（`pnpm release:check`）
 - ✅ 至少 1 名 Reviewer 批准
 - ✅ 无未解决的讨论
 
@@ -564,7 +557,7 @@ pnpm test:run
 pnpm test tests/unit/memory/repository.test.ts
 
 # 生成覆盖率报告
-pnpm test:run --coverage
+pnpm test:coverage
 
 # 监视模式（开发时使用）
 pnpm test --watch

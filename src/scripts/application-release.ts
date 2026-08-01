@@ -1363,6 +1363,8 @@ function copyCrossVersionRelease(sourceDir: string, releaseDir: string): void {
   mkdirSync(releaseDir, { recursive: true });
   cpSync(join(sourceDir, 'dist'), join(releaseDir, 'dist'), { recursive: true });
   cpSync(join(sourceDir, 'migrations'), join(releaseDir, 'migrations'), { recursive: true });
+  cpSync(join(sourceDir, 'LICENSE'), join(releaseDir, 'LICENSE'));
+  cpSync(join(sourceDir, 'README.md'), join(releaseDir, 'README.md'));
   cpSync(join(sourceDir, 'package.json'), join(releaseDir, 'package.json'));
   cpSync(join(sourceDir, 'pnpm-lock.yaml'), join(releaseDir, 'pnpm-lock.yaml'));
   symlinkSync(
@@ -1496,6 +1498,8 @@ function copyRehearsalRelease(releaseDir: string): void {
   mkdirSync(releaseDir, { recursive: true });
   cpSync(join(PROJECT_ROOT, 'dist'), join(releaseDir, 'dist'), { recursive: true });
   cpSync(join(PROJECT_ROOT, 'migrations'), join(releaseDir, 'migrations'), { recursive: true });
+  cpSync(join(PROJECT_ROOT, 'LICENSE'), join(releaseDir, 'LICENSE'));
+  cpSync(join(PROJECT_ROOT, 'README.md'), join(releaseDir, 'README.md'));
   cpSync(join(PROJECT_ROOT, 'package.json'), join(releaseDir, 'package.json'));
   cpSync(join(PROJECT_ROOT, 'pnpm-lock.yaml'), join(releaseDir, 'pnpm-lock.yaml'));
   symlinkSync('../../node_modules', join(releaseDir, 'node_modules'), 'dir');

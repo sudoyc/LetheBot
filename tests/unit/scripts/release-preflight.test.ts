@@ -23,7 +23,8 @@ function createProjectFixture(options: {
 
   mkdirSync(join(projectRoot, 'dist'), { recursive: true });
   mkdirSync(join(projectRoot, 'migrations'), { recursive: true });
-  writeFileSync(join(projectRoot, 'dist/index.js'), 'export {};\n', 'utf8');
+  writeFileSync(join(projectRoot, 'dist/index.js'), "export const VERSION = '0.1.0';\n", 'utf8');
+  writeFileSync(join(projectRoot, 'LICENSE'), 'MIT License\n', 'utf8');
   writeFileSync(join(projectRoot, 'migrations/001_initial_schema.sql'), 'SELECT 1;\n', 'utf8');
   writeFileSync(join(projectRoot, 'migrations/002_governed_context.sql'), 'SELECT 2;\n', 'utf8');
   writeFileSync(join(projectRoot, 'migrations/003_evaluator_invocations.sql'), 'SELECT 3;\n', 'utf8');
@@ -35,6 +36,8 @@ function createProjectFixture(options: {
   writeFileSync(
     join(projectRoot, 'package.json'),
     options.packageJson ?? JSON.stringify({
+      type: 'module',
+      version: '0.1.0',
       packageManager: 'pnpm@9.0.0',
       lethebotSchema: schemaContract,
     }),
@@ -57,7 +60,7 @@ describe('release preflight', () => {
 
     expect(result).toEqual({
       ok: true,
-      checkedFileCount: 4,
+      checkedFileCount: 5,
       diagnostics: [],
       schemaContract,
     });
@@ -91,6 +94,7 @@ describe('release preflight', () => {
     ['migrations/008_memory_maintenance_proposals.sql', 'invalid-migration-set'],
     ['package.json', 'missing-package-manifest'],
     ['pnpm-lock.yaml', 'missing-lockfile'],
+    ['LICENSE', 'missing-license'],
   ])('fails closed when %s is missing', (relativePath, expectedCode) => {
     const projectRoot = createProjectFixture();
     rmSync(join(projectRoot, relativePath));
@@ -113,6 +117,37 @@ describe('release preflight', () => {
     expect(result.ok).toBe(false);
     expect(result.diagnostics.map((diagnostic) => diagnostic.code)).toContain(
       'invalid-migration-set',
+    );
+  });
+
+  it('rejects a built entrypoint version that differs from package.json', () => {
+    const projectRoot = createProjectFixture();
+    writeFileSync(
+      join(projectRoot, 'dist/index.js'),
+      "export const VERSION = '0.1.1';\n",
+      'utf8',
+    );
+
+    const result = runReleasePreflight(projectRoot);
+
+    expect(result.ok).toBe(false);
+    expect(result.diagnostics.map((diagnostic) => diagnostic.code)).toContain(
+      'dist-version-mismatch',
+    );
+  });
+
+  it('rejects a package manifest without a valid semantic version', () => {
+    const result = runReleasePreflight(createProjectFixture({
+      packageJson: JSON.stringify({
+        packageManager: 'pnpm@9.0.0',
+        version: '01.0.0',
+        lethebotSchema: schemaContract,
+      }),
+    }));
+
+    expect(result.ok).toBe(false);
+    expect(result.diagnostics.map((diagnostic) => diagnostic.code)).toContain(
+      'invalid-package-version',
     );
   });
 
@@ -206,7 +241,7 @@ describe('release preflight', () => {
     expect(result.status, result.stderr).toBe(0);
     expect(result.stderr).toBe('');
     expect(result.stdout).toBe(
-      'Release preflight passed: 4 required files; pnpm/lockfile and schema contract valid.\n',
+      'Release preflight passed: 5 required files; pnpm/lockfile, version, license, and schema contract valid.\n',
     );
     expect(result.stdout).not.toContain(projectRoot);
   });
@@ -224,11 +259,11 @@ describe('release preflight', () => {
 
     expect(result.status).toBe(1);
     expect(result.stdout).toBe('');
-    expect(result.stderr).toContain('Release preflight failed: 4 issue(s).');
+    expect(result.stderr).toContain('Release preflight failed: 5 issue(s).');
     expect(result.stderr).not.toContain(projectRoot);
     expect(result.stderr).not.toContain('sk-secret');
     expect(result.stderr).not.toContain('1234567890');
     expect(result.stderr.length).toBeLessThan(1_024);
-    expect(result.stderr.trim().split('\n')).toHaveLength(5);
+    expect(result.stderr.trim().split('\n')).toHaveLength(6);
   });
 });

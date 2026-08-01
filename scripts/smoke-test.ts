@@ -5,21 +5,21 @@
  * 快速验证 LetheBot 核心功能
  */
 
-import { initDatabase, runMigrations, closeDatabase } from '../src/storage/database';
-import { MemoryRepository } from '../src/storage/memory-repository';
-import { IdentityRepository } from '../src/storage/identity-repository';
-import { AttentionEngine } from '../src/attention/engine';
-import { MockPi } from '../src/pi/mock-pi';
-import { ContextBuilder } from '../src/context/builder';
-import { ToolRegistry } from '../src/tools/registry';
-import { PolicyGate } from '../src/policy/gate';
-import { BackgroundWorker } from '../src/workers/background';
-import { GovernanceCLI } from '../src/cli/governance';
+import { initDatabase, runMigrations, closeDatabase } from '../src/storage/database.js';
+import { MemoryRepository } from '../src/storage/memory-repository.js';
+import { IdentityRepository } from '../src/storage/identity-repository.js';
+import { AttentionEngine } from '../src/attention/engine.js';
+import { MockPi } from '../src/pi/mock-pi.js';
+import { ContextBuilder } from '../src/context/builder.js';
+import { ToolRegistry } from '../src/tools/registry.js';
+import { PolicyGate } from '../src/policy/gate.js';
+import { BackgroundWorker } from '../src/workers/background.js';
+import { GovernanceCLI } from '../src/cli/governance.js';
 import { join, dirname } from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { redactSecretsInText } from '../src/memory/secret-scan';
+import { redactSecretsInText } from '../src/memory/secret-scan.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -185,15 +185,13 @@ export async function smokeTest(): Promise<void> {
     console.log('4️⃣  MockPi (reasoning core stub)...');
     const pi = new MockPi();
     const piResult = await pi.run({
-      turnId: 'smoke-turn',
-      conversationId: 'smoke-conv',
       contextPack: {
         id: 'ctx-001',
         turnId: 'smoke-turn',
+        createdAt: new Date(),
         conversation: {
           conversationId: 'smoke-conv',
           conversationType: 'private',
-          participants: [],
         },
         recentMessages: [
           {
@@ -205,11 +203,20 @@ export async function smokeTest(): Promise<void> {
             isFromBot: false,
           },
         ],
-        memory: { retrievedFacts: [], totalRetrieved: 0 },
-        tokenBudget: { max: 4000, used: 100, available: 3900 },
-        metadata: { buildTimestamp: new Date(), retrievalLatencyMs: 10 },
+        memory: { retrievedFacts: [], selectedMemoryIds: [] },
+        participants: [],
+        injectedIdentityFields: [],
+        tokenBudget: {
+          max: 4000,
+          used: 100,
+          breakdown: {
+            recentMessages: 100,
+            memory: 0,
+            identity: 0,
+            system: 0,
+          },
+        },
       },
-      toolRegistry: [],
     });
 
     if (!piResult.responseText || piResult.responseText.length === 0) {
@@ -240,7 +247,7 @@ export async function smokeTest(): Promise<void> {
       name: 'smoke_tool',
       version: '1.0.0',
       description: 'Smoke test tool',
-      capabilities: ['test'],
+      capabilities: ['read_context'],
       permissions: {
         allowedActors: ['user'],
         allowedContexts: ['private_chat'],

@@ -17,17 +17,24 @@ pnpm exec vitest run tests/integration/e2e-conversation.test.ts -t "failed turn"
 # All default deterministic tests
 pnpm test:run
 
-# Static checks
+# Static checks, including source, tests, and scripts
 pnpm typecheck
+pnpm typecheck:test
 pnpm lint
-git diff --check
 
-# Release gate: typecheck, lint, build, artifact preflight, default tests, diff hygiene
+# Coverage regression gate
+pnpm test:coverage
+
+# Release gate: build, runtime/version/license/package checks, tests, diff hygiene
 pnpm release:check
+
+# CI-equivalent gate: release checks plus smoke and coverage
+pnpm ci:check
 ```
 
 `pnpm test` starts Vitest's interactive development mode. Automation and
-completion evidence use `pnpm test:run` or `pnpm release:check`.
+completion evidence use `pnpm test:run`, `pnpm release:check`, or
+`pnpm ci:check`. The CI workflow also builds both maintained Dockerfiles.
 
 Do not hardcode pass counts in stable documentation. Counts change as focused
 regressions are added; command exit status and the current output are evidence.
