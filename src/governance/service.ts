@@ -33,15 +33,19 @@ import {
 } from '../storage/privacy-preference-repository.js';
 import type { MemoryRecord } from '../types/memory.js';
 import type { ActorClass, InvocationContext } from '../types/tool.js';
+import type {
+  DisplayProfileRedactionSnapshot,
+  PlatformAccountUnlinkSnapshot,
+} from './query-contracts.js';
+import {
+  redactGovernanceDisplayString,
+  redactGovernanceStructuredValue,
+} from './query-projections.js';
 import {
   deriveDisplayProfileTargetResourceId,
   readDisplayProfileRedactionSnapshot,
   readPlatformAccountUnlinkSnapshot,
-  redactGovernanceDisplayString,
-  redactGovernanceStructuredValue,
-  type DisplayProfileRedactionSnapshot,
-  type PlatformAccountUnlinkSnapshot,
-} from './query-service.js';
+} from './query-snapshots.js';
 import {
   parseQqGovernanceCommand,
   type QqGovernanceCommand,
