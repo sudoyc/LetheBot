@@ -5,7 +5,7 @@
  * 用于测试和开发阶段
  */
 
-import { ulid } from 'ulid';
+import { ulid } from 'ulidx';
 import type {
   IEvaluator,
   ToolEvaluationRequest,
