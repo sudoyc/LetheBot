@@ -177,6 +177,111 @@ group boundary: private turns do not expose the tool, and group turns without a
 current group identifier receive only a rejected no-data result rather than a
 fallback summary from any other group.
 
+Built-in `runtime.status` is a read-only local operations tool available only to
+`owner` and `admin` actors in `private_chat`. It uses `read_local`, bypasses
+evaluator review, uses `redacted_full` audit, declares `normal` output, and has
+no filesystem or network access. In-process execution is limited to 1,000 ms
+and 4,096 output bytes. Empty-object input returns only fixed health, readiness,
+database, and gateway states plus aggregate pending-event, process-lifetime
+event-failure, job-status, and worker-status counts. It returns no identifiers,
+paths, payloads, messages, configuration, or diagnostics. Invalid local state,
+reader failure, or database-query failure produces the same fixed
+`runtime_status_unavailable` shape with unknown states and null counts. The
+handler performs no durable writes; normal Pi execution still creates the
+standard linked terminal `tool_calls` and redacted audit evidence.
+
+Built-in `runtime.tools` is a read-only catalog inspector available only to
+`owner` and `admin` actors in `private_chat`. It uses `read_local`, bypasses
+evaluator review, uses `redacted_full` audit, declares `secret_possible`
+output, and has no filesystem or network access. In-process execution is
+limited to 1,000 ms and 8,192 output bytes. Empty-object input returns at most
+32 entries in deterministic canonical-name order. Each entry contains only a
+bounded redacted tool name, declared capabilities, current actor/context
+availability, and whether evaluator review is required. Aggregate fields give
+registered, available, and listed counts plus truncation and redaction flags.
+
+The same result reports only coarse optional registration state: workspace is
+enabled when both reviewed workspace tools are registered, and web fetch is
+enabled when its bounded origin metadata is present, with only the origin count
+returned. Workspace roots, origin values, permission identifier lists,
+descriptions, handlers, payloads, credentials, private identifiers, and
+diagnostics are never returned. The handler does not mutate the registry,
+configuration, filesystem, network, or durable domain state and has no
+prepared effect, retry, or compensation path. Static environment configuration
+remains the enable/disable boundary; ordinary Pi execution adds only the
+standard linked terminal `tool_calls` and redacted audit evidence.
+
+Built-in `workspace.list` is absent by default and is registered only when
+`LETHEBOT_WORKSPACE_ROOT` names an absolute existing directory. The resolved
+root is captured at composition time; tool input cannot replace or widen it.
+The tool is available only to `owner` and `admin` actors in `private_chat`, uses
+`read_local`, bypasses evaluator review, uses `redacted_full` audit, declares
+`secret_possible` output, and runs in-process with readonly filesystem, no
+network, a 1,000-ms limit, and an 8,192-byte output limit. Each call accepts one
+clean relative directory path, lists non-hidden entries non-recursively, scans
+at most 200 entries, returns at most 100 sorted relative names with coarse
+file/directory/symlink type and file size, and marks truncation explicitly.
+Entry symlinks are described with `lstat` metadata and never followed; a
+requested directory resolves inside the immutable root or fails closed. Hidden,
+absolute, traversal, control-character, and backslash paths are rejected.
+Secret/platform-shaped names are redacted, and filesystem failures use fixed
+path-free errors. The tool reads no file content and performs no filesystem or
+durable domain mutation; ordinary Pi terminal tool/audit evidence still applies.
+The legacy `list_directory`, read/write/delete, and general network entries
+remain unregistered.
+
+Built-in `workspace.read_text` shares the same default-off configured root,
+private owner/admin permission, `read_local`, evaluator bypass, `redacted_full`
+audit, `secret_possible` output, readonly/no-network in-process sandbox, 1,000-ms
+runtime limit, and 8,192-byte output limit. It accepts one clean relative file
+path and reads at most 2,048 bytes through a no-follow descriptor. Every path
+component must exist without a symlink, the leaf must be a regular file, and
+the complete path must remain beneath the captured root. Hidden, absolute,
+traversal, control-character, backslash, credential-shaped, database, log,
+key/certificate, and runtime-data paths are rejected before content access.
+Content must decode as strict UTF-8 and contain no disallowed control bytes;
+the returned relative path and content are secret/platform-redacted with a byte
+count and redaction marker. Errors are fixed and path-free. Reading changes no
+file content or modification time; OS-managed access time is not part of the
+no-write guarantee. The legacy binary/base64 `read_file` remains unregistered.
+
+Built-in `web.fetch_text` is independently absent by default and is registered
+only when `LETHEBOT_WEB_FETCH_ALLOWED_ORIGINS` contains one to 16 unique exact
+HTTPS origins. It is available only to `owner` and `admin` actors in
+`private_chat`, declares `network` plus `external_side_effect`, requires
+evaluator approval, uses `redacted_full`, has no filesystem access, and uses
+restricted in-process network execution with a 5,000-ms runtime limit, an
+8,192-byte output limit, exact `allowedOrigins` metadata, and
+`secret_possible` output. The handler also requires the persisted evaluator
+decision ID before resolving a destination.
+
+Input is one URL of at most 2,048 characters. There is no caller-selected
+method, header, body, cookie, credential, timeout, or redirect policy. The tool
+sends a header-fixed GET only after rejecting userinfo, fragments, control/
+backslash syntax, non-matching origins, and secret/platform-shaped path or query
+data. A hostname resolves to at most 16 A/AAAA results; an empty, malformed,
+mixed-public/private, or wholly non-public answer fails before transport. A
+literal address is subject to the same public-address rules. One validated
+address is pinned into the HTTPS lookup while the original hostname remains the
+TLS and Host identity. Redirects are limited to three and must retain the exact
+initiating origin; every hop is validated, resolved, and pinned again.
+
+Only `2xx`, allowlisted textual media types with absent/UTF-8 charset, identity
+content encoding, strict UTF-8, and no disallowed control content succeed.
+Declared and streamed source bytes are capped at 2,048; the final redacted JSON
+envelope is capped at 8,192. Output contains final redacted URL, numeric status,
+normalized content type, redacted content, source-byte count, redirect count,
+and redaction flag. It omits arbitrary response headers, status text, bodies on
+failure, and transport diagnostics. Errors are fixed; the tool never retries.
+The dormant general `network_request` remains unchanged and unregistered.
+
+Evaluator approval is the final authorization before the external request, but
+an external GET is not a `PreparedLocalToolEffect`: remote observation or
+logging cannot be atomically committed with SQLite or compensated afterward.
+Unregistering the tool prevents future calls only. Normal Pi execution links
+the completed evaluator invocation/decision, terminal tool call, redacted
+audit, and turn; evaluator or permission denial performs no DNS/transport call.
+
 ## Evaluator Policy
 
 P0 evaluator policy has two values:
@@ -294,6 +399,7 @@ interface SandboxPolicy {
   maxOutputBytes?: number;
   allowedPaths?: string[];
   allowedDomains?: string[];
+  allowedOrigins?: string[];
 }
 ```
 
@@ -368,6 +474,9 @@ Initial output sensitivity values:
 - `secret_possible`
 
 `secret_possible` outputs must be scanned before audit, memory proposal, or prompt injection.
+For `web.fetch_text`, only the bounded body and final URL enter output; both are
+redacted before return. Remote headers, status text, and network diagnostics are
+never exposed, and fixed failures contain none of those values.
 For `network_request`, this includes response bodies, response headers,
 response `statusText`, and thrown network error messages before the handler
 returns them to Pi/tool-call callers. Adjacent secret/platform fragments such as

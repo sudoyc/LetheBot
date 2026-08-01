@@ -95,17 +95,23 @@ The only mutable evidence/status checkpoint is
 old loop-state files, gap analyses, prompt files, or historical test counts as
 current completion evidence.
 
-The latest controlled audit found the OneBot transport, SQLite persistence,
-outbound delivery, and extraction worker operational. It also found that the
-bot is not yet reliably usable for multi-person quoted group conversation:
-historical speakers collapse in prompt context, quote relations do not reach
-Pi, ordinary relevance is conflated with evaluator risk, and group continuity
-has no active/selected memory or summaries.
+The latest recorded controlled audit found the OneBot transport, SQLite
+persistence, outbound delivery, and extraction worker operational, but the
+overall product verdict remains `EXPERIMENTAL_NOT_NORMAL`. The audited live
+runtime delivered 57 of 65 group mentions and 8 of 12 reply-to-bot turns.
+Speaker/quote, evaluator, delayed Attention, governance, restart-memory, and
+retrieval fixes are substantially deterministic-ready, but the audited live
+runtime predates those fixes.
 
-The active repair is defined by:
+The active next-stage program first closes ingress trust, request bounding,
+logging privacy, worker fairness, Pi concurrency, and Pi invocation accounting;
+it then proceeds through controlled live acceptance, governed memory
+maintenance, product tools, application decomposition, governance UX, and
+release soak:
 
-- [Group Chat Reliability Constraints](docs/group-chat-reliability-constraints.md)
-- [Group Chat Reliability Goal Prompt](docs/prompts/group-chat-reliability-goal.md)
+- [Long-Term Development Program And Constraints](docs/long-term-development-constraints.md)
+- [Long-Term Development Goal Prompt](docs/prompts/repair-and-long-term-development-goal.md)
+- [Current Goal State](docs/long-running-goal-state.md)
 - [Test Strategy Behavior Matrix](docs/test-strategy.md#conversation-reliability-matrix)
 - [Local Container Behavior Canary](docs/local-container-acceptance.md#验收步骤)
 
@@ -120,8 +126,9 @@ Start here:
 - [Agent Instructions](AGENTS.md) - Contribution rules
 - [Documentation Index](docs/README.md) - All design docs
 - [Architecture](docs/architecture.md) - System design
-- [Current Goal State](docs/long-running-goal-state.md) - Current evidence and ordered repair route
-- [Reliability Constraints](docs/group-chat-reliability-constraints.md) - Active scoped invariants
+- [Current Goal State](docs/long-running-goal-state.md) - Current evidence, phase, and exact next slice
+- [Long-Term Development Constraints](docs/long-term-development-constraints.md) - Active P0-P9 program and completion contract
+- [Reliability Constraints](docs/group-chat-reliability-constraints.md) - Scoped conversation invariants reused by the program
 - [Deployment Guide](docs/deployment.md) - Production setup
 
 Key concepts:

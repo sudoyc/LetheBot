@@ -141,6 +141,17 @@ Tests should preserve these P0 boundaries.
   duplicate ingress, successful delivery, handled send failure, and thrown
   persistence failure retain their distinct durable contracts.
 - Prepared local tool effects and their terminal evidence commit atomically.
+- Production tool exposure is an exact reviewed allowlist. Dormant file/network
+  handlers are absent from the application registry; `runtime.status` is
+  visible only to private owner/admin turns and returns fixed aggregate output
+  or a diagnostic-free unavailable shape without durable domain writes.
+  `runtime.tools` is likewise private owner/admin and returns only a bounded,
+  redacted registry projection plus coarse optional-tool state. An unset
+  workspace root and empty origin list preserve that six-tool catalog; an
+  explicit absolute root produces eight tools, an independently configured
+  exact HTTPS-origin list produces seven, and both options compose to nine.
+  No catalog includes a legacy read/write/delete or general `network_request`
+  entry.
 - Output limits and cooperative deadlines remain bounded; tests cover
   pre-abort, timer expiry, synchronous elapsed overruns, wait-for-settlement,
   cleanup/reuse, fixed failure evidence, and no late prepared-effect commit
@@ -184,6 +195,7 @@ or database rows into the repository.
 | `REL-MEM-01` | No memory effect, proposal success/failure, active memory, and unrelated or ambiguous evidence | No effect, failed/partial proposal, inactive/unselected memory, target mismatch, unsafe proposition, and unrelated or ambiguous evidence produce neutral wording; a fully committed same-turn `memory.propose` effect produces pending-review wording; only exact selected active evidence permits durable wording. Returned and stored decisions carry the same guard suppressor and action text, delivered text equals the persisted bot response, the turn retains the pre-guard Pi draft, ordinary non-claim language is unchanged, and foreign keys remain clean. |
 | `REL-MEM-02` | Private recall, group proposal, opted-in group summary, and restart | Private memory recalls only in allowed scope; group-derived user memory stays proposed/same-group; summary requires per-group opt-in; approved memory remains available after process/container restart. |
 | `REL-MEM-03` | Opted-in group-summary frozen-window continuity | Canonical local-ingress planning freezes exact post-budget sources; discovery/action routes converge; policy races and invalid source sets fail before Provider/effect; later old-clock rows cannot join; completed windows are disjoint and terminally failed windows do not block newer sources; pending/running sources survive retention; final memory and invocation sources match; integrity and foreign keys remain clean. |
+| `REL-MAINT-01` | Conflict/consolidation/decay proposal inspection, review, apply, and rollback | Normalized proposal reads contain no memory payload/source IDs and apply exact user/private-conversation/group/operator predicates before limits. Approve/reject/expire compare exact state/revision and atomically write one actor audit plus one contiguous proposal revision without memory effects. Apply requires an exact approved revision, recomputes record/source fingerprints and boundaries, requires an explicit conflict retained candidate, and atomically writes retained/superseded or disabled memory revisions/audits plus proposal revision-effect evidence while preserving all records/sources. Superseded/disabled memory is immediately absent from active retrieval. Rollback requires an exact applied revision, consumes normalized apply links, and requires every linked apply revision to remain uniquely latest with matching current memory/source/scope evidence; it atomically appends restore revisions/audits, a rolled-back proposal revision/audit, and restored links so every candidate returns to active retrieval without rewriting history. Exact apply and rollback retries remain write-free across reopen; stale snapshots and competing choices have zero effects; two connections produce one winner; injected failures at memory, audit, proposal-revision, and effect-link stages roll back the whole operation; integrity and foreign keys remain clean. |
 | `REL-GOV-01` | QQ/CLI list, forget, summary lifecycle, and prior-turn explanation | The 512-character exact parser, one canonical raw/chat derivation, canonical `qq-group-[1-9][0-9]{4,11}` scope, and persisted identity proof enforce bot-owner/exact-group authority; group listing/forget stay group-safe while private bot-owner and known-ID authority follow their wider contracts. Forget is immediately unretrievable with revision/audit evidence and bounded ID/decision projections. Summary is default-off, idempotent, generation/audit bound, cancel-on-disable, and no-backfill across persisted chat ingress, pending-normalization raw ingress, or rollback/future clocks; redacted policy audits correlate through `groupIdHash`. The mutation/audit and reply decision commit atomically before send; injected decision failure rolls them back. `/why` selects only the latest prior exact-conversation ingress. CLI records `local_admin`; replies, titles, stderr, and audit bodies are bounded/redacted, deduplicated, executor-routed, and preserve the completed-turn/failed-execution contract on handled send failure. Integrity and foreign keys remain clean. |
 | `REL-RET-01` | At least 12 synthetic retrieval queries, each with one expected same-scope source, eight or more newer/higher-importance same-scope distractors, and incompatible-scope records | Existing ranking may skip R8 only when the expected source is selected in 12/12 under production count/token limits, incompatible selections are zero, and selection/rejection trace reasons are complete; otherwise query/FTS/quote/thread ranking is required. |
 | `REL-SCOPE-01` | Similar users/messages across two groups | History, quote targets, participant refs, memory, action targets, and bot responses remain in the exact conversation; integrity and foreign-key checks are clean. |
@@ -205,6 +217,27 @@ Minimum test ownership:
   `tests/unit/evaluator/pi-ai-client.test.ts` across social, memory, and tool
   domains, plus schema-migration/model-invocation repository tests and DB-backed
   social, memory, and required-tool terminal evidence;
+- production tool catalog, runtime status, workspace access, and bounded fetch:
+  `tests/unit/index-pi-runtime.test.ts` owns the exact registered inventory,
+  `tests/unit/tools/runtime-tools.test.ts` owns bounded/redacted inventory,
+  current-context availability, evaluator flags, coarse optional registration,
+  fixed failures, cancellation, output limits, and no registry mutation,
+  `tests/unit/tools/runtime-status.test.ts` owns metadata, permissions, schema,
+  aggregate reads, fixed failures, integrity, and no-write behavior,
+  `tests/unit/tools/workspace-list.test.ts` owns root/path/symlink bounds,
+  metadata, deterministic entry limits, redaction, cancellation, fixed failures,
+  and no filesystem mutation; `tests/unit/tools/workspace-read-text.test.ts`
+  owns sensitive-path and symlink exclusion, strict UTF-8/byte/output bounds,
+  redaction, cancellation, fixed failures, and no content/mtime mutation;
+  `tests/unit/tools/web-fetch-text.test.ts` owns exact-origin input, permission/
+  approval prerequisites, public-address classification, DNS pinning, literal
+  IP handling, production GET/header projection, same-origin redirect bounds,
+  content status/type/encoding/byte/UTF-8 bounds, cancellation, redaction,
+  fixed failures, output size, and zero retry with injected resolver/transport
+  fixtures only; and
+  `tests/unit/pi/pi-adapter.test.ts` owns actor-context exposure plus linked
+  evaluator/invocation/tool-call/audit/turn evidence. These tests never perform
+  real DNS or network access;
 - memory-claim truthfulness:
   `tests/unit/actions/memory-claim-truthfulness.test.ts` for evidence binding,
   correction, safe echo, and ordinary-language boundaries, plus the focused
@@ -212,7 +245,10 @@ Minimum test ownership:
   delivery, bot-response, raw-draft, and foreign-key integrity;
 - memory/governance/worker scenarios:
   focused memory extraction, retrieval/injection, summary-worker, governance,
-  scheduler, and full-memory-cycle suites. `REL-MEM-03` additionally belongs to
+  scheduler, and full-memory-cycle suites. `REL-MAINT-01` belongs to
+  `tests/unit/storage/memory-maintenance-proposal-repository.test.ts`, the three
+  maintenance worker tests, and `tests/unit/governance/service.test.ts`.
+  `REL-MEM-03` additionally belongs to
   the group-summary job service, index wiring, action executor, SQLite
   maintenance, summary integration, and frozen-window conversation E2E suites.
 - QQ governance grammar, source proof, authority, redaction, listing, forget,

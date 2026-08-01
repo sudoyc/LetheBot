@@ -94,6 +94,21 @@ Decision:
 - Permissions combine actor class, invocation context, and allowlist/denylist.
 - Audit defaults to at least `summary`; `full` is owner/debug only and still secret-scanned.
 - Sandbox policy is object-shaped over filesystem, network, execution backend, and limits.
+- Production exposure is an explicit reviewed registration allowlist, not a
+  consequence of a handler existing. Local runtime status is private
+  owner/admin aggregate output only and never includes diagnostic payloads.
+- Workspace access is default-off and rooted in one explicitly configured,
+  composition-time-resolved absolute directory. Production access is limited to
+  bounded non-recursive listing and a strict small UTF-8 text read that rejects
+  symlinks and credential/runtime-data paths; legacy general file operations
+  remain dormant.
+- Network text fetch is a separate default-off production tool configured by at
+  most 16 exact HTTPS origins. It is private owner/admin, evaluator-required,
+  GET-only, address-validated and pinned, same-origin redirect bounded, and
+  strict UTF-8/output bounded. The legacy general request handler stays dormant.
+  Evaluator approval is the final pre-request authorization; a completed GET is
+  not a transactional local prepared effect, is never retried by the tool, and
+  cannot be rolled back after the remote endpoint observes it.
 
 Primary docs:
 
@@ -228,6 +243,28 @@ Decision:
 - A QQ governance mutation and its reply action decision commit atomically
   before delivery. Decision-persistence failure rolls the mutation and audit
   back while the local turn/admission records the failure.
+- Maintenance proposal review is a shared-service boundary, not scanner
+  authority. Local admin and a verified private bot owner are broad; exact users
+  own only their user/private-conversation boundary; group users own only their
+  exact same-group user boundary; and a verified group owner/admin or bot owner
+  in group context receives only the existing exact-group safe set. Subject
+  identity grants nothing. Approve/reject/expire compare the expected state and
+  revision and atomically write proposal, audit, and proposal-revision evidence;
+  they do not apply memory effects. No QQ/CLI review grammar is added yet.
+- Maintenance apply is a separate shared-service operation from an exact
+  approved proposal revision. It revalidates the frozen record/source snapshot
+  and boundary in its write transaction. Conflict requires an explicit retained
+  candidate, consolidation retains its normalized target, and decay disables
+  its normalized target. Every candidate receives linked revision/audit
+  evidence; records and sources are preserved; stale/competing applications
+  have zero effects; and exact retry is idempotent across reopen. Rollback is a
+  separate shared-service operation from the exact applied revision. It consumes
+  normalized apply links, requires those memory revisions and snapshots plus
+  source/scope evidence to remain current, and appends restore revisions/audits,
+  a rolled-back proposal revision/audit, and restored effect links atomically.
+  It restores every candidate to active without rewriting history; exact retry
+  is reopen-safe, and stale/competing or failed rollback has zero effects. No
+  QQ/CLI apply or rollback grammar is added yet.
 - Policy audit display fields redact platform/secret-shaped group and source
   identifiers while a purpose-bound SHA-256 `groupIdHash` preserves exact-group
   correlation. Delete display/audit bodies use a bounded memory-ID projection;
@@ -237,6 +274,13 @@ Decision:
 - Default retention is 90 days for raw/chat/failure evidence, 365 days for audit,
   and 90 days for rejected/disabled/deleted memory, subject to the existing
   privacy and tombstone contracts.
+- Configured retention is executed through a system-scoped authenticated
+  preview-confirm contract. The SELECT-only planner fixes one server-owned time,
+  confirmation recomputes and exact-applies the same plan in an `IMMEDIATE`
+  transaction, and aggregate-only redacted audit insertion is part of that
+  transaction. Candidate IDs, SQL, paths, handles, and digests are never public;
+  hard deletion has no in-process rollback and a verified backup is recommended,
+  not a prerequisite.
 
 Primary docs:
 

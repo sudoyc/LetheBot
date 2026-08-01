@@ -1029,6 +1029,119 @@ interface MemoryRevision {
 }
 ```
 
+### 5.4 Maintenance Proposal Lifecycle
+
+Conflict, consolidation, and decay scanners emit bounded maintenance proposal
+previews without creating or changing a `MemoryRecord` lifecycle state:
+
+```typescript
+interface MemoryMaintenanceProposal {
+  proposalId: string;       // memory-maintenance-<kind>-v1-<sha256>
+  proposalAuditId: string;  // memory.maintenance.proposed audit row
+  kind: 'conflict' | 'consolidation' | 'decay';
+  candidateMemoryIds: string[];
+  sourceSet: Array<{
+    memoryId: string;
+    sourceCount: number;
+    sourceFingerprint: string;
+  }>;
+  reasonCodes: Array<
+    | 'same_boundary_title_different_content'
+    | 'same_boundary_title_and_content'
+    | 'stale'
+    | 'low_confidence'
+    | 'low_importance'
+  >;
+  confidence: number;
+  proposedEffect:
+    | { type: 'resolve_conflict'; candidateMemoryIds: string[] }
+    | {
+      type: 'consolidate';
+      retainedMemoryId: string;
+      supersedeMemoryIds: string[];
+    }
+    | { type: 'disable'; memoryId: string };
+  candidateFingerprint: string;
+}
+```
+
+Candidate IDs are sorted before hashing. The candidate fingerprint covers each
+record's owner/scope boundaries, visibility, sensitivity, authority, kind,
+state, confidence, importance, update timestamp, hashed title/content, and its
+exact source-link fingerprint. Raw title, content, and source IDs are not
+returned or written to proposal audit details. Proposal confidence is the
+minimum stored confidence among the candidate records.
+
+An unchanged candidate/effect/reason set produces the same proposal ID. One
+immediate transaction writes or reuses the normalized pending-review proposal,
+its ordered candidate and reason rows, revision 1, and the linked
+`memory.maintenance.proposed` audit. Retry after process or database reopen adds
+none of those rows; each scan job still writes its own scan-summary audit. A
+pre-v8 audit-only preview can supply the audit link only after a scanner has
+recomputed the current snapshot; audit JSON is never parsed as lifecycle state.
+Proposal creation remains non-mutating: scanner execution writes no memory
+revision and does not disable, supersede, delete, approve, or activate a record.
+This maintenance preview is distinct from a content `MemoryRecord` whose
+lifecycle state is `proposed`.
+
+The shared governance service reads only normalized proposal, candidate,
+reason, and proposal-revision metadata. Review-list scope predicates run in SQL
+before the bounded FIFO limit. A verified local admin or private-chat bot owner
+has broad access. A user is limited to their exact user scope or current private
+conversation; a group user is limited to their own exact-boundary
+`same_group_only` user proposals. In group context, a verified bot owner or
+exact group owner/admin receives the same group-safe set as existing memory
+governance: exact-group, exact-conversation, and same-group user proposals.
+`subjectUserId` never grants review authority. Global/tool/system and ambiguous
+conversation scopes fail closed to broad operator access.
+
+Review requires the caller's expected lifecycle state and revision. One
+immediate transaction performs exactly one of:
+
+```text
+pending_review -> approved
+pending_review -> rejected
+pending_review|approved -> expired
+```
+
+The transaction updates the proposal and inserts one redacted actor-bound audit
+plus one contiguous proposal revision. An exact retry reuses the committed
+revision, including after database reopen. A stale state/revision or competing
+decision has zero effects; missing and unauthorized proposals are
+indistinguishable at the governance boundary. Review never writes
+`memory_records`, `memory_revisions`, or proposal revision-effect rows. No new
+QQ/CLI grammar exposes this internal service yet.
+
+Application is a separate shared-service operation requiring exact `approved`
+state and revision plus the same verified scope authority. In one immediate
+transaction it recomputes every candidate's record fingerprint, active state,
+source count/fingerprint, and shared scope boundary before mutation. Conflict
+requires one retained candidate selected from the frozen candidate set;
+consolidation uses its stored retained candidate; decay uses its stored disable
+target. Conflict/consolidation write one retained `update` revision and
+supersede revisions for every other candidate; decay writes one disable
+revision. The memory rows/revisions/audits, proposal `apply` revision/audit, and
+one exact revision-effect link per candidate commit atomically without deleting
+records or sources. Existing active-state retrieval excludes superseded and
+disabled effects immediately. Exact retry, including after reopen, adds zero
+rows; a different conflict choice, stale proposal state/revision, or changed
+candidate/source snapshot has zero effects.
+
+Rollback is another separate shared-service operation requiring the exact
+`applied` state/revision and the same verified scope authority. It consumes the
+normalized apply proposal revision and revision-effect links, never audit JSON.
+Every linked apply memory revision must still be the candidate's unique latest
+revision, and each current memory snapshot must equal that apply revision's
+`new_state`; source count/fingerprint and the shared scope boundary are
+revalidated before mutation. One immediate transaction restores every candidate
+to active through a new `restore` revision and redacted audit, writes the
+`applied -> rolled_back` proposal revision/audit, and links one `restored`
+effect per candidate. Prior records, sources, revisions, audits, and apply links
+remain intact, and restored memories return to active retrieval immediately.
+Exact retry/reopen adds zero rows; drift or a competing rollback has zero
+effects; any child-write failure rolls back the whole operation. No QQ/CLI
+grammar exposes this internal lifecycle service yet.
+
 ---
 
 ## 6. Tool Registry
@@ -1239,6 +1352,17 @@ For completed reply turns, `responseText` preserves the Pi draft before the
 memory-claim guard. The executable action decision, delivered message, and
 persisted `bot.response` evidence use the guarded action payload instead.
 
+For a production Provider-backed turn, durable `agent_turns.tokens_input`,
+`tokens_output`, and `tokens_total` are settled from the ordered
+`purpose='pi_turn'` invocation rows, not from `PiAdapterOutput.tokensUsed`. The
+turn can complete only when it is running, has at least one gap-free matching
+provider/model invocation, and every owned Pi invocation completed. When every
+round has known usage, each dimension is summed; if any completed round has
+unknown usage, all three durable turn totals remain `NULL`. Settlement and the
+turn status update use the same SQLite handle and transaction, and repeating a
+completed settlement is a no-op. Deterministic local governance and mock paths
+that do not own this ledger retain their explicit known-zero completion path.
+
 The production `PiAdapter.runTurn()` invocation has a cooperative deadline from
 `PI_TURN_TIMEOUT_MS` (default `120000`, valid range `1..2147483647`). Deadline
 expiry calls Pi abort once, awaits prompt/idle settlement, and returns a stable
@@ -1247,14 +1371,35 @@ not promise forced termination when a provider or in-process tool ignores the
 abort signal, and it does not currently change the unused streaming-turn
 lifecycle.
 
-Because `PiAdapter` owns one mutable SDK Agent, every `runTurn()` and
-`streamTurn()` invocation acquires the same FIFO lease before resetting or
-installing turn state. The adapter resets the retained SDK transcript under that
-lease and releases it only after the prompt and idle state settle and the result
-is captured or generator cleanup completes. Queued `runTurn()` deadlines begin
-after lease acquisition. Closing a streamed turn early aborts an active Agent run
-and awaits prompt plus idle settlement before releasing the next turn; the
-streaming surface still has no automatic deadline.
+`PiAdapter` gives each active `runTurn()` or `streamTurn()` an isolated Agent
+session and resets a settled slot before reuse. Transcript, prompt, tools, actor,
+events, and tool-call attribution therefore remain turn-local. Closing a stream
+early aborts and settles only that session; the streaming surface still has no
+automatic deadline.
+
+Application admission wraps the complete accepted conversational workflow,
+including delayed Attention rechecks. Each conversation is FIFO with one active
+workflow, while `PI_MAX_CONCURRENT_TURNS` bounds active conversations globally
+(default `2`, valid range `1..16`). `PI_MAX_QUEUED_TURNS` bounds waiting work
+(default `128`, valid range `0..128`, excluding active workflows). Accepted
+queued work drains during shutdown. The absolute deadline is established at
+admission as `accepted_at + PI_TURN_TIMEOUT_MS` and is passed through context,
+Pi, and action admission. Over-limit work is durably terminalized with the
+`turn_admission_overloaded` failure stage; queued expiry uses
+`turn_admission_queue_timeout` and never invokes the Provider. Both outcomes
+reuse the existing admission/failure rows, with no migration in this slice.
+
+Operations latency aggregates use the same durable lifecycle timestamps. Queue
+wait is `event_processing_admissions.processing_started_at - accepted_at` for an
+accepted admission with a terminal turn-owned `agent_turns` row. Pi Provider
+latency is `model_invocations.completed_at - started_at` for terminal
+`purpose='pi_turn'` rows. Total turn latency is
+`agent_turns.completed_at - event_processing_admissions.accepted_at` for
+terminal turns joined to their trigger event. JSON, Prometheus, and CLI
+consumers include only complete non-negative timestamp pairs, report bounded
+`count`, `sumMs`, and `maxMs` aggregates, and exclude running, missing, or
+malformed pairs rather than treating them as zero. `--since` filters each
+aggregate by its lifecycle start timestamp.
 
 After a pending turn exists, caught context, action-decision, bot-response
 persistence, or completion-write failures terminalize it as `failed`, set

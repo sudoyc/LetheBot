@@ -39,10 +39,18 @@ LETHEBOT_BACKGROUND_SUMMARY_ENABLED=false
 
 # 数据库
 LETHEBOT_DB_PATH=./data/lethebot.db
+# Optional absolute path visible inside this process/container. When set, it
+# enables bounded read-only workspace.list/read_text for private owner/admin.
+# LETHEBOT_WORKSPACE_ROOT=/absolute/path/to/workspace
+# Optional comma-separated exact HTTPS origins. Non-empty configuration adds
+# evaluator-required private owner/admin web.fetch_text; no wildcard or path.
+# LETHEBOT_WEB_FETCH_ALLOWED_ORIGINS=https://docs.example.com
+# Retention days; 0 means retain forever for that category.
 LETHEBOT_RAW_EVENT_RETENTION_DAYS=90
 LETHEBOT_CHAT_MESSAGE_RETENTION_DAYS=90
-LETHEBOT_AUDIT_LOG_RETENTION_DAYS=90
-LETHEBOT_DISABLED_DELETED_MEMORY_RETENTION_DAYS=365
+LETHEBOT_AUDIT_LOG_RETENTION_DAYS=365
+# Compatibility name: covers rejected, disabled, and deleted terminal memory.
+LETHEBOT_DISABLED_DELETED_MEMORY_RETENTION_DAYS=90
 LETHEBOT_EVENT_PROCESSING_FAILURE_RETENTION_DAYS=90
 
 # Pi runtime（src/index.ts 使用这些变量）
@@ -51,6 +59,8 @@ PI_MODEL=deepseek-v4-flash
 PI_BASE_URL=https://api.deepseek.com
 PI_API_KEY=your_api_key_here
 PI_TURN_TIMEOUT_MS=120000
+PI_MAX_CONCURRENT_TURNS=2
+PI_MAX_QUEUED_TURNS=128
 
 # Structured evaluator for social decisions and evaluator-required Pi tools.
 # Provider/model/base/key inherit the complete Pi identity when both identity
@@ -75,28 +85,397 @@ LETHEBOT_BOT_QQ_ID=<bot-qq-id>
 
 # LetheBot HTTP server
 LETHEBOT_PORT=6700
-LETHEBOT_HOST=0.0.0.0
+LETHEBOT_HOST=127.0.0.1
 LETHEBOT_HEALTH_PATH=/healthz
 LETHEBOT_READINESS_PATH=/readyz
 LETHEBOT_METRICS_PATH=/metrics
 LETHEBOT_EVENT_PATH=/onebot/event
+LETHEBOT_REVERSE_HTTP_ENABLED=false
+LETHEBOT_MAX_EVENT_BODY_BYTES=262144
+LETHEBOT_EVENT_BODY_TIMEOUT_MS=5000
+
+# Optional separate local governance listener; disabled by default.
+LETHEBOT_GOVERNANCE_ENABLED=false
+LETHEBOT_GOVERNANCE_HOST=127.0.0.1
+LETHEBOT_GOVERNANCE_PORT=6701
+LETHEBOT_GOVERNANCE_SESSION_TTL_MS=900000
+# Required only when enabled; use a separate 32-512-byte secret.
+# LETHEBOT_GOVERNANCE_ADMIN_TOKEN=
 ```
+
+`LETHEBOT_WORKSPACE_ROOT` is optional and must be an absolute existing
+directory. Leaving it unset keeps both `workspace.list` and
+`workspace.read_text` out of the production tool catalog. A container deployment
+must separately mount the selected directory at that in-container path; use a
+read-only mount. LetheBot does not create, mount, or widen the configured
+directory.
+
+`LETHEBOT_WEB_FETCH_ALLOWED_ORIGINS` is optional and blank/unset by default. A
+non-empty value contains at most 16 comma-separated exact `https://host[:port]`
+origins; credentials, paths, queries, fragments, wildcards, and duplicates fail
+startup validation. It adds only `web.fetch_text` for private owner/admin turns.
+Each call still requires a durable evaluator approval and uses a header-fixed
+GET with no caller body, headers, cookies, or credentials. Operators should
+allow only origins they intend the bot to contact. No additional container
+network permission is created by the setting; existing runtime egress controls
+remain independently authoritative.
+
+`LETHEBOT_GOVERNANCE_ENABLED` only accepts literal `true` or `false`. When it is
+`true`, the governance host must be exact `127.0.0.1` or `::1`, its port must be
+an integer in `1..65535` different from `LETHEBOT_PORT`, the session TTL must be
+`60000..3600000` ms, and a control-free admin token of 32-512 UTF-8 bytes is
+required. The token is independent of `ONEBOT_TOKEN` and QQ owner/admin roles.
+The listener remains separate from health, metrics, and OneBot ingress; startup
+failure on either listener closes both. The current P8 wiring provides the
+session boundary, authenticated Activity reads for the aggregate model-
+invocation summary plus bounded default tool-call, action-decision, action-
+execution, job, job-attempt, worker-heartbeat, event-processing-failure, and
+audit lists, authenticated purpose-specific Privacy user-scope discovery, and
+the exact-scope owner-identifier-free Privacy preference page. It also provides
+authenticated `GET /governance/api/v1/group-summary/scopes`; the returned exact-
+group handles are bound to the current session, expiry, and
+`governance.group_summary_policy.status.read`. Exact-scope read-only
+`GET /governance/api/v1/group-summary/policy` returns only the fixed effective
+state, stored-evidence flag, generation, eligibility, and date projection for
+the resolved group. Mutation-marked `POST` at the same path requires exact
+Origin/CSRF and exact `{ "action": "change", "targetState": STATE }`, then
+returns only the write-free change projection with a short-lived current-session
+group/snapshot/digest-bound preview handle. Separate CSRF-protected
+`POST /governance/api/v1/group-summary/policy/confirm` accepts only exact
+`{ "confirm": true, "previewHandle": HANDLE, "targetState": STATE }`, consumes
+matching current-session authority once, recomputes the exact snapshot, and
+invokes only the shared atomic expected-snapshot mutation. Unknown authority is
+concealed; reused, drifted, no-op, or stale authority conflicts. Success returns
+fixed state, generation, eligibility, enforcement, audit, cancellation, and
+semantic-rollback evidence without raw identifiers or reasons. Authenticated
+`GET /governance/api/v1/display-profile/scopes` separately
+returns only the bounded identifier-free exact-user catalog. Queries and scope
+headers are rejected before catalog work; issued handles are bound to the
+current session, expiry, and `governance.display_profile.targets.read`. Scoped
+read-only `GET /governance/api/v1/display-profile/targets` requires one such
+handle and returns the unchanged bounded identifier-free target page with
+resource handles bound to that session and expiry, the same purpose, resource
+kind `display_profile_target`, the full internal target ID, and the resolved
+exact user scope. Read-only
+`GET /governance/api/v1/display-profile/targets/<resource-handle>` requires that
+same scope authority, resolves the resource against all current-session
+bindings, and returns only the bounded redacted shared target detail. Missing
+detail is concealed as `404`. Mutation-marked `POST` at that same path accepts
+only `{ "action": "redact" }`, returns the write-free full-row preview plus
+fresh current-session action-specific authority, and performs no redaction.
+Mutation-marked `POST` at that same resource path plus `/confirm` accepts only
+exact `{ "confirm": true, "previewHandle": HANDLE }`, consumes matching
+authority once, recomputes the preview fingerprint, row count, and digest,
+resolves the trusted internal mutation selectors, and invokes only the shared
+atomic expected-snapshot redaction. Unknown authority is concealed; reused,
+drifted, or stale authority conflicts. Success returns identifier-free affected
+counts, ISO redaction time, effects, audit evidence, and the irreversible
+rollback boundary.
+Mutation-marked authenticated-unscoped
+`POST /governance/api/v1/identity/platform-accounts/unlink` requires exact
+Origin/CSRF and exact `{ "action": "unlink", "platform": "qq",
+"platformAccountId": ID }` with a normalized account ID. It performs only the
+write-free exact active-mapping preview and returns that identifier-free DTO
+plus current-session opaque resource and preview handles. The private resource
+binding retains the structured selector; the preview binding carries the same
+system scope/resource, unlink action, snapshot fingerprint, fixed one-row
+version, and preview digest. Confirm only through mutation-marked
+`POST /governance/api/v1/identity/platform-accounts/unlink/confirm` with exact
+`{ "confirm": true, "resourceHandle": HANDLE, "previewHandle": HANDLE }`.
+The server resolves and validates the current-session private resource selector
+before consuming the matching preview once, revalidates the full B27A evidence,
+and calls only the atomic expected-snapshot unlink with its fixed reason. Unknown
+authority is `404`; replay, drift, inactive state, and service races are `409`.
+Success returns bounded identifier-free disable time/count, effects, redacted-
+audit evidence, and the unsupported-relink boundary.
+Mutation-marked `POST /governance/api/v1/privacy/preferences` requires that
+same scope plus exact
+Origin/CSRF and exact `{ "action": "change", "preferenceType": TYPE,
+"targetState": STATE }`. It returns only the existing write-free change
+projection with a short-lived current-session type/scope/state/version/digest-
+bound preview handle. A separate CSRF-protected
+`POST /governance/api/v1/privacy/preferences/confirm` accepts only exact
+`{ "confirm": true, "previewHandle": HANDLE, "preferenceType": TYPE,
+"targetState": STATE }`, consumes matching current-session authority once,
+recomputes the exact B22B snapshot, and invokes only the shared atomic B22D
+expected-snapshot mutation. Unknown authority is concealed; reused, drifted, or
+stale authority conflicts. Success returns fixed preference, audit, immediate-
+enforcement, and semantic-rollback evidence without raw identifiers or reasons.
+The listener also provides
+authenticated purpose-specific record-backed Memory scope discovery and the
+exact-scope bounded identifier-free Memory-record page, plus trace-backed
+purpose-specific Explain conversation-scope discovery and its exact-scope
+bounded identifier-free turn page. Each turn entry adds an opaque
+`explain_turn` handle bound to the current session, expiry, Explain-read
+purpose, and exact scope. Read-only turn detail resolves that same authority and
+returns only the fixed bounded identifier-free context/decision/execution/tool
+projection; ContextBuilder rebuild and Explain mutation routes remain absent.
+Each record entry adds
+an opaque `memory_record` handle bound to the current session, expiry, read
+purpose, and exact scope. Read-only record detail returns the fixed bounded
+record/source/revision/audit provenance projection. CSRF-protected
+`POST /governance/api/v1/memory/records/<resource-handle>` accepts only exact
+`{ "action": "forget" }` or `{ "action": "restore" }`, returns the
+corresponding write-free fixed projection, and issues a short-lived action/
+state/revision/digest-bound preview handle. Exact
+`POST /governance/api/v1/memory/records/<resource-handle>/confirm` accepts only
+exact two-key forget confirmation or exact three-key restore confirmation under
+current-session single-use authority. It recomputes the matching current
+preview and calls only the shared atomic expected-snapshot forget or restore
+operation. Stale/reused authority conflicts; success returns fixed redacted
+lifecycle/revision/audit/retrieval and rollback evidence. When the listener is
+enabled, open `http://<governance-host>:<governance-port>/governance/` for the
+dependency-free local browser shell. It signs in through the existing session
+API and displays the existing aggregate Overview plus the read-only payload-free
+model-invocation Activity aggregate, bounded payload-free Tool calls list, and
+bounded details-free Worker heartbeats, payload-free Jobs, and result-free Job
+attempts lists, plus the actions-free Action decisions and audit-entry-free
+Action executions lists and details-free hash-backed Event processing failures
+list. Activity secondary
+navigation keeps Model invocations as the default, followed by Tool calls,
+Worker heartbeats, Jobs, Job attempts, Action decisions, Action executions, and
+Event processing failures; each subview issues only its exact same-origin
+default GET and adds no filters, caller limit, scope header, body, CSRF value,
+or authority. Each list shows at most 100 strictly validated records. Tool calls
+omit call, turn, canonical-user,
+input, and output values;
+Worker heartbeats
+expose only worker/type, fixed status, optional current job, and heartbeat time
+and reject details. Jobs expose bounded redacted identity/type/status, attempt,
+schedule/update, and optional lease/run/error evidence while rejecting payload,
+result, unknown keys, and malformed fields. Job attempts expose only job/attempt,
+worker, fixed status, optional error, and start/heartbeat/completion times; the
+separate attempt ID is validated but omitted, and result or unknown fields fail
+closed. Action decisions expose only the redacted decision reference, actor and
+risk, confidence, evaluator state, action count, bounded reasons and suppressors,
+and decision time. Their turn ID is validated but omitted; actions, unknown
+keys, malformed fields, unbounded nested values, and oversized arrays fail
+closed. Action executions expose only the redacted execution and linked-decision
+references, action/status, optional message/memory/job effects, bounded
+downgrade/error evidence, audit level, and execution time. Unknown keys,
+`auditEntry`, nested or malformed fields, and oversized arrays fail closed before
+row replacement. Event processing failures expose only the redacted failure and
+time, optional raw-event/turn references, stage/conversation type, error name,
+and fixed lowercase hash evidence. Unknown keys, `details`, invalid hashes or
+conversation types, nested or malformed fields, and oversized arrays fail
+closed before row replacement. C5C keeps the same three fixed asset paths and consolidates only the
+repeated lifecycle of the Tool calls, Worker
+heartbeats, and Jobs lists. Their endpoint closures, renderers, request
+sequences, state messages, and DOM bindings remain explicit; the combined fixed
+bundle is held below the C5C 61,500-byte regression and the permanent
+65,536-byte boundary without a new asset or lazy request. C5E further holds the
+same bundle below 57,500 bytes by sharing only explicit DOM binding, accepted-
+value presentation, bounded text/date validation, record cell/status creation,
+and bounded list rendering in JavaScript. HTML, CSS, visible output, endpoint
+calls, and per-view validation remain unchanged. C5D reuses that controller and
+those primitives for the fifth view without adding CSS; its less-than-61,500-
+byte result remains the completed feature threshold. C6A reuses the same
+controller and primitives for the sixth view without adding CSS, a new asset,
+or lazy loading; the current bundle remains below the 65,536-byte permanent
+boundary. C6B replaces only the static HTML representation of the five
+non-model list shells with one fixed local JavaScript definition table. It
+constructs the exact tabs and panels through `document.createElement`, fixed
+attributes, and `textContent` before the existing controllers bind; runtime
+DOM, text, order, classes, states, requests, validation, session handling,
+keyboard/focus behavior, CSS, and responsive behavior remain unchanged. The
+served HTML/CSS/JavaScript bodies are 8,641/14,794/37,000 bytes, 60,435 total,
+without a parser, dynamic code, new request or asset, lazy loading, compression,
+minification, or dependency. C6C adds the seventh fixed list definition and
+strict B14F validator/renderer, with the two new status classes mapped to the
+existing semantic tokens. The final HTML/CSS/JavaScript bodies are
+8,641/14,850/39,809 bytes, 63,300 total, and remain below 65,536 without a new
+asset, backend change, or dependency. C7A adds the eighth fixed list definition
+and strict B14H validator/renderer without CSS or backend changes. The final
+HTML/CSS/JavaScript bodies are 8,641/14,850/42,007 bytes, 65,498 total, and
+remain below 65,536 without a new asset or dependency. C7B changes only the
+JavaScript representation: three shared fixed bounds replace identical legacy
+tool/worker/job constants, fixed row-line class constants replace repeated
+strings, and conservative delimiter-adjacent line compaction removes only
+lexically unnecessary line terminators. HTML/CSS remain byte-identical and all
+requests, validation, DOM, text, classes, states, session, keyboard/focus, and
+responsive behavior remain exact. Final bodies are 8,641/14,850/39,788 bytes,
+63,279 total, below the 63,300-byte Audit prerequisite and 65,536-byte permanent
+boundary without token renaming, a parser, another asset, lazy loading, or a
+dependency. C7C adds the ninth fixed list definition and strict B14I validator/
+renderer without CSS or backend changes. It sends only the existing exact
+same-origin default Audit GET, rejects unknown or details-bearing records, and
+renders only bounded already-redacted evidence plus explicit redaction signals.
+Final HTML/CSS/JavaScript bodies are 8,641/14,850/41,778 bytes, 65,269 total,
+and remain below 65,536 without a new asset or dependency. C8A then extracts
+only the fixed Activity projections into same-origin `activity.js`, statically
+imported by `app.js`. HTML/CSS, endpoint values, requests, validation, DOM,
+states, session behavior, and responsive output remain exact. Final HTML/CSS/
+shell-JavaScript/Activity-module bodies are 8,641/14,850/18,380/23,616 bytes;
+the three-asset shell is 41,871 bytes and all four assets total 65,487, below
+65,536 without a build step or dependency. C8B adds same-origin `memory.js` and
+the Memory destination over the existing `/memory/scopes` and
+`/memory/records` reads. The operator must select an exact labelled fingerprint
+before a record request is sent; the selected opaque handle is carried only in
+`X-LetheBot-Scope` and is not rendered or persisted. Scope and record loading,
+empty, unavailable, malformed, stale, expiry, and logout states are bounded.
+Record detail, maintenance review, and every Memory mutation remain absent.
+Final HTML/CSS/shell-JavaScript/Activity-module/Memory-module bodies are
+8,641/16,415/20,939/23,616/16,720 bytes. The fixed shell is 45,995 bytes and
+each asset remains below 65,536; independent feature modules are not combined
+into one transfer-size gate. C8C adds the secondary read-only Memory Review tab
+over `/scopes` and `/memory-reviews`. Review catalog/selection/handles remain
+separate from Records, and the operator must explicitly select a Review scope
+before the exact Review handle is sent in `X-LetheBot-Scope`. Only the bounded
+proposal-list fields and handle expiry render; resource handles, detail,
+preview, confirmation, and mutation controls remain absent. Final HTML/CSS/
+shell-JavaScript/Activity-module/Memory-module bodies are
+8,641/16,918/24,328/23,616/31,215 bytes, with a 49,887-byte fixed shell and
+every asset below 65,536. No build step or dependency is added. The admin token input is cleared, CSRF remains in
+page memory, and reload returns to sign in. The same
+no-store/CSP headers cover HTML, CSS, and JavaScript; unknown, query-bearing, or
+non-GET asset paths and unregistered governance domain routes return `404`.
+C8D adds only row-selected exact-scope Review detail over the existing
+`GET /memory-reviews/:resourceHandle` route. The request carries the current
+Review scope handle, no query/body/Origin/CSRF value, and the list-issued
+resource handle only in its path. Independent cancellation clears stale
+authority on scope, subview, navigation, refresh, expiry, and logout changes;
+list refresh can retain a proposal reference only after replacing its resource
+handle. Exact schema and list/detail-coherence failures expose fixed states
+without replacing prior valid detail. Final HTML/CSS/shell/Activity/Memory
+assets are 8,641/16,918/24,227/23,616/50,900 bytes, with a 49,786-byte fixed
+shell and every asset below 65,536. Other scoped views and all browser
+mutations remain absent.
+C8E adds only row-selected exact-scope Record provenance over the existing
+`GET /memory/records/:resourceHandle` route. The request carries the current
+Records scope handle and the current row's list-issued resource handle, with no
+query, body, Origin, CSRF value, raw selector, or non-GET method. Exact nested
+record coherence and bounded source/revision/audit validation fail closed
+without replacing prior content. Refresh may retain a record reference only
+after receiving replacement authority; scope, Review, navigation, expiry, and
+logout clear it. Final HTML/CSS/shell/Activity/Memory assets are
+8,641/16,918/24,227/23,616/64,978 bytes, with the unchanged 49,786-byte fixed
+shell and every asset below 65,536. No backend, CSS, build, package, dependency,
+preview, confirmation, or mutation boundary changes.
+C8F adds exact static same-origin `/governance/memory-presentation.js` and makes
+`memory.js` import it once. Static dispatch uses the same no-store and CSP
+headers and creates no session, scope, resource, preview, CSRF, or domain
+authority. HTML, CSS, `app.js`, and `activity.js` remain byte-identical at
+8,641/16,918/24,227/23,616 bytes. The controller and presentation modules are
+32,442/33,072 bytes respectively, both below the 35,000-byte Memory-module
+boundary and the permanent 65,536-byte per-asset boundary. Requests, accepted
+payloads, DOM output, states, navigation, focus, responsive behavior, and
+handle non-disclosure remain exact; no package, dependency, build, backend,
+preview, confirmation, mutation, or runtime deployment behavior changes.
+C8G adds one browser-only write-free approval preview from coherent selected
+Review detail. It sends exact same-origin
+`POST /governance/api/v1/memory-reviews/:resourceHandle` with browser-derived
+`Origin`, current Review `X-LetheBot-Scope`, in-memory session CSRF, JSON content
+type, and only `{ "action": "approve" }`. Exact response validation requires
+complete scope/row/detail/preview coherence before rendering bounded action,
+effect, transition, rollback, and expiry evidence. Preview handles and digests
+are discarded after validation and never render or persist. Scope, selection,
+refresh, tab, navigation, expiry, session, and logout changes cancel or clear
+the independent preview state. Confirmation, handle consumption, review or
+memory mutation, backend routing changes, and durable writes remain absent.
+Final HTML/CSS/shell/Activity/Memory-controller/Memory-presentation bodies are
+8,641/16,918/24,428/23,616/39,220/38,754 bytes, with a 49,987-byte fixed shell
+and every asset below 65,536. No CSS, build step, package, dependency, runtime
+configuration, deployment, or restart behavior changes.
+C8H adds the explicit second activation over the existing approval-confirmation
+route. Only a coherent, unexpired C8G preview enables `Confirm approval`.
+Browser memory retains the preview handle only in a private transient authority
+bound to its expiry and the current Review scope/resource selection; the digest
+remains discarded. Confirmation clears that authority before sending exact
+same-origin
+`POST /governance/api/v1/memory-reviews/:resourceHandle/confirm` with browser
+`Origin`, current Review `X-LetheBot-Scope`, in-memory CSRF, JSON content type,
+and exact `{ "confirm": true, "previewHandle": HANDLE }`. There is no query,
+display-derived path, Records authority, or caller-selected action.
+The exact B7D success is rendered only after proposal/revision coherence,
+approve revision/audit references, false memory-record mutation, and the fixed
+rollback boundary validate. A malformed, unavailable, not-found, or conflict
+result consumes local authority and requires a fresh preview. Success preserves
+bounded result evidence while refreshing the Review queue. Scope, resource,
+selection, refresh, tab, navigation, expiry, session, and logout invalidation
+clear authority; the handle never enters DOM, storage, logs, announcements,
+presentation values, or exported feature state. Final six asset bodies are
+8,641/16,918/24,428/23,616/46,670/41,758 bytes, the fixed shell remains 49,987
+bytes, and every asset remains below 65,536. No backend, CSS, dependency,
+runtime configuration, deployment, restart, rejection, application, or
+rollback behavior changes.
+C8I adds one browser-only write-free rejection preview over the existing B8A
+route. From coherent current pending Review detail it sends exact same-origin
+`POST /governance/api/v1/memory-reviews/:resourceHandle` with browser-derived
+`Origin`, current Review `X-LetheBot-Scope`, in-memory session CSRF, JSON content
+type, and only `{ "action": "reject" }`. The path always uses the current
+list-issued resource handle; displayed evidence and Records authority are not
+request authority.
+The exact response must project `pending_review@N -> rejected@(N+1)`, the fixed
+proposal-transition/revision/audit effects, unavailable memory-record mutation,
+the rejection rollback boundary, and a safe future expiry while remaining
+coherent with current scope, row, and detail. The validated rejection handle
+and digest are discarded. An independent sequence/timer implements
+unrequested, loading, populated, malformed, unavailable, not-found, and stale
+states, disables duplicate requests, and suppresses late responses. Starting a
+rejection preview clears existing approval confirmation authority; scope,
+resource, selection, refresh, tab, navigation, expiry, session, and logout
+changes clear both competing authority and rejection state. A fresh approval
+preview remains available afterward. Final six asset bodies are
+8,641/16,918/24,428/23,616/53,035/46,484 bytes, the fixed shell remains 49,987
+bytes, and every asset remains below 65,536. No rejection confirmation,
+application, durable write, backend, CSS, dependency, runtime configuration,
+deployment, restart, or rollback behavior changes.
+
+C8J subsequently adds explicit browser rejection confirmation using the already-
+deployed B8B `/confirm` boundary; it introduces no new listener, environment
+variable, deployment setting, restart requirement, backend route, or reverse-
+proxy exposure. After a coherent unexpired C8I preview, the browser keeps the
+opaque rejection preview handle only in private transient memory bound to the
+current Review scope/resource/selection and expiry, discarding its digest.
+`Confirm rejection` clears that authority before one same-origin
+`POST /governance/api/v1/memory-reviews/:resourceHandle/confirm` with current
+Review scope, in-memory CSRF, browser `Origin`, JSON content type, and exact
+`{ "confirm": true, "previewHandle": HANDLE, "action": "reject" }`. It validates
+the fixed B8B rejected result before rendering, refreshes Review only after
+success, and leaves memory application, rollback, durable memory-record
+mutation, deployment, and restart behavior unchanged.
+
+C9A reuses the already-deployed B9A application-preview route without adding a
+listener, environment variable, reverse-proxy path, migration, restart, or
+runtime dependency. The loopback browser may preview only an `approved` current
+Review resource. Conflict requires an explicit public retained-memory reference
+from current detail; consolidation and decay carry no selection. The browser
+keeps the returned opaque preview handle only in transient module memory,
+discards the digest, validates the bounded projection, and exposes no confirm
+control. Application remains impossible until a later independently reviewed
+slice.
+
+Do not publish this loopback listener through a reverse proxy.
 
 ### SnowLuma / OneBot 配置要点
 
-1. 推荐第一版使用 `ONEBOT_TRANSPORT=ws`，SnowLuma WebSocket server 地址写入 `ONEBOT_WS_URL`。
+1. 推荐第一版使用 `ONEBOT_TRANSPORT=ws`，SnowLuma WebSocket server 地址写入
+   `ONEBOT_WS_URL`。此模式默认不开放 reverse HTTP event route。
 2. 如需 reverse HTTP 兼容模式，设置 `ONEBOT_TRANSPORT=http`，OneBot HTTP API 地址写入 `ONEBOT_HTTP_URL`，并把 SnowLuma `httpClients[].url` 配为：
    `http://<lethebot-host>:<LETHEBOT_PORT><LETHEBOT_EVENT_PATH>`。
-3. 如果设置 `ONEBOT_TOKEN`：
+3. 如需在 `ONEBOT_TRANSPORT=ws` 时同时接收 reverse HTTP event，显式设置
+   `LETHEBOT_REVERSE_HTTP_ENABLED=true`。该开关只接受 literal `true` / `false`；
+   其他值会导致配置校验失败。HTTP transport 无需额外设置此开关。
+4. HTTP server 默认只绑定 `127.0.0.1`。启用的 reverse HTTP event route 与健康、
+   readiness 和 metrics 共用该 listener；仅当该 route 已启用时，非-loopback bind
+   才必须同时配置非空 `ONEBOT_TOKEN`，否则应用在创建 adapter/listener 前拒绝启动。
+   literal `127.0.0.1` / `::1` loopback development 可无 token 启用该 route。
+5. 如果设置 `ONEBOT_TOKEN`：
    - LetheBot 出站 HTTP API 会发送 `Authorization: Bearer <ONEBOT_TOKEN>`。
    - LetheBot 出站 WS 会在 URL query 中设置 `access_token=<ONEBOT_TOKEN>`。
    - LetheBot 入站 reverse HTTP 同时接受 Bearer token 和 SnowLuma `X-Signature: sha1=<hmac>`。
-4. `LETHEBOT_BOT_QQ_ID` 必须是机器人自己的 QQ 号；群聊中只有 `[CQ:at,qq=<bot-id>]` 会触发 `mentionsBot=true`。
+6. Reverse HTTP event body 默认最多 `262144` raw bytes，并须在 `5000ms` 内完整
+   接收；分别由 `LETHEBOT_MAX_EVENT_BODY_BYTES` 和
+   `LETHEBOT_EVENT_BODY_TIMEOUT_MS` 配置，且都只接受正整数。声明或实际超限返回
+   `413`，接收超时返回 `408`。配置 token 后，缺少可用 Bearer 或 SnowLuma
+   signature candidate 的请求在读取 body 前返回 `401`；HMAC 只在 bounded body
+   完整接收后校验。上述拒绝均不进入 event admission 或 governance。
+7. `LETHEBOT_BOT_QQ_ID` 必须是机器人自己的 QQ 号；群聊中只有 `[CQ:at,qq=<bot-id>]` 会触发 `mentionsBot=true`。
 
 ## 数据库迁移
 
 生产环境首次启动前创建数据目录。当前应用启动时会先验证完整的
-`001 -> 002 -> 003 -> 004 -> 005` 连续迁移集合，再自动迁移：
+`001 -> 002 -> 003 -> 004 -> 005 -> 006 -> 007 -> 008` 连续迁移集合，再自动迁移：
 
 ```bash
 mkdir -p ./data
@@ -105,12 +484,14 @@ mkdir -p ./data
 `001` creates an empty `schema_version` ledger. On first application startup,
 the runner applies v1 compatibility work, the v2 evaluator-owner migration, the
 v3 evaluator Provider-invocation migration, the v4 correction-attempt migration,
-and the v5 delayed-Attention migration. It validates each migration-derived
-structure and foreign-key data and records ledger rows `[1,2,3,4,5]` in the same
-transaction. Existing legacy databases with no ledger and v1-v4 databases are
+the v5 delayed-Attention migration, the v6 group-summary policy migration, the
+v7 Pi-turn invocation migration, and the v8 normalized memory-maintenance
+proposal ledger. It validates each migration-derived structure and foreign-key
+data and records ledger rows `[1,2,3,4,5,6,7,8]` in the same transaction.
+Existing legacy databases with no ledger and v1-v7 databases are
 adopted only when their LetheBot-owned objects can be migrated to that contract;
 an incompatible same-name table/index/trigger or FK violation rolls the
-transaction back. A malformed ledger or a valid version above 5 is rejected
+transaction back. A malformed ledger or a valid version above 8 is rejected
 before migration schema/data writes; do not edit the ledger by hand to bypass
 that guard.
 Known early-v1 memory CHECK constraints are rebuilt transactionally to the
@@ -122,13 +503,16 @@ definition, so additional UNIQUE/STRICT/COLLATE/conflict/deferrable semantics
 are not silently erased. If the external-content `memory_fts` table was absent,
 startup recreates and rebuilds it from existing memory rows in the same
 transaction.
-This runtime targets v5 and can activate against a v1, v2, v3, v4, or v5 shared
-database, so release preflight requires target 5 with readable range 1 through
-5. Widening only the package manifest or omitting any required migration is
-rejected. Migration `005_delayed_attention.sql` adds the source-bound
-`attention_candidates`, `attention_decisions`, and `attention_suppressors`
-contract used by `attention_recheck` jobs; take and retain a verified backup
-before activating the first v5 release.
+This runtime targets v8 and can activate against a v1 through v8 shared
+database, so release preflight requires target 8 with readable range 1 through
+8. Widening only the package manifest or omitting any required migration is
+rejected. Migration `007_pi_turn_model_invocations.sql` adds exact-turn
+`pi_turn` Provider-call capacity plus nullable cache/reasoning usage while
+preserving summary/evaluator evidence. Migration
+`008_memory_maintenance_proposals.sql` adds normalized proposal, candidate,
+reason, lifecycle-revision, and memory-revision-link tables; it creates no
+proposal state from historical audit JSON and does not enable apply behavior.
+Take and retain a verified v7 backup before activating the first v8 release.
 
 ## 启动服务
 
@@ -341,16 +725,16 @@ JSON line without input paths or DB content:
 
 ```bash
 pnpm --silent ops:rehearse-cross-version -- \
-  --prior-release=/srv/lethebot/releases/<v4-release> \
-  --candidate-release=/srv/lethebot/releases/<v5-release>
+  --prior-release=/srv/lethebot/releases/<v6-release> \
+  --candidate-release=/srv/lethebot/releases/<v7-release>
 ```
 
-It requires three independent outcomes: readiness failure restores the exact v4
-DB/pointers and starts/probes v4; an unconfirmed v5 crash is denied by the stable
-gate and explicit recovery restores v4; a wrong confirmation preserves the
-recovery point while exact confirmation removes it and permits a marker-free v5
-restart. The rehearsal checks the v4/v5 ledgers, absence/presence of the v5
-delayed-Attention tables, DB mode/UID/GID, sentinel/integrity/FKs, and operation
+It requires three independent outcomes: readiness failure restores the exact v6
+DB/pointers and starts/probes v6; an unconfirmed v7 crash is denied by the stable
+gate and explicit recovery restores v6; a wrong confirmation preserves the
+recovery point while exact confirmation removes it and permits a marker-free v7
+restart. The rehearsal checks the v6/v7 ledgers, absence/presence of the v7 Pi
+invocation columns/index, DB mode/UID/GID, sentinel/integrity/FKs, and operation
 cleanup. Never point it at a live managed root or mutable release directory.
 
 Use `--manager=pm2` for the PM2 artifact. The command must run with authority to
@@ -491,7 +875,7 @@ pnpm cli redact-display-profile <canonical-user-id>
 
 - [ ] FakeOneBot private message path 覆盖 raw event、chat message、Pi turn、reply sink。
 - [ ] FakeOneBot group path 覆盖普通群聊静默、目标 @bot 触发、非目标 @ 不触发。
-- [ ] OneBot HTTP event endpoint 在未配置 token 时允许 dev flow，在配置 `ONEBOT_TOKEN` 后拒绝无效 Bearer / SnowLuma 签名请求。
+- [ ] 已启用的 OneBot HTTP event endpoint 仅在 literal loopback bind 时允许无 token dev flow；启用 route 的非-loopback 无 token 配置在 listen 前失败，WS-only mode 对 event POST 返回 `404`，配置 `ONEBOT_TOKEN` 后拒绝无效 Bearer / SnowLuma 签名请求。
 - [ ] OneBot HTTP/WS 出站 API 调用使用同一个 token。
 - [ ] CQ `at` 只在匹配 `LETHEBOT_BOT_QQ_ID` 时设置 `mentionsBot=true`。
 - [ ] 私聊/群聊 message id、sender role、group card、quote、media 被结构化保存，不把 CQ 控制码当成普通文本注入。
@@ -548,6 +932,8 @@ backup.
 3. 生产 token/API key 不写入文档、测试 fixture 或 audit full payload。
 4. 根据隐私要求配置 raw event / chat / memory retention。
 5. 受控试运行先限制到一个 bot account、一个 QQ group、一个 SQLite 数据库。
+6. Governance HTTP 保持 loopback，不通过 reverse proxy 发布，并使用独立于
+   OneBot/QQ authority 的 admin token。
 
 ## 故障排查
 
@@ -566,7 +952,7 @@ provider 不是 `mock` 时才使用结构化模型客户端。若未设置
 `EVALUATOR_PROVIDER` / `EVALUATOR_MODEL`，它继承完整的 Pi provider/model/base/key
 配置。若要覆盖 evaluator identity，必须同时设置两个字段；该路径不会继承
 Pi endpoint 或 key，还必须显式设置 `EVALUATOR_API_KEY`。缺失凭据会在启动时
-失败，不会退回 stub。非 mock evaluator 还要求当前 schema v6 中的 durable
+失败，不会退回 stub。非 mock evaluator 还要求 schema v7 或更新版本中的 durable
 invocation ledger；启动时应用会注入当前数据库 repository。每次调用应留下
 一个或在严格结构纠正时两个 `completed`、`failed` 或 `aborted` invocation，成功决策应通过
 `evaluator_decisions.model_invocation_id` 唯一链接它。`LETHEBOT_TEST=true` 或

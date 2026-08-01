@@ -349,6 +349,60 @@ Repository-backed memory creation rejects non-finite `expires_at` lifecycle
 metadata before durable rows are written, so invalid expiration cannot silently
 become permanent or unreliable memory.
 
+## Maintenance Proposal Review, Apply, And Rollback
+
+Conflict, consolidation, and decay scanners persist normalized
+`pending_review` proposals but retain no review or memory lifecycle authority.
+The shared `GovernanceService` lists and reads those proposals through scope
+predicates applied before the bounded FIFO limit. Trusted caller context maps to
+this authority matrix:
+
+- local admin and a verified bot owner in private chat: all proposal scopes;
+- exact user in private chat: that user's scope and the exact current private
+  conversation, except `owner_admin_only` candidate records;
+- exact user in group chat: only that user's `same_group_only` proposal bound to
+  the exact current group/conversation;
+- verified bot owner or group owner/admin in group chat: non-secret
+  exact-group, exact-conversation, and same-group user proposals;
+- global, tool, system, or ambiguous conversation ownership: broad operator
+  authority only.
+
+The proposal subject is descriptive metadata and never grants authority. A
+surface must prove the actor/context before calling this service; the review API
+does not make an unverified authority claim trustworthy. Missing and denied
+proposal IDs have the same result.
+
+Approve/reject requires exact `pending_review` state and revision; expire
+requires exact `pending_review` or `approved` state and revision. The proposal
+update, actor/context/reason audit, and contiguous proposal revision commit in
+one immediate transaction. An identical retry after commit or database reopen
+adds no row, while a stale or competing decision has zero effects. Review does
+not write a memory record/revision or a proposal revision-effect row. Applying
+an approved proposal is a distinct exact-state/revision operation using the
+same verified scope authority. It recomputes the frozen record/source
+fingerprints, active state, and shared boundary inside one immediate
+transaction. Conflict requires an explicit retained candidate; consolidation
+uses the normalized retained candidate; decay uses the normalized disable
+target. Retained, superseded, and disabled candidates each receive a memory
+revision and audit linked from the proposal apply revision. Records and source
+links are preserved, while existing active-state retrieval filters exclude
+superseded/disabled candidates immediately. Exact retry/reopen adds no rows;
+stale evidence or a competing conflict choice has zero effects; any child-write
+failure rolls the whole application back.
+
+Rollback is a separate exact-`applied`-state/revision operation through the same
+verified scope authority. It reads normalized apply revisions and effect links,
+not audit JSON, and proceeds only while each linked apply memory revision is the
+candidate's unique latest revision, each current memory snapshot matches that
+revision's `new_state`, and the source fingerprints and shared boundary still
+match. One immediate transaction restores every candidate to active with a new
+`restore` revision and redacted audit, writes the proposal
+`applied -> rolled_back` revision/audit, and links one `restored` effect per
+candidate. All earlier records, sources, revisions, audits, and apply evidence
+remain intact, and restored candidates are immediately visible to active-state
+retrieval. Exact retry/reopen adds no rows; drift or a competing rollback has
+zero effects; any child-write failure rolls back every mutation.
+
 ## QQ And CLI Memory Governance
 
 The implemented QQ surface is deliberately small and exact:

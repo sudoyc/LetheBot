@@ -45,15 +45,27 @@ returns a stable failed result (`Pi turn timed out after <N> ms`). The underlyin
 provider rejection is not returned or logged on that timeout path, and the
 deadline timer is cleared on success and failure so the adapter can be reused.
 
-`PiAdapter` owns one stateful Pi SDK `Agent`, so `runTurn()` and `streamTurn()`
-enter the same FIFO turn lease before changing any adapter or Agent state. Under
-that lease the adapter resets the SDK transcript and queues, installs the current
-turn/actor/tool context, and supplies only the history selected in the current
-`ContextPack`. It releases the lease only after prompt and idle settlement plus
-output capture or stream cleanup. A queued `runTurn()` starts its deadline after
-lease acquisition, preventing an earlier turn's timer from aborting later work.
-Early stream-consumer cancellation aborts an active SDK run and awaits both the
-prompt and idle settlement before another turn may start.
+`PiAdapter` keeps resettable SDK `Agent` slots and gives every active
+`runTurn()`/`streamTurn()` a distinct session. Each session owns its transcript,
+system prompt, tool directory, actor attribution, events, and recorded tool-call
+IDs; a slot is reset only after prompt/idle settlement and output or stream
+cleanup. Early stream-consumer cancellation aborts and settles only its own
+session. Direct adapter callers therefore do not share mutable turn state.
+
+The application admission controller wraps accepted conversational work around
+context building, Pi, action execution, and durable terminalization. It enforces
+one active workflow per conversation and a configurable global cap from
+`PI_MAX_CONCURRENT_TURNS` (default `2`, valid range `1..16`), including delayed
+Attention rechecks. `PI_MAX_QUEUED_TURNS` defaults to `128` (valid range
+`0..128`) and excludes active workflows. Over-limit admissions are durably
+recorded as `turn_admission_overloaded`; queued items whose absolute deadline
+(`accepted_at + PI_TURN_TIMEOUT_MS`) expires are recorded as
+`turn_admission_queue_timeout` and do not call the Provider. Summary and
+evaluator-only background calls remain separate worker paths.
+
+The absolute deadline is passed into each Pi run. The adapter uses the remaining
+time after queue/context work, aborts at expiry, and awaits prompt/idle cleanup
+before releasing the isolated session.
 
 This is cooperative cancellation, not forced termination: a provider or
 in-process tool that ignores Pi's abort signal can still delay settlement and
@@ -61,6 +73,48 @@ requires a different execution/isolation policy. The configured deadline
 currently governs the production `runTurn()` path. The unused `streamTurn()`
 surface has no automatic deadline and retains explicit/manual abort semantics;
 closing its async generator still performs the abort-and-settle cleanup above.
+
+## Main Pi Provider Invocation Ledger
+
+Production `PiAdapter` and the evaluator share one `ModelInvocationRepository`
+over the application database. For a source-bound main turn, the adapter wraps
+Pi's typed `streamFn` and synchronously creates one `purpose='pi_turn'` row
+before each Provider stream starts. The initial request, every tool-result
+follow-up, and any continuation/correction are separate rows with a gap-free
+per-turn call number, the requested provider/model identity, and a snapshot of
+the ordered raw-event sources. The wrapper forces `maxRetries: 0`, so a
+transport-internal retry cannot disappear behind one application-visible row.
+
+The matching typed `AssistantMessage` terminalizes that row. Safe nonnegative
+input, output, cache-read, cache-write, and total counts are persisted only when
+the reported total equals their sum and the dimensions are not all zero;
+otherwise every token column remains `NULL` (unknown). Pi Agent Core `0.80.2`
+does not expose a separate reasoning-token dimension, so that column remains
+`NULL`. Completed rows persist only a SHA-256 digest and UTF-8 byte count of the
+response content, never the response, prompt, tool payload, or Provider error
+text. Failures use fixed codes: `provider_error`, `provider_aborted`,
+`turn_timeout`, or `runtime_exception`.
+
+Turn-terminal schema triggers abort any still-running owned row with
+`turn_ended`; startup admission recovery therefore closes an interrupted row
+through the existing idempotent turn transition. Source-less background summary
+calls bypass this wrapper because their separately governed `summary` rows are
+job-attempt-owned. A ledger-owning runtime settles the main `agent_turns` row
+only after every gap-free `pi_turn` row completed with the exact configured
+provider/model identity. It sums input/output/total only when every round has
+known usage; otherwise all three aggregate columns stay `NULL`. The transaction
+does not consult `PiAdapterOutput.tokensUsed`, which remains compatibility output
+for runtimes that do not own durable invocation evidence. Local governance turns
+continue to record an explicit known zero.
+
+The same ledger timestamps provide payload-free latency evidence. Operations
+metrics count queue wait from admission `accepted_at` to
+`processing_started_at`, Provider latency from each terminal invocation's
+`started_at` to `completed_at`, and total turn latency from admission
+`accepted_at` to terminal turn `completed_at`. Only complete non-negative pairs
+are counted; running or malformed rows remain unobserved rather than becoming
+zero. The JSON/Prometheus operations surfaces and invocation-summary CLI use
+the same `count`/`sumMs`/`maxMs` semantics.
 
 ## Evaluator Integration
 

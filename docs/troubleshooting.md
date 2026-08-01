@@ -95,6 +95,14 @@ value. Also confirm:
   chat-completions operation URL.
 - `PI_TURN_TIMEOUT_MS` is an integer in `1..2147483647` (default `120000`);
   expiry requests cooperative abort and then waits for Pi to settle.
+- `PI_MAX_CONCURRENT_TURNS` is an integer in `1..16` (default `2`); it keeps
+  accepted workflows FIFO within one conversation and bounds different
+  conversations globally.
+- `PI_MAX_QUEUED_TURNS` is an integer in `0..128` (default `128`); excess
+  admissions are terminalized as durable overload outcomes instead of being
+  dropped. Each accepted event starts an absolute deadline at ingress; queued
+  work that reaches it is terminalized as `turn_admission_queue_timeout` and
+  never invokes Pi.
 - the service manager injects the reviewed runtime environment explicitly.
 - redacted application logs and `pnpm cli list-event-failures --stage pi_inference --include-details`
   show a bounded diagnostic rather than a raw provider response.
@@ -264,7 +272,8 @@ Current core variables are:
 - `LETHEBOT_TEST`
 - `LETHEBOT_HOST`, `LETHEBOT_PORT`, and the health/readiness/metrics/event paths
 - `PI_PROVIDER`, `PI_MODEL`, optional `PI_BASE_URL`, `PI_API_KEY`, and
-  `PI_TURN_TIMEOUT_MS` for a real provider
+  `PI_TURN_TIMEOUT_MS`, optional `PI_MAX_CONCURRENT_TURNS`, and optional
+  `PI_MAX_QUEUED_TURNS` for a real provider
 - optional paired `EVALUATOR_PROVIDER` / `EVALUATOR_MODEL`, optional
   `EVALUATOR_BASE_URL`, `EVALUATOR_API_KEY`, and evaluator timeout/retry/
   temperature/prompt-version controls

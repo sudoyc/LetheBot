@@ -16,7 +16,7 @@ Current docs are split into four classes:
 1. [Vision](vision.md)
 2. [Architecture](architecture.md)
 3. [Design Decisions](design-decisions.md)
-4. [Long-Term Development Constraints](long-term-development-constraints.md)
+4. [Long-Term Development Program And Constraints](long-term-development-constraints.md)
 5. [Contracts](contracts.md)
 6. [Data Model](data-model.md)
 7. [SQLite Schema](sqlite-schema.md)
@@ -25,36 +25,46 @@ Current docs are split into four classes:
 10. [Context Orchestration](context-orchestration.md)
 11. [Social Action Model](social-action-model.md)
 12. [Agent Governance](agent-governance.md)
-13. [Tool Registry](tool-registry.md)
-14. [Pi Integration](pi-integration.md)
-15. [Security and Privacy](security-privacy.md)
-16. [Tech Stack](tech-stack.md)
-17. [Deployment](deployment.md)
-18. [Local Container Acceptance](local-container-acceptance.md)
-19. [Operations](operations.md)
-20. [Troubleshooting](troubleshooting.md)
-21. [Test Strategy](test-strategy.md)
+13. [Local Governance Experience](governance-ui.md)
+14. [Tool Registry](tool-registry.md)
+15. [Pi Integration](pi-integration.md)
+16. [Security and Privacy](security-privacy.md)
+17. [Tech Stack](tech-stack.md)
+18. [Deployment](deployment.md)
+19. [Local Container Acceptance](local-container-acceptance.md)
+20. [Operations](operations.md)
+21. [Troubleshooting](troubleshooting.md)
+22. [Test Strategy](test-strategy.md)
 
 ## Focus Documents
 
-- [Long-Term Development Constraints](long-term-development-constraints.md) — hard evidence, architecture, memory, privacy, testing, and Git constraints.
+- [Long-Term Development Program And Constraints](long-term-development-constraints.md)
+  — active P0-P9 roadmap and the stable evidence, architecture, privacy,
+  verification, rollback, checkpoint, Git, and completion contract.
+- [Long-Term Development `/goal` Prompt](prompts/repair-and-long-term-development-goal.md)
+  — active umbrella execution prompt for the next-stage program.
 - [Long-Running Goal State](long-running-goal-state.md) — mutable current
-  requirement/evidence checkpoint and ordered repair route; this is the only
-  mutable status document and is never completion proof by itself.
+  requirement/evidence checkpoint, active phase, and exact next slice; this is
+  the only mutable status document and is never completion proof by itself.
 - [Group Chat Reliability Constraints](group-chat-reliability-constraints.md) —
   scoped speaker, quote, Attention, evaluator, memory-truthfulness, sequencing,
-  and verification invariants for the active repair.
+  and verification invariants reused by relevant P4/P5 slices.
 - [Group Chat Reliability `/goal` Prompt](prompts/group-chat-reliability-goal.md)
-  — active scoped execution prompt for the current reliability repair.
-- [Long-Horizon Full Completion Constraints](one-shot-full-completion-constraints.md) — resumable supervisor-loop, checkpoint, critical-path, stop, and completion rules for a goal spanning many verified slices.
-- [Long-Horizon Full Completion `/goal` Prompt](prompts/one-shot-full-completion-goal.md) — umbrella production-readiness prompt; use it only when that broader objective is explicitly selected.
+  — retained scoped prompt for a reliability-only objective, not the active
+  umbrella roadmap.
+- [Long-Horizon Full Completion Constraints](one-shot-full-completion-constraints.md)
+  and [its `/goal` prompt](prompts/one-shot-full-completion-goal.md) — superseded
+  umbrella methodology retained as planning history; the active program uses
+  the long-term constraints and prompt above.
 - [Next Full Implementation Plan](next-full-implementation-plan.md) — superseded
   2026-07-03 planning snapshot; use only as a hypothesis after checking current
   implementation, tests, and the active requirement matrix.
 
 Do not maintain a second current roadmap, gap-analysis log, or loop-state file.
-Stable decisions belong in `design-decisions.md`; current evidence and the exact
-next slice belong only in `long-running-goal-state.md`.
+The stable phase contract belongs in `long-term-development-constraints.md`;
+stable product decisions belong in `design-decisions.md`; current evidence,
+phase status, and the exact next slice belong only in
+`long-running-goal-state.md`.
 
 ## Supporting References
 

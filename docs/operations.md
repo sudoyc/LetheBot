@@ -42,6 +42,37 @@ such as `api_key=sk-...-qq-...` preserve both
 `[REDACTED:api_key_assignment]` and `[REDACTED:platform_id]` marker evidence in
 formatted smoke errors while omitting raw values and stack paths.
 
+## Configured Retention
+
+The canonical configured policy defaults are raw events 90 days, chat messages
+90 days, audit log 365 days, rejected/disabled/deleted memory 90 days, and
+event-processing failures 90 days. `0` means retain forever for that category.
+The compatibility setting `disabledDeletedMemoryRetentionDays` covers all three
+terminal memory states; active memory is never hard-purged by retention.
+
+All scheduler, manual, and governance execution uses the same SELECT-only
+planner and exact-plan apply order (`memory -> chat -> raw`). The planner fixes
+one `asOfMs`, models pins released by terminal-memory purge in the same run, and
+produces aggregate effects plus purpose-bound candidate fingerprints. Candidate
+IDs remain server-internal.
+
+The local governance Operations view exposes a system-scoped two-step action:
+
+- `POST /governance/api/v1/operations/retention` accepts only
+  `{ "action": "apply_configured_retention" }` and returns aggregate policy,
+  effects, hard-delete/no-rollback boundary, and short-lived authority.
+- `POST /governance/api/v1/operations/retention/confirm` accepts only
+  `{ "confirm": true, "previewHandle": "<opaque>" }`.
+
+Confirmation consumes authority before dispatch, recomputes the plan at the
+preview's server-owned time, and performs exact apply plus redacted aggregate
+audit insertion in one SQLite `IMMEDIATE` transaction. Drift or replay is a
+conflict; lock contention is temporarily unavailable; apply/count/audit failure
+rolls back all deletion. A verified backup is recommended because deletion is
+irreversible, but it is not a programmatic prerequisite. Never run this against
+a private/live database without separate explicit authorization and a reviewed
+backup/recovery procedure.
+
 ## Background Worker Runtime
 
 The app process registers an in-process durable background worker in the local
@@ -136,17 +167,28 @@ The durable worker and scheduler also:
   generated digest audit details, while raw source rows remain local DB evidence;
 - enqueues daily idempotent `conflict` jobs that detect active memory conflicts
   and write redacted `memory.conflict.detected` audit rows using memory IDs and
-  title hashes only. The current handler does not automatically supersede,
+  title hashes only. Each sampled pair also produces a stable, source-bound
+  `memory.maintenance.proposed` preview with a reviewer-selected conflict
+  resolution effect. The current handler does not automatically supersede,
   delete, or activate memory.
 - enqueues daily idempotent `decay` jobs that detect stale low-confidence or
   low-importance active memories and write redacted
-  `memory.decay.candidates_detected` audit rows. The current handler does not
+  `memory.decay.candidates_detected` audit rows. Each sampled record also
+  produces a stable proposed-disable preview. The current handler does not
   automatically change memory state, confidence, importance, or revisions.
 - enqueues daily idempotent `consolidation` jobs that detect duplicate active
   memory groups and write redacted
   `memory.consolidation.candidates_detected` audit rows using memory IDs,
-  title hashes, content hashes, and counts only. The current handler does not
+  title hashes, content hashes, and counts only. Each sampled group also
+  produces a stable preview that retains the lexically first memory ID and
+  proposes superseding the other duplicates. The current handler does not
   automatically merge, supersede, delete, or otherwise mutate memory records.
+
+All three preview types expose candidate memory IDs, source counts and
+fingerprints, reason codes, minimum candidate confidence, the proposed effect,
+and a whole-candidate fingerprint. Raw title/content/source IDs remain absent.
+An unchanged rerun reuses one proposal event ID and one
+`memory.maintenance.proposed` audit row; scan-summary audits remain per job.
 
 Deterministic tests keep wall-clock scheduling disabled through
 `LETHEBOT_TEST=true` and drive the same durable worker manually, so tests can
@@ -157,9 +199,11 @@ Current limits:
 
 - summary, extraction, delayed-Attention recheck, retention, admin-digest,
   conflict, decay, and consolidation handlers are wired.
-  Conflict/decay/consolidation workers remain review/audit-only and never
-  mutate memory automatically; owner/admin review can explicitly approve a safe
-  supersede through governance CLI for conflict or consolidation audit rows.
+  Conflict/decay/consolidation workers remain preview/review-only and never
+  mutate memory automatically. The existing owner/admin CLI can explicitly
+  approve a safe supersede from a conflict/consolidation scan audit or disable
+  a decay candidate, but the stable proposal previews do not yet have their own
+  approve/reject/expire/apply/rollback command lifecycle.
 - the worker runs in-process for the local profile and is not a separate worker
   service yet;
 - real SnowLuma/QQ acceptance is still manual/opt-in.
@@ -537,6 +581,8 @@ pnpm cli list-tool-calls --status error
 pnpm cli list-jobs --status failed
 pnpm cli list-job-attempts --status failed
 pnpm cli list-worker-heartbeats --status error
+pnpm cli summarize-model-invocations
+pnpm cli summarize-model-invocations --purpose pi_turn --status completed
 pnpm cli summarize-governance-health
 pnpm cli summarize-governance-health --compact
 ```
@@ -685,6 +731,16 @@ latest failure/heartbeat timestamps. It does not include payloads, memory
 contents, tool input/output, job payload/result, heartbeat details, audit
 summaries/details, event-failure details, action payloads, raw IDs, or stored
 dynamic strings.
+`summarize-model-invocations` returns aggregate ledger row counts by the finite
+`summary`, `evaluator`, and `pi_turn` purposes and the finite `running`,
+`completed`, `failed`, and `aborted` statuses. It separately counts completed
+rows whose input/output/total usage is fully known and completed rows with any
+unknown dimension. It also returns a bounded `providerLatencyMs` aggregate
+(`count`, `sumMs`, `maxMs`) for terminal rows in the selected filter. Optional
+`--purpose` and `--status` filters accept only those values; running rows have
+no latency observation. The output includes no invocation, turn, job, context,
+source, provider, model, response-hash, error, prompt, response, tool-payload,
+or private-platform fields and does not mutate the database.
 Memory inspection/export commands validate finite enum filters before dispatch:
 `--state` accepts `proposed`, `active`, `rejected`, `superseded`, `disabled`,
 or `deleted`; `--scope` accepts `global`, `user`, `group`, `conversation`,
@@ -947,6 +1003,8 @@ Safety checks:
 Use environment variables for secrets and deployment-specific values:
 
 - `LETHEBOT_DB_PATH`
+- `LETHEBOT_WORKSPACE_ROOT` (optional absolute directory for bounded workspace tools)
+- `LETHEBOT_WEB_FETCH_ALLOWED_ORIGINS` (optional exact HTTPS origins for bounded text fetch)
 - `LETHEBOT_RAW_EVENT_RETENTION_DAYS`
 - `LETHEBOT_CHAT_MESSAGE_RETENTION_DAYS`
 - `LETHEBOT_AUDIT_LOG_RETENTION_DAYS`
@@ -968,6 +1026,8 @@ Use environment variables for secrets and deployment-specific values:
 - `PI_BASE_URL`
 - `PI_API_KEY`
 - `PI_TURN_TIMEOUT_MS`
+- `PI_MAX_CONCURRENT_TURNS`
+- `PI_MAX_QUEUED_TURNS`
 - `EVALUATOR_PROVIDER`
 - `EVALUATOR_MODEL`
 - `EVALUATOR_BASE_URL`
@@ -979,11 +1039,60 @@ Use environment variables for secrets and deployment-specific values:
 
 Do not commit `.env` files, logs, SQLite databases, API keys, or private QQ identifiers.
 
+`LETHEBOT_WORKSPACE_ROOT` is unset by default. When set, it must be an absolute
+existing directory visible to the LetheBot process; startup otherwise fails
+with a fixed path-free error. It adds only bounded read-only `workspace.list`
+and `workspace.read_text` tools for private owner/admin turns. Container
+operators must provide the corresponding read-only mount themselves.
+
+`LETHEBOT_WEB_FETCH_ALLOWED_ORIGINS` is unset or blank by default, which keeps
+`web.fetch_text` out of the catalog. A non-empty value is a comma-separated list
+of at most 16 exact HTTPS origins and rejects wildcard, credential, path, query,
+fragment, duplicate, and non-HTTPS entries during startup. Configuration is not
+execution approval: only private owner/admin turns see the tool, and every call
+must receive a persisted unchanged evaluator approval before DNS or transport
+access. The tool sends one header-fixed GET sequence with no caller headers,
+body, cookies, or credentials; it performs no retries.
+
+For each URL and same-origin redirect, the tool rejects secret/platform-shaped
+URL data, resolves at most 16 A/AAAA results, rejects the complete answer when
+any address is malformed or non-public, and pins one validated address while
+retaining the hostname for TLS and the Host header. It follows at most three
+redirects and never crosses the initiating origin. Only successful identity-
+encoded textual responses are streamed; declared and actual source bytes are
+capped at 2,048, content is strict UTF-8 without disallowed controls, and the
+redacted result is capped at 8,192 bytes. Output contains only final URL,
+numeric status, normalized content type, content, source-byte count, redirect
+count, and a redaction flag. Remote headers, status text, and diagnostics are
+not returned; failures use fixed messages.
+
+An approved external GET may be observed or logged by its remote endpoint.
+`PreparedLocalToolEffect` coordinates local transactional writes and does not
+make that observation reversible. Disabling or unregistering `web.fetch_text`
+prevents future calls only; no completed GET is retried or described as rolled
+back. Deterministic tests inject resolver and transport fixtures and must not
+contact real DNS or network endpoints.
+
 `PI_TURN_TIMEOUT_MS` is the cooperative production `runTurn()` deadline in
 integer milliseconds. It defaults to `120000`; startup rejects values outside
 `1..2147483647`. Expiry asks Pi to abort and waits for the run to settle before
 the turn is failed. It does not force-stop providers or in-process tools that
 ignore cancellation.
+
+`PI_MAX_CONCURRENT_TURNS` bounds accepted conversational workflows after
+ingress admission. It defaults to `2` and accepts integers from `1` through
+`16`. A conversation has one active workflow and retains FIFO order; different
+conversations may use separate global slots. The workflow includes context
+building, Pi, action execution, and durable terminalization, and accepted work
+is drained during shutdown.
+
+`PI_MAX_QUEUED_TURNS` defaults to `128` and accepts integers from `0` through
+`128`. The queue cap excludes active workflows. An admission above the cap is
+terminalized as `turn_admission_overloaded` in the durable event-failure ledger.
+Each accepted event establishes an absolute deadline at `accepted_at` plus
+`PI_TURN_TIMEOUT_MS`; a queued item that reaches it is terminalized as
+`turn_admission_queue_timeout` and never invokes the Provider. These admission
+outcomes use the existing failure/admission rows and require no schema change.
 
 The non-test social/tool evaluator uses a stateless structured model request.
 When `EVALUATOR_PROVIDER` and `EVALUATOR_MODEL` are both unset, it inherits the
@@ -1119,16 +1228,16 @@ database; never recursively change ownership of a parent shared with SnowLuma.
 
 Startup treats `schema_version` and the migration-derived structure as
 fail-closed compatibility boundaries. The release requires the contiguous
-`001` through `006` migration set, targets schema v6, and reads only v1 through
-v6. Malformed/noncontiguous metadata or a version above 6 is rejected before
+`001` through `008` migration set, targets schema v8, and reads only v1 through
+v8. Malformed/noncontiguous metadata or a version above 8 is rejected before
 any migration schema/data write. For a missing or valid-empty ledger, v1
-compatibility patches and migrations v2-v6 run in one `IMMEDIATE` transaction;
+compatibility patches and migrations v2-v8 run in one `IMMEDIATE` transaction;
 each version is recorded only after the result matches its migration-derived
 table, column/type/nullability/default/primary-key, foreign-key,
 required-index, supported CHECK, virtual-table, and migration-owned trigger
 contract and `PRAGMA foreign_key_check` is clean. A same-named but incompatible
 legacy object therefore aborts and rolls back every patch and DDL change
-instead of being stamped current. Existing v1-v6 metadata is idempotent, keeps
+instead of being stamped current. Existing v1-v8 metadata is idempotent, keeps
 its original timestamps, and receives the same structural validation. Three exact
 early-v1 memory CHECK shapes are upgraded transactionally: the runner rebuilds
 `memory_records`, `memory_revisions`, and/or `memory_sources` from the current
@@ -1292,6 +1401,273 @@ message text, audit details, tool input/output, job payloads/results, or worker
 details. Output paths and other display strings are passed through the same ops
 redaction boundary as backup/restore/metrics/worker-soak JSON output.
 
+The inspection is owned by the top-level `runOperationsDoctor` function in
+`src/operations/doctor.ts`; the CLI opens and closes the database and delegates
+to that typed owner. This keeps the field order, classifications, and read-only
+behavior identical for later governance projections without importing a CLI
+entrypoint or duplicating SQLite inspection in an HTTP handler. The current
+owner still returns the internal database path for the local CLI boundary; the
+governance coordinator projects it away before any route is enabled.
+
+`GovernanceOperationsCoordinator` in
+`src/governance/operations-coordinator.ts` provides that HTTP-disabled
+projection. It calls the shared doctor once and rebuilds a fixed DTO with the
+generation time, overall state, open/read-only state, integrity/FK/schema
+classifications, fixed aggregate count categories, configuration-presence
+booleans, and retention days. It does not pass through the database path, raw
+integrity result, missing-table names, URLs, credentials, identifiers, row
+payloads, unrestricted keys, or dynamic diagnostics. Workflow metadata states
+only that private verified backup creation is available and that restore is
+available through the `stopped_service_only` execution boundary. Inspection
+does not create a backup, restore a database, apply retention, write an audit,
+or register an HTTP route.
+
+The coordinator's HTTP-disabled `createVerifiedBackup({ backupPath })` method
+accepts a trusted internal destination path and delegates once to
+`backupSqliteDatabase`; the path is not an HTTP selector. A successful call
+returns only fixed completion status, verified integrity, bounded artifact-size
+and total/remaining-page evidence, and a `stopped_service_only` restore handoff.
+Owner failures return one fixed diagnostic-free `attention_required` shape.
+Malformed numeric metadata is bounded, marks the result
+`attention_required`, and keeps restore unavailable. Paths, error text, raw
+integrity diagnostics, rows, identifiers, and injected properties are not
+returned. Private staging, `0600` publication, integrity validation, candidate
+cleanup, and destination no-clobber behavior remain owned by
+`backupSqliteDatabase`. This adapter adds no route, restore execution,
+retention mutation, or audit write.
+
+B23D exposes the same fixed status through the authenticated-unscoped
+`GET /governance/api/v1/operations` route with purpose
+`governance.operations.status.read`. The existing HTTP boundary rejects missing
+sessions, queries, and scope headers before `GovernanceOperationsCoordinator`
+is called. The route calls only `inspect()` and returns the B23B DTO unchanged;
+it does not call backup creation or expose a destination selector. The existing
+`/governance/api/v1/overview` aggregate route remains separate.
+
+The coordinator's HTTP-disabled `previewVerifiedBackup()` method returns only
+the fixed `create_verified_backup` action, available state, contract version,
+database-no-write/private-artifact/integrity-verification/no-overwrite effects,
+the `stopped_service_only` restore boundary, unavailable in-process rollback,
+and a domain-separated SHA-256 digest over those ordered semantic fields. It
+accepts no input and does not inspect the database, choose a destination, issue
+authority, create a file, or call the backup owner. A later confirmation path
+must use a private server-owned destination before it can call
+`createVerifiedBackup()`.
+
+B23F exposes only that fixed preview through authenticated-unscoped mutation
+`POST /governance/api/v1/operations` with purpose
+`governance.operations.backup.preview`. The shared boundary enforces session,
+same-origin, CSRF, JSON body, query, and scope-header checks before accepting the
+exact `{ action: 'create_verified_backup' }` body. A successful request returns
+the B23E projection unchanged plus fresh opaque authority bound to the current
+session, local-admin actor, fixed system operation, available state, contract
+version, and digest. It does not inspect Operations status, accept or return a
+destination, consume authority, call backup creation, create a file, write the
+database/audit log, or register confirmation.
+
+The HTTP-disabled B23G `createServerOwnedVerifiedBackup()` coordinator method
+accepts no path or client input. It resolves the database file and uses only a
+fixed `.lethebot-governance-backups` directory beside it. A new directory is
+created as `0700`; an existing entry is accepted only when it is a real,
+non-symlink, current-process-owned directory with exactly `0700` permissions.
+The method generates one random 256-bit base64url reference, derives the private
+`<reference>.db` destination internally, and calls B23C once. Completed output
+adds only the opaque reference to B23C's path-free evidence; every non-completed
+result has a null reference. The backup artifact remains `0600` through the
+existing owner. Unsafe directories and local errors return fixed path-free
+attention evidence without repair or retry. No artifact catalog scan, path
+disclosure, authority operation, route, audit/SQLite write, restore, retention,
+or configuration is added.
+
+B23H registers only authenticated-unscoped mutation
+`POST /governance/api/v1/operations/confirm` with purpose
+`governance.operations.backup.confirm`. The shared session, same-origin, CSRF,
+JSON, query, and scope-header boundary accepts only the exact
+`{ confirm: true, previewHandle }` body. The route consumes that current-session
+authority once against B23F's fixed action, resource, and system scope, then
+recomputes B23E and requires exact state, contract-version, and digest equality.
+Unknown authority returns `404`; consumed or stale authority returns `409`
+before backup execution. A current confirmation calls B23G once with no input
+and returns its unchanged fixed result with HTTP `200`; attention evidence has a
+null reference and is not retried. The response exposes no path, filename, or
+diagnostic. B23D status and B23F preview behavior remain unchanged, and no
+direct B23C call, SQLite/audit write, restore, retention, artifact deletion, or
+rollback route is added.
+
+The HTTP-disabled B23I `previewServerOwnedBackupRestore(backupRef)` coordinator
+method accepts only one exact 43-character base64url reference. It resolves the
+fixed managed-backup directory without creating or repairing it, requires the
+directory to retain B23G's non-symlink owned `0700` boundary, and opens only the
+exact `<reference>.db` entry. The artifact must remain a contained, owned,
+single-link, non-symlink `0600` regular file with stable device, inode, and size
+evidence across a no-follow read. Integrity verification uses a copied byte
+snapshot: the shared snapshot owner validates the SQLite header, normalizes the
+two rollback/WAL header bytes only in that private copy, and runs
+`PRAGMA integrity_check` in memory. It neither changes the artifact bytes nor
+creates WAL/SHM sidecars; the existing path-based backup/restore verifier is
+unchanged.
+
+A valid artifact returns only the fixed `prepare_restore_handoff` action,
+`verified_backup_available` state, contract version, verified bounded size,
+database/artifact/restore no-effect evidence, required service stop,
+`stopped_service_only` execution boundary, and `no_in_process_effect` rollback
+boundary. Its domain-separated digest binds the exact reference, artifact
+bytes, and ordered semantics without returning the reference or a fingerprint.
+Invalid, missing, unsafe, empty, changed, or corrupt artifacts return no
+preview and no diagnostic. No catalog/list, path, filename, route, authority,
+handoff file, database/audit write, deletion, restore, or retention behavior is
+added; B23D-H remain unchanged.
+
+B23J registers only authenticated-unscoped mutation
+`POST /governance/api/v1/operations/restore` with purpose
+`governance.operations.restore.preview`. The existing session, same-origin,
+CSRF, JSON, query, and scope-header boundary accepts exactly
+`{ action: "prepare_restore_handoff", backupRef }` with one 43-character
+base64url reference. The handler calls only B23I once. Missing or unsafe exact
+artifacts return fixed `404`; a verified preview is bound to the current session,
+local-admin actor, fixed action and resource kind, reference as internal resource
+ID, system scope, state, contract version, and digest. HTTP `201` returns the
+unchanged path-free preview plus an opaque handle and bounded expiry without
+reflecting the reference.
+
+This preview route neither consumes authority nor adds a restore-confirm route.
+It creates, changes, or deletes no artifact; writes no database or audit state;
+and executes no restore or retention operation. Backup preview/confirmation and
+B23I validation remain unchanged. Paths, filenames, references, fingerprints,
+credentials, and diagnostics remain absent from the response.
+
+B23K registers only authenticated-unscoped mutation
+`POST /governance/api/v1/operations/restore/confirm` with purpose
+`governance.operations.restore.confirm`. The existing session, same-origin,
+CSRF, JSON, query, and scope-header boundary accepts exactly
+`{ confirm: true, previewHandle, backupRef }`, with two 43-character base64url
+values. The handler consumes only B23J authority bound to the current session,
+local-admin actor, fixed restore action and resource kind, exact reference, and
+system scope. Unknown or mismatched authority returns fixed `404`; consumed
+authority returns fixed `409`.
+
+After consumption, the handler calls B23I once with the exact reference and
+requires current state, contract version, and digest to match the consumed
+preview. Missing or changed artifacts return fixed `409`; a current confirmation
+reaches B23N, which calls the B23L publisher with only the trusted configured
+database path, exact internal reference, current preview digest, contract
+version `1`, and the current governance clock. The route returns the publisher's
+fixed path-free receipt with `200`; pending state exposes only the opaque handoff
+ID and expiry, while an existing, raced, unsafe, or local-error state returns the
+fixed attention receipt. The reference, digest, database path, handoff path, and
+diagnostics are not reflected. Confirmation still writes no database or audit
+row, changes no backup artifact, and executes no restore, retention, service-stop,
+restart, or supervisor operation.
+
+The HTTP-disabled B23L `prepareGovernanceRestoreHandoff` owner is the independent
+durable boundary for a later stopped-service integration. It accepts only a
+trusted absolute normalized database location, an exact 43-character internal
+backup reference, a lowercase SHA-256 preview digest, restore contract version
+`1`, and an injected valid time. It accepts no client-selected handoff path,
+session handle, credential, or restore command. The database location selects
+only the fixed sibling `.lethebot-governance-restore-handoff` directory; the
+owner does not open the database or managed-backup artifact.
+
+The owner creates that directory as `0700`, or accepts it only as a canonical,
+current-user-owned, non-symlink directory with exactly `0700` permissions. It
+publishes at most one fixed `pending.json` as a current-user-owned, single-link
+`0600` regular file. The strict JSON envelope has schema version `1`, state
+`pending`, a random 256-bit base64url handoff ID, the exact internal backup
+reference and preview digest, restore contract version `1`, millisecond ISO
+creation time, expiry exactly 15 minutes later, and the
+`stopped_service_only` execution boundary. Timestamp input is bounded so both
+ISO values remain four-digit UTC dates.
+
+Publication uses an exclusive operation-owned `0600` staging inode, file fsync,
+hard-link no-clobber publication, directory fsync, and removal of only that
+owned staging link. Success returns only `pending`, the handoff ID, expiry,
+execution boundary, and `restoreExecution: false`. Invalid input, an existing or
+raced entry, an unsafe directory or pending entry, and local owner errors all
+return the same path-free `attention_required` receipt with null ID/expiry and
+the same no-restore evidence. Existing entries are never read for diagnostics,
+repaired, overwritten, or deleted. B23L remains HTTP-disabled and has no CLI,
+supervisor, or service-lifecycle owner; B23N is the sole current B23K call site.
+
+The HTTP-disabled B23M `readGovernanceRestoreHandoff` owner independently
+reopens B23L state after process restart. It accepts only a trusted absolute
+normalized database location and an optional injected current time, derives the
+same fixed sibling directory and `pending.json`, and creates nothing. The
+database parent and handoff directory must remain canonical non-symlink
+directories; the handoff directory must remain current-user-owned `0700` and
+contain exactly the one fixed entry. The pending entry must remain an owned,
+single-link, non-symlink `0600` regular file no larger than 2048 bytes.
+
+The reader compares path and opened device/inode evidence, uses no-follow file
+access, bounds and rechecks size, and revalidates the directory and fixed entry
+after reading. Its canonical one-line JSON parser requires the exact B23L key
+set/order and values: schema `1`, pending state, 43-character base64url handoff
+ID/reference, lowercase SHA-256 preview digest, restore contract version `1`,
+millisecond four-digit UTC timestamps exactly 15 minutes apart, and
+`stopped_service_only`. The supplied current time must be within the closed-open
+creation/expiry interval.
+
+A valid reopen returns only pending state, handoff ID, expiry, contract version,
+execution boundary, and `restoreExecution: false`; it does not return the
+internal backup reference, preview digest, path, or diagnostic. Missing,
+expired, malformed, changed, oversized, multi-link, over-permissive, symlink,
+wrong-owner, extra-entry, or local-error state returns one fixed
+`attention_required` receipt with null ID/expiry/version. Every result is
+read-only: no entry is repaired, consumed, extended, overwritten, or deleted,
+and the database, backup artifact, SQLite/audit state, B23K/B23N, HTTP/CLI/
+supervisor, service lifecycle, retention, and restore execution remain unchanged.
+
+B23N is the only route-to-publication wiring. After B23K has consumed exact
+current-session authority and recomputed an equal B23I preview, it calls only
+`prepareGovernanceRestoreHandoff` with trusted internal values and returns that
+receipt unchanged with `200`. It does not call B23M, read the database or backup,
+write SQLite/audit state, expose any reference/path/digest, retry an attention
+receipt, or stop/restart/control the service. Repeated confirmation is rejected
+by the single-use authority before publication, and B23M can reopen a successful
+pending envelope from a fresh process.
+
+The HTTP-disabled B23O `createGovernanceRestoreHandoffConsumer` owner is the
+separate stopped-service execution boundary. Construction accepts one trusted
+absolute normalized database location, the B23I resolver already bound to that
+database, and optionally the existing `restoreSqliteDatabase` owner for tests.
+Each consumption accepts only an injected current time and a typed proof whose
+state is `stopped`, database location exactly matches construction, and
+observation time is valid and not in the future. Missing, running, mismatched,
+or future proof returns fixed `stop_proof_required` evidence before handoff,
+database, backup, resolver, or restore access.
+
+For a live `pending.json`, B23O reuses B23M's strict canonical envelope parser
+and private path/mode/owner/link/identity checks; it does not define a weaker
+envelope. Before claim it requires an exact B23I action/state/version/digest and
+effect projection, rereads the fixed database-sibling managed backup between
+two equal B23I resolutions, requires the owned `0700` backup directory and
+owned single-link `0600` artifact, rejects target WAL/SHM sidecars, and requires
+both SQLite integrity and an empty foreign-key check. A drifted, stale, unsafe,
+corrupt, FK-invalid, or sidecar-bearing pending handoff remains unclaimed.
+
+Claim publishes one canonical private `claim.json` containing the exact strict
+envelope, backup/target fingerprints, and a restore-attempt count, then removes
+only the matching pending entry and fsyncs the directory. Attempt state is
+durable before the atomic restore call. The initial attempt plus one retry is
+the fixed limit. If an interrupted call already replaced the target with the
+verified backup, recovery publishes completion without calling restore again;
+if the target still matches the captured pre-restore fingerprint, one remaining
+attempt may run. A third attempt, changed target, changed backup, or foreign
+state produces attention evidence without another restore. Operation-owned
+claim/completion staging and the `pending.json` plus `claim.json` crash window
+are recoverable after restart.
+
+Successful consumption leaves only a canonical private `completed.json` and
+returns fixed path-free `completed/restored` evidence. Post-effect recovery
+returns fixed `recovered` evidence with `restoreExecution: false`; repeated
+execution returns fixed `already_consumed` attention evidence and never calls
+the resolver or restore owner again. Receipts expose no database/backup/handoff
+path, backup reference, preview or artifact digest, SQLite diagnostic, or row.
+The existing restore owner remains responsible for candidate-copy integrity,
+foreign-key verification, sidecar rechecks, atomic target replacement, and
+candidate cleanup. B23O does not mutate or delete backup bytes, add audit rows,
+touch unrelated files, or add CLI, HTTP, supervisor, stop/restart, retention,
+schema, migration, or deployment behavior.
+
 Run a disposable maintenance rehearsal before handoff or after changing
 maintenance code:
 
@@ -1398,10 +1774,24 @@ Metrics fields:
 - `rawEvents.total`
 - `eventIngressReceipts.total`
 - `eventIngressReceipts.byDisposition` (`accepted` / `duplicate` only)
+- `eventProcessingAdmissions.total`
+- `eventProcessingAdmissions.byState`
+- `latency.queueWaitMs` (`count`, `sumMs`, `maxMs`)
+- `latency.providerLatencyMs` (`count`, `sumMs`, `maxMs`)
+- `latency.totalTurnLatencyMs` (`count`, `sumMs`, `maxMs`)
 - `chatMessages.total`
 - `agentTurns.total`
 - `agentTurns.byStatus`
+- `agentTurns.tokensInput`
+- `agentTurns.tokensOutput`
 - `agentTurns.tokensTotal`
+- `agentTurns.completedKnownUsage`
+- `agentTurns.completedUnknownUsage`
+- `modelInvocations.total`
+- `modelInvocations.byPurpose` (`summary` / `evaluator` / `pi_turn` only)
+- `modelInvocations.byStatus` (`running` / `completed` / `failed` / `aborted` only)
+- `modelInvocations.completedKnownUsage`
+- `modelInvocations.completedUnknownUsage`
 - `contextTraces.total`
 - `actionDecisions.total`
 - `actionDecisions.byDecidedBy`
@@ -1440,6 +1830,24 @@ Ingress receipt metrics count retained receipt rows and use `received_at` for
 bounded `lethebot_event_ingress_receipts_total` and
 `lethebot_event_ingress_receipts_disposition_total{disposition="..."}` series
 without raw event IDs, platform IDs, payloads, or dynamic labels.
+
+Agent-turn token sums include only non-`NULL` durable values. A completed turn
+is counted as known only when input/output/total are all present; otherwise it is
+counted as unknown. Model invocation known/unknown counters use the identical
+rule. Prometheus publishes fixed gauges for both counters and bounds invocation
+purpose/status labels to the finite values above, bucketing malformed legacy
+values as `other` rather than echoing them.
+
+Latency aggregates use complete, non-negative durable timestamp pairs only.
+Queue wait uses `accepted_at` to `processing_started_at` for accepted
+turn-owned admissions; Provider latency uses `started_at` to `completed_at` for
+terminal `pi_turn` invocations; and total turn latency uses admission
+`accepted_at` to terminal `agent_turns.completed_at`. Running, missing, or
+malformed pairs are excluded, while a valid zero-millisecond pair is counted.
+The `--since` window is applied to the start timestamp for each aggregate.
+Prometheus publishes each aggregate as count-only gauges with `_count`, `_sum`,
+and `_max` suffixes; no row identifiers, payloads, source values, or provider
+metadata are included.
 
 Structured logs should include these operational identifiers when available:
 
@@ -1638,10 +2046,10 @@ pnpm typecheck && pnpm lint && pnpm build && pnpm release:preflight && pnpm test
 ```
 
 `release:preflight` fails if the built `dist/index.js`, any checked-in migration
-from `001` through `006`, `package.json`, or `pnpm-lock.yaml` is missing. It also
+from `001` through `008`, `package.json`, or `pnpm-lock.yaml` is missing. It also
 requires an exact `packageManager` pnpm version whose major matches the lockfile
-format major and an exact-key `lethebotSchema` contract. The v6 contract targets
-6, reads versions 1 through 6, and records whether a legacy absent/empty ledger
+format major and an exact-key `lethebotSchema` contract. The v8 contract targets
+8, reads versions 1 through 8, and records whether a legacy absent/empty ledger
 may be adopted. Preflight then loads the built
 entrypoint dependency graph in a bounded Node child process without starting
 the guarded application main. This proves the minimum source-release layout is
@@ -1777,8 +2185,8 @@ Recommended local install/update sequence:
    successful A-to-B slot activation. A second B uses a deliberately mismatched
    readiness route, so fixed `/readyz` fails and the activator must stop B,
    restore pointers, and restart/probe A. Aggregate output also requires
-   empty-ledger v6 adoption, stable v1/v2/v3/v4/v5/v6 timestamps, preserved synthetic sentinel
-   and a stable logical fingerprint of every non-internal schema
+   empty-ledger v8 adoption, stable v1/v2/v3/v4/v5/v6/v7/v8 timestamps, preserved
+   synthetic sentinel, and a stable logical fingerprint of every non-internal schema
    object and table row after A readiness, clean integrity/FKs, stopped child
    processes, and removed temporary state. It does not call a provider or QQ. Because both
    slots contain the same build, this command proves built-process, pointer,
@@ -1792,15 +2200,16 @@ Recommended local install/update sequence:
 
    ```bash
    pnpm --silent ops:rehearse-cross-version -- \
-     --prior-release=/srv/lethebot/releases/<v5-release> \
-     --candidate-release=/srv/lethebot/releases/<v6-release>
+     --prior-release=/srv/lethebot/releases/<v7-release> \
+     --candidate-release=/srv/lethebot/releases/<v8-release>
    ```
 
-   This proves readiness-failure rollback to runnable v5, startup-gate denial
-   plus explicit recovery for a crashed unconfirmed v6, and wrong-confirmation
-   preservation followed by exact confirmation and marker-free v6 restart. It
-   checks the prior/current ledgers and the v6 group-summary policy/binding table
-   boundary.
+   This proves readiness-failure rollback to runnable v7, startup-gate denial
+   plus explicit recovery for a crashed unconfirmed v8, and wrong-confirmation
+   preservation followed by exact confirmation and marker-free v8 restart. It
+   checks the prior/current ledgers, preserves the v7 Pi invocation boundary,
+   and reaches readiness only after the v8 migration-derived maintenance
+   proposal schema passes structural and foreign-key validation.
    Output contains only aggregate booleans; input paths and synthetic DB content
    are not emitted.
 

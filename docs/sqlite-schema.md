@@ -697,6 +697,92 @@ deterministic extraction retry. These memory/audit columns also hold local
 policy IDs and therefore are not foreign keys to `evaluator_decisions` in schema
 v2.
 
+### memory_maintenance_proposals and lifecycle evidence
+
+Schema v8 adds an authoritative normalized ledger for governed conflict,
+consolidation, and decay proposals. The migration creates these tables empty;
+historical `memory.maintenance.proposed` audit JSON is display evidence and is
+never promoted into executable lifecycle state.
+
+`memory_maintenance_proposals` stores the stable proposal ID, kind, constrained
+effect type, exact scope/owner snapshot, aggregate candidate fingerprint,
+confidence, current lifecycle state/revision, timestamps, and the creation
+audit link. Conflict has no preselected target; consolidation must name one
+`retained` candidate; decay must name one `disable_target` candidate. A deferred
+composite foreign key requires each named target to exist in the proposal's
+candidate set before the write transaction commits.
+
+`memory_maintenance_proposal_candidates` stores ordered memory IDs, the
+kind-compatible effect role, expected active state, per-record fingerprint, and
+source count/fingerprint. It does not copy memory title/content or source IDs.
+Candidate memory IDs are foreign keys to `memory_records`; a proposal cannot
+repeat a candidate, consolidation can have at most one retained candidate, and
+decay can have at most one disable target.
+
+`memory_maintenance_proposal_reasons` stores an ordered unique set of fixed
+reason codes. Conflict accepts only
+`same_boundary_title_different_content`, consolidation accepts only
+`same_boundary_title_and_content`, and decay accepts `stale`,
+`low_confidence`, and/or `low_importance`.
+
+`memory_maintenance_proposal_revisions` is the actor/audit-linked transition
+history. Its constrained transition graph is:
+
+```text
+propose:  null -> pending_review
+approve:  pending_review -> approved
+reject:   pending_review -> rejected
+expire:   pending_review|approved -> expired
+apply:    approved -> applied
+rollback: applied -> rolled_back
+```
+
+The initial `propose` revision is system-worker/background-worker evidence.
+Every later revision records an actor class, optional canonical actor, invocation
+context, bounded reason code, exact audit row, and timestamp. A migration-owned
+trigger requires the inserted revision number/state to match the proposal's
+current row and requires a contiguous prior revision with the stated previous
+state. This supports compare-and-transition review logic without treating audit
+details as state.
+
+`memory_maintenance_proposal_revision_effects` links only `apply` or `rollback`
+proposal revisions to exact candidate memories and exact `memory_revisions`
+rows. Conflict/consolidation apply links may be `retained` or `superseded`, decay
+apply links must be `disabled`, and rollback links are `restored`. The ledger
+therefore preserves which durable memory revisions implemented or reversed a
+decision while leaving all prior memories, sources, proposal revisions, and
+audits intact.
+
+Migration 008 establishes this persistence contract without audit backfill. The
+scanner repository now recomputes the current record/source snapshot and writes
+the proposal, candidates, reasons, initial revision, and new audit atomically.
+It may reuse an existing matching audit row, but never reads audit JSON as
+state. The governance repository reads normalized rows through SQL exact-scope
+predicates before its limit and compare-transitions approve, reject, or expire
+from an exact state/revision. Proposal state, the redacted actor audit, and the
+contiguous proposal revision commit atomically; exact retry is a no-op and
+stale/competing review has zero effects. Review creates no revision-effect row
+and changes no memory row. The governed application repository recomputes the
+same candidate/source fingerprints and exact boundary inside one immediate
+transaction, then records retained/superseded or disabled memory revisions and
+audits, the `approved -> applied` proposal revision/audit, and one effect link
+per candidate. Conflict requires an explicit retained candidate; consolidation
+and decay use their normalized targets. Exact retry/reopen adds no rows, stale
+evidence or a competing choice has zero effects, and a child-write failure
+rolls back all proposal and memory mutations. No record or source link is
+deleted. The governed rollback repository requires the exact `applied`
+state/revision and consumes the normalized apply revision/effect links rather
+than audit JSON. Each linked apply memory revision must remain the candidate's
+unique latest revision, the current memory row must equal its `new_state`
+snapshot, and source count/fingerprint plus exact scope must remain unchanged.
+One immediate transaction restores every candidate to active through a new
+`restore` revision/audit, records the `applied -> rolled_back` proposal
+revision/audit, and adds one `restored` effect link per candidate. It preserves
+all earlier records, sources, revisions, audits, and links. Exact retry/reopen is
+a no-op; drift or a competing rollback has zero effects; and any child-write
+failure rolls back the whole operation. No background scanner receives memory
+mutation authority from proposal persistence.
+
 ### memory_embeddings (P1, optional for P0)
 
 Vector embeddings for semantic search.
@@ -1301,7 +1387,8 @@ keys.
 `model_contexts` remains the privacy-minimized context trace for summary jobs.
 Schema v3 generalized the Provider-call ledger so `model_invocations` could also
 record evaluator calls without inventing a summary context. Schema v4 added one
-correction call; schemas v5 and v6 leave that ledger shape unchanged:
+correction call; schemas v5 and v6 leave that ledger shape unchanged. Schema v7
+adds exact main-Pi Provider requests as `purpose='pi_turn'` rows:
 
 ```sql
 CREATE TABLE model_invocations (
@@ -1309,7 +1396,7 @@ CREATE TABLE model_invocations (
   turn_id TEXT,
   job_attempt_id TEXT,
   context_id TEXT,
-  purpose TEXT NOT NULL CHECK(purpose IN ('summary', 'evaluator')),
+  purpose TEXT NOT NULL CHECK(purpose IN ('summary', 'evaluator', 'pi_turn')),
 
   evaluator_request_id TEXT,
   evaluator_domain TEXT CHECK(
@@ -1326,6 +1413,9 @@ CREATE TABLE model_invocations (
   tokens_input INTEGER,
   tokens_output INTEGER,
   tokens_total INTEGER,
+  tokens_cache_read INTEGER,
+  tokens_cache_write INTEGER,
+  tokens_reasoning INTEGER,
   response_sha256 TEXT,
   response_bytes INTEGER,
   error_code TEXT,
@@ -1352,6 +1442,9 @@ CREATE UNIQUE INDEX idx_model_invocations_summary_call
 CREATE UNIQUE INDEX idx_model_invocations_evaluator_request_call
   ON model_invocations(evaluator_request_id, call_number)
   WHERE purpose = 'evaluator';
+CREATE UNIQUE INDEX idx_model_invocations_pi_turn_call
+  ON model_invocations(turn_id, call_number)
+  WHERE purpose = 'pi_turn';
 ```
 
 The migration's CHECK constraints require exactly one owner. Summary rows are
@@ -1362,10 +1455,14 @@ request plus call number;
 tool/social rows must be turn-owned, while memory may be turn- or extraction-
 attempt-owned. Running rows have no terminal payload. Completed rows require
 token counts and a SHA-256/byte-count response digest but no error code. Failed
-or aborted rows require only a bounded error code and terminal timestamp. Ordered
-source rows must exactly equal the evaluator request's raw-event sources before a
-decision can link the invocation. Turn and job-attempt terminal triggers abort
-any still-running owned invocation.
+or aborted rows require only a bounded error code and terminal timestamp. A
+`pi_turn` row is owned only by a running `agent_turns` row, has no summary or
+evaluator metadata, and is unique by `(turn_id, call_number)`. Its cache-read,
+cache-write, and reasoning token dimensions are nullable; a completed Pi row
+may retain all usage as `NULL` when the provider supplies no usage metadata.
+Unknown is therefore distinct from a reported zero. Ordered source rows remain
+in `model_invocation_sources` and retain their nonnegative ordinal/FK contract.
+Turn and job-attempt terminal triggers abort any still-running owned invocation.
 Repository start/binding checks allow call 2 only when the same request's call 1
 has already failed with `invalid_structured_output`, completed no later than call
 2 starts, and has the same domain, owner, provider, model, prompt version, and
@@ -1404,12 +1501,16 @@ CREATE TABLE worker_heartbeats (
    `004_evaluator_correction_attempts.sql` adds the separately ledgered second
    call without rewriting v3 history; `005_delayed_attention.sql` adds the
    source-bound candidate, decision, and suppressor tables for delayed group
-   Attention; and `006_group_summary_policy.sql` adds exact-group summary policy
-   epochs and durable job bindings.
+   Attention; `006_group_summary_policy.sql` adds exact-group summary policy
+   epochs and durable job bindings; `007_pi_turn_model_invocations.sql` adds
+   exact-turn Pi invocation rows and nullable extended usage; and
+   `008_memory_maintenance_proposals.sql` adds the normalized maintenance
+   proposal, candidate, reason, lifecycle-revision, and memory-revision-link
+   ledger without backfilling audit JSON.
 2. Startup validates the complete contiguous migration set before DB writes.
-   Fresh/legacy and v1-v5 upgrades apply atomically and finish with ledger
-   `[1,2,3,4,5,6]`; an already-current v6 database receives a validation-only,
-   zero-write pass.
+   Fresh/legacy and v1-v7 upgrades apply atomically and finish with ledger
+   `[1,2,3,4,5,6,7,8]`; an already-current v8 database receives a
+   validation-only, zero-write pass.
 3. Current startup migration also applies additive compatibility patches for
    existing local v1 DBs, including `action_executions.executed_memory_id` and
    `action_executions.executed_job_id`.
@@ -1429,7 +1530,7 @@ CREATE TABLE worker_heartbeats (
    keep their original `applied_at`; any failure rolls the entire migration back
    to the exact input.
 7. Before commit, the runner builds clean in-memory schemas from the applicable
-   migration prefix through final v6 and compares the database's complete required table
+   migration prefix through final v8 and compares the database's complete required table
    columns, types, nullability, compatible defaults, primary keys, foreign keys,
    indexes, supported CHECK shapes, virtual table, and migration-owned trigger.
    It also requires
@@ -1455,8 +1556,8 @@ CREATE TABLE worker_heartbeats (
 - Never delete columns (mark deprecated, filter in queries)
 - Add new tables freely
 - Update CHECK constraints carefully (may require table rebuild)
-- This release targets schema v6 and accepts v1-v5 for migration. An older v5
-  runtime intentionally rejects v6, so application activation must retain and
+- This release targets schema v8 and accepts v1-v7 for migration. An older v7
+  runtime intentionally rejects v8, so application activation must retain and
   restore its pre-upgrade SQLite snapshot before restarting that prior release.
 
 ---
