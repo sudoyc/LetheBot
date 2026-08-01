@@ -7451,6 +7451,9 @@ describe('LetheBot governance HTTP lifecycle wiring', () => {
     const governancePort = await reserveLoopbackPort();
     const platformId = '934567890';
     const secret = 'sk-memoryhttpabcdefghijklmnopqrstuvwxyz123456';
+    const posixPath = '/srv/lethebot/private/lethebot.db';
+    const windowsPath = 'C:\\Users\\LetheBot\\private\\lethebot.db';
+    const sql = 'SELECT content FROM memory_records WHERE state = "active";';
     const canonicalUserId = `memory-http-page-user-${platformId}-${secret}`;
     const visibleMemoryId = `memory-http-page-visible-${platformId}-${secret}`;
     const restrictedMemoryId = `memory-http-page-restricted-${platformId}-${secret}`;
@@ -7524,8 +7527,8 @@ describe('LetheBot governance HTTP lifecycle wiring', () => {
       canonicalUserId,
       `memory-http-subject-${platformId}-${secret}`,
       'normal',
-      `Memory ${platformId}`,
-      `api_key=${secret}`,
+      `Memory ${platformId} ${posixPath}`,
+      `api_key=${secret} ${windowsPath} ${sql}`,
       'active',
       0.7,
       0.9,
@@ -7565,7 +7568,7 @@ describe('LetheBot governance HTTP lifecycle wiring', () => {
     ).run(
       visibleRevisionId,
       visibleMemoryId,
-      `memory-http-reason-${platformId}-${secret}`,
+      `memory-http-reason-${platformId}-${secret} ${posixPath} ${sql}`,
       `memory-http-actor-${platformId}-${secret}`,
       `memory-http-revision-evaluator-${platformId}-${secret}`,
       now,
@@ -7712,8 +7715,8 @@ describe('LetheBot governance HTTP lifecycle wiring', () => {
         sensitivity: 'normal',
         authority: 'system',
         kind: 'fact',
-        title: 'Memory [REDACTED:platform_id]',
-        contentPreview: '[REDACTED:api_key_assignment]',
+        title: 'Memory [REDACTED:platform_id] [REDACTED:filesystem_path]',
+        contentPreview: '[REDACTED:api_key_assignment] [REDACTED:filesystem_path] [REDACTED:sql]',
         state: 'active',
         confidence: 0.7,
         importance: 0.9,
@@ -7794,6 +7797,9 @@ describe('LetheBot governance HTTP lifecycle wiring', () => {
       'memory-http-evaluator',
       'memory_http_source_context',
       firstSessionDigest,
+      posixPath,
+      windowsPath,
+      sql,
     ]) {
       expect(responseText).not.toContain(rawValue);
     }
@@ -7921,8 +7927,8 @@ describe('LetheBot governance HTTP lifecycle wiring', () => {
         sensitivity: 'normal',
         authority: 'system',
         kind: 'fact',
-        title: 'Memory [REDACTED:platform_id]',
-        contentPreview: '[REDACTED:api_key_assignment]',
+        title: 'Memory [REDACTED:platform_id] [REDACTED:filesystem_path]',
+        contentPreview: '[REDACTED:api_key_assignment] [REDACTED:filesystem_path] [REDACTED:sql]',
         state: 'active',
         confidence: 0.7,
         importance: 0.9,
@@ -7950,7 +7956,9 @@ describe('LetheBot governance HTTP lifecycle wiring', () => {
         revisionNumber: 1,
         changeType: 'update',
         actorClass: 'other',
-        reason: expect.stringContaining('[REDACTED:platform_id]'),
+        reason: expect.stringMatching(
+          /\[REDACTED:platform_id\].*\[REDACTED:filesystem_path\].*\[REDACTED:sql\]/u,
+        ),
         reasonRedacted: true,
         reasonTruncated: false,
         evaluatorLinked: true,
@@ -7960,6 +7968,9 @@ describe('LetheBot governance HTTP lifecycle wiring', () => {
       audit: [],
       auditTruncated: false,
     });
+    expect(detailText).not.toContain(posixPath);
+    expect(detailText).not.toContain(windowsPath);
+    expect(detailText).not.toContain(sql);
     expect(memoryResourceRead).toHaveBeenCalledTimes(1);
     expect(memoryDetailRead).toHaveBeenCalledTimes(2);
     expect(memoryDetailRead).toHaveBeenLastCalledWith({
@@ -8660,7 +8671,7 @@ describe('LetheBot governance HTTP lifecycle wiring', () => {
         revisionNumber: 1,
         changeType: 'update',
         actor: `memory-http-actor-${platformId}-${secret}`,
-        reason: `memory-http-reason-${platformId}-${secret}`,
+        reason: `memory-http-reason-${platformId}-${secret} ${posixPath} ${sql}`,
       },
       {
         revisionNumber: 2,

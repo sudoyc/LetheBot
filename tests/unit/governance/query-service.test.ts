@@ -1153,6 +1153,8 @@ describe('GovernanceQueryService', () => {
   it('owns bounded action-execution inspection with exact filters and diagnostic redaction', async () => {
     const platformId = '234567890';
     const secret = 'actionexecutionsecret';
+    const diagnosticPath = '/srv/lethebot/private/action-execution.db';
+    const diagnosticSql = 'DELETE FROM action_executions WHERE status = "failed";';
     db.prepare(
       `INSERT INTO raw_events (
          id, type, timestamp, source, platform, conversation_id, payload, created_at
@@ -1224,9 +1226,9 @@ describe('GovernanceQueryService', () => {
       null,
       null,
       'reply_short',
-      `reason password=${secret}`,
+      `reason password=${secret} ${diagnosticPath}`,
       `code-${platformId}`,
-      `message token=${secret}`,
+      `message token=${secret} ${diagnosticSql}`,
       'full',
       `audit password=${secret} target=${platformId}`,
       NOW + 200,
@@ -1334,14 +1336,16 @@ describe('GovernanceQueryService', () => {
       actionDecisionId: 'decision-query-actions-[REDACTED:platform_id]',
       executedMessageId: 'message-[REDACTED:platform_id]',
       downgradedFrom: 'reply_short',
-      downgradedReason: 'reason [REDACTED:password_assignment]',
+      downgradedReason: 'reason [REDACTED:password_assignment] [REDACTED:filesystem_path]',
       errorCode: 'code-[REDACTED:platform_id]',
-      errorMessage: 'message [REDACTED:token_assignment]',
+      errorMessage: 'message [REDACTED:token_assignment] [REDACTED:sql]',
       auditEntry: 'audit [REDACTED:password_assignment] target=[REDACTED:platform_id]',
       executedAt: new Date(NOW + 200),
     });
     expect(JSON.stringify(included)).not.toContain(secret);
     expect(JSON.stringify(included)).not.toContain(platformId);
+    expect(JSON.stringify(included)).not.toContain(diagnosticPath);
+    expect(JSON.stringify(included)).not.toContain(diagnosticSql);
 
     const defaultWindow = await service.listActionExecutions();
     expect(defaultWindow).toHaveLength(100);
@@ -7038,6 +7042,9 @@ describe('GovernanceQueryService', () => {
   it('projects a bounded exact-scope Memory-record page without raw identifiers', async () => {
     const platformId = '864209753';
     const secret = 'sk-memorypageabcdefghijklmnopqrstuvwxyz123456';
+    const posixPath = '/srv/lethebot/private/lethebot.db';
+    const windowsPath = 'C:\\Users\\LetheBot\\private\\lethebot.db';
+    const sql = 'SELECT content FROM memory_records WHERE state = "active";';
     const targetUserId = `memory-page-user-${platformId}-${secret}`;
     const otherUserId = `memory-page-other-user-${platformId}-${secret}`;
     const targetGroupId = `memory-page-group-${platformId}-${secret}`;
@@ -7069,10 +7076,10 @@ describe('GovernanceQueryService', () => {
         sensitivity: index === 3 ? 'secret' : index === 4 ? 'prohibited' : 'normal',
         state: states[index % states.length] ?? 'active',
         title: visibleTextRecord
-          ? `title-${platformId}-${'T'.repeat(180)} api_key=${secret}`
+          ? `title-${posixPath}-${platformId}-${'T'.repeat(180)} api_key=${secret}`
           : `Synthetic Memory page title ${index} api_key=${secret}`,
         content: visibleTextRecord
-          ? `content-${platformId}-${'C'.repeat(540)} api_key=${secret}`
+          ? `content-${windowsPath} ${sql} ${platformId}-${'C'.repeat(540)} api_key=${secret}`
           : `Synthetic Memory page content ${index} api_key=${secret}`,
         importance: index < 2 ? 1 : index === 2 ? 0.99 : 0.5,
         createdAt: index < 2 ? NOW + 500 : NOW + 400 - index,
@@ -7222,6 +7229,12 @@ describe('GovernanceQueryService', () => {
       contentRedacted: true,
       contentTruncated: true,
     });
+    expect(visible?.title).toContain('[REDACTED:filesystem_path]');
+    expect(visible?.contentPreview).toContain('[REDACTED:filesystem_path]');
+    expect(visible?.contentPreview).toContain('[REDACTED:sql]');
+    expect(JSON.stringify(visible)).not.toContain(posixPath);
+    expect(JSON.stringify(visible)).not.toContain(windowsPath);
+    expect(JSON.stringify(visible)).not.toContain(sql);
     expect(Object.keys(visible ?? {}).sort()).toEqual([
       'authority',
       'confidence',

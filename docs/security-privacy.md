@@ -207,8 +207,12 @@ and returns only bounded aggregate projections to governance clients.
   the bounded default list with details absent and the details-redacted/redacted
   signals set. Operational identifiers, classifications, reasons, suppressors,
   summaries, and diagnostics use the shared redaction boundary. None adds a
-  direct repository/SQL path. C1 serves only fixed sessionless same-origin HTML,
-  CSS, and JavaScript at the four exact `/governance` browser paths. Static
+  direct repository/SQL path. Browser-bound free text additionally collapses
+  POSIX, Windows/UNC filesystem paths and SQL statements to fixed category
+  markers. This applies uniformly to memory text and revision/audit/action/job/
+  tool diagnostics without rewriting their durable source evidence. C1 serves
+  only fixed sessionless same-origin HTML, CSS, and JavaScript at the four exact
+  `/governance` browser paths. Static
   dispatch creates no session or callback effect, accepts no query or non-GET
   variant, and returns the existing no-store/referrer/nosniff/CSP headers. The
   module calls the existing session and Overview APIs plus the exact

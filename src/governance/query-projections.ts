@@ -621,6 +621,63 @@ export function sameMemoryMaintenanceExactScope(
   }
 }
 
+const GOVERNANCE_FILE_URL_PATTERN = new RegExp(
+  String.raw`\bfile:///(?:[^/\s"'<>()\[\]{},;:\x60]+/)*[^/\s"'<>()\[\]{},;:\x60]+`,
+  'giu',
+);
+const GOVERNANCE_POSIX_PATH_PATTERN = new RegExp(
+  String.raw`(?<![A-Za-z0-9/])/(?:[^/\s"'<>()\[\]{},;:\x60]+/)+[^/\s"'<>()\[\]{},;:\x60]*`,
+  'gu',
+);
+const GOVERNANCE_WINDOWS_PATH_PATTERN = new RegExp(
+  String.raw`\b[A-Za-z]:[\\/](?:[^\\/\s"'<>()\[\]{},;:\x60]+[\\/])+[^\\/\s"'<>()\[\]{},;:\x60]+`,
+  'gu',
+);
+const GOVERNANCE_UNC_PATH_PATTERN = new RegExp(
+  String.raw`(?<![\\A-Za-z0-9])\\\\[^\\\s"'<>()\[\]{},;:\x60]+\\[^\\\s"'<>()\[\]{},;:\x60]+(?:\\[^\\\s"'<>()\[\]{},;:\x60]+)+`,
+  'gu',
+);
+const GOVERNANCE_FILESYSTEM_PATH_PATTERNS = [
+  GOVERNANCE_FILE_URL_PATTERN,
+  GOVERNANCE_POSIX_PATH_PATTERN,
+  GOVERNANCE_WINDOWS_PATH_PATTERN,
+  GOVERNANCE_UNC_PATH_PATTERN,
+] as const;
+const GOVERNANCE_SQL_PATTERNS = [
+  new RegExp(String.raw`\bSELECT\b[^\r\n;]{0,2048}?\bFROM\b[^\r\n;]*(?:;|$)`, 'gimu'),
+  new RegExp(String.raw`\bINSERT\s+(?:OR\s+\w+\s+)?INTO\b[^\r\n;]*(?:;|$)`, 'gimu'),
+  new RegExp(String.raw`\bUPDATE\b[^\r\n;]{0,512}?\bSET\b[^\r\n;]*(?:;|$)`, 'gimu'),
+  new RegExp(String.raw`\bDELETE\s+FROM\b[^\r\n;]*(?:;|$)`, 'gimu'),
+  new RegExp(String.raw`\b(?:CREATE|ALTER|DROP)\s+(?:TABLE|INDEX|VIEW|TRIGGER)\b[^\r\n;]*(?:;|$)`, 'gimu'),
+  new RegExp(String.raw`\b(?:PRAGMA|VACUUM|ATTACH|DETACH|REINDEX|ANALYZE)\b[^\r\n;]*(?:;|$)`, 'gimu'),
+] as const;
+const GOVERNANCE_REDACTION_MARKER_PATTERN = new RegExp(
+  String.raw`\[REDACTED:[A-Za-z0-9_]+\]`,
+  'gu',
+);
+
+function redactGovernanceDiagnosticFragment(fragment: string, category: 'filesystem_path' | 'sql'): string {
+  const categoryMarker = `[REDACTED:${category}]`;
+  const adjacentMarkers = Array.from(new Set(fragment.match(GOVERNANCE_REDACTION_MARKER_PATTERN) ?? []))
+    .filter((marker) => marker !== categoryMarker);
+  return [categoryMarker, ...adjacentMarkers].join(' ');
+}
+
+function redactGovernanceDiagnosticText(text: string): string {
+  let redacted = text;
+  for (const pattern of GOVERNANCE_FILESYSTEM_PATH_PATTERNS) {
+    redacted = redacted.replace(pattern, (fragment) => (
+      redactGovernanceDiagnosticFragment(fragment, 'filesystem_path')
+    ));
+  }
+  for (const pattern of GOVERNANCE_SQL_PATTERNS) {
+    redacted = redacted.replace(pattern, (fragment) => (
+      redactGovernanceDiagnosticFragment(fragment, 'sql')
+    ));
+  }
+  return redacted;
+}
+
 export function redactGovernanceDisplayString(text: string): {
   text: string;
   redacted: boolean;
@@ -631,15 +688,17 @@ export function redactGovernanceDisplayString(text: string): {
   const platformMarkerLost =
     initialPlatformRedacted.includes('[REDACTED:platform_id]')
     && !platformRedacted.includes('[REDACTED:platform_id]');
-  const redactedText = platformMarkerLost
+  const secretAndPlatformRedacted = platformMarkerLost
     ? `${platformRedacted} [REDACTED:platform_id]`
     : platformRedacted;
+  const redactedText = redactGovernanceDiagnosticText(secretAndPlatformRedacted);
   return {
     text: redactedText,
     redacted: result.findings.length > 0
       || initialPlatformRedacted !== text
       || platformRedacted !== result.text
-      || platformMarkerLost,
+      || platformMarkerLost
+      || redactedText !== secretAndPlatformRedacted,
   };
 }
 
