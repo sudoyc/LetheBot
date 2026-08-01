@@ -2,12 +2,17 @@
  * Memory consolidation worker.
  *
  * Detects duplicate active memory groups that are safe candidates for future
- * governed consolidation. This handler writes redacted audit evidence only; it
- * does not supersede, merge, delete, or otherwise mutate memory records.
+ * governed consolidation. This handler writes a normalized pending-review
+ * proposal and redacted audit evidence; it does not supersede, merge, delete,
+ * or otherwise mutate memory records.
  */
 
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
+import {
+  createMemoryMaintenanceProposal,
+  type MemoryMaintenanceProposal,
+} from '../memory/maintenance-proposal.js';
 import type { AuditRepository } from '../storage/audit-repository.js';
 
 export interface MemoryConsolidationInput {
@@ -28,6 +33,7 @@ export interface MemoryConsolidationResult {
   sampledGroupCount: number;
   redacted: true;
   minGroupSize: number;
+  proposals: MemoryMaintenanceProposal[];
   filters: {
     scope?: string;
     canonicalUserId?: string;
@@ -92,7 +98,7 @@ export class MemoryConsolidationWorker {
 
     const groupCount = this.countGroups(query);
     const groups = this.sampleGroups(query, limit).map((row) => ({
-      memoryIds: row.memory_ids.split(',').filter((id) => id.length > 0),
+      memoryIds: row.memory_ids.split(',').filter((id) => id.length > 0).sort(),
       scope: row.scope,
       canonicalUserId: row.canonical_user_id ?? undefined,
       groupId: row.group_id ?? undefined,
@@ -104,6 +110,24 @@ export class MemoryConsolidationWorker {
       groupSize: row.group_size,
       updatedAt: row.updated_at,
     }));
+    const proposals: MemoryMaintenanceProposal[] = [];
+    for (const group of groups) {
+      const retainedMemoryId = group.memoryIds[0];
+      if (!retainedMemoryId) {
+        continue;
+      }
+      proposals.push(await createMemoryMaintenanceProposal(this.db, this.auditRepository, {
+        kind: 'consolidation',
+        candidateMemoryIds: group.memoryIds,
+        reasonCodes: ['same_boundary_title_and_content'],
+        proposedEffect: {
+          type: 'consolidate',
+          retainedMemoryId,
+          supersedeMemoryIds: group.memoryIds.slice(1),
+        },
+        nowMs: untilMs,
+      }));
+    }
 
     const auditId = await this.auditRepository.create({
       timestamp: new Date(untilMs),
@@ -124,6 +148,8 @@ export class MemoryConsolidationWorker {
         filters,
         groupCount,
         sampledGroupCount: groups.length,
+        proposalCount: proposals.length,
+        proposalIds: proposals.map((proposal) => proposal.proposalId),
         groups,
         redaction: 'memory_ids_title_hashes_content_hashes_and_counts_only',
       },
@@ -138,6 +164,7 @@ export class MemoryConsolidationWorker {
       sampledGroupCount: groups.length,
       redacted: true,
       minGroupSize,
+      proposals,
       filters,
       groups,
     };

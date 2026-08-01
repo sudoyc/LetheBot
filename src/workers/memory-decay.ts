@@ -2,13 +2,18 @@
  * Memory decay worker.
  *
  * Finds stale and low-confidence/low-importance active memories that should be
- * reviewed. This handler is intentionally non-destructive: it writes redacted
- * audit evidence only and never changes memory state, confidence, importance,
- * or revisions.
+ * reviewed. This handler writes a normalized pending-review proposal and
+ * redacted audit evidence, but never changes memory state, confidence,
+ * importance, or revisions.
  */
 
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
+import {
+  createMemoryMaintenanceProposal,
+  type MemoryMaintenanceProposal,
+  type MemoryMaintenanceReasonCode,
+} from '../memory/maintenance-proposal.js';
 import type { AuditRepository } from '../storage/audit-repository.js';
 
 export interface MemoryDecayInput {
@@ -31,6 +36,7 @@ export interface MemoryDecayResult {
   candidateCount: number;
   sampledCandidateCount: number;
   redacted: true;
+  proposals: MemoryMaintenanceProposal[];
   thresholds: {
     maxConfidence: number;
     maxImportance: number;
@@ -121,6 +127,19 @@ export class MemoryDecayWorker {
       updatedAt: row.updated_at,
       reasons: this.reasonsFor(row, staleBeforeMs, maxConfidence, maxImportance),
     }));
+    const proposals: MemoryMaintenanceProposal[] = [];
+    for (const candidate of candidates) {
+      proposals.push(await createMemoryMaintenanceProposal(this.db, this.auditRepository, {
+        kind: 'decay',
+        candidateMemoryIds: [candidate.memoryId],
+        reasonCodes: candidate.reasons as MemoryMaintenanceReasonCode[],
+        proposedEffect: {
+          type: 'disable',
+          memoryId: candidate.memoryId,
+        },
+        nowMs: untilMs,
+      }));
+    }
 
     const auditId = await this.auditRepository.create({
       timestamp: new Date(untilMs),
@@ -145,6 +164,8 @@ export class MemoryDecayWorker {
         filters,
         candidateCount,
         sampledCandidateCount: candidates.length,
+        proposalCount: proposals.length,
+        proposalIds: proposals.map((proposal) => proposal.proposalId),
         candidates,
         redaction: 'memory_ids_title_hashes_scores_and_reasons_only',
       },
@@ -159,6 +180,7 @@ export class MemoryDecayWorker {
       candidateCount,
       sampledCandidateCount: candidates.length,
       redacted: true,
+      proposals,
       thresholds: {
         maxConfidence,
         maxImportance,

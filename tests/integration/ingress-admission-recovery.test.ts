@@ -833,6 +833,17 @@ describe('accepted event admission recovery', () => {
         id, conversation_id, trigger_event_id, pi_model, pi_provider, status, started_at
       ) VALUES (?, ?, ?, 'mock', 'mock', 'running', ?)`
     ).run('turn-stale-running', stale.conversationId, stale.id, Date.now());
+    const staleInvocationStartedAt = Date.now();
+    db.prepare(
+      `INSERT INTO model_invocations (
+        id, turn_id, purpose, call_number, provider, model, status, started_at
+      ) VALUES (?, ?, 'pi_turn', 1, 'mock', 'mock', 'running', ?)`
+    ).run('invocation-stale-running', 'turn-stale-running', staleInvocationStartedAt);
+    db.prepare(
+      `INSERT INTO model_invocation_sources (
+        model_invocation_id, raw_event_id, source_ordinal
+      ) VALUES (?, ?, 0)`
+    ).run('invocation-stale-running', stale.id);
 
     let piCalls = 0;
     let sendCalls = 0;
@@ -899,6 +910,21 @@ describe('accepted event admission recovery', () => {
         completed_at: expect.any(Number),
       },
     ]);
+    const interruptedInvocation = db.prepare(
+      `SELECT status, completed_at, error_code
+         FROM model_invocations
+        WHERE id = ?`
+    ).get('invocation-stale-running') as {
+      status: string;
+      completed_at: number | null;
+      error_code: string | null;
+    };
+    expect(interruptedInvocation).toEqual({
+      status: 'aborted',
+      completed_at: expect.any(Number),
+      error_code: 'turn_ended',
+    });
+    expect(interruptedInvocation.completed_at).toBeGreaterThanOrEqual(staleInvocationStartedAt);
     expect(getAdmission(app, malformed.id)).toMatchObject({
       state: 'interrupted_review',
       reason_code: 'invalid_stored_event',
@@ -956,6 +982,11 @@ describe('accepted event admission recovery', () => {
         completed_at: completedAtByTurn.get(turn.id),
       })),
     );
+    expect(restartedApp.getDatabase().prepare(
+      `SELECT status, completed_at, error_code
+         FROM model_invocations
+        WHERE id = ?`
+    ).get('invocation-stale-running')).toEqual(interruptedInvocation);
     expect(restartedApp.getDatabase().prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 

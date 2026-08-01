@@ -197,6 +197,106 @@ describe('BackgroundWorker', () => {
   });
 
   describe('durable job repository integration', () => {
+    it('claims configured interactive work ahead of an older maintenance backlog', async () => {
+      const testDir = mkdtempSync(join(tmpdir(), 'lethebot-bg-worker-interactive-lane-'));
+      const db = initDatabase({ path: join(testDir, 'test.db') });
+
+      try {
+        runMigration(db, join(__dirname, '../../../migrations/001_initial_schema.sql'));
+        const jobRepository = new JobRepository(db);
+        const now = Date.now();
+        const maintenanceJobId = jobRepository.enqueue({
+          type: 'retention',
+          payload: { rawEventsDays: 30 },
+          scheduledAt: now - 1_000,
+          now: now - 1_000,
+        });
+        const interactiveJobId = jobRepository.enqueue({
+          type: 'attention_recheck',
+          payload: { candidateId: 'candidate-interactive-lane' },
+          scheduledAt: now,
+          now,
+        });
+        const interactiveWorker = new BackgroundWorker({
+          jobRepository,
+          workerId: 'worker-bg-interactive-lane',
+          claimTypes: ['attention_recheck'],
+          handlers: {
+            attention_recheck: async () => ({ outcome: 'respond' }),
+          },
+        });
+
+        const result = await interactiveWorker.processNext(now);
+
+        expect(result).toEqual({
+          taskId: interactiveJobId,
+          status: 'completed',
+          output: { outcome: 'respond' },
+        });
+        expect(jobRepository.findById(maintenanceJobId)).toMatchObject({
+          status: 'pending',
+          attempts: 0,
+        });
+        expect(jobRepository.findById(interactiveJobId)).toMatchObject({
+          status: 'completed',
+          attempts: 1,
+          leaseOwner: undefined,
+        });
+        expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+      } finally {
+        closeDatabase(db);
+        rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('keeps maintenance claims out of the interactive lane while failing unknown jobs', async () => {
+      const testDir = mkdtempSync(join(tmpdir(), 'lethebot-bg-worker-maintenance-lane-'));
+      const db = initDatabase({ path: join(testDir, 'test.db') });
+
+      try {
+        runMigration(db, join(__dirname, '../../../migrations/001_initial_schema.sql'));
+        const jobRepository = new JobRepository(db);
+        const now = Date.now();
+        const interactiveJobId = jobRepository.enqueue({
+          type: 'attention_recheck',
+          payload: { candidateId: 'candidate-maintenance-exclusion' },
+          scheduledAt: now - 1_000,
+          now: now - 1_000,
+        });
+        const unknownJobId = jobRepository.enqueue({
+          type: 'unknown_maintenance_job',
+          payload: {},
+          scheduledAt: now,
+          now,
+        });
+        const maintenanceWorker = new BackgroundWorker({
+          jobRepository,
+          workerId: 'worker-bg-maintenance-lane',
+          excludedClaimTypes: ['attention_recheck'],
+        });
+
+        const result = await maintenanceWorker.processNext(now);
+
+        expect(result).toMatchObject({
+          taskId: unknownJobId,
+          status: 'failed',
+          error: expect.stringContaining('Unsupported background job type'),
+        });
+        expect(jobRepository.findById(interactiveJobId)).toMatchObject({
+          status: 'pending',
+          attempts: 0,
+        });
+        expect(jobRepository.findById(unknownJobId)).toMatchObject({
+          status: 'failed',
+          attempts: 1,
+        });
+        expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+      } finally {
+        closeDatabase(db);
+        rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
     it('recognizes a scheduled attention recheck and does not claim it before its due time', async () => {
       const testDir = mkdtempSync(join(tmpdir(), 'lethebot-bg-worker-attention-'));
       const db = initDatabase({ path: join(testDir, 'test.db') });

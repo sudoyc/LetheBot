@@ -18,6 +18,8 @@ export type TaskType =
   | 'admin_digest'
   | 'retention';
 
+export const INTERACTIVE_TASK_TYPES = ['attention_recheck'] as const satisfies readonly TaskType[];
+
 export interface BackgroundTask {
   id: string;
   type: TaskType | string;
@@ -67,6 +69,8 @@ export interface BackgroundWorkerOptions {
   workerId?: string;
   leaseMs?: number;
   clock?: () => number;
+  claimTypes?: readonly TaskType[];
+  excludedClaimTypes?: readonly TaskType[];
   handlers?: Partial<Record<TaskType, BackgroundTaskHandler>>;
 }
 
@@ -83,6 +87,8 @@ export class BackgroundWorker {
   private readonly workerId: string;
   private readonly leaseMs: number;
   private readonly clock: () => number;
+  private readonly claimTypes?: TaskType[];
+  private readonly excludedClaimTypes?: TaskType[];
   private readonly handlers: Partial<Record<TaskType, BackgroundTaskHandler>>;
   private readonly jobRepository?: JobRepository;
 
@@ -91,6 +97,13 @@ export class BackgroundWorker {
     this.workerId = options.workerId ?? 'background-worker-local';
     this.leaseMs = options.leaseMs ?? 60_000;
     this.clock = options.clock ?? Date.now;
+    if (options.claimTypes?.length && options.excludedClaimTypes?.length) {
+      throw new Error('Background worker claim types and excluded claim types are mutually exclusive');
+    }
+    this.claimTypes = options.claimTypes ? [...options.claimTypes] : undefined;
+    this.excludedClaimTypes = options.excludedClaimTypes
+      ? [...options.excludedClaimTypes]
+      : undefined;
     this.handlers = options.handlers ?? {};
   }
 
@@ -151,7 +164,11 @@ export class BackgroundWorker {
    */
   async processNext(now?: number, types?: TaskType[]): Promise<TaskResult | null> {
     if (this.jobRepository) {
-      return this.processNextDurable(now, types);
+      return this.processNextDurable(
+        now,
+        types ?? this.claimTypes,
+        types === undefined ? this.excludedClaimTypes : undefined,
+      );
     }
 
     const pending = Array.from(this.tasks.values()).find((t) => t.status === 'pending');
@@ -191,6 +208,7 @@ export class BackgroundWorker {
   private async processNextDurable(
     nowOverride?: number,
     types?: TaskType[],
+    excludedTypes?: TaskType[],
   ): Promise<TaskResult | null> {
     if (!this.jobRepository) {
       return null;
@@ -211,6 +229,7 @@ export class BackgroundWorker {
       leaseMs: this.leaseMs,
       now: claimNow,
       types,
+      excludedTypes,
     });
 
     if (!claimed) {

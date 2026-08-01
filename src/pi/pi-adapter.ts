@@ -18,9 +18,10 @@ import {
   type BeforeToolCallResult,
   type AfterToolCallContext,
   type AfterToolCallResult,
+  type StreamFn,
 } from '@earendil-works/pi-agent-core';
-import { getModel } from '@earendil-works/pi-ai/compat';
-import type { Api, Message, Model, TextContent } from '@earendil-works/pi-ai';
+import { getModel, streamSimple } from '@earendil-works/pi-ai/compat';
+import type { Api, AssistantMessage, Message, Model, TextContent } from '@earendil-works/pi-ai';
 import { ulid } from 'ulidx';
 import { isDeepStrictEqual } from 'node:util';
 import { createDeepSeekModel } from './deepseek-provider.js';
@@ -54,6 +55,10 @@ import type {
   ToolEvaluationRequest,
   ToolEvaluationResult,
 } from '../types/evaluator.js';
+import type {
+  ModelInvocationRepository,
+  ModelInvocationTokens,
+} from '../storage/model-invocation-repository.js';
 
 type ToolResultContent = AfterToolCallContext['result']['content'];
 
@@ -65,6 +70,20 @@ const MAX_TOOL_EVALUATOR_CONTEXT_SUMMARY_CHARS = 512;
 const MAX_TOOL_EVALUATOR_USER_UTTERANCE_CHARS = 256;
 const TOOL_EVALUATOR_USER_UTTERANCE_TRUNCATION_MARKER =
   '[TRUNCATED:tool_evaluator_user_utterance]';
+
+type PiInvocationFailureCode =
+  | 'provider_error'
+  | 'provider_aborted'
+  | 'turn_timeout'
+  | 'runtime_exception';
+
+type PiTurnInvocationWriter = Pick<
+  ModelInvocationRepository,
+  | 'startPiTurnInvocation'
+  | 'completePiTurnInvocation'
+  | 'failInvocation'
+  | 'findInvocationById'
+>;
 
 interface ToolAuditWriter {
   create(entry: Omit<AuditEntry, 'id'>): Promise<string>;
@@ -118,6 +137,27 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+function readPiInvocationUsage(message: AssistantMessage): ModelInvocationTokens | undefined {
+  const { input, output, cacheRead, cacheWrite, totalTokens } = message.usage;
+  const values = [input, output, cacheRead, cacheWrite, totalTokens];
+  if (values.some((value) => !Number.isSafeInteger(value) || value < 0)) {
+    return undefined;
+  }
+  if (values.every((value) => value === 0)) {
+    return undefined;
+  }
+  if (totalTokens !== input + output + cacheRead + cacheWrite) {
+    return undefined;
+  }
+  return {
+    input,
+    output,
+    total: totalTokens,
+    cacheRead,
+    cacheWrite,
+  };
+}
+
 function isToolHandler(value: unknown): value is ToolHandler {
   return typeof value === 'function';
 }
@@ -136,6 +176,8 @@ export interface PiAdapterInput {
   invocationContext: InvocationContext;
   turnId: string;
   sourceEventIds?: string[];
+  /** Absolute epoch deadline established at application admission. */
+  deadlineAtMs?: number;
 }
 
 /**
@@ -165,27 +207,42 @@ export interface PiAdapterEvent {
   piEvent: AgentEvent;
 }
 
+interface PiAgentSlot {
+  agent: Agent;
+  session?: PiTurnSession;
+}
+
+interface PiTurnSession {
+  slot: PiAgentSlot;
+  input: PiAdapterInput;
+  actor: ActorContext;
+  events: PiAdapterEvent[];
+  recordedToolCallIds: string[];
+  providerToolNameToCanonical: Map<string, string>;
+  providerCallNumber: number;
+  pendingInvocationFinalizations: Set<Promise<void>>;
+  invocationFinalizationError?: unknown;
+  providerAbortCode?: Extract<PiInvocationFailureCode, 'provider_aborted' | 'turn_timeout'>;
+}
+
 /**
  * Main adapter class
  */
 export class PiAdapter {
-  private agent: Agent;
+  readonly usesDurableInvocationLedger: boolean;
   private toolRegistry: ToolRegistry;
   private policyGate: PolicyGate;
-  private currentTurnId?: string;
-  private events: PiAdapterEvent[] = [];
-  private recordedToolCallIds: string[] = [];
-  private currentActor?: ActorContext;
-  private currentInvocationContext?: InvocationContext;
   private auditRepository?: ToolAuditWriter;
   private toolCallRepository?: ToolCallWriter;
   private evaluator?: Pick<IEvaluator, 'evaluateTool'>;
   private evaluatorDecisionWriter?: ToolEvaluatorDecisionWriter;
   private localToolEffectCoordinator?: LocalToolEffectCoordinator;
+  private modelInvocationRepository?: PiTurnInvocationWriter;
+  private readonly model: Model<Api>;
+  private readonly apiKey?: string;
   private readonly turnTimeoutMs: number;
-  private turnLeaseTail: Promise<void> = Promise.resolve();
-  private providerToolNameToCanonical = new Map<string, string>();
-  private toolDirectoryGeneration = 0;
+  private readonly idleAgentSlots: PiAgentSlot[] = [];
+  private readonly activeTurnSessions = new Set<PiTurnSession>();
 
   constructor(options: {
     toolRegistry: ToolRegistry;
@@ -200,6 +257,7 @@ export class PiAdapter {
     evaluator?: Pick<IEvaluator, 'evaluateTool'>;
     evaluatorDecisionWriter?: ToolEvaluatorDecisionWriter;
     localToolEffectCoordinator?: LocalToolEffectCoordinator;
+    modelInvocationRepository?: PiTurnInvocationWriter;
   }) {
     const turnTimeoutMs = options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS;
     if (
@@ -217,6 +275,8 @@ export class PiAdapter {
     this.evaluator = options.evaluator;
     this.evaluatorDecisionWriter = options.evaluatorDecisionWriter;
     this.localToolEffectCoordinator = options.localToolEffectCoordinator;
+    this.modelInvocationRepository = options.modelInvocationRepository;
+    this.usesDurableInvocationLedger = options.modelInvocationRepository !== undefined;
     this.turnTimeoutMs = turnTimeoutMs;
 
     // Create model configuration
@@ -243,40 +303,61 @@ export class PiAdapter {
       };
     }
 
-    // Create Pi Agent with LetheBot-specific configuration
-    this.agent = new Agent({
-      initialState: {
-        systemPrompt: '', // Will be set per-turn
-        model,
-        tools: [],
-        messages: [],
-      },
-      getApiKey: async (_provider: string) => {
-        return options.apiKey;
-      },
-      convertToLlm: this.convertToLlm.bind(this),
-      beforeToolCall: this.beforeToolCall.bind(this),
-      afterToolCall: this.afterToolCall.bind(this),
-    });
-
-    // Subscribe to Pi events
-    this.agent.subscribe(this.handlePiEvent.bind(this));
+    this.model = model;
+    this.apiKey = options.apiKey;
+    this.idleAgentSlots.push(this.createAgentSlot());
   }
 
   /**
    * Run a single agent turn
    */
   async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
-    const releaseTurnLease = await this.acquireTurnLease();
+    const deadlineAtMs = input.deadlineAtMs;
+    if (
+      deadlineAtMs !== undefined
+      && (!Number.isSafeInteger(deadlineAtMs) || deadlineAtMs < 0)
+    ) {
+      return {
+        turnId: input.turnId,
+        toolCallIds: [],
+        events: [],
+        tokensUsed: { input: 0, output: 0, total: 0 },
+        status: 'failed',
+        errorMessage: 'Pi turn deadline is invalid',
+      };
+    }
+
+    const remainingDeadlineMs = deadlineAtMs === undefined
+      ? undefined
+      : deadlineAtMs - Date.now();
+    if (remainingDeadlineMs !== undefined && remainingDeadlineMs <= 0) {
+      return {
+        turnId: input.turnId,
+        toolCallIds: [],
+        events: [],
+        tokensUsed: { input: 0, output: 0, total: 0 },
+        status: 'failed',
+        errorMessage: 'Pi turn deadline exceeded before provider invocation',
+      };
+    }
+
+    const effectiveTimeoutMs = remainingDeadlineMs === undefined
+      ? this.turnTimeoutMs
+      : Math.min(this.turnTimeoutMs, remainingDeadlineMs);
+    const usesAdmissionDeadline = remainingDeadlineMs !== undefined
+      && remainingDeadlineMs <= this.turnTimeoutMs;
+    const timeoutMessage = usesAdmissionDeadline
+      ? 'Pi turn deadline exceeded'
+      : `Pi turn timed out after ${this.turnTimeoutMs} ms`;
+    const session = this.acquireTurnSession(input);
+    const { agent } = session.slot;
     let deadlineReached = false;
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
 
     try {
-      this.prepareTurn(input);
-
       // Update system prompt and tools
-      this.agent.state.systemPrompt = input.systemPrompt;
-      this.agent.state.tools = this.convertTools(input);
+      agent.state.systemPrompt = input.systemPrompt;
+      agent.state.tools = this.convertTools(session);
 
       // Convert ContextPack to AgentMessage[]
       const messages = this.contextPackToMessages(input.contextPack);
@@ -284,32 +365,39 @@ export class PiAdapter {
       // Run Pi agent
       deadlineTimer = setTimeout(() => {
         deadlineReached = true;
-        this.agent.abort();
-      }, this.turnTimeoutMs);
-      await this.agent.prompt(messages);
+        session.providerAbortCode = 'turn_timeout';
+        agent.abort();
+      }, effectiveTimeoutMs);
+      await agent.prompt(messages);
 
       // Wait for completion
-      await this.agent.waitForIdle();
+      await agent.waitForIdle();
+      await this.waitForInvocationFinalizations(session);
 
       if (deadlineReached) {
-        throw new Error(`Pi turn timed out after ${this.turnTimeoutMs} ms`);
+        throw new Error(timeoutMessage);
       }
 
       // Extract result
-      return this.extractOutput(input.turnId);
+      return this.extractOutput(session);
     } catch (error) {
       if (deadlineReached) {
-        await this.agent.waitForIdle().catch(() => undefined);
+        await agent.waitForIdle().catch(() => undefined);
       }
-      const failure = deadlineReached
-        ? new Error(`Pi turn timed out after ${this.turnTimeoutMs} ms`)
+      let failure = deadlineReached
+        ? new Error(timeoutMessage)
         : error;
+      try {
+        await this.waitForInvocationFinalizations(session);
+      } catch (finalizationError) {
+        failure = finalizationError;
+      }
       console.error('[PiAdapter] runTurn failed:', formatRuntimeFailureDiagnostic(failure));
 
       return {
         turnId: input.turnId,
-        toolCallIds: this.recordedToolCallIds,
-        events: this.events,
+        toolCallIds: session.recordedToolCallIds,
+        events: session.events,
         tokensUsed: { input: 0, output: 0, total: 0 },
         status: 'failed',
         errorMessage: extractRuntimeFailureMessage(failure),
@@ -318,7 +406,7 @@ export class PiAdapter {
       if (deadlineTimer !== undefined) {
         clearTimeout(deadlineTimer);
       }
-      releaseTurnLease();
+      this.releaseTurnSession(session);
     }
   }
 
@@ -326,33 +414,32 @@ export class PiAdapter {
    * Stream a turn (returns async iterator)
    */
   async *streamTurn(input: PiAdapterInput): AsyncGenerator<PiAdapterEvent> {
-    const releaseTurnLease = await this.acquireTurnLease();
+    const session = this.acquireTurnSession(input);
+    const { agent } = session.slot;
     let runPromise: Promise<void> | undefined;
 
     try {
-      this.prepareTurn(input);
-
       // Update system prompt and tools
-      this.agent.state.systemPrompt = input.systemPrompt;
-      this.agent.state.tools = this.convertTools(input);
+      agent.state.systemPrompt = input.systemPrompt;
+      agent.state.tools = this.convertTools(session);
 
       // Convert ContextPack to AgentMessage[]
       const messages = this.contextPackToMessages(input.contextPack);
 
       // Start agent turn (non-blocking)
-      runPromise = this.agent.prompt(messages);
+      runPromise = agent.prompt(messages);
 
       // Yield events as they arrive
       let eventIndex = 0;
       while (true) {
         // Check if new events arrived
-        if (eventIndex < this.events.length) {
-          const event = this.events[eventIndex];
+        if (eventIndex < session.events.length) {
+          const event = session.events[eventIndex];
           if (event) {
             yield event;
           }
           eventIndex++;
-        } else if (!this.agent.state.isStreaming) {
+        } else if (!agent.state.isStreaming) {
           // Agent finished and no more events
           break;
         } else {
@@ -362,25 +449,31 @@ export class PiAdapter {
       }
 
       // Ensure agent is fully idle
-      await this.agent.waitForIdle();
+      await agent.waitForIdle();
       await runPromise;
+      await this.waitForInvocationFinalizations(session);
 
       // Yield any remaining events
-      while (eventIndex < this.events.length) {
-        const event = this.events[eventIndex];
+      while (eventIndex < session.events.length) {
+        const event = session.events[eventIndex];
         if (event) {
           yield event;
         }
         eventIndex++;
       }
     } finally {
-      if (runPromise) {
-        if (this.agent.state.isStreaming) {
-          this.agent.abort();
+      try {
+        if (runPromise) {
+          if (agent.state.isStreaming) {
+            session.providerAbortCode = 'provider_aborted';
+            agent.abort();
+          }
+          await Promise.allSettled([runPromise, agent.waitForIdle()]);
+          await this.waitForInvocationFinalizations(session);
         }
-        await Promise.allSettled([runPromise, this.agent.waitForIdle()]);
+      } finally {
+        this.releaseTurnSession(session);
       }
-      releaseTurnLease();
     }
   }
 
@@ -388,7 +481,10 @@ export class PiAdapter {
    * Abort current turn
    */
   abort(): void {
-    this.agent.abort();
+    for (const session of this.activeTurnSessions) {
+      session.providerAbortCode = 'provider_aborted';
+      session.slot.agent.abort();
+    }
   }
 
   /**
@@ -502,7 +598,7 @@ export class PiAdapter {
   }
 
   private historyBotMessageToAssistantMessage(msg: RecentMessage): AgentMessage {
-    const model = this.agent.state.model;
+    const model = this.model;
     const fallbackModelId = isRecord(model) && typeof model.model === 'string'
       ? model.model
       : 'history';
@@ -558,9 +654,9 @@ export class PiAdapter {
    * 2. Wrap handler execution with audit and error handling
    * 3. Store actor/context for use in beforeToolCall hook
    */
-  private convertTools(input: PiAdapterInput): AgentTool[] {
+  private convertTools(session: PiTurnSession): AgentTool[] {
     const tools: AgentTool[] = [];
-    const actor = this.buildActorContext(input);
+    const { input, actor } = session;
 
     // Get all registered tools
     const registryTools = this.toolRegistry.getAll();
@@ -571,7 +667,6 @@ export class PiAdapter {
     const providerToolNames = createProviderToolNameMap(
       allowedTools.map((entry) => entry.name),
     );
-    const generation = this.toolDirectoryGeneration;
 
     allowedTools.forEach((entry) => {
       const canonicalName = entry.name;
@@ -586,8 +681,8 @@ export class PiAdapter {
 
         execute: async (toolCallId, params, signal, _onUpdate) => {
           if (
-            generation !== this.toolDirectoryGeneration
-            || this.providerToolNameToCanonical.get(providerName) !== canonicalName
+            session.slot.session !== session
+            || session.providerToolNameToCanonical.get(providerName) !== canonicalName
           ) {
             throw new Error('Tool is not available for the current turn');
           }
@@ -616,7 +711,7 @@ export class PiAdapter {
               executionTimeMs: Date.now() - startedAt,
               redactionApplied: false,
             });
-            this.recordToolCallId(toolCallId);
+            this.recordToolCallId(session, toolCallId);
 
             throw new Error(reason);
           }
@@ -649,7 +744,7 @@ export class PiAdapter {
                 executionTimeMs: Date.now() - startedAt,
                 redactionApplied: false,
               });
-              this.recordToolCallId(toolCallId);
+              this.recordToolCallId(session, toolCallId);
               throw new Error(authorization.reason);
             }
 
@@ -677,7 +772,7 @@ export class PiAdapter {
                 executionTimeMs: Date.now() - startedAt,
                 redactionApplied: false,
               });
-              this.recordToolCallId(toolCallId);
+              this.recordToolCallId(session, toolCallId);
               throw new Error(reason);
             }
           }
@@ -701,7 +796,7 @@ export class PiAdapter {
               executionTimeMs: Date.now() - startedAt,
               redactionApplied: false,
             });
-            this.recordToolCallId(toolCallId);
+            this.recordToolCallId(session, toolCallId);
             throw new Error(reason);
           }
 
@@ -742,7 +837,7 @@ export class PiAdapter {
             const result = preparedEffect ? preparedEffect.publicResult : handlerResult;
 
             // Track executed tool
-            this.recordToolCallId(toolCallId);
+            this.recordToolCallId(session, toolCallId);
 
             const formatted = this.formatToolResult(result);
             const redactedText = redactRuntimeDiagnosticText(formatted);
@@ -808,7 +903,7 @@ export class PiAdapter {
               },
               preparedEffect ? { atomicTerminal: true } : undefined,
             );
-            this.recordToolCallId(toolCallId);
+            this.recordToolCallId(session, toolCallId);
             throw new Error(redactedMessage.text);
           }
         },
@@ -817,7 +912,7 @@ export class PiAdapter {
       tools.push(piTool);
     });
 
-    this.providerToolNameToCanonical = providerToolNames;
+    session.providerToolNameToCanonical = providerToolNames;
     return tools;
   }
 
@@ -856,21 +951,23 @@ export class PiAdapter {
    * 4. Extract token usage and status
    */
   private async handlePiEvent(
+    slot: PiAgentSlot,
     event: AgentEvent,
     _signal: AbortSignal
   ): Promise<void> {
-    if (!this.currentTurnId) return;
+    const session = slot.session;
+    if (!session || !this.activeTurnSessions.has(session)) return;
 
     // Create adapter event
     const adapterEvent: PiAdapterEvent = {
       type: event.type,
       timestamp: new Date(),
-      turnId: this.currentTurnId,
+      turnId: session.input.turnId,
       piEvent: event,
     };
 
     // Store event
-    this.events.push(adapterEvent);
+    session.events.push(adapterEvent);
 
     // Handle specific event types
     switch (event.type) {
@@ -899,8 +996,8 @@ export class PiAdapter {
   /**
    * Extract final output from agent state and events
    */
-  private extractOutput(turnId: string): PiAdapterOutput {
-    const agent = this.agent;
+  private extractOutput(session: PiTurnSession): PiAdapterOutput {
+    const { agent } = session.slot;
 
     // Get final assistant message
     const messages = agent.state.messages;
@@ -926,7 +1023,7 @@ export class PiAdapter {
     };
 
     // Try to extract from events (provider-specific)
-    const messageEndEvents = this.events.filter((e) => e.type === 'message_end');
+    const messageEndEvents = session.events.filter((e) => e.type === 'message_end');
     if (messageEndEvents.length > 0) {
       // Would need to inspect piEvent for usage metadata
       // This is provider-specific (Anthropic includes usage in response)
@@ -942,10 +1039,10 @@ export class PiAdapter {
     }
 
     return {
-      turnId,
+      turnId: session.input.turnId,
       responseText,
-      toolCallIds: this.recordedToolCallIds,
-      events: this.events,
+      toolCallIds: session.recordedToolCallIds,
+      events: session.events,
       tokensUsed,
       status,
       errorMessage,
@@ -1126,10 +1223,19 @@ export class PiAdapter {
    * 4. Store metadata for audit
    */
   private async beforeToolCall(
+    slot: PiAgentSlot,
     context: BeforeToolCallContext,
     _signal?: AbortSignal
   ): Promise<BeforeToolCallResult | undefined> {
-    const toolName = this.providerToolNameToCanonical.get(context.toolCall.name);
+    const session = slot.session;
+    if (!session) {
+      return {
+        block: true,
+        reason: 'Missing active turn session',
+      };
+    }
+
+    const toolName = session.providerToolNameToCanonical.get(context.toolCall.name);
     if (!toolName) {
       return {
         block: true,
@@ -1138,15 +1244,8 @@ export class PiAdapter {
     }
 
     // Get actor context from current turn
-    const actor = this.getCurrentActor();
-    const invocationContext = this.getCurrentInvocationContext();
-
-    if (!actor || !invocationContext) {
-      return {
-        block: true,
-        reason: 'Missing actor or context information',
-      };
-    }
+    const actor = session.actor;
+    const invocationContext = session.input.invocationContext;
 
     const tool = this.toolRegistry.get(toolName);
 
@@ -1163,7 +1262,7 @@ export class PiAdapter {
         await this.auditToolCall({
           entry: tool,
           toolCallId: context.toolCall.id,
-          turnId: this.currentTurnId,
+          turnId: session.input.turnId,
           params: context.args,
           status: 'rejected',
           actor,
@@ -1173,7 +1272,7 @@ export class PiAdapter {
           errorCode: 'POLICY_DENIED',
           redactionApplied: false,
         });
-        this.recordToolCallId(context.toolCall.id);
+        this.recordToolCallId(session, context.toolCall.id);
       }
 
       // Block tool execution
@@ -1204,10 +1303,19 @@ export class PiAdapter {
    * 4. Check for termination conditions
    */
   private async afterToolCall(
+    slot: PiAgentSlot,
     context: AfterToolCallContext,
     _signal?: AbortSignal
   ): Promise<AfterToolCallResult | undefined> {
-    const toolName = this.providerToolNameToCanonical.get(context.toolCall.name);
+    const session = slot.session;
+    if (!session) {
+      return {
+        content: [{ type: 'text', text: 'Missing active turn session' }],
+        isError: true,
+      };
+    }
+
+    const toolName = session.providerToolNameToCanonical.get(context.toolCall.name);
     if (!toolName) {
       return {
         content: [{ type: 'text', text: 'Unknown provider tool name' }],
@@ -1248,20 +1356,6 @@ export class PiAdapter {
           terminate: true,
         }
       : undefined;
-  }
-
-  /**
-   * Helper: Get current actor context
-   */
-  private getCurrentActor() {
-    return this.currentActor;
-  }
-
-  /**
-   * Helper: Get current invocation context
-   */
-  private getCurrentInvocationContext() {
-    return this.currentInvocationContext;
   }
 
   /**
@@ -1337,9 +1431,9 @@ export class PiAdapter {
     return { value, redacted: false };
   }
 
-  private recordToolCallId(toolCallId: string): void {
-    if (!this.recordedToolCallIds.includes(toolCallId)) {
-      this.recordedToolCallIds.push(toolCallId);
+  private recordToolCallId(session: PiTurnSession, toolCallId: string): void {
+    if (!session.recordedToolCallIds.includes(toolCallId)) {
+      session.recordedToolCallIds.push(toolCallId);
     }
   }
 
@@ -1411,7 +1505,7 @@ export class PiAdapter {
           redactionApplied,
         };
 
-    const turnId = input.turnId ?? this.currentTurnId;
+    const turnId = input.turnId;
     const toolCall = turnId
       ? {
           id: input.toolCallId,
@@ -1505,41 +1599,183 @@ export class PiAdapter {
     return 'low';
   }
 
-  /**
-   * Store actor/context when starting turn
-   * (Called at beginning of runTurn/streamTurn)
-   */
-  private setCurrentContext(input: PiAdapterInput): void {
-    this.currentActor = this.buildActorContext(input);
-    this.currentInvocationContext = input.invocationContext;
-  }
+  private streamProviderRound(
+    slot: PiAgentSlot,
+    model: Parameters<StreamFn>[0],
+    context: Parameters<StreamFn>[1],
+    options: Parameters<StreamFn>[2],
+  ): ReturnType<StreamFn> {
+    const streamOptions = { ...options, maxRetries: 0 };
+    const session = slot.session;
+    const sourceEventIds = session?.input.sourceEventIds;
+    if (
+      !session
+      || !this.activeTurnSessions.has(session)
+      || !this.modelInvocationRepository
+      || !sourceEventIds
+      || sourceEventIds.length === 0
+    ) {
+      return streamSimple(model, context, streamOptions);
+    }
 
-  private prepareTurn(input: PiAdapterInput): void {
-    this.currentTurnId = input.turnId;
-    this.events = [];
-    this.recordedToolCallIds = [];
-    this.setCurrentContext(input);
-    this.toolDirectoryGeneration += 1;
-    this.providerToolNameToCanonical = new Map();
-    this.agent.reset();
-    this.agent.state.tools = [];
-  }
-
-  private async acquireTurnLease(): Promise<() => void> {
-    const previousLease = this.turnLeaseTail;
-    let releaseLease = (): void => undefined;
-    this.turnLeaseTail = new Promise<void>((resolve) => {
-      releaseLease = resolve;
+    session.providerCallNumber += 1;
+    const invocationId = this.modelInvocationRepository.startPiTurnInvocation({
+      turnId: session.input.turnId,
+      callNumber: session.providerCallNumber,
+      provider: model.provider,
+      model: model.id,
+      rawEventIds: [...sourceEventIds],
     });
-    await previousLease;
 
-    let released = false;
-    return () => {
-      if (!released) {
-        released = true;
-        releaseLease();
+    let providerStream: ReturnType<typeof streamSimple>;
+    try {
+      providerStream = streamSimple(model, context, streamOptions);
+    } catch (error) {
+      this.writeInvocationTerminal(invocationId, () => {
+        this.modelInvocationRepository?.failInvocation(
+          invocationId,
+          'runtime_exception',
+          'failed',
+        );
+      });
+      throw error;
+    }
+
+    const finalization = providerStream.result()
+      .then((message) => {
+        this.terminalizeProviderResult(session, invocationId, message);
+      })
+      .catch((error: unknown) => {
+        try {
+          this.writeInvocationTerminal(invocationId, () => {
+            this.modelInvocationRepository?.failInvocation(
+              invocationId,
+              'runtime_exception',
+              'failed',
+            );
+          });
+        } catch (terminalizationError) {
+          session.invocationFinalizationError ??= terminalizationError;
+          return;
+        }
+        session.invocationFinalizationError ??= error;
+      });
+    session.pendingInvocationFinalizations.add(finalization);
+    void finalization.then(() => {
+      session.pendingInvocationFinalizations.delete(finalization);
+    });
+    return providerStream;
+  }
+
+  private terminalizeProviderResult(
+    session: PiTurnSession,
+    invocationId: string,
+    message: AssistantMessage,
+  ): void {
+    if (message.stopReason === 'error') {
+      this.writeInvocationTerminal(invocationId, () => {
+        this.modelInvocationRepository?.failInvocation(invocationId, 'provider_error', 'failed');
+      });
+      return;
+    }
+    if (message.stopReason === 'aborted') {
+      this.writeInvocationTerminal(invocationId, () => {
+        this.modelInvocationRepository?.failInvocation(
+          invocationId,
+          session.providerAbortCode ?? 'provider_aborted',
+          'aborted',
+        );
+      });
+      return;
+    }
+
+    const responseText = JSON.stringify(message.content);
+    this.writeInvocationTerminal(invocationId, () => {
+      this.modelInvocationRepository?.completePiTurnInvocation(
+        invocationId,
+        readPiInvocationUsage(message),
+        responseText,
+      );
+    });
+  }
+
+  private writeInvocationTerminal(invocationId: string, write: () => void): void {
+    try {
+      write();
+    } catch (error) {
+      const invocation = this.modelInvocationRepository?.findInvocationById(invocationId);
+      if (invocation && invocation.status !== 'running') {
+        return;
       }
+      throw error;
+    }
+  }
+
+  private async waitForInvocationFinalizations(session: PiTurnSession): Promise<void> {
+    while (session.pendingInvocationFinalizations.size > 0) {
+      await Promise.all([...session.pendingInvocationFinalizations]);
+    }
+    const error = session.invocationFinalizationError;
+    session.invocationFinalizationError = undefined;
+    if (error !== undefined) {
+      throw error;
+    }
+  }
+
+  private createAgentSlot(): PiAgentSlot {
+    let slot: PiAgentSlot;
+    const agent = new Agent({
+      initialState: {
+        systemPrompt: '',
+        model: { ...this.model },
+        tools: [],
+        messages: [],
+      },
+      getApiKey: async (_provider: string) => this.apiKey,
+      convertToLlm: this.convertToLlm.bind(this),
+      streamFn: (model, context, options) =>
+        this.streamProviderRound(slot, model, context, options),
+      beforeToolCall: (context, signal) => this.beforeToolCall(slot, context, signal),
+      afterToolCall: (context, signal) => this.afterToolCall(slot, context, signal),
+    });
+    slot = { agent };
+    agent.subscribe((event, signal) => this.handlePiEvent(slot, event, signal));
+    return slot;
+  }
+
+  private acquireTurnSession(input: PiAdapterInput): PiTurnSession {
+    const slot = this.idleAgentSlots.pop() ?? this.createAgentSlot();
+    const sessionInput: PiAdapterInput = {
+      ...input,
+      ...(input.sourceEventIds === undefined
+        ? {}
+        : { sourceEventIds: [...input.sourceEventIds] }),
     };
+    const session: PiTurnSession = {
+      slot,
+      input: sessionInput,
+      actor: this.buildActorContext(sessionInput),
+      events: [],
+      recordedToolCallIds: [],
+      providerToolNameToCanonical: new Map(),
+      providerCallNumber: 0,
+      pendingInvocationFinalizations: new Set(),
+    };
+
+    slot.session = session;
+    this.activeTurnSessions.add(session);
+    slot.agent.reset();
+    slot.agent.state.tools = [];
+    return session;
+  }
+
+  private releaseTurnSession(session: PiTurnSession): void {
+    if (session.slot.session !== session) {
+      return;
+    }
+
+    this.activeTurnSessions.delete(session);
+    this.idleAgentSlots.push(session.slot);
   }
 
   private buildActorContext(input: PiAdapterInput): ActorContext {

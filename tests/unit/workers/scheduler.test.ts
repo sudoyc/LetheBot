@@ -209,6 +209,127 @@ describe('WorkerScheduler', () => {
     expect(drained).toBe(true);
   });
 
+  it('drains concurrent interactive and maintenance claim lanes without running attempts', async () => {
+    const testDir = mkdtempSync(join(tmpdir(), 'lethebot-scheduler-lane-drain-'));
+    const db = initDatabase({ path: join(testDir, 'test.db') });
+
+    try {
+      runMigration(db, join(__dirname, '../../../migrations/001_initial_schema.sql'));
+      const now = new Date('2026-07-24T00:00:00.000Z');
+      vi.setSystemTime(now);
+      const jobRepository = new JobRepository(db);
+      let releaseMaintenance = (): void => undefined;
+      let releaseInteractive = (): void => undefined;
+      const maintenancePending = new Promise<void>((resolve) => {
+        releaseMaintenance = resolve;
+      });
+      const interactivePending = new Promise<void>((resolve) => {
+        releaseInteractive = resolve;
+      });
+      const maintenanceWorker = new BackgroundWorker({
+        jobRepository,
+        workerId: 'scheduler-maintenance-lane',
+        excludedClaimTypes: ['attention_recheck'],
+        handlers: {
+          retention: async () => {
+            await maintenancePending;
+            return { retained: true };
+          },
+        },
+      });
+      const interactiveWorker = new BackgroundWorker({
+        jobRepository,
+        workerId: 'scheduler-interactive-lane',
+        claimTypes: ['attention_recheck'],
+        handlers: {
+          attention_recheck: async () => {
+            await interactivePending;
+            return { outcome: 'respond' };
+          },
+        },
+      });
+      const maintenanceJobId = jobRepository.enqueue({
+        type: 'retention',
+        payload: { rawEventsDays: 30 },
+        scheduledAt: now.getTime() - 1_000,
+        now: now.getTime() - 1_000,
+      });
+      const interactiveJobId = jobRepository.enqueue({
+        type: 'attention_recheck',
+        payload: { candidateId: 'candidate-scheduler-lane-drain' },
+        scheduledAt: now,
+        now: now.getTime(),
+      });
+
+      scheduler.register({
+        name: 'maintenance-lane',
+        intervalMs: 1_000,
+        handler: async () => {
+          await maintenanceWorker.processNext();
+        },
+      });
+      scheduler.register({
+        name: 'interactive-lane',
+        intervalMs: 1_000,
+        handler: async () => {
+          await interactiveWorker.processNext();
+        },
+      });
+      scheduler.start();
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(jobRepository.findById(maintenanceJobId)?.status).toBe('running');
+      expect(jobRepository.findById(interactiveJobId)?.status).toBe('running');
+      expect(db.prepare(
+        "SELECT COUNT(*) AS count FROM job_attempts WHERE status = 'running'",
+      ).get()).toEqual({ count: 2 });
+
+      let drained = false;
+      const drainPromise = scheduler.stopAndDrain().then(() => {
+        drained = true;
+      });
+      await Promise.resolve();
+      expect(drained).toBe(false);
+
+      releaseInteractive();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(drained).toBe(false);
+      expect(jobRepository.findById(interactiveJobId)?.status).toBe('completed');
+      expect(jobRepository.findById(maintenanceJobId)?.status).toBe('running');
+
+      releaseMaintenance();
+      await drainPromise;
+
+      expect(jobRepository.findById(maintenanceJobId)?.status).toBe('completed');
+      expect(jobRepository.findById(interactiveJobId)?.status).toBe('completed');
+      expect(db.prepare(
+        "SELECT COUNT(*) AS count FROM job_attempts WHERE status = 'running'",
+      ).get()).toEqual({ count: 0 });
+      expect(db.prepare(
+        `SELECT worker_id, status, current_job_id
+           FROM worker_heartbeats
+          WHERE worker_id IN (?, ?)
+          ORDER BY worker_id`,
+      ).all('scheduler-interactive-lane', 'scheduler-maintenance-lane')).toEqual([
+        {
+          worker_id: 'scheduler-interactive-lane',
+          status: 'idle',
+          current_job_id: null,
+        },
+        {
+          worker_id: 'scheduler-maintenance-lane',
+          status: 'idle',
+          current_job_id: null,
+        },
+      ]);
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+    } finally {
+      scheduler.stop();
+      closeDatabase(db);
+      rmSync(testDir, { recursive: true, force: true });
+    }
+  });
+
   it('should handle job errors gracefully', async () => {
     const handler = vi.fn().mockRejectedValue(new Error('Job failed'));
 

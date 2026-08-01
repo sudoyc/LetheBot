@@ -2,12 +2,17 @@
  * Memory conflict worker.
  *
  * Detects active memory records that share the same owner/kind/title but hold
- * different content. The worker only writes redacted audit evidence; it does
- * not automatically supersede, delete, or activate memory.
+ * different content. The worker writes a normalized pending-review proposal and
+ * redacted audit evidence; it does not automatically supersede, delete, or
+ * activate memory.
  */
 
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
+import {
+  createMemoryMaintenanceProposal,
+  type MemoryMaintenanceProposal,
+} from '../memory/maintenance-proposal.js';
 import type { AuditRepository } from '../storage/audit-repository.js';
 
 export interface MemoryConflictInput {
@@ -24,6 +29,7 @@ export interface MemoryConflictResult {
   conflictCount: number;
   sampledConflictCount: number;
   redacted: true;
+  proposals: MemoryMaintenanceProposal[];
   conflicts: Array<{
     memoryIds: [string, string];
     scope: string;
@@ -80,6 +86,19 @@ export class MemoryConflictWorker {
       titleHash: this.hashTitle(row.normalized_title),
       updatedAt: row.updated_at,
     }));
+    const proposals: MemoryMaintenanceProposal[] = [];
+    for (const conflict of conflicts) {
+      proposals.push(await createMemoryMaintenanceProposal(this.db, this.auditRepository, {
+        kind: 'conflict',
+        candidateMemoryIds: conflict.memoryIds,
+        reasonCodes: ['same_boundary_title_different_content'],
+        proposedEffect: {
+          type: 'resolve_conflict',
+          candidateMemoryIds: [...conflict.memoryIds].sort(),
+        },
+        nowMs: untilMs,
+      }));
+    }
 
     const auditId = await this.auditRepository.create({
       timestamp: new Date(untilMs),
@@ -99,6 +118,8 @@ export class MemoryConflictWorker {
         untilMs,
         conflictCount,
         sampledConflictCount: conflicts.length,
+        proposalCount: proposals.length,
+        proposalIds: proposals.map((proposal) => proposal.proposalId),
         conflicts,
         redaction: 'memory_ids_and_title_hashes_only',
       },
@@ -113,6 +134,7 @@ export class MemoryConflictWorker {
       conflictCount,
       sampledConflictCount: conflicts.length,
       redacted: true,
+      proposals,
       conflicts,
     };
   }
