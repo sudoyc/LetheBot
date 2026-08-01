@@ -3,11 +3,13 @@ import { PolicyGate } from '../../../src/policy/gate';
 import { ToolRegistry } from '../../../src/tools/registry';
 import type { SandboxPolicy } from '../../../src/types/tool';
 
-function createSandboxPolicy(): SandboxPolicy {
+function createSandboxPolicy(
+  execution: SandboxPolicy['execution'] = 'in_process',
+): SandboxPolicy {
   return {
     filesystem: 'none',
     network: 'none',
-    execution: 'in_process',
+    execution,
     maxRuntimeMs: 1000,
   };
 }
@@ -108,14 +110,26 @@ describe('PolicyGate', () => {
     it.each(['none', 'subprocess', 'docker'] as const)(
       'should deny unsupported %s execution before handler dispatch',
       (execution) => {
-        const tool = registry.get('test_tool');
-        if (!tool) {
-          throw new Error('Expected registered test tool');
-        }
-        tool.sandboxPolicy.execution = execution;
+        const toolName = `unsupported_${execution}`;
+        registry.register({
+          name: toolName,
+          version: '1.0.0',
+          description: 'Unsupported execution tool',
+          capabilities: ['read_context'],
+          permissions: {
+            allowedActors: ['user'],
+            allowedContexts: ['private_chat'],
+          },
+          evaluatorPolicy: 'bypass',
+          auditLevel: 'summary',
+          sandboxPolicy: createSandboxPolicy(execution),
+          outputSensitivity: 'normal',
+          piSchema: { input: {}, output: {} },
+          handler: async () => ({ ok: true }),
+        });
 
         const result = gate.checkToolCall({
-          toolName: 'test_tool',
+          toolName,
           actor: { actorClass: 'user', canonicalUserId: 'user-001' },
           context: 'private_chat',
         });
@@ -125,22 +139,27 @@ describe('PolicyGate', () => {
       }
     );
 
-    it('should deny missing execution metadata after registration', () => {
-      const tool = registry.get('test_tool');
-      if (!tool) {
-        throw new Error('Expected registered test tool');
-      }
-      const mutablePolicy: Partial<SandboxPolicy> = tool.sandboxPolicy;
-      delete mutablePolicy.execution;
+    it('should reject missing execution metadata during registration', () => {
+      const sandboxPolicy = createSandboxPolicy();
+      expect(Reflect.deleteProperty(sandboxPolicy, 'execution')).toBe(true);
 
-      const result = gate.checkToolCall({
-        toolName: 'test_tool',
-        actor: { actorClass: 'user', canonicalUserId: 'user-001' },
-        context: 'private_chat',
-      });
-
-      expect(result).toMatchObject({ allowed: false });
-      expect(result.reason).toMatch(/execution backend/i);
+      expect(() => registry.register({
+        name: 'missing_execution',
+        version: '1.0.0',
+        description: 'Missing execution metadata tool',
+        capabilities: ['read_context'],
+        permissions: {
+          allowedActors: ['user'],
+          allowedContexts: ['private_chat'],
+        },
+        evaluatorPolicy: 'bypass',
+        auditLevel: 'summary',
+        sandboxPolicy,
+        outputSensitivity: 'normal',
+        piSchema: { input: {}, output: {} },
+        handler: async () => ({ ok: true }),
+      })).toThrow(/execution/i);
+      expect(registry.get('missing_execution')).toBeUndefined();
     });
   });
 

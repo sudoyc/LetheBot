@@ -124,15 +124,16 @@ describe('Context History Loading', () => {
       db.prepare(`
         INSERT INTO chat_messages (
           id, raw_event_id, message_id, conversation_id,
-          conversation_type, sender_id, text,
+          conversation_type, group_id, sender_id, text,
           has_media, has_quote, mentions_bot, timestamp
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         `msg-${i}`,
         rawEventId,
         `platform-msg-${i}`,
         conversationId,
         'group',
+        conversationId,
         '123456',
         `Message ${i}`,
         0,
@@ -147,6 +148,7 @@ describe('Context History Loading', () => {
       turnId: 'turn-test',
       conversationId,
       conversationType: 'group',
+      groupId: conversationId,
       recentMessages: [], // 应该从数据库加载，而不是使用这个空数组
       targetUserId: '123456',
     });
@@ -311,6 +313,7 @@ describe('Context History Loading', () => {
       turnId: 'turn-test',
       conversationId,
       conversationType: 'group',
+      groupId: conversationId,
       recentMessages: [
         {
           messageId: 'msg-fallback',
@@ -354,15 +357,16 @@ describe('Context History Loading', () => {
       db.prepare(`
         INSERT INTO chat_messages (
           id, raw_event_id, message_id, conversation_id,
-          conversation_type, sender_id, text,
+          conversation_type, group_id, sender_id, text,
           has_media, has_quote, mentions_bot, timestamp
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         `msg-${i}`,
         rawEventId,
         `platform-msg-${i}`,
         conversationId,
         'group',
+        conversationId,
         '123456',
         `Message ${i}`,
         0,
@@ -377,6 +381,7 @@ describe('Context History Loading', () => {
       turnId: 'turn-test',
       conversationId,
       conversationType: 'group',
+      groupId: conversationId,
       recentMessages: [],
       targetUserId: '123456',
     });
