@@ -38,6 +38,7 @@ export {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+const SUPERVISOR_STOP_GRACE_MS = 300_000;
 
 function redactForDisplay(value: string): string {
   const platformRedacted = redactPlatformIdentifiers(value);
@@ -60,15 +61,6 @@ function display(value: unknown): string {
   return redactForDisplay(value instanceof Error ? value.message : String(value));
 }
 
-interface StatusResponse {
-  status?: unknown;
-  retcode?: unknown;
-  message?: unknown;
-  echo?: unknown;
-  data?: {
-    nickname?: unknown;
-  };
-}
 
 /**
  * Deployment mode
@@ -83,9 +75,7 @@ export interface DeploymentOptions {
   configPath?: string;
   outputDir?: string;
   deploymentRoot?: string;
-  healthCheck?: boolean;
   verifyNapCat?: boolean;
-  healthCheckTimeout?: number;
 }
 
 /**
@@ -96,7 +86,6 @@ export interface DeploymentDetails {
   serverUrl: string;
   oneBotUrl: string;
   napCatUrl: string;
-  healthCheckPassed?: boolean;
 }
 
 /**
@@ -122,18 +111,6 @@ export class NapCatConnectionError extends Error {
   }
 }
 
-/**
- * Health check timeout error
- */
-export class HealthCheckTimeoutError extends Error {
-  constructor(
-    message: string,
-    public readonly lastError?: string,
-  ) {
-    super(message);
-    this.name = 'HealthCheckTimeoutError';
-  }
-}
 
 /**
  * Port conflict error
@@ -177,63 +154,6 @@ export async function generateNapCatConfig(outputPath: string): Promise<void> {
   console.log('  - LETHEBOT_PORT: HTTP server port (default: 6700)');
 }
 
-/**
- * Perform health check
- */
-async function healthCheck(url: string): Promise<boolean> {
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-
-    const response = await fetch(url, {
-      method: 'GET',
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      return false;
-    }
-
-    const result = (await response.json()) as StatusResponse;
-    return result.status === 'ok';
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Wait for service to be healthy
- * @internal Reserved for future use when auto-starting services
- */
-export async function waitForHealthy(
-  url: string,
-  timeout: number = 30000,
-): Promise<void> {
-  const startTime = Date.now();
-  let lastError = '';
-
-  while (Date.now() - startTime < timeout) {
-    try {
-      const isHealthy = await healthCheck(url);
-      if (isHealthy) {
-        console.log('✓ Service health check passed');
-        return;
-      }
-      lastError = 'Health check returned non-ok status';
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-  }
-
-  throw new HealthCheckTimeoutError(
-    `Health check timeout after ${timeout}ms`,
-    lastError,
-  );
-}
 
 /**
  * Generate Docker Compose configuration
@@ -251,7 +171,7 @@ function generateDockerCompose(config: NapCatConfig): string {
         bind:
           create_host_path: false
     ports:
-      - "127.0.0.1:${config.serverPort}:${config.serverPort}"
+      - "127.0.0.1:\${LETHEBOT_PORT:-${config.serverPort}}:\${LETHEBOT_PORT:-${config.serverPort}}"
     environment:
       - NODE_ENV=production
       - LOG_LEVEL=\${LOG_LEVEL:-info}
@@ -275,16 +195,20 @@ function generateDockerCompose(config: NapCatConfig): string {
       - ONEBOT_WS_URL=\${ONEBOT_WS_URL:?Set ONEBOT_WS_URL in .env or shell}
       - ONEBOT_TOKEN=\${ONEBOT_TOKEN:-}
       - LETHEBOT_BOT_QQ_ID=\${LETHEBOT_BOT_QQ_ID:-}
-      - LETHEBOT_PORT=${config.serverPort}
-      - LETHEBOT_HOST=${config.serverHost}
-      - LETHEBOT_HEALTH_PATH=${config.healthCheckPath}
-      - LETHEBOT_READINESS_PATH=${config.readinessPath}
-      - LETHEBOT_METRICS_PATH=${config.metricsPath}
-      - LETHEBOT_EVENT_PATH=${config.eventPath}
+      - LETHEBOT_PORT=\${LETHEBOT_PORT:-${config.serverPort}}
+      - LETHEBOT_HOST=0.0.0.0
+      - LETHEBOT_HEALTH_PATH=\${LETHEBOT_HEALTH_PATH:-${config.healthCheckPath}}
+      - LETHEBOT_READINESS_PATH=\${LETHEBOT_READINESS_PATH:-${config.readinessPath}}
+      - LETHEBOT_METRICS_PATH=\${LETHEBOT_METRICS_PATH:-${config.metricsPath}}
+      - LETHEBOT_EVENT_PATH=\${LETHEBOT_EVENT_PATH:-${config.eventPath}}
       - LETHEBOT_DB_PATH=/app/data/lethebot.db
     restart: unless-stopped
+    stop_grace_period: ${SUPERVISOR_STOP_GRACE_MS / 1000}s
     healthcheck:
-      test: ["CMD-SHELL", "node -e \\"fetch('http://127.0.0.1:${config.serverPort}${config.healthCheckPath}').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))\\""]
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "fetch('http://127.0.0.1:' + process.env.LETHEBOT_PORT + process.env.LETHEBOT_HEALTH_PATH).then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"
       interval: 30s
       timeout: 10s
       retries: 3
@@ -319,6 +243,7 @@ ExecCondition=+/usr/bin/env ${literal(process.execPath)} ${literal(gatePath)} ${
 ExecStart=${literal('/usr/bin/env')} ${literal('NODE_ENV=production')} ${literal(`LETHEBOT_DB_PATH=${join(sharedDir, 'data/lethebot.db')}`)} ${literal(process.execPath)} ${literal(entrypointPath)}
 Restart=always
 RestartSec=10
+TimeoutStopSec=${SUPERVISOR_STOP_GRACE_MS / 1000}s
 
 [Install]
 WantedBy=multi-user.target
@@ -356,6 +281,7 @@ module.exports = {
     instances: 1,
     autorestart: true,
     stop_exit_codes: [78],
+    kill_timeout: ${SUPERVISOR_STOP_GRACE_MS},
     watch: false,
     max_memory_restart: '1G',
     env: {
@@ -449,11 +375,10 @@ export async function deployLetheBot(
   const {
     mode,
     outputDir = process.cwd(),
-    healthCheck: enableHealthCheck = true,
     verifyNapCat = false,
   } = options;
   const configPath = options.configPath
-    ?? (mode === 'configure' ? join(outputDir, '.env') : '.env');
+    ?? (mode === 'configure' || mode === 'docker' ? join(outputDir, '.env') : '.env');
 
   try {
     const managedMode = mode === 'systemd' || mode === 'pm2';
@@ -548,7 +473,7 @@ export async function deployLetheBot(
       writeFileSync(composePath, dockerCompose, 'utf-8');
       console.log(`✓ docker-compose.yml written to ${redactForDisplay(composePath)}`);
       console.log('\nTo start the service, run:');
-      console.log('  docker-compose up -d');
+      console.log('  docker compose --env-file .env up -d');
     } else if (mode === 'systemd') {
       console.log('Generating systemd service file...');
       writeManagedStartupAssets(outputDir);
@@ -582,12 +507,6 @@ export async function deployLetheBot(
       throw new Error(`Unsupported deployment mode: ${mode}`);
     }
 
-    // Perform health check if enabled
-    let healthCheckPassed: boolean | undefined;
-    if (enableHealthCheck) {
-      console.log('\nNote: Manual service start required.');
-      console.log('Health check skipped (service not auto-started).');
-    }
 
     return {
       success: true,
@@ -599,7 +518,6 @@ export async function deployLetheBot(
         serverUrl,
         oneBotUrl: config.transport === 'ws' ? config.wsUrl : config.httpUrl,
         napCatUrl: config.httpUrl,
-        healthCheckPassed,
       },
     };
   } catch (error) {
@@ -614,7 +532,6 @@ export async function deployLetheBot(
 export interface DeploymentCliOptions extends DeploymentOptions {
   mode: DeploymentMode;
   verifyNapCat: boolean;
-  healthCheck: boolean;
 }
 
 const DEPLOYMENT_MODES = new Set<DeploymentMode>(['docker', 'systemd', 'pm2', 'configure']);
@@ -625,7 +542,6 @@ export function parseDeploymentCliArgs(args: string[]): DeploymentCliOptions {
   let configPath: string | undefined;
   let deploymentRoot: string | undefined;
   let verifyNapCat = false;
-  let healthCheck = true;
   const seenValueOptions = new Set<string>();
 
   const readValue = (index: number, option: string): { value: string; nextIndex: number } => {
@@ -654,10 +570,6 @@ export function parseDeploymentCliArgs(args: string[]): DeploymentCliOptions {
     const argument = args[index];
     if (argument === '--verify-napcat' || argument === '--verify-onebot') {
       verifyNapCat = true;
-      continue;
-    }
-    if (argument === '--no-health-check') {
-      healthCheck = false;
       continue;
     }
 
@@ -705,7 +617,6 @@ export function parseDeploymentCliArgs(args: string[]): DeploymentCliOptions {
     ...(configPath ? { configPath } : {}),
     ...(resolvedDeploymentRoot ? { deploymentRoot: resolvedDeploymentRoot } : {}),
     verifyNapCat,
-    healthCheck,
   };
 }
 
@@ -733,9 +644,6 @@ async function main() {
       console.log(`  Config: ${redactForDisplay(result.details.configPath)}`);
       console.log(`  Server: ${redactForDisplay(result.details.serverUrl)}`);
       console.log(`  OneBot: ${redactForDisplay(result.details.oneBotUrl)}`);
-      if (result.details.healthCheckPassed !== undefined) {
-        console.log(`  Health: ${result.details.healthCheckPassed ? '✓' : '✗'}`);
-      }
     }
   } else {
     console.log(`✗ ${redactForDisplay(result.message)}`);

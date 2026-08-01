@@ -1976,6 +1976,13 @@ replays only valid accepted or evidence-empty processing work. Evidence-bearing
 delivery/effect-unknown work is quarantined for manual review and is not resent
 automatically.
 
+Generated Docker Compose, systemd, and PM2 assets give this sequence 300 seconds
+before their supervisor sends `SIGKILL`. That bound exceeds the default
+120-second cooperative turn deadline; it is not evidence that a non-cooperative
+provider or tool drained. Deployments that raise `PI_TURN_TIMEOUT_MS` above this
+bound must also review the generated supervisor policy, and any forced exit must
+follow the crash-recovery and effect-unknown/manual-review rules above.
+
 ## Failure Runbook
 
 ### Event processing failures

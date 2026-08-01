@@ -495,7 +495,6 @@ describe('NapCat Deployment Scripts', () => {
       const result = await deployLetheBot({
         mode: 'docker',
         outputDir: testOutputDir,
-        healthCheck: false,
       });
 
       expect(result.success).toBe(true);
@@ -523,10 +522,13 @@ describe('NapCat Deployment Scripts', () => {
       expect(content).toContain('LETHEBOT_BACKGROUND_SUMMARY_ENABLED=${LETHEBOT_BACKGROUND_SUMMARY_ENABLED:-false}');
       expect(content).toContain('- EVALUATOR_PROVIDER');
       expect(content).toContain('- EVALUATOR_MODEL');
-      expect(content).toContain('LETHEBOT_HEALTH_PATH=/ops/health');
-      expect(content).toContain('http://127.0.0.1:6700/ops/health');
+      expect(content).toContain('LETHEBOT_HEALTH_PATH=${LETHEBOT_HEALTH_PATH:-/ops/health}');
+      expect(content).toContain('LETHEBOT_HOST=0.0.0.0');
+      expect(content).not.toContain('LETHEBOT_HOST=127.0.0.1');
+      expect(content).toContain('process.env.LETHEBOT_PORT + process.env.LETHEBOT_HEALTH_PATH');
       expect(content).toContain('response.ok ? 0 : 1');
-      expect(content).toContain('"127.0.0.1:6700:6700"');
+      expect(content).toContain('stop_grace_period: 300s');
+      expect(content).toContain('"127.0.0.1:${LETHEBOT_PORT:-6700}:${LETHEBOT_PORT:-6700}"');
       expect(content).not.toContain('http://localhost:6700/healthz');
       expect(content).not.toContain('"wget"');
       expect(content).not.toContain('image: node:');
@@ -535,6 +537,7 @@ describe('NapCat Deployment Scripts', () => {
       expect(content).not.toContain('pnpm install');
       expect(content).not.toContain('pnpm build');
       expect(content).not.toContain('pnpm start');
+      expect(result.details?.configPath).toBe(join(testOutputDir, '.env'));
     });
 
     test('systemd mode generates service file', async () => {
@@ -543,7 +546,6 @@ describe('NapCat Deployment Scripts', () => {
         mode: 'systemd',
         outputDir: managedOutputDir,
         deploymentRoot: testDeploymentRoot,
-        healthCheck: false,
       });
 
       expect(result.success).toBe(true);
@@ -567,6 +569,7 @@ describe('NapCat Deployment Scripts', () => {
       expect(content).toContain(
         `ExecStart=${JSON.stringify('/usr/bin/env')} ${JSON.stringify('NODE_ENV=production')} ${JSON.stringify(`LETHEBOT_DB_PATH=${join(testDeploymentRoot, 'shared/data/lethebot.db')}`)} ${JSON.stringify(process.execPath)} ${JSON.stringify(join(testDeploymentRoot, 'current/dist/index.js'))}`,
       );
+      expect(content).toContain('TimeoutStopSec=300s');
       expect(content).not.toContain('LETHEBOT_MANAGED_ROOT=');
       expect(existsSync(join(managedOutputDir, 'bin/managed-startup.js'))).toBe(true);
       expect(existsSync(join(managedOutputDir, 'bin/release-artifact.js'))).toBe(true);
@@ -608,7 +611,6 @@ describe('NapCat Deployment Scripts', () => {
         mode: 'pm2',
         outputDir: managedOutputDir,
         deploymentRoot: testDeploymentRoot,
-        healthCheck: false,
       });
 
       expect(result.success).toBe(true);
@@ -631,6 +633,7 @@ describe('NapCat Deployment Scripts', () => {
           interpreter?: string;
           args?: string[];
           stop_exit_codes?: number[];
+          kill_timeout?: number;
           cwd?: string;
           env?: {
             NODE_ENV?: string;
@@ -652,6 +655,7 @@ describe('NapCat Deployment Scripts', () => {
           `--entrypoint=${join(testDeploymentRoot, 'current/dist/index.js')}`,
         ],
         stop_exit_codes: [78],
+        kill_timeout: 300_000,
         cwd: join(testDeploymentRoot, 'current'),
         env: {
           NODE_ENV: 'production',
@@ -713,7 +717,6 @@ describe('NapCat Deployment Scripts', () => {
         mode: 'pm2',
         outputDir: sharedDir,
         deploymentRoot: rootDir,
-        healthCheck: false,
       });
       expect(deployment.success).toBe(true);
       persistManagedStartupAuthorization({ rootDir, operationId, releaseId: 'B' });
@@ -746,25 +749,21 @@ describe('NapCat Deployment Scripts', () => {
         const missing = await deployLetheBot({
           mode,
           outputDir: testOutputDir,
-          healthCheck: false,
         });
         const relative = await deployLetheBot({
           mode,
           outputDir: testOutputDir,
           deploymentRoot: 'relative-managed-root',
-          healthCheck: false,
         });
         const specifier = await deployLetheBot({
           mode,
           outputDir: testOutputDir,
           deploymentRoot: '/srv/lethebot/%n',
-          healthCheck: false,
         });
         const variable = await deployLetheBot({
           mode,
           outputDir: testOutputDir,
           deploymentRoot: '/srv/lethebot/${HOME}',
-          healthCheck: false,
         });
 
         expect(missing.success).toBe(false);
@@ -801,7 +800,6 @@ describe('NapCat Deployment Scripts', () => {
               ? { deploymentRoot: testDeploymentRoot }
               : {}
           ),
-          healthCheck: false,
         });
 
         expect(result.success).toBe(true);
@@ -844,7 +842,6 @@ describe('NapCat Deployment Scripts', () => {
 
       const result = await deployLetheBot({
         mode: 'docker',
-        healthCheck: false,
       });
 
       expect(result.success).toBe(false);
@@ -885,6 +882,7 @@ describe('NapCat Deployment Scripts', () => {
       expect(dockerfile).toContain('USER node');
       expect(dockerfile).toContain('umask 077 && exec node dist/index.js');
       expect(dockerfile).toContain('EXPOSE 6700');
+      expect(dockerfile).toContain('ENV LETHEBOT_HOST=0.0.0.0');
       expect(dockerfile).not.toContain('EXPOSE 8080');
       expect(acceptanceDockerfile).toContain('pnpm install --frozen-lockfile');
       expect(acceptanceDockerfile).toContain('FROM node:22-bookworm-slim AS build');
@@ -904,6 +902,7 @@ describe('NapCat Deployment Scripts', () => {
       expect(acceptanceDockerfile).toContain('USER node');
       expect(acceptanceDockerfile).toContain('umask 077 && exec node dist/index.js');
       expect(acceptanceDockerfile).toContain('EXPOSE 6700');
+      expect(acceptanceDockerfile).toContain('ENV LETHEBOT_HOST=0.0.0.0');
       for (const compose of [localCompose, frameworkCompose]) {
         expect(compose).toContain('user: "${LETHEBOT_UID:-1000}:${LETHEBOT_GID:-1000}"');
         expect(compose).toContain('create_host_path: false');
@@ -938,13 +937,11 @@ describe('NapCat Deployment Scripts', () => {
         '--output-dir',
         '/tmp/lethebot-deploy-output',
         '--config-path=/tmp/lethebot-runtime.env',
-        '--no-health-check',
       ])).toEqual({
         mode: 'configure',
         outputDir: '/tmp/lethebot-deploy-output',
         configPath: '/tmp/lethebot-runtime.env',
         verifyNapCat: false,
-        healthCheck: false,
       });
 
       expect(parseDeploymentCliArgs([
@@ -957,7 +954,6 @@ describe('NapCat Deployment Scripts', () => {
         outputDir: '/srv/lethebot/shared',
         deploymentRoot: '/srv/lethebot',
         verifyNapCat: false,
-        healthCheck: true,
       });
 
       for (const args of [
@@ -1003,7 +999,6 @@ describe('NapCat Deployment Scripts', () => {
         script,
         '--mode=configure',
         `--output-dir=${cliOutputDir}`,
-        '--no-health-check',
       ], { cwd: process.cwd(), env, encoding: 'utf8' });
       expect(defaultConfigure.status, defaultConfigure.stderr).toBe(0);
       expect(existsSync(join(cliOutputDir, '.env'))).toBe(true);
@@ -1013,7 +1008,6 @@ describe('NapCat Deployment Scripts', () => {
         '--mode=configure',
         `--config-path=${cliConfigPath}`,
         `--output-dir=${cliOutputDir}`,
-        '--no-health-check',
       ], { cwd: process.cwd(), env, encoding: 'utf8' });
       expect(configure.status, configure.stderr).toBe(0);
       expect(existsSync(cliConfigPath)).toBe(true);
@@ -1022,7 +1016,6 @@ describe('NapCat Deployment Scripts', () => {
         script,
         '--mode=docker',
         `--output-dir=${cliOutputDir}`,
-        '--no-health-check',
       ], { cwd: process.cwd(), env, encoding: 'utf8' });
       expect(docker.status, docker.stderr).toBe(0);
       expect(existsSync(join(cliOutputDir, 'docker-compose.yml'))).toBe(true);
@@ -1045,7 +1038,6 @@ describe('NapCat Deployment Scripts', () => {
         '--mode=pm2',
         `--output-dir=${quotedOutputDir}`,
         `--deployment-root=${quotedDeploymentRoot}`,
-        '--no-health-check',
       ], { cwd: quotedWorkDir, env, encoding: 'utf8' });
       expect(pm2.status, pm2.stderr).toBe(0);
       const quotedEcosystemPath = join(quotedOutputDir, 'ecosystem.config.cjs');
@@ -1077,7 +1069,6 @@ describe('NapCat Deployment Scripts', () => {
         mode: 'docker',
         outputDir: testOutputDir,
         verifyNapCat: true,
-        healthCheck: false,
       });
 
       expect(result.success).toBe(true);
@@ -1105,7 +1096,6 @@ describe('NapCat Deployment Scripts', () => {
 
       const result = await deployLetheBot({
         mode: 'docker',
-        healthCheck: false,
       });
 
       expect(result.success).toBe(false);
@@ -1136,7 +1126,6 @@ describe('NapCat Deployment Scripts', () => {
       const result = await deployLetheBot({
         mode: 'docker',
         outputDir: testOutputDir,
-        healthCheck: false,
       });
 
       // Should succeed with defaults

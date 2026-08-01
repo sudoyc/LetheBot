@@ -564,9 +564,12 @@ WebUI reset 会删除并重新生成整份 WebUI auth 配置。未获授权时�
 拒绝生成引用一个 root、却把 gate 写到另一个目录的自相矛盾配置。
 
 ```bash
+# Docker: configure writes /tmp/lethebot-deploy/.env; Compose consumes it explicitly.
 pnpm deploy:configure --output-dir=/tmp/lethebot-deploy
-pnpm deploy:configure --config-path=/tmp/lethebot-deploy/runtime.env
 pnpm deploy:docker --output-dir=/tmp/lethebot-deploy
+
+# Managed hosts use the fixed shared runtime environment path.
+pnpm deploy:configure --config-path=/srv/lethebot/shared/runtime.env
 pnpm deploy:systemd --deployment-root=/srv/lethebot --output-dir=/srv/lethebot/shared
 pnpm deploy:pm2 --deployment-root=/srv/lethebot --output-dir=/srv/lethebot/shared
 ```
@@ -630,6 +633,11 @@ export LETHEBOT_GID="$(id -g)"
 install -d -m 700 /tmp/lethebot-deploy/data/lethebot
 ```
 
+The reviewed images listen on `0.0.0.0` inside the container namespace so a
+published port reaches the process. Generated and checked-in Compose files keep
+the host-side application port bound to `127.0.0.1`; container reachability does
+not widen host exposure.
+
 If an older root-running container already created a database, stop LetheBot
 and change ownership of only its main DB and existing `-wal` / `-shm` sidecars,
 regardless of their current mode, before switching identities. Do not make the files group/world
@@ -650,7 +658,9 @@ docker build -t lethebot:<reviewed-revision> .
 LETHEBOT_IMAGE=lethebot:<reviewed-revision> \
 LETHEBOT_UID="$(id -u)" \
 LETHEBOT_GID="$(id -g)" \
-  docker compose -f /tmp/lethebot-deploy/docker-compose.yml up -d
+  docker compose \
+    --env-file /tmp/lethebot-deploy/.env \
+    -f /tmp/lethebot-deploy/docker-compose.yml up -d
 ```
 
 Generated Compose never bind-mounts the source checkout and never installs or
@@ -660,8 +670,11 @@ builds packages at container startup. It fails interpolation when
 required. Its explicit runtime contract defaults Pi/model to `mock`, keeps
 background summaries off, forwards optional evaluator overrides without
 inventing empty values, and uses a Node-based status-aware healthcheck available
-in the reviewed image. Edit the local runtime configuration before selecting a
-real provider. The generated PM2 artifact is
+in the reviewed image. The generated Compose port and HTTP path fields use the
+same explicitly supplied `.env`; the container listener itself remains fixed to
+`0.0.0.0` so bridge forwarding cannot be made falsely healthy by a loopback-only
+process. Edit the local runtime configuration before selecting a real provider.
+The generated PM2 artifact is
 `ecosystem.config.cjs`, so its `module.exports` contract remains loadable under
 this repository's ESM package mode. It parses
 `<deployment-root>/shared/runtime.env`, then forces the shared database path;
@@ -672,6 +685,12 @@ PM2 activation and recovery reject a missing/symlinked/misbound ecosystem file
 before taking the release lock. Updates delete the old PM2 process record before
 starting the reviewed ecosystem again, so variables removed from `runtime.env`
 do not survive a reload.
+
+Generated Compose, systemd, and PM2 assets all grant 300 seconds for the
+application's accepted-work drain before forced termination. This exceeds the
+default `PI_TURN_TIMEOUT_MS=120000`; it is still a hard supervisor boundary, so
+raising the turn timeout or running non-cooperative tools requires an explicit
+policy review and forced exits require effect-unknown/manual-review handling.
 
 Both managers use the release-external protocol-3 gate in `shared/bin`. Its
 manifest binds the protocol and SHA-256 of `managed-startup.js` and
