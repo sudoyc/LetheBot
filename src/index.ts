@@ -5,17 +5,28 @@
  */
 
 import Database from 'better-sqlite3';
-import { createHash, randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
-import { createServer, type ServerResponse } from 'node:http';
-import { loadConfig, type Config } from './config/index.js';
+import { type IncomingMessage, type ServerResponse } from 'node:http';
+import {
+  isReverseHttpIngressEnabled,
+  loadConfig,
+  type Config,
+} from './config/index.js';
 import { getLogger } from './logger/index.js';
+import { ApplicationHttpServer } from './http/application-http-server.js';
+import { GovernanceHttpServer } from './http/governance-http-server.js';
+import { GovernancePreviewHandleRegistry } from './http/governance-preview-handle-registry.js';
+import { GovernanceResourceHandleRegistry } from './http/governance-resource-handle-registry.js';
+import { GovernanceScopeHandleRegistry } from './http/governance-scope-handle-registry.js';
+import { TurnApplicationService } from './application/turn-application-service.js';
+import { BackgroundRuntimeService } from './application/background-runtime-service.js';
+import {
+  ConversationTurnService,
+  type PiRuntime,
+} from './application/conversation-turn-service.js';
 import { closeDatabase, initDatabase, runMigrations } from './storage/database.js';
 import { MemoryRepository } from './storage/memory-repository.js';
-import {
-  IdentityRepository,
-  InactivePlatformAccountError,
-} from './storage/identity-repository.js';
+import { IdentityRepository } from './storage/identity-repository.js';
 import { AuditRepository } from './storage/audit-repository.js';
 import { ContextTraceRepository } from './storage/context-trace-repository.js';
 import { TurnRepository } from './storage/turn-repository.js';
@@ -26,8 +37,8 @@ import { ModelInvocationRepository } from './storage/model-invocation-repository
 import { PrivacyPreferenceRepository } from './storage/privacy-preference-repository.js';
 import { JobRepository } from './storage/job-repository.js';
 import {
-  GroupSummaryPolicyError,
   GroupSummaryPolicyRepository,
+  type GroupSummaryPolicyExpectedVersion,
 } from './storage/group-summary-policy-repository.js';
 import { ActionRepository } from './actions/action-repository.js';
 import { ActionCooldownManager } from './actions/cooldown.js';
@@ -40,62 +51,63 @@ import {
   type OneBotTransport,
 } from './gateway/onebot-adapter.js';
 import { AttentionEngine } from './attention/engine.js';
-import {
-  DelayedAttentionService,
-  parseDelayedAttentionTaskPayload,
-  type DelayedAttentionCandidate,
-  type DelayedAttentionDecision,
-} from './attention/delayed-attention-service.js';
+import { DelayedAttentionService } from './attention/delayed-attention-service.js';
 import { ContextBuilder } from './context/builder.js';
 import { PiAdapter, type PiAdapterInput, type PiAdapterOutput } from './pi/pi-adapter.js';
+import { TurnAdmissionController } from './pi/turn-admission-controller.js';
 import { ToolRegistry } from './tools/registry.js';
 import { registerBuiltInTools } from './tools/builtins/memory-search.js';
+import {
+  createRuntimeStatusTool,
+  type RuntimeStatusLocalState,
+} from './tools/builtins/runtime-status.js';
+import { createRuntimeToolsTool } from './tools/builtins/runtime-tools.js';
+import { createWorkspaceListTool } from './tools/builtins/workspace-list.js';
+import { createWorkspaceReadTextTool } from './tools/builtins/workspace-read-text.js';
+import { createWebFetchTextTool } from './tools/builtins/web-fetch-text.js';
 import { PolicyGate } from './policy/gate.js';
 import {
   createRuntimeEvaluator,
   resolveEvaluatorConfig,
 } from './evaluator/runtime.js';
-import { buildSystemPrompt } from './context/persona.js';
 import { redactSecretsInText } from './memory/secret-scan.js';
 import { MemoryProposalService } from './memory/proposal-service.js';
-import {
-  isAutomaticExtractionCandidate,
-  MemoryExtractionWorker,
-} from './workers/memory-extraction.js';
-import {
-  BackgroundWorker,
-  NonRetryableBackgroundTaskError,
-  type BackgroundTask,
-  type BackgroundTaskExecutionContext,
-  type EnqueueTaskInput,
-  type TaskType,
-  type TaskResult,
+import { MemoryExtractionWorker } from './workers/memory-extraction.js';
+import type {
+  EnqueueTaskInput,
+  TaskType,
+  TaskResult,
 } from './workers/background.js';
-import { WorkerScheduler } from './workers/scheduler.js';
-import { SummaryWorker, type ConversationSummaryInput } from './workers/summary-worker.js';
+import type { GroupSummaryJobService } from './workers/group-summary-job-service.js';
+import { EventAdmissionRecovery } from './ingestion/event-admission-recovery.js';
+import { EventIngressClaimService } from './ingestion/event-ingress-claim.js';
 import {
-  GroupSummaryJobService,
-  GroupSummaryWindowError,
-} from './workers/group-summary-job-service.js';
-import { AdminDigestWorker } from './workers/admin-digest.js';
-import { MemoryConsolidationWorker } from './workers/memory-consolidation.js';
-import { MemoryConflictWorker } from './workers/memory-conflict.js';
-import { MemoryDecayWorker } from './workers/memory-decay.js';
+  GovernanceQueryService,
+  MEMORY_MAINTENANCE_APPLICATION_ACTION,
+  MEMORY_MAINTENANCE_APPROVAL_ACTION,
+  MEMORY_MAINTENANCE_EXPIRATION_ACTION,
+  MEMORY_MAINTENANCE_REJECTION_ACTION,
+  MEMORY_MAINTENANCE_ROLLBACK_ACTION,
+  MEMORY_RECORD_FORGET_ACTION,
+  MEMORY_RECORD_RESTORE_ACTION,
+  DISPLAY_PROFILE_REDACTION_ACTION,
+  GROUP_SUMMARY_POLICY_CHANGE_ACTION,
+  PLATFORM_ACCOUNT_UNLINK_ACTION,
+  PRIVACY_PREFERENCE_CHANGE_ACTION,
+  type ResolvedMemoryMaintenanceApplication,
+} from './governance/query-service.js';
+import { GovernanceOperationsCoordinator } from './governance/operations-coordinator.js';
 import {
-  parseStoredChatMessageReceived,
-  type StoredChatEventRow,
-} from './ingestion/stored-chat-event.js';
-import { parseQqGovernanceCommand } from './governance/qq-command.js';
-import { GovernanceService } from './governance/service.js';
+  DISPLAY_PROFILE_REDACTION_REASON_CODE,
+  PLATFORM_ACCOUNT_UNLINK_REASON_CODE,
+  GovernanceService,
+} from './governance/service.js';
 import {
-  applyRetentionPolicy,
   collectOperationsMetrics,
   formatOperationsMetricsPrometheus,
-  type RetentionPolicy,
 } from './operations/sqlite-maintenance.js';
+import { prepareGovernanceRestoreHandoff } from './operations/governance-restore-handoff.js';
 import type { ChatMessageReceived } from './types/events.js';
-import type { ActionDecision, ActionExecutionResult } from './types/action.js';
-import type { AttentionSignals } from './types/attention.js';
 import type { IEvaluator } from './types/evaluator.js';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -105,6 +117,140 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const logger = getLogger();
+const GOVERNANCE_SCOPES_PATH = '/governance/api/v1/scopes';
+const GOVERNANCE_MEMORY_SCOPES_PATH = '/governance/api/v1/memory/scopes';
+const GOVERNANCE_MEMORY_RECORDS_PATH = '/governance/api/v1/memory/records';
+const GOVERNANCE_MEMORY_RECORD_DETAIL_PATH = `${GOVERNANCE_MEMORY_RECORDS_PATH}/:resourceHandle`;
+const GOVERNANCE_MEMORY_RECORD_CONFIRM_PATH = `${GOVERNANCE_MEMORY_RECORD_DETAIL_PATH}/confirm`;
+const GOVERNANCE_PRIVACY_SCOPES_PATH = '/governance/api/v1/privacy/scopes';
+const GOVERNANCE_PRIVACY_PREFERENCES_PATH = '/governance/api/v1/privacy/preferences';
+const GOVERNANCE_PRIVACY_PREFERENCE_CONFIRM_PATH =
+  `${GOVERNANCE_PRIVACY_PREFERENCES_PATH}/confirm`;
+const GOVERNANCE_GROUP_SUMMARY_SCOPES_PATH =
+  '/governance/api/v1/group-summary/scopes';
+const GOVERNANCE_GROUP_SUMMARY_POLICY_PATH =
+  '/governance/api/v1/group-summary/policy';
+const GOVERNANCE_GROUP_SUMMARY_POLICY_CONFIRM_PATH =
+  `${GOVERNANCE_GROUP_SUMMARY_POLICY_PATH}/confirm`;
+const GOVERNANCE_DISPLAY_PROFILE_SCOPES_PATH =
+  '/governance/api/v1/display-profile/scopes';
+const GOVERNANCE_DISPLAY_PROFILE_TARGETS_PATH =
+  '/governance/api/v1/display-profile/targets';
+const GOVERNANCE_DISPLAY_PROFILE_TARGET_DETAIL_PATH =
+  `${GOVERNANCE_DISPLAY_PROFILE_TARGETS_PATH}/:resourceHandle`;
+const GOVERNANCE_DISPLAY_PROFILE_TARGET_CONFIRM_PATH =
+  `${GOVERNANCE_DISPLAY_PROFILE_TARGET_DETAIL_PATH}/confirm`;
+const GOVERNANCE_PLATFORM_ACCOUNT_UNLINK_PATH =
+  '/governance/api/v1/identity/platform-accounts/unlink';
+const GOVERNANCE_PLATFORM_ACCOUNT_UNLINK_CONFIRM_PATH =
+  `${GOVERNANCE_PLATFORM_ACCOUNT_UNLINK_PATH}/confirm`;
+const GOVERNANCE_EXPLAIN_SCOPES_PATH = '/governance/api/v1/explain/scopes';
+const GOVERNANCE_EXPLAIN_TURNS_PATH = '/governance/api/v1/explain/turns';
+const GOVERNANCE_EXPLAIN_TURN_DETAIL_PATH =
+  `${GOVERNANCE_EXPLAIN_TURNS_PATH}/:resourceHandle`;
+const GOVERNANCE_OVERVIEW_PATH = '/governance/api/v1/overview';
+const GOVERNANCE_OPERATIONS_PATH = '/governance/api/v1/operations';
+const GOVERNANCE_OPERATIONS_CONFIRM_PATH = `${GOVERNANCE_OPERATIONS_PATH}/confirm`;
+const GOVERNANCE_OPERATIONS_RESTORE_PATH = `${GOVERNANCE_OPERATIONS_PATH}/restore`;
+const GOVERNANCE_OPERATIONS_RESTORE_CONFIRM_PATH =
+  `${GOVERNANCE_OPERATIONS_RESTORE_PATH}/confirm`;
+const GOVERNANCE_OPERATIONS_RETENTION_PATH = `${GOVERNANCE_OPERATIONS_PATH}/retention`;
+const GOVERNANCE_OPERATIONS_RETENTION_CONFIRM_PATH =
+  `${GOVERNANCE_OPERATIONS_RETENTION_PATH}/confirm`;
+const GOVERNANCE_ACTIVITY_MODEL_INVOCATIONS_PATH =
+  '/governance/api/v1/activity/model-invocations';
+const GOVERNANCE_ACTIVITY_WORKER_HEARTBEATS_PATH =
+  '/governance/api/v1/activity/worker-heartbeats';
+const GOVERNANCE_ACTIVITY_JOBS_PATH = '/governance/api/v1/activity/jobs';
+const GOVERNANCE_ACTIVITY_JOB_ATTEMPTS_PATH = '/governance/api/v1/activity/job-attempts';
+const GOVERNANCE_ACTIVITY_TOOL_CALLS_PATH = '/governance/api/v1/activity/tool-calls';
+const GOVERNANCE_ACTIVITY_ACTION_DECISIONS_PATH =
+  '/governance/api/v1/activity/action-decisions';
+const GOVERNANCE_ACTIVITY_ACTION_EXECUTIONS_PATH =
+  '/governance/api/v1/activity/action-executions';
+const GOVERNANCE_ACTIVITY_EVENT_PROCESSING_FAILURES_PATH =
+  '/governance/api/v1/activity/event-processing-failures';
+const GOVERNANCE_ACTIVITY_AUDIT_PATH = '/governance/api/v1/activity/audit';
+const GOVERNANCE_MEMORY_REVIEWS_PATH = '/governance/api/v1/memory-reviews';
+const GOVERNANCE_MEMORY_REVIEW_DETAIL_PATH = `${GOVERNANCE_MEMORY_REVIEWS_PATH}/:resourceHandle`;
+const GOVERNANCE_MEMORY_REVIEW_CONFIRM_PATH = `${GOVERNANCE_MEMORY_REVIEW_DETAIL_PATH}/confirm`;
+const GOVERNANCE_SCOPE_DISCOVERY_PURPOSE = 'memory.maintenance.review.scopes';
+const GOVERNANCE_MEMORY_REVIEW_PURPOSE = 'memory.maintenance.review';
+const GOVERNANCE_MEMORY_REVIEW_RESOURCE_KIND = 'memory_maintenance_review';
+const GOVERNANCE_MEMORY_SCOPE_DISCOVERY_PURPOSE = 'governance.memory.records.scopes';
+const GOVERNANCE_MEMORY_RECORDS_PURPOSE = 'governance.memory.records.read';
+const GOVERNANCE_MEMORY_RECORD_RESOURCE_KIND = 'memory_record';
+const GOVERNANCE_PRIVACY_SCOPE_DISCOVERY_PURPOSE =
+  'governance.privacy.preferences.scopes';
+const GOVERNANCE_PRIVACY_PREFERENCES_PURPOSE = 'governance.privacy.preferences.read';
+const GOVERNANCE_GROUP_SUMMARY_SCOPE_DISCOVERY_PURPOSE =
+  'governance.group_summary_policy.scopes';
+const GOVERNANCE_GROUP_SUMMARY_POLICY_STATUS_PURPOSE =
+  'governance.group_summary_policy.status.read';
+const GOVERNANCE_DISPLAY_PROFILE_SCOPE_DISCOVERY_PURPOSE =
+  'governance.display_profile.scopes';
+const GOVERNANCE_DISPLAY_PROFILE_TARGETS_PURPOSE =
+  'governance.display_profile.targets.read';
+const GOVERNANCE_DISPLAY_PROFILE_TARGET_RESOURCE_KIND = 'display_profile_target';
+const GOVERNANCE_PLATFORM_ACCOUNT_UNLINK_PURPOSE =
+  'governance.identity.platform_account.unlink';
+const GOVERNANCE_PLATFORM_ACCOUNT_RESOURCE_KIND = 'platform_account';
+const GOVERNANCE_GROUP_SUMMARY_POLICY_RESOURCE_KIND = 'group_summary_policy';
+const GOVERNANCE_GROUP_SUMMARY_POLICY_RESOURCE_ID = 'policy';
+const GOVERNANCE_PRIVACY_PREFERENCE_RESOURCE_KIND = 'privacy_preference';
+const GOVERNANCE_EXPLAIN_SCOPE_DISCOVERY_PURPOSE = 'governance.explain.turns.scopes';
+const GOVERNANCE_EXPLAIN_TURNS_PURPOSE = 'governance.explain.turns.read';
+const GOVERNANCE_EXPLAIN_TURN_RESOURCE_KIND = 'explain_turn';
+const GOVERNANCE_OVERVIEW_PURPOSE = 'governance.overview.read';
+const GOVERNANCE_OPERATIONS_PURPOSE = 'governance.operations.status.read';
+const GOVERNANCE_OPERATIONS_BACKUP_PREVIEW_PURPOSE =
+  'governance.operations.backup.preview';
+const GOVERNANCE_OPERATIONS_BACKUP_CONFIRM_PURPOSE =
+  'governance.operations.backup.confirm';
+const GOVERNANCE_OPERATIONS_RESTORE_PREVIEW_PURPOSE =
+  'governance.operations.restore.preview';
+const GOVERNANCE_OPERATIONS_RESTORE_CONFIRM_PURPOSE =
+  'governance.operations.restore.confirm';
+const GOVERNANCE_OPERATIONS_RETENTION_PREVIEW_PURPOSE =
+  'governance.operations.retention.preview';
+const GOVERNANCE_OPERATIONS_RETENTION_CONFIRM_PURPOSE =
+  'governance.operations.retention.confirm';
+const GOVERNANCE_OPERATIONS_BACKUP_RESOURCE_KIND = 'operations_verified_backup';
+const GOVERNANCE_OPERATIONS_BACKUP_RESOURCE_ID = 'verified_backup';
+const GOVERNANCE_OPERATIONS_BACKUP_ACTION = 'create_verified_backup';
+const GOVERNANCE_OPERATIONS_RESTORE_RESOURCE_KIND = 'operations_backup_restore';
+const GOVERNANCE_OPERATIONS_RESTORE_ACTION = 'prepare_restore_handoff';
+const GOVERNANCE_OPERATIONS_RETENTION_RESOURCE_KIND = 'operations_configured_retention';
+const GOVERNANCE_OPERATIONS_RETENTION_RESOURCE_ID = 'configured_retention';
+const GOVERNANCE_OPERATIONS_RETENTION_ACTION = 'apply_configured_retention';
+const GOVERNANCE_ACTIVITY_MODEL_INVOCATIONS_PURPOSE =
+  'governance.activity.model_invocations.read';
+const GOVERNANCE_ACTIVITY_WORKER_HEARTBEATS_PURPOSE =
+  'governance.activity.worker_heartbeats.read';
+const GOVERNANCE_ACTIVITY_JOBS_PURPOSE = 'governance.activity.jobs.read';
+const GOVERNANCE_ACTIVITY_JOB_ATTEMPTS_PURPOSE = 'governance.activity.job_attempts.read';
+const GOVERNANCE_ACTIVITY_TOOL_CALLS_PURPOSE = 'governance.activity.tool_calls.read';
+const GOVERNANCE_ACTIVITY_ACTION_DECISIONS_PURPOSE =
+  'governance.activity.action_decisions.read';
+const GOVERNANCE_ACTIVITY_ACTION_EXECUTIONS_PURPOSE =
+  'governance.activity.action_executions.read';
+const GOVERNANCE_ACTIVITY_EVENT_PROCESSING_FAILURES_PURPOSE =
+  'governance.activity.event_processing_failures.read';
+const GOVERNANCE_ACTIVITY_AUDIT_PURPOSE = 'governance.activity.audit.read';
+const GOVERNANCE_OPAQUE_HANDLE_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
+const GOVERNANCE_REFERENCE_PATTERN = /^[0-9a-f]{16}$/u;
+const GOVERNANCE_QQ_PLATFORM_ACCOUNT_ID_PATTERN = /^[1-9][0-9]{4,11}$/u;
+const GOVERNANCE_HTTP_APPROVAL_REASON = 'governance_http_approval_confirmed';
+const GOVERNANCE_HTTP_REJECTION_REASON = 'governance_http_rejection_confirmed';
+const GOVERNANCE_HTTP_EXPIRATION_REASON = 'governance_http_expiration_confirmed';
+const GOVERNANCE_HTTP_APPLICATION_REASON = 'governance_http_application_confirmed';
+const GOVERNANCE_HTTP_ROLLBACK_REASON = 'governance_http_rollback_confirmed';
+const GOVERNANCE_HTTP_FORGET_REASON = 'governance_http_forget_confirmed';
+const GOVERNANCE_HTTP_RESTORE_REASON = 'governance_http_restore_confirmed';
+const GOVERNANCE_HTTP_PRIVACY_PREFERENCE_CHANGE_REASON =
+  'governance_http_privacy_preference_change_confirmed';
+const GOVERNANCE_HTTP_GROUP_SUMMARY_POLICY_CHANGE_REASON =
+  'governance_http_group_summary_policy_change_confirmed';
 
 export const VERSION = '0.1.0';
 
@@ -123,8 +269,6 @@ type PublicAdapterStatus = Pick<
   OneBotReadiness,
   'ready' | 'mode' | 'wsConnected' | 'pendingWsRequests' | 'hasToken' | 'botIdConfigured'
 >;
-
-type EventHandlingOutcome = 'completed' | 'failed';
 
 /**
  * 测试导出函数
@@ -146,6 +290,14 @@ export function formatFatalErrorForConsole(error: unknown): string {
   } catch {
     return redactFatalDiagnosticText(String(sanitized));
   }
+}
+
+function isSqliteBusyError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null || !('code' in error)) {
+    return false;
+  }
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'string' && code.startsWith('SQLITE_BUSY');
 }
 
 function sanitizeFatalDiagnosticValue(value: unknown, path: string[]): unknown {
@@ -244,8 +396,11 @@ class LetheBotApp {
   private memoryRepo: MemoryRepository;
   private identityRepo: IdentityRepository;
   private auditRepo: AuditRepository;
-  private contextTraceRepo: ContextTraceRepository;
   private turnRepo: TurnRepository;
+  private admissionRecovery: EventAdmissionRecovery;
+  private eventIngressClaim: EventIngressClaimService;
+  private turnApplication: TurnApplicationService;
+  private conversationTurn: ConversationTurnService;
   private toolCallRepo: ToolCallRepository;
   private privacyPreferenceRepo: PrivacyPreferenceRepository;
   private jobRepo: JobRepository;
@@ -256,10 +411,10 @@ class LetheBotApp {
   private adapter: OneBotAdapter;
   private attention: AttentionEngine;
   private delayedAttention: DelayedAttentionService;
-  private contextBuilder: ContextBuilder;
   private toolRegistry: ToolRegistry;
   private policyGate: PolicyGate;
-  private pi: { runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> };
+  private pi: PiRuntime;
+  private turnAdmission: TurnAdmissionController;
   private piProvider: string;
   private piModel: string;
   private actionExecutor: ActionExecutor;
@@ -267,21 +422,17 @@ class LetheBotApp {
   private cooldowns: ActionCooldownManager;
   private socialDecisionService: SocialDecisionService;
   private memoryExtractor: MemoryExtractionWorker;
-  private backgroundWorker: BackgroundWorker;
-  private workerScheduler: WorkerScheduler;
-  private server: ReturnType<typeof createServer> | null = null;
+  private backgroundRuntime: BackgroundRuntimeService;
+  private httpServer: ApplicationHttpServer | null = null;
+  private governanceHttpServer: GovernanceHttpServer | null = null;
   private acceptingIngress = false;
   private stopPromise: Promise<void> | null = null;
-  private pendingEventTasks = new Set<Promise<void>>();
-  private eventProcessingFailures: Array<{
-    eventId: string;
-    messageId: string;
-    conversationId?: string;
-    errorMessage: string;
-  }> = [];
-
   constructor() {
     this.config = loadConfig();
+    this.turnAdmission = new TurnAdmissionController(
+      this.config.piMaxConcurrentTurns,
+      this.config.piMaxQueuedTurns,
+    );
 
     // 初始化数据库
     logger.info('Initializing database...');
@@ -292,8 +443,23 @@ class LetheBotApp {
     this.memoryRepo = new MemoryRepository(this.db);
     this.identityRepo = new IdentityRepository(this.db);
     this.auditRepo = new AuditRepository(this.db);
-    this.contextTraceRepo = new ContextTraceRepository(this.db);
+    const contextTraceRepo = new ContextTraceRepository(this.db);
     this.turnRepo = new TurnRepository(this.db);
+    this.admissionRecovery = new EventAdmissionRecovery(this.db, this.turnRepo);
+    this.eventIngressClaim = new EventIngressClaimService(this.db);
+    this.turnApplication = new TurnApplicationService(this.db, this.turnAdmission, {
+      turnTimeoutMs: this.config.piTurnTimeoutMs,
+      handleEvent: (event, rawEventId, options) => (
+        this.conversationTurn.handleEvent(event, rawEventId, options)
+      ),
+      redactSensitiveText: (text) => this.redactSensitiveText(text),
+      onFailurePersistenceError: (error) => {
+        logger.error({ error }, 'Failed to persist event processing failure record');
+      },
+      onTaskFailure: (error) => {
+        logger.error({ error: this.redactErrorForLog(error) }, 'Admission processing transition failed');
+      },
+    });
     this.toolCallRepo = new ToolCallRepository(this.db);
     this.privacyPreferenceRepo = new PrivacyPreferenceRepository(this.db);
     this.jobRepo = new JobRepository(this.db);
@@ -309,27 +475,32 @@ class LetheBotApp {
     // 初始化工具注册表和策略门
     this.toolRegistry = new ToolRegistry();
     registerBuiltInTools(this.toolRegistry, { memoryRepository: this.memoryRepo, database: this.db });
+    this.toolRegistry.register(createRuntimeStatusTool({
+      database: this.db,
+      readRuntimeState: () => this.buildRuntimeStatusLocalState(),
+    }));
+    if (this.config.workspaceRoot) {
+      this.toolRegistry.register(createWorkspaceListTool({
+        workspaceRoot: this.config.workspaceRoot,
+      }));
+      this.toolRegistry.register(createWorkspaceReadTextTool({
+        workspaceRoot: this.config.workspaceRoot,
+      }));
+    }
+    if (this.config.webFetchAllowedOrigins.length > 0) {
+      this.toolRegistry.register(createWebFetchTextTool({
+        allowedOrigins: this.config.webFetchAllowedOrigins,
+      }));
+    }
+    this.toolRegistry.register(createRuntimeToolsTool({
+      registry: this.toolRegistry,
+    }));
     this.policyGate = new PolicyGate(this.toolRegistry);
 
     // 初始化核心模块
     this.attention = new AttentionEngine();
     this.delayedAttention = new DelayedAttentionService(this.db, this.jobRepo);
-    this.contextBuilder = new ContextBuilder(this.memoryRepo, this.identityRepo, this.db);
-    this.backgroundWorker = new BackgroundWorker({
-      jobRepository: this.jobRepo,
-      workerId: 'lethebot-background-main',
-      handlers: {
-        summary: (task, execution) => this.handleSummaryBackgroundTask(task, execution),
-        extraction: (task, execution) => this.handleExtractionBackgroundTask(task, execution),
-        attention_recheck: (task, execution) => this.handleAttentionRecheckBackgroundTask(task, execution),
-        consolidation: (task) => this.handleConsolidationBackgroundTask(task),
-        conflict: (task) => this.handleConflictBackgroundTask(task),
-        decay: (task) => this.handleDecayBackgroundTask(task),
-        admin_digest: (task) => this.handleAdminDigestBackgroundTask(task),
-        retention: (task) => this.handleRetentionBackgroundTask(task),
-      },
-    });
-    this.workerScheduler = new WorkerScheduler();
+    const contextBuilder = new ContextBuilder(this.memoryRepo, this.identityRepo, this.db);
 
     // 初始化 Pi Agent
     this.piProvider = process.env.PI_PROVIDER || 'openai';
@@ -355,9 +526,10 @@ class LetheBotApp {
       temperature: this.config.evaluatorTemperature,
       promptVersion: this.config.evaluatorPromptVersion,
     });
+    const modelInvocationRepository = new ModelInvocationRepository(this.db);
     this.socialEvaluator = createRuntimeEvaluator(evaluatorConfig, {
       test: this.config.test,
-      invocationLedger: new ModelInvocationRepository(this.db),
+      invocationLedger: modelInvocationRepository,
     });
     this.socialDecisionService = new SocialDecisionService(
       this.actionRepo,
@@ -379,6 +551,7 @@ class LetheBotApp {
           auditRepository: this.auditRepo,
           toolCallRepository: this.toolCallRepo,
           evaluator: this.socialEvaluator,
+          modelInvocationRepository,
           evaluatorDecisionWriter: new EvaluatorDecisionRepository(this.db),
           localToolEffectCoordinator: new LocalToolEffectCoordinator(
             this.db,
@@ -387,13 +560,35 @@ class LetheBotApp {
           ),
         });
 
-    this.groupSummaryJobService = new GroupSummaryJobService(this.db, {
+    this.backgroundRuntime = new BackgroundRuntimeService({
+      db: this.db,
       jobRepository: this.jobRepo,
-      policyRepository: this.groupSummaryPolicyRepo,
-      planGroupSummaryWindow: (input) => (
-        this.createSummaryWorker().planGroupSummaryWindow(input)
+      memoryRepository: this.memoryRepo,
+      identityRepository: this.identityRepo,
+      auditRepository: this.auditRepo,
+      groupSummaryPolicyRepository: this.groupSummaryPolicyRepo,
+      attentionEngine: this.attention,
+      delayedAttentionService: this.delayedAttention,
+      turnAdmissionController: this.turnAdmission,
+      test: this.config.test,
+      backgroundSummaryEnabled: this.config.backgroundSummaryEnabled,
+      piProvider: this.piProvider,
+      piModel: this.piModel,
+      piTurnTimeoutMs: this.config.piTurnTimeoutMs,
+      retentionPolicy: {
+        rawEventsDays: this.config.rawEventRetentionDays,
+        chatMessagesDays: this.config.chatMessageRetentionDays,
+        auditLogDays: this.config.auditLogRetentionDays,
+        disabledDeletedMemoryDays: this.config.disabledDeletedMemoryRetentionDays,
+        eventProcessingFailuresDays: this.config.eventProcessingFailureRetentionDays,
+      },
+      getPiRuntime: () => this.pi,
+      getMemoryExtractor: () => this.memoryExtractor,
+      handleConversationTurn: (event, rawEventId, options) => (
+        this.conversationTurn.handleEvent(event, rawEventId, options)
       ),
     });
+    this.groupSummaryJobService = this.backgroundRuntime.groupSummaryJobService;
 
     logger.info({ provider: this.piProvider, model: this.piModel, baseUrl }, 'Pi Agent initialized');
     logger.info({
@@ -415,6 +610,31 @@ class LetheBotApp {
       summaryJobService: this.groupSummaryJobService,
       memoryRepository: this.memoryRepo,
     });
+    this.conversationTurn = new ConversationTurnService({
+      db: this.db,
+      identityRepository: this.identityRepo,
+      contextTraceRepository: contextTraceRepo,
+      turnRepository: this.turnRepo,
+      actionRepository: this.actionRepo,
+      attentionEngine: this.attention,
+      delayedAttentionService: this.delayedAttention,
+      contextBuilder,
+      governanceService: this.governance,
+      enqueueBackgroundTask: (task) => this.backgroundRuntime.enqueue(task),
+      piProvider: this.piProvider,
+      piModel: this.piModel,
+      ...(this.config.botOwnerQqId === undefined
+        ? {}
+        : { botOwnerQqId: this.config.botOwnerQqId }),
+      getPiRuntime: () => this.pi,
+      getActionExecutor: () => this.actionExecutor,
+      getSocialDecisionService: () => this.socialDecisionService,
+      redactSensitiveText: (text) => this.redactSensitiveText(text),
+      recordEventProcessingFailure: (input) => {
+        this.turnApplication.recordEventProcessingFailure(input);
+      },
+      logger,
+    });
 
     // Register the durable ingress claim before any downstream event work.
     this.adapter.onIngress((event) => this.claimAndEnqueueEvent(event));
@@ -426,46 +646,2118 @@ class LetheBotApp {
    * 启动应用
    */
   async start(): Promise<void> {
-    const acceptedEvents = this.prepareAdmissionRecovery();
+    const acceptedEvents = this.admissionRecovery.recover();
     await this.adapter.start();
 
     this.adapter.whenReady(() => {
       for (const acceptedEvent of acceptedEvents) {
-        this.enqueueEvent(acceptedEvent.event, acceptedEvent.rawEventId);
+        this.turnApplication.enqueue(
+          acceptedEvent.event,
+          acceptedEvent.rawEventId,
+          acceptedEvent.acceptedAt,
+        );
       }
       this.acceptingIngress = true;
     });
 
-    this.registerBackgroundWorkerJobs();
+    this.backgroundRuntime.registerJobs();
     if (!this.config.test) {
-      this.workerScheduler.start();
+      this.backgroundRuntime.start();
     }
 
-    // 启动 HTTP 服务器接收健康检查和 OneBot reverse HTTP 事件
-    const port = this.config.lethebotPort;
+    const governanceNow = (): number => Date.now();
+    const governanceScopeHandles = new GovernanceScopeHandleRegistry({ now: governanceNow });
+    const governanceResourceHandles = new GovernanceResourceHandleRegistry({ now: governanceNow });
+    const governancePreviewHandles = new GovernancePreviewHandleRegistry({ now: governanceNow });
+    const governanceQueries = new GovernanceQueryService(this.db);
+    const governanceOperations = new GovernanceOperationsCoordinator({
+      db: this.db,
+      dbPath: this.config.dbPath,
+      config: {
+        onebotTransport: this.config.onebotTransport,
+        onebotHttpUrl: this.config.onebotHttpUrl,
+        onebotWsUrl: this.config.onebotWsUrl,
+        onebotToken: this.config.onebotToken,
+        onebotBotQqId: this.config.onebotBotQqId,
+        lethebotHost: this.config.lethebotHost,
+        lethebotPort: this.config.lethebotPort,
+        lethebotHealthPath: this.config.lethebotHealthPath,
+        lethebotReadinessPath: this.config.lethebotReadinessPath,
+        lethebotMetricsPath: this.config.lethebotMetricsPath,
+        lethebotEventPath: this.config.lethebotEventPath,
+        rawEventRetentionDays: this.config.rawEventRetentionDays,
+        chatMessageRetentionDays: this.config.chatMessageRetentionDays,
+        auditLogRetentionDays: this.config.auditLogRetentionDays,
+        disabledDeletedMemoryRetentionDays: this.config.disabledDeletedMemoryRetentionDays,
+        eventProcessingFailureRetentionDays: this.config.eventProcessingFailureRetentionDays,
+      },
+      now: governanceNow,
+    });
+    this.governanceHttpServer = new GovernanceHttpServer({
+      enabled: this.config.governanceEnabled,
+      host: this.config.governanceHost,
+      port: this.config.governancePort,
+      adminToken: this.config.governanceAdminToken,
+      sessionTtlMs: this.config.governanceSessionTtlMs,
+      bodyLimitBytes: 4_096,
+      bodyTimeoutMs: 5_000,
+      now: governanceNow,
+      authorizedRoutes: [{
+        method: 'GET',
+        path: GOVERNANCE_MEMORY_RECORDS_PATH,
+        purpose: GOVERNANCE_MEMORY_RECORDS_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_MEMORY_RECORD_DETAIL_PATH,
+        purpose: GOVERNANCE_MEMORY_RECORDS_PURPOSE,
+        mutation: false,
+        resourceKind: GOVERNANCE_MEMORY_RECORD_RESOURCE_KIND,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_MEMORY_RECORD_DETAIL_PATH,
+        purpose: GOVERNANCE_MEMORY_RECORDS_PURPOSE,
+        mutation: true,
+        resourceKind: GOVERNANCE_MEMORY_RECORD_RESOURCE_KIND,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_MEMORY_RECORD_CONFIRM_PATH,
+        purpose: GOVERNANCE_MEMORY_RECORDS_PURPOSE,
+        mutation: true,
+        resourceKind: GOVERNANCE_MEMORY_RECORD_RESOURCE_KIND,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_PRIVACY_PREFERENCES_PATH,
+        purpose: GOVERNANCE_PRIVACY_PREFERENCES_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_GROUP_SUMMARY_POLICY_PATH,
+        purpose: GOVERNANCE_GROUP_SUMMARY_POLICY_STATUS_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_DISPLAY_PROFILE_TARGETS_PATH,
+        purpose: GOVERNANCE_DISPLAY_PROFILE_TARGETS_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_DISPLAY_PROFILE_TARGET_DETAIL_PATH,
+        purpose: GOVERNANCE_DISPLAY_PROFILE_TARGETS_PURPOSE,
+        mutation: false,
+        resourceKind: GOVERNANCE_DISPLAY_PROFILE_TARGET_RESOURCE_KIND,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_DISPLAY_PROFILE_TARGET_DETAIL_PATH,
+        purpose: GOVERNANCE_DISPLAY_PROFILE_TARGETS_PURPOSE,
+        mutation: true,
+        resourceKind: GOVERNANCE_DISPLAY_PROFILE_TARGET_RESOURCE_KIND,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_DISPLAY_PROFILE_TARGET_CONFIRM_PATH,
+        purpose: GOVERNANCE_DISPLAY_PROFILE_TARGETS_PURPOSE,
+        mutation: true,
+        resourceKind: GOVERNANCE_DISPLAY_PROFILE_TARGET_RESOURCE_KIND,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_GROUP_SUMMARY_POLICY_PATH,
+        purpose: GOVERNANCE_GROUP_SUMMARY_POLICY_STATUS_PURPOSE,
+        mutation: true,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_GROUP_SUMMARY_POLICY_CONFIRM_PATH,
+        purpose: GOVERNANCE_GROUP_SUMMARY_POLICY_STATUS_PURPOSE,
+        mutation: true,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_PRIVACY_PREFERENCES_PATH,
+        purpose: GOVERNANCE_PRIVACY_PREFERENCES_PURPOSE,
+        mutation: true,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_PRIVACY_PREFERENCE_CONFIRM_PATH,
+        purpose: GOVERNANCE_PRIVACY_PREFERENCES_PURPOSE,
+        mutation: true,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_EXPLAIN_TURNS_PATH,
+        purpose: GOVERNANCE_EXPLAIN_TURNS_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_EXPLAIN_TURN_DETAIL_PATH,
+        purpose: GOVERNANCE_EXPLAIN_TURNS_PURPOSE,
+        mutation: false,
+        resourceKind: GOVERNANCE_EXPLAIN_TURN_RESOURCE_KIND,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_MEMORY_REVIEWS_PATH,
+        purpose: GOVERNANCE_MEMORY_REVIEW_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_MEMORY_REVIEW_DETAIL_PATH,
+        purpose: GOVERNANCE_MEMORY_REVIEW_PURPOSE,
+        mutation: false,
+        resourceKind: GOVERNANCE_MEMORY_REVIEW_RESOURCE_KIND,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_MEMORY_REVIEW_DETAIL_PATH,
+        purpose: GOVERNANCE_MEMORY_REVIEW_PURPOSE,
+        mutation: true,
+        resourceKind: GOVERNANCE_MEMORY_REVIEW_RESOURCE_KIND,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_MEMORY_REVIEW_CONFIRM_PATH,
+        purpose: GOVERNANCE_MEMORY_REVIEW_PURPOSE,
+        mutation: true,
+        resourceKind: GOVERNANCE_MEMORY_REVIEW_RESOURCE_KIND,
+      }],
+      authenticatedUnscopedRoutes: [{
+        method: 'GET',
+        path: GOVERNANCE_SCOPES_PATH,
+        purpose: GOVERNANCE_SCOPE_DISCOVERY_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_MEMORY_SCOPES_PATH,
+        purpose: GOVERNANCE_MEMORY_SCOPE_DISCOVERY_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_PRIVACY_SCOPES_PATH,
+        purpose: GOVERNANCE_PRIVACY_SCOPE_DISCOVERY_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_GROUP_SUMMARY_SCOPES_PATH,
+        purpose: GOVERNANCE_GROUP_SUMMARY_SCOPE_DISCOVERY_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_DISPLAY_PROFILE_SCOPES_PATH,
+        purpose: GOVERNANCE_DISPLAY_PROFILE_SCOPE_DISCOVERY_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_PLATFORM_ACCOUNT_UNLINK_PATH,
+        purpose: GOVERNANCE_PLATFORM_ACCOUNT_UNLINK_PURPOSE,
+        mutation: true,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_PLATFORM_ACCOUNT_UNLINK_CONFIRM_PATH,
+        purpose: GOVERNANCE_PLATFORM_ACCOUNT_UNLINK_PURPOSE,
+        mutation: true,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_EXPLAIN_SCOPES_PATH,
+        purpose: GOVERNANCE_EXPLAIN_SCOPE_DISCOVERY_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_OVERVIEW_PATH,
+        purpose: GOVERNANCE_OVERVIEW_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_OPERATIONS_PATH,
+        purpose: GOVERNANCE_OPERATIONS_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_OPERATIONS_PATH,
+        purpose: GOVERNANCE_OPERATIONS_BACKUP_PREVIEW_PURPOSE,
+        mutation: true,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_OPERATIONS_CONFIRM_PATH,
+        purpose: GOVERNANCE_OPERATIONS_BACKUP_CONFIRM_PURPOSE,
+        mutation: true,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_OPERATIONS_RESTORE_PATH,
+        purpose: GOVERNANCE_OPERATIONS_RESTORE_PREVIEW_PURPOSE,
+        mutation: true,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_OPERATIONS_RESTORE_CONFIRM_PATH,
+        purpose: GOVERNANCE_OPERATIONS_RESTORE_CONFIRM_PURPOSE,
+        mutation: true,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_OPERATIONS_RETENTION_PATH,
+        purpose: GOVERNANCE_OPERATIONS_RETENTION_PREVIEW_PURPOSE,
+        mutation: true,
+      }, {
+        method: 'POST',
+        path: GOVERNANCE_OPERATIONS_RETENTION_CONFIRM_PATH,
+        purpose: GOVERNANCE_OPERATIONS_RETENTION_CONFIRM_PURPOSE,
+        mutation: true,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_ACTIVITY_MODEL_INVOCATIONS_PATH,
+        purpose: GOVERNANCE_ACTIVITY_MODEL_INVOCATIONS_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_ACTIVITY_WORKER_HEARTBEATS_PATH,
+        purpose: GOVERNANCE_ACTIVITY_WORKER_HEARTBEATS_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_ACTIVITY_JOBS_PATH,
+        purpose: GOVERNANCE_ACTIVITY_JOBS_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_ACTIVITY_JOB_ATTEMPTS_PATH,
+        purpose: GOVERNANCE_ACTIVITY_JOB_ATTEMPTS_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_ACTIVITY_TOOL_CALLS_PATH,
+        purpose: GOVERNANCE_ACTIVITY_TOOL_CALLS_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_ACTIVITY_ACTION_DECISIONS_PATH,
+        purpose: GOVERNANCE_ACTIVITY_ACTION_DECISIONS_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_ACTIVITY_ACTION_EXECUTIONS_PATH,
+        purpose: GOVERNANCE_ACTIVITY_ACTION_EXECUTIONS_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_ACTIVITY_EVENT_PROCESSING_FAILURES_PATH,
+        purpose: GOVERNANCE_ACTIVITY_EVENT_PROCESSING_FAILURES_PURPOSE,
+        mutation: false,
+      }, {
+        method: 'GET',
+        path: GOVERNANCE_ACTIVITY_AUDIT_PATH,
+        purpose: GOVERNANCE_ACTIVITY_AUDIT_PURPOSE,
+        mutation: false,
+      }],
+      scopeHandles: governanceScopeHandles,
+      resourceHandles: governanceResourceHandles,
+      previewHandles: governancePreviewHandles,
+      handleAuthorizedRequest: async ({ actor, route, session, scope, resource, body }) => {
+        if (
+          route.method === 'GET'
+          && route.path === GOVERNANCE_MEMORY_RECORDS_PATH
+          && resource === undefined
+        ) {
+          return {
+            status: 200,
+            body: await governanceQueries.listMemoryRecordResourceHandlePage(
+              scope,
+              ({ scope: recordScope, memoryId }) => governanceResourceHandles.issue({
+                sessionId: session.sessionId,
+                sessionExpiresAt: session.expiresAt,
+                purpose: GOVERNANCE_MEMORY_RECORDS_PURPOSE,
+                resourceKind: GOVERNANCE_MEMORY_RECORD_RESOURCE_KIND,
+                resourceId: memoryId,
+                scope: recordScope,
+              }),
+            ),
+          };
+        }
+        if (
+          route.method === 'GET'
+          && route.path === GOVERNANCE_MEMORY_RECORD_DETAIL_PATH
+          && resource?.kind === GOVERNANCE_MEMORY_RECORD_RESOURCE_KIND
+        ) {
+          const detail = await governanceQueries.getMemoryRecordDetailForScope({
+            scope,
+            memoryId: resource.resourceId,
+          });
+          return detail
+            ? { status: 200, body: detail }
+            : { status: 404, body: { error: 'not_found' } };
+        }
+        if (
+          route.method === 'POST'
+          && route.path === GOVERNANCE_MEMORY_RECORD_CONFIRM_PATH
+          && resource?.kind === GOVERNANCE_MEMORY_RECORD_RESOURCE_KIND
+        ) {
+          const bodyRecord = typeof body === 'object'
+            && body !== null
+            && !Array.isArray(body)
+            ? body as Record<string, unknown>
+            : null;
+          const bodyKeys = bodyRecord ? Object.keys(bodyRecord) : [];
+          const previewHandle = bodyRecord?.previewHandle;
+          const isRestoreConfirmation = bodyKeys.length === 3
+            && bodyKeys.includes('confirm')
+            && bodyKeys.includes('previewHandle')
+            && bodyKeys.includes('action')
+            && bodyRecord?.confirm === true
+            && bodyRecord.action === 'restore'
+            && typeof previewHandle === 'string'
+            && GOVERNANCE_OPAQUE_HANDLE_PATTERN.test(previewHandle);
+          if (isRestoreConfirmation) {
+            const consumed = governancePreviewHandles.consumeWithOutcome({
+              sessionId: session.sessionId,
+              handle: previewHandle,
+              actor,
+              action: MEMORY_RECORD_RESTORE_ACTION,
+              resourceKind: GOVERNANCE_MEMORY_RECORD_RESOURCE_KIND,
+              resourceId: resource.resourceId,
+              scope,
+            });
+            if (consumed.outcome === 'not_found_or_denied') {
+              return { status: 404, body: { error: 'not_found' } };
+            }
+            if (consumed.outcome === 'already_consumed') {
+              return { status: 409, body: { error: 'conflict' } };
+            }
 
-    this.server = createServer(async (req, res) => {
-      // 健康检查
-      const requestPath = this.getRequestPath(req.url);
+            const currentPreview = await governanceQueries.getMemoryRecordRestorePreviewForScope({
+              scope,
+              memoryId: resource.resourceId,
+            });
+            if (
+              !currentPreview
+              || scope.kind === 'tool'
+              || consumed.binding.expectedState !== currentPreview.current.lifecycleState
+              || consumed.binding.expectedRevisionNumber !== currentPreview.current.revisionNumber
+              || consumed.binding.previewDigest !== currentPreview.previewDigest
+            ) {
+              return { status: 409, body: { error: 'conflict' } };
+            }
 
-      if (requestPath === this.config.lethebotHealthPath && req.method === 'GET') {
+            const result = this.governance.restoreMemoryAsLocalAdmin({
+              memoryId: resource.resourceId,
+              scope,
+              expectedState: currentPreview.current.lifecycleState,
+              expectedRevisionNumber: consumed.binding.expectedRevisionNumber,
+              reasonCode: GOVERNANCE_HTTP_RESTORE_REASON,
+            });
+            if (result.outcome !== 'restored') {
+              return result.outcome === 'not_found'
+                ? { status: 404, body: { error: 'not_found' } }
+                : { status: 409, body: { error: 'conflict' } };
+            }
+            return {
+              status: 200,
+              body: {
+                action: MEMORY_RECORD_RESTORE_ACTION,
+                outcome: 'restored',
+                recordRef: currentPreview.recordRef,
+                scopeKind: currentPreview.scopeKind,
+                current: {
+                  lifecycleState: 'active',
+                  revisionNumber: result.revisionNumber,
+                },
+                durableEffects: [...currentPreview.expected.durableEffects],
+                retrievalConsequences: [...currentPreview.expected.retrievalConsequences],
+                evidence: {
+                  changeType: 'restore',
+                  revisionNumber: result.revisionNumber,
+                  auditEvent: 'memory.restore',
+                },
+                rollback: { ...currentPreview.rollback },
+              },
+            };
+          }
+          if (
+            bodyKeys.length !== 2
+            || !bodyKeys.includes('confirm')
+            || !bodyKeys.includes('previewHandle')
+            || bodyRecord?.confirm !== true
+            || typeof previewHandle !== 'string'
+            || !GOVERNANCE_OPAQUE_HANDLE_PATTERN.test(previewHandle)
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+          const consumed = governancePreviewHandles.consumeWithOutcome({
+            sessionId: session.sessionId,
+            handle: previewHandle,
+            actor,
+            action: MEMORY_RECORD_FORGET_ACTION,
+            resourceKind: GOVERNANCE_MEMORY_RECORD_RESOURCE_KIND,
+            resourceId: resource.resourceId,
+            scope,
+          });
+          if (consumed.outcome === 'not_found_or_denied') {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          if (consumed.outcome === 'already_consumed') {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+
+          const currentPreview = await governanceQueries.getMemoryRecordForgetPreviewForScope({
+            scope,
+            memoryId: resource.resourceId,
+          });
+          if (
+            !currentPreview
+            || scope.kind === 'tool'
+            || consumed.binding.expectedState !== currentPreview.current.lifecycleState
+            || consumed.binding.expectedRevisionNumber !== currentPreview.current.revisionNumber
+            || consumed.binding.previewDigest !== currentPreview.previewDigest
+          ) {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+
+          const result = this.governance.forgetMemoryAsLocalAdmin({
+            memoryId: resource.resourceId,
+            scope,
+            expectedState: currentPreview.current.lifecycleState,
+            expectedRevisionNumber: consumed.binding.expectedRevisionNumber,
+            reasonCode: GOVERNANCE_HTTP_FORGET_REASON,
+          });
+          if (result.outcome !== 'forgotten') {
+            return result.outcome === 'not_found'
+              ? { status: 404, body: { error: 'not_found' } }
+              : { status: 409, body: { error: 'conflict' } };
+          }
+          return {
+            status: 200,
+            body: {
+              action: MEMORY_RECORD_FORGET_ACTION,
+              outcome: 'forgotten',
+              recordRef: currentPreview.recordRef,
+              scopeKind: currentPreview.scopeKind,
+              current: {
+                lifecycleState: 'deleted',
+                revisionNumber: result.revisionNumber,
+              },
+              durableEffects: [...currentPreview.expected.durableEffects],
+              retrievalConsequences: [...currentPreview.expected.retrievalConsequences],
+              evidence: {
+                changeType: 'delete',
+                revisionNumber: result.revisionNumber,
+                auditEvent: 'memory.delete',
+              },
+              rollback: { ...currentPreview.rollback },
+            },
+          };
+        }
+        if (
+          route.method === 'POST'
+          && route.path === GOVERNANCE_MEMORY_RECORD_DETAIL_PATH
+          && resource?.kind === GOVERNANCE_MEMORY_RECORD_RESOURCE_KIND
+        ) {
+          if (
+            typeof body === 'object'
+            && body !== null
+            && !Array.isArray(body)
+            && Object.keys(body).length === 1
+            && (body as Record<string, unknown>).action === 'restore'
+          ) {
+            const preview = await governanceQueries.getMemoryRecordRestorePreviewForScope({
+              scope,
+              memoryId: resource.resourceId,
+            });
+            if (!preview) {
+              return { status: 404, body: { error: 'not_found' } };
+            }
+            const issued = governancePreviewHandles.issue({
+              sessionId: session.sessionId,
+              sessionExpiresAt: session.expiresAt,
+              actor,
+              action: MEMORY_RECORD_RESTORE_ACTION,
+              resourceKind: GOVERNANCE_MEMORY_RECORD_RESOURCE_KIND,
+              resourceId: resource.resourceId,
+              scope,
+              expectedState: preview.current.lifecycleState,
+              expectedRevisionNumber: preview.current.revisionNumber,
+              previewDigest: preview.previewDigest,
+            });
+            return {
+              status: 201,
+              body: {
+                ...preview,
+                previewHandle: issued.handle,
+                previewExpiresAt: issued.expiresAt,
+              },
+            };
+          }
+          if (
+            typeof body !== 'object'
+            || body === null
+            || Array.isArray(body)
+            || Object.keys(body).length !== 1
+            || (body as Record<string, unknown>).action !== 'forget'
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+          const preview = await governanceQueries.getMemoryRecordForgetPreviewForScope({
+            scope,
+            memoryId: resource.resourceId,
+          });
+          if (!preview) {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          const issued = governancePreviewHandles.issue({
+            sessionId: session.sessionId,
+            sessionExpiresAt: session.expiresAt,
+            actor,
+            action: MEMORY_RECORD_FORGET_ACTION,
+            resourceKind: GOVERNANCE_MEMORY_RECORD_RESOURCE_KIND,
+            resourceId: resource.resourceId,
+            scope,
+            expectedState: preview.current.lifecycleState,
+            expectedRevisionNumber: preview.current.revisionNumber,
+            previewDigest: preview.previewDigest,
+          });
+          return {
+            status: 201,
+            body: {
+              ...preview,
+              previewHandle: issued.handle,
+              previewExpiresAt: issued.expiresAt,
+            },
+          };
+        }
+        if (
+          route.method === 'POST'
+          && route.path === GOVERNANCE_PRIVACY_PREFERENCE_CONFIRM_PATH
+          && resource === undefined
+        ) {
+          const bodyRecord = typeof body === 'object'
+            && body !== null
+            && !Array.isArray(body)
+            ? body as Record<string, unknown>
+            : null;
+          const bodyKeys = bodyRecord ? Object.keys(bodyRecord) : [];
+          const previewHandle = bodyRecord?.previewHandle;
+          const preferenceType = bodyRecord?.preferenceType;
+          const targetState = bodyRecord?.targetState;
+          if (
+            bodyKeys.length !== 4
+            || !bodyKeys.includes('confirm')
+            || !bodyKeys.includes('previewHandle')
+            || !bodyKeys.includes('preferenceType')
+            || !bodyKeys.includes('targetState')
+            || bodyRecord?.confirm !== true
+            || typeof previewHandle !== 'string'
+            || !GOVERNANCE_OPAQUE_HANDLE_PATTERN.test(previewHandle)
+            || (preferenceType !== 'proactive_dm'
+              && preferenceType !== 'memory_association')
+            || (targetState !== 'opted_in' && targetState !== 'opted_out')
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+          if (scope.kind !== 'user') {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+
+          const consumed = governancePreviewHandles.consumeWithOutcome({
+            sessionId: session.sessionId,
+            handle: previewHandle,
+            actor,
+            action: PRIVACY_PREFERENCE_CHANGE_ACTION,
+            resourceKind: GOVERNANCE_PRIVACY_PREFERENCE_RESOURCE_KIND,
+            resourceId: preferenceType,
+            scope,
+          });
+          if (consumed.outcome === 'not_found_or_denied') {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          if (consumed.outcome === 'already_consumed') {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+
+          const currentPreview =
+            await governanceQueries.getPrivacyPreferenceChangePreviewForScope({
+              scope,
+              preferenceType,
+              targetState,
+            });
+          if (
+            !currentPreview
+            || consumed.binding.expectedState !== currentPreview.current.state
+            || consumed.binding.expectedRevisionNumber
+              !== Math.max(1, currentPreview.current.version.updatedAt ?? 1)
+            || consumed.binding.previewDigest !== currentPreview.previewDigest
+          ) {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+
+          const result = this.governance.setPrivacyPreferenceAsLocalAdmin({
+            canonicalUserId: scope.canonicalUserId,
+            preferenceType: currentPreview.preferenceType,
+            state: currentPreview.expected.state,
+            expectedState: currentPreview.current.state,
+            expectedVersion: currentPreview.current.version,
+            reasonCode: GOVERNANCE_HTTP_PRIVACY_PREFERENCE_CHANGE_REASON,
+          });
+          if (result.outcome !== 'updated') {
+            return result.outcome === 'not_found'
+              ? { status: 404, body: { error: 'not_found' } }
+              : { status: 409, body: { error: 'conflict' } };
+          }
+          return {
+            status: 200,
+            body: {
+              action: PRIVACY_PREFERENCE_CHANGE_ACTION,
+              outcome: 'updated',
+              preferenceType: currentPreview.preferenceType,
+              current: {
+                state: currentPreview.expected.state,
+                version: {
+                  source: 'stored_preference',
+                  updatedAt: result.updatedAt,
+                },
+              },
+              durableEffects: [...currentPreview.expected.durableEffects],
+              enforcementConsequences: [
+                ...currentPreview.expected.enforcementConsequences,
+              ],
+              evidence: {
+                auditEvent: 'privacy.preference_set',
+                updatedAt: result.updatedAt,
+              },
+              rollback: { ...currentPreview.rollback },
+            },
+          };
+        }
+        if (
+          route.method === 'POST'
+          && route.path === GOVERNANCE_PRIVACY_PREFERENCES_PATH
+          && resource === undefined
+        ) {
+          const bodyRecord = typeof body === 'object'
+            && body !== null
+            && !Array.isArray(body)
+            ? body as Record<string, unknown>
+            : null;
+          const bodyKeys = bodyRecord ? Object.keys(bodyRecord) : [];
+          const preferenceType = bodyRecord?.preferenceType;
+          const targetState = bodyRecord?.targetState;
+          if (
+            bodyKeys.length !== 3
+            || !bodyKeys.includes('action')
+            || !bodyKeys.includes('preferenceType')
+            || !bodyKeys.includes('targetState')
+            || bodyRecord?.action !== 'change'
+            || (preferenceType !== 'proactive_dm'
+              && preferenceType !== 'memory_association')
+            || (targetState !== 'opted_in' && targetState !== 'opted_out')
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+          const preview = await governanceQueries.getPrivacyPreferenceChangePreviewForScope({
+            scope,
+            preferenceType,
+            targetState,
+          });
+          if (!preview) {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          const issued = governancePreviewHandles.issue({
+            sessionId: session.sessionId,
+            sessionExpiresAt: session.expiresAt,
+            actor,
+            action: PRIVACY_PREFERENCE_CHANGE_ACTION,
+            resourceKind: GOVERNANCE_PRIVACY_PREFERENCE_RESOURCE_KIND,
+            resourceId: preview.preferenceType,
+            scope,
+            expectedState: preview.current.state,
+            expectedRevisionNumber: Math.max(1, preview.current.version.updatedAt ?? 1),
+            previewDigest: preview.previewDigest,
+          });
+          return {
+            status: 201,
+            body: {
+              ...preview,
+              previewHandle: issued.handle,
+              previewExpiresAt: issued.expiresAt,
+            },
+          };
+        }
+        if (
+          route.method === 'GET'
+          && route.path === GOVERNANCE_PRIVACY_PREFERENCES_PATH
+          && resource === undefined
+        ) {
+          return {
+            status: 200,
+            body: await governanceQueries.listPrivacyPreferencesForScope(scope),
+          };
+        }
+        if (
+          route.method === 'POST'
+          && route.path === GOVERNANCE_GROUP_SUMMARY_POLICY_CONFIRM_PATH
+          && resource === undefined
+        ) {
+          const bodyRecord = typeof body === 'object'
+            && body !== null
+            && !Array.isArray(body)
+            ? body as Record<string, unknown>
+            : null;
+          const bodyKeys = bodyRecord ? Object.keys(bodyRecord) : [];
+          const previewHandle = bodyRecord?.previewHandle;
+          const targetState = bodyRecord?.targetState;
+          if (
+            bodyKeys.length !== 3
+            || !bodyKeys.includes('confirm')
+            || !bodyKeys.includes('previewHandle')
+            || !bodyKeys.includes('targetState')
+            || bodyRecord?.confirm !== true
+            || typeof previewHandle !== 'string'
+            || !GOVERNANCE_OPAQUE_HANDLE_PATTERN.test(previewHandle)
+            || (targetState !== 'enabled' && targetState !== 'disabled')
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+          if (scope.kind !== 'group') {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+
+          const consumed = governancePreviewHandles.consumeWithOutcome({
+            sessionId: session.sessionId,
+            handle: previewHandle,
+            actor,
+            action: GROUP_SUMMARY_POLICY_CHANGE_ACTION,
+            resourceKind: GOVERNANCE_GROUP_SUMMARY_POLICY_RESOURCE_KIND,
+            resourceId: GOVERNANCE_GROUP_SUMMARY_POLICY_RESOURCE_ID,
+            scope,
+          });
+          if (consumed.outcome === 'not_found_or_denied') {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          if (consumed.outcome === 'already_consumed') {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+
+          const currentPreview =
+            await governanceQueries.getGroupSummaryPolicyChangePreviewForScope({
+              scope,
+              targetState,
+            });
+          if (
+            !currentPreview
+            || consumed.binding.expectedState !== currentPreview.current.state
+            || consumed.binding.expectedRevisionNumber
+              !== (currentPreview.current.version.generation ?? 1)
+            || consumed.binding.previewDigest !== currentPreview.previewDigest
+          ) {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+
+          let expectedVersion: GroupSummaryPolicyExpectedVersion;
+          if (currentPreview.current.stored) {
+            const { generation, updatedAt } = currentPreview.current.version;
+            if (generation === null || updatedAt === null) {
+              return { status: 409, body: { error: 'conflict' } };
+            }
+            expectedVersion = {
+              source: 'stored_policy',
+              generation,
+              updatedAt: updatedAt.getTime(),
+            };
+          } else {
+            expectedVersion = {
+              source: 'implicit_default',
+              generation: null,
+              updatedAt: null,
+            };
+          }
+          const result = this.governance.setGroupSummaryPolicyAsLocalAdmin({
+            groupId: scope.groupId,
+            enabled: currentPreview.expected.state === 'enabled',
+            expectedState: currentPreview.current.state,
+            expectedVersion,
+            reasonCode: GOVERNANCE_HTTP_GROUP_SUMMARY_POLICY_CHANGE_REASON,
+          });
+          if (result.outcome !== 'updated') {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+
+          const updatedAt = new Date(result.updatedAt);
+          return {
+            status: 200,
+            body: {
+              action: GROUP_SUMMARY_POLICY_CHANGE_ACTION,
+              outcome: 'updated',
+              current: {
+                state: result.state,
+                stored: true,
+                version: {
+                  generation: result.generation,
+                  updatedAt,
+                },
+                eligibleAfter: result.eligibleAfter === null
+                  ? null
+                  : new Date(result.eligibleAfter),
+              },
+              durableEffects: [...currentPreview.expected.durableEffects],
+              enforcementConsequences: [
+                ...currentPreview.expected.enforcementConsequences,
+              ],
+              evidence: {
+                auditEvent: 'group.summary_policy_changed',
+                generation: result.generation,
+                updatedAt,
+                canceledJobCount: result.canceledJobCount,
+              },
+              rollback: { ...currentPreview.rollback },
+            },
+          };
+        }
+        if (
+          route.method === 'POST'
+          && route.path === GOVERNANCE_GROUP_SUMMARY_POLICY_PATH
+          && resource === undefined
+        ) {
+          const bodyRecord = typeof body === 'object'
+            && body !== null
+            && !Array.isArray(body)
+            ? body as Record<string, unknown>
+            : null;
+          const bodyKeys = bodyRecord ? Object.keys(bodyRecord) : [];
+          const targetState = bodyRecord?.targetState;
+          if (
+            bodyKeys.length !== 2
+            || !bodyKeys.includes('action')
+            || !bodyKeys.includes('targetState')
+            || bodyRecord?.action !== 'change'
+            || (targetState !== 'enabled' && targetState !== 'disabled')
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+          const preview = await governanceQueries.getGroupSummaryPolicyChangePreviewForScope({
+            scope,
+            targetState,
+          });
+          if (!preview) {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          const issued = governancePreviewHandles.issue({
+            sessionId: session.sessionId,
+            sessionExpiresAt: session.expiresAt,
+            actor,
+            action: GROUP_SUMMARY_POLICY_CHANGE_ACTION,
+            resourceKind: GOVERNANCE_GROUP_SUMMARY_POLICY_RESOURCE_KIND,
+            resourceId: GOVERNANCE_GROUP_SUMMARY_POLICY_RESOURCE_ID,
+            scope,
+            expectedState: preview.current.state,
+            expectedRevisionNumber: preview.current.version.generation ?? 1,
+            previewDigest: preview.previewDigest,
+          });
+          return {
+            status: 201,
+            body: {
+              ...preview,
+              previewHandle: issued.handle,
+              previewExpiresAt: issued.expiresAt,
+            },
+          };
+        }
+        if (
+          route.method === 'GET'
+          && route.path === GOVERNANCE_GROUP_SUMMARY_POLICY_PATH
+          && resource === undefined
+        ) {
+          const policy = await governanceQueries.getGroupSummaryPolicyForScope(scope);
+          return policy
+            ? { status: 200, body: policy }
+            : { status: 404, body: { error: 'not_found' } };
+        }
+        if (
+          route.method === 'GET'
+          && route.path === GOVERNANCE_DISPLAY_PROFILE_TARGETS_PATH
+          && resource === undefined
+        ) {
+          return {
+            status: 200,
+            body: await governanceQueries.listDisplayProfileTargetResourceHandlePage(
+              scope,
+              ({ scope: targetScope, targetId }) => governanceResourceHandles.issue({
+                sessionId: session.sessionId,
+                sessionExpiresAt: session.expiresAt,
+                purpose: GOVERNANCE_DISPLAY_PROFILE_TARGETS_PURPOSE,
+                resourceKind: GOVERNANCE_DISPLAY_PROFILE_TARGET_RESOURCE_KIND,
+                resourceId: targetId,
+                scope: targetScope,
+              }),
+            ),
+          };
+        }
+        if (
+          route.method === 'GET'
+          && route.path === GOVERNANCE_DISPLAY_PROFILE_TARGET_DETAIL_PATH
+          && resource?.kind === GOVERNANCE_DISPLAY_PROFILE_TARGET_RESOURCE_KIND
+        ) {
+          const detail = await governanceQueries.getDisplayProfileTargetDetailForScope({
+            scope,
+            targetId: resource.resourceId,
+          });
+          return detail
+            ? { status: 200, body: detail }
+            : { status: 404, body: { error: 'not_found' } };
+        }
+        if (
+          route.method === 'POST'
+          && route.path === GOVERNANCE_DISPLAY_PROFILE_TARGET_CONFIRM_PATH
+          && resource?.kind === GOVERNANCE_DISPLAY_PROFILE_TARGET_RESOURCE_KIND
+        ) {
+          const bodyRecord = typeof body === 'object'
+            && body !== null
+            && !Array.isArray(body)
+            ? body as Record<string, unknown>
+            : null;
+          const bodyKeys = bodyRecord ? Object.keys(bodyRecord) : [];
+          const previewHandle = bodyRecord?.previewHandle;
+          if (
+            bodyKeys.length !== 2
+            || !bodyKeys.includes('confirm')
+            || !bodyKeys.includes('previewHandle')
+            || bodyRecord?.confirm !== true
+            || typeof previewHandle !== 'string'
+            || !GOVERNANCE_OPAQUE_HANDLE_PATTERN.test(previewHandle)
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+          const consumed = governancePreviewHandles.consumeWithOutcome({
+            sessionId: session.sessionId,
+            handle: previewHandle,
+            actor,
+            action: DISPLAY_PROFILE_REDACTION_ACTION,
+            resourceKind: GOVERNANCE_DISPLAY_PROFILE_TARGET_RESOURCE_KIND,
+            resourceId: resource.resourceId,
+            scope,
+          });
+          if (consumed.outcome === 'not_found_or_denied') {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          if (consumed.outcome === 'already_consumed') {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+
+          const currentPreview =
+            await governanceQueries.getDisplayProfileTargetRedactionPreviewForScope({
+              scope,
+              targetId: resource.resourceId,
+            });
+          if (
+            !currentPreview
+            || consumed.binding.expectedState
+              !== currentPreview.current.snapshotFingerprint
+            || consumed.binding.expectedRevisionNumber
+              !== currentPreview.expected.affectedRows.total
+            || consumed.binding.previewDigest !== currentPreview.previewDigest
+          ) {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+          const selection =
+            await governanceQueries.resolveDisplayProfileTargetRedactionMutationForScope({
+              scope,
+              targetId: resource.resourceId,
+            });
+          if (!selection) {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+          const result = this.governance.redactDisplayProfileAsLocalAdmin({
+            canonicalUserId: selection.canonicalUserId,
+            ...(selection.groupId === null ? {} : { groupId: selection.groupId }),
+            targetId: selection.targetId,
+            expectedSnapshot: currentPreview.current,
+            reasonCode: DISPLAY_PROFILE_REDACTION_REASON_CODE,
+          });
+          if (result.outcome !== 'redacted') {
+            return result.outcome === 'not_found'
+              ? { status: 404, body: { error: 'not_found' } }
+              : { status: 409, body: { error: 'conflict' } };
+          }
+          return {
+            status: 200,
+            body: {
+              action: DISPLAY_PROFILE_REDACTION_ACTION,
+              outcome: 'redacted',
+              target: currentPreview.target,
+              affectedRows: {
+                displayProfiles: result.displayProfilesUpdated,
+                nicknameHistory: result.nicknameHistoryUpdated,
+                total: result.displayProfilesUpdated + result.nicknameHistoryUpdated,
+              },
+              openNicknameHistoryRowsClosed: result.openNicknameHistoryRowsClosed,
+              redactedAt: new Date(result.redactedAt),
+              durableEffects: [...currentPreview.expected.durableEffects],
+              privacyConsequences: [...currentPreview.expected.privacyConsequences],
+              evidence: {
+                auditEvent: 'display_profile.redact',
+                reasonCode: DISPLAY_PROFILE_REDACTION_REASON_CODE,
+              },
+              rollback: { ...currentPreview.rollback },
+            },
+          };
+        }
+        if (
+          route.method === 'POST'
+          && route.path === GOVERNANCE_DISPLAY_PROFILE_TARGET_DETAIL_PATH
+          && resource?.kind === GOVERNANCE_DISPLAY_PROFILE_TARGET_RESOURCE_KIND
+        ) {
+          if (
+            typeof body !== 'object'
+            || body === null
+            || Array.isArray(body)
+            || Object.keys(body).length !== 1
+            || (body as Record<string, unknown>).action !== 'redact'
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+          const preview =
+            await governanceQueries.getDisplayProfileTargetRedactionPreviewForScope({
+              scope,
+              targetId: resource.resourceId,
+            });
+          if (!preview) {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          const issued = governancePreviewHandles.issue({
+            sessionId: session.sessionId,
+            sessionExpiresAt: session.expiresAt,
+            actor,
+            action: DISPLAY_PROFILE_REDACTION_ACTION,
+            resourceKind: GOVERNANCE_DISPLAY_PROFILE_TARGET_RESOURCE_KIND,
+            resourceId: resource.resourceId,
+            scope,
+            expectedState: preview.current.snapshotFingerprint,
+            expectedRevisionNumber: preview.expected.affectedRows.total,
+            previewDigest: preview.previewDigest,
+          });
+          return {
+            status: 201,
+            body: {
+              ...preview,
+              previewHandle: issued.handle,
+              previewExpiresAt: issued.expiresAt,
+            },
+          };
+        }
+        if (
+          route.method === 'GET'
+          && route.path === GOVERNANCE_EXPLAIN_TURNS_PATH
+          && resource === undefined
+        ) {
+          return {
+            status: 200,
+            body: await governanceQueries.listExplainTurnResourceHandlePage(
+              scope,
+              ({ scope: turnScope, turnId }) => governanceResourceHandles.issue({
+                sessionId: session.sessionId,
+                sessionExpiresAt: session.expiresAt,
+                purpose: GOVERNANCE_EXPLAIN_TURNS_PURPOSE,
+                resourceKind: GOVERNANCE_EXPLAIN_TURN_RESOURCE_KIND,
+                resourceId: turnId,
+                scope: turnScope,
+              }),
+            ),
+          };
+        }
+        if (
+          route.method === 'GET'
+          && route.path === GOVERNANCE_EXPLAIN_TURN_DETAIL_PATH
+          && resource?.kind === GOVERNANCE_EXPLAIN_TURN_RESOURCE_KIND
+        ) {
+          const detail = await governanceQueries.getExplainTurnDetailForScope({
+            scope,
+            turnId: resource.resourceId,
+          });
+          return detail
+            ? { status: 200, body: detail }
+            : { status: 404, body: { error: 'not_found' } };
+        }
+        if (route.path === GOVERNANCE_MEMORY_REVIEWS_PATH && resource === undefined) {
+          return {
+            status: 200,
+            body: await governanceQueries.listMemoryMaintenanceReviewResourceHandlePage(
+              { scope },
+              ({ scope: proposalScope, proposalId }) => governanceResourceHandles.issue({
+                sessionId: session.sessionId,
+                sessionExpiresAt: session.expiresAt,
+                purpose: GOVERNANCE_MEMORY_REVIEW_PURPOSE,
+                resourceKind: GOVERNANCE_MEMORY_REVIEW_RESOURCE_KIND,
+                resourceId: proposalId,
+                scope: proposalScope,
+              }),
+            ),
+          };
+        }
+        if (
+          route.method === 'GET'
+          && route.path === GOVERNANCE_MEMORY_REVIEW_DETAIL_PATH
+          && resource?.kind === GOVERNANCE_MEMORY_REVIEW_RESOURCE_KIND
+        ) {
+          const detail = await governanceQueries.getMemoryMaintenanceReview({
+            scope,
+            proposalId: resource.resourceId,
+          });
+          return detail
+            ? { status: 200, body: detail }
+            : { status: 404, body: { error: 'not_found' } };
+        }
+        if (
+          route.method === 'POST'
+          && route.path === GOVERNANCE_MEMORY_REVIEW_CONFIRM_PATH
+          && resource?.kind === GOVERNANCE_MEMORY_REVIEW_RESOURCE_KIND
+        ) {
+          const bodyRecord = typeof body === 'object'
+            && body !== null
+            && !Array.isArray(body)
+            ? body as Record<string, unknown>
+            : null;
+          if (!bodyRecord) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+          const bodyKeys = Object.keys(bodyRecord);
+          const hasExactKeys = (keys: readonly string[]): boolean =>
+            bodyKeys.length === keys.length && keys.every((key) => bodyKeys.includes(key));
+          const previewHandle = bodyRecord.previewHandle;
+          const retainedMemoryRef = bodyRecord.retainedMemoryRef;
+          const isApprovalConfirmation = hasExactKeys(['confirm', 'previewHandle']);
+          const isRejectionConfirmation = bodyRecord.action === 'reject'
+            && hasExactKeys(['confirm', 'previewHandle', 'action']);
+          const isExpirationConfirmation = bodyRecord.action === 'expire'
+            && hasExactKeys(['confirm', 'previewHandle', 'action']);
+          const isApplicationConfirmation = bodyRecord.action === 'apply'
+            && hasExactKeys(['confirm', 'previewHandle', 'action']);
+          const isSelectedApplicationConfirmation = bodyRecord.action === 'apply'
+            && hasExactKeys(['confirm', 'previewHandle', 'action', 'retainedMemoryRef'])
+            && typeof retainedMemoryRef === 'string'
+            && GOVERNANCE_REFERENCE_PATTERN.test(retainedMemoryRef);
+          const isRollbackConfirmation = bodyRecord.action === 'rollback'
+            && hasExactKeys(['confirm', 'previewHandle', 'action']);
+          if (
+            bodyRecord.confirm !== true
+            || typeof previewHandle !== 'string'
+            || !GOVERNANCE_OPAQUE_HANDLE_PATTERN.test(previewHandle)
+            || (
+              !isApprovalConfirmation
+              && !isRejectionConfirmation
+              && !isExpirationConfirmation
+              && !isApplicationConfirmation
+              && !isSelectedApplicationConfirmation
+              && !isRollbackConfirmation
+            )
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+          const requestedAction = isApprovalConfirmation
+            ? MEMORY_MAINTENANCE_APPROVAL_ACTION
+            : isRejectionConfirmation
+              ? MEMORY_MAINTENANCE_REJECTION_ACTION
+              : isExpirationConfirmation
+                ? MEMORY_MAINTENANCE_EXPIRATION_ACTION
+                : isRollbackConfirmation
+                  ? MEMORY_MAINTENANCE_ROLLBACK_ACTION
+                  : MEMORY_MAINTENANCE_APPLICATION_ACTION;
+          const consumed = governancePreviewHandles.consumeWithOutcome({
+            sessionId: session.sessionId,
+            handle: previewHandle,
+            actor,
+            action: requestedAction,
+            resourceKind: GOVERNANCE_MEMORY_REVIEW_RESOURCE_KIND,
+            resourceId: resource.resourceId,
+            scope,
+          });
+          if (consumed.outcome === 'not_found_or_denied') {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          if (consumed.outcome === 'already_consumed') {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+
+          let currentApplication: ResolvedMemoryMaintenanceApplication | null = null;
+          if (requestedAction === MEMORY_MAINTENANCE_APPLICATION_ACTION) {
+            currentApplication = await governanceQueries.resolveMemoryMaintenanceApplication({
+              scope,
+              proposalId: resource.resourceId,
+              ...(isSelectedApplicationConfirmation
+                ? { retainedMemoryRef: retainedMemoryRef as string }
+              : {}),
+            });
+          }
+          const currentRollback = requestedAction === MEMORY_MAINTENANCE_ROLLBACK_ACTION
+            ? await governanceQueries.getMemoryMaintenanceRollbackPreview({
+              scope,
+              proposalId: resource.resourceId,
+            })
+            : null;
+          const currentPreview = requestedAction === MEMORY_MAINTENANCE_APPROVAL_ACTION
+            ? await governanceQueries.getMemoryMaintenanceApprovalPreview({
+              scope,
+              proposalId: resource.resourceId,
+            })
+            : requestedAction === MEMORY_MAINTENANCE_REJECTION_ACTION
+              ? await governanceQueries.getMemoryMaintenanceRejectionPreview({
+                scope,
+                proposalId: resource.resourceId,
+              })
+              : requestedAction === MEMORY_MAINTENANCE_EXPIRATION_ACTION
+                ? await governanceQueries.getMemoryMaintenanceExpirationPreview({
+                  scope,
+                  proposalId: resource.resourceId,
+                })
+                : requestedAction === MEMORY_MAINTENANCE_ROLLBACK_ACTION
+                  ? currentRollback
+                  : currentApplication?.preview ?? null;
+          if (
+            !currentPreview
+            || consumed.binding.expectedState !== currentPreview.current.lifecycleState
+            || consumed.binding.expectedRevisionNumber !== currentPreview.current.revisionNumber
+            || consumed.binding.previewDigest !== currentPreview.previewDigest
+          ) {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+
+          if (requestedAction === MEMORY_MAINTENANCE_APPLICATION_ACTION) {
+            if (!currentApplication) {
+              return { status: 409, body: { error: 'conflict' } };
+            }
+            const application = this.governance.applyMemoryMaintenanceProposal({
+              authority: { kind: 'local_admin' },
+              proposalId: resource.resourceId,
+              expectedState: 'approved',
+              expectedRevisionNumber: consumed.binding.expectedRevisionNumber,
+              reasonCode: GOVERNANCE_HTTP_APPLICATION_REASON,
+              ...(currentApplication.retainedMemoryId === undefined
+                ? {}
+                : { retainedMemoryId: currentApplication.retainedMemoryId }),
+            });
+            if (application.outcome === 'not_found_or_denied') {
+              return { status: 404, body: { error: 'not_found' } };
+            }
+            if (application.outcome !== 'transitioned') {
+              return { status: 409, body: { error: 'conflict' } };
+            }
+            const confirmation =
+              governanceQueries.projectMemoryMaintenanceApplicationConfirmation({
+                scope,
+                proposal: application.proposal,
+                expectedRevisionNumber: consumed.binding.expectedRevisionNumber,
+                operation: currentApplication,
+              });
+            return confirmation
+              ? { status: 200, body: confirmation }
+              : { status: 503, body: { error: 'unavailable' } };
+          }
+
+          if (requestedAction === MEMORY_MAINTENANCE_ROLLBACK_ACTION) {
+            if (!currentRollback) {
+              return { status: 409, body: { error: 'conflict' } };
+            }
+            const rollback = this.governance.rollbackMemoryMaintenanceProposal({
+              authority: { kind: 'local_admin' },
+              proposalId: resource.resourceId,
+              expectedState: 'applied',
+              expectedRevisionNumber: consumed.binding.expectedRevisionNumber,
+              reasonCode: GOVERNANCE_HTTP_ROLLBACK_REASON,
+            });
+            if (rollback.outcome === 'not_found_or_denied') {
+              return { status: 404, body: { error: 'not_found' } };
+            }
+            if (rollback.outcome !== 'transitioned') {
+              return { status: 409, body: { error: 'conflict' } };
+            }
+            const confirmation =
+              governanceQueries.projectMemoryMaintenanceRollbackConfirmation({
+                scope,
+                proposal: rollback.proposal,
+                expectedRevisionNumber: consumed.binding.expectedRevisionNumber,
+                preview: currentRollback,
+              });
+            return confirmation
+              ? { status: 200, body: confirmation }
+              : { status: 503, body: { error: 'unavailable' } };
+          }
+
+          const review = this.governance.reviewMemoryMaintenanceProposal({
+            authority: { kind: 'local_admin' },
+            proposalId: resource.resourceId,
+            expectedState: 'pending_review',
+            expectedRevisionNumber: consumed.binding.expectedRevisionNumber,
+            transition: requestedAction === MEMORY_MAINTENANCE_APPROVAL_ACTION
+              ? 'approve'
+              : requestedAction === MEMORY_MAINTENANCE_EXPIRATION_ACTION
+                ? 'expire'
+                : 'reject',
+            reasonCode: requestedAction === MEMORY_MAINTENANCE_APPROVAL_ACTION
+              ? GOVERNANCE_HTTP_APPROVAL_REASON
+              : requestedAction === MEMORY_MAINTENANCE_EXPIRATION_ACTION
+                ? GOVERNANCE_HTTP_EXPIRATION_REASON
+                : GOVERNANCE_HTTP_REJECTION_REASON,
+          });
+          if (review.outcome === 'not_found_or_denied') {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          if (review.outcome !== 'transitioned') {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+          const confirmation = requestedAction === MEMORY_MAINTENANCE_APPROVAL_ACTION
+            ? governanceQueries.projectMemoryMaintenanceApprovalConfirmation({
+              scope,
+              proposal: review.proposal,
+              expectedRevisionNumber: consumed.binding.expectedRevisionNumber,
+            })
+            : requestedAction === MEMORY_MAINTENANCE_EXPIRATION_ACTION
+              ? governanceQueries.projectMemoryMaintenanceExpirationConfirmation({
+                scope,
+                proposal: review.proposal,
+                expectedRevisionNumber: consumed.binding.expectedRevisionNumber,
+              })
+              : governanceQueries.projectMemoryMaintenanceRejectionConfirmation({
+                scope,
+                proposal: review.proposal,
+                expectedRevisionNumber: consumed.binding.expectedRevisionNumber,
+              });
+          return confirmation
+            ? { status: 200, body: confirmation }
+            : { status: 503, body: { error: 'unavailable' } };
+        }
+        if (
+          route.method === 'POST'
+          && route.path === GOVERNANCE_MEMORY_REVIEW_DETAIL_PATH
+          && resource?.kind === GOVERNANCE_MEMORY_REVIEW_RESOURCE_KIND
+        ) {
+          if (
+            typeof body !== 'object'
+            || body === null
+            || Array.isArray(body)
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+          const bodyRecord = body as Record<string, unknown>;
+          const bodyKeys = Object.keys(bodyRecord);
+          const requestedAction = bodyRecord.action;
+          const retainedMemoryRef = bodyRecord.retainedMemoryRef;
+          const isApprovalRequest = bodyKeys.length === 1
+            && bodyKeys[0] === 'action'
+            && requestedAction === 'approve';
+          const isRejectionRequest = bodyKeys.length === 1
+            && bodyKeys[0] === 'action'
+            && requestedAction === 'reject';
+          const isExpirationRequest = bodyKeys.length === 1
+            && bodyKeys[0] === 'action'
+            && requestedAction === 'expire';
+          const isApplicationWithoutSelection = bodyKeys.length === 1
+            && bodyKeys[0] === 'action'
+            && requestedAction === 'apply';
+          const isApplicationWithSelection = bodyKeys.length === 2
+            && bodyKeys.includes('action')
+            && bodyKeys.includes('retainedMemoryRef')
+            && requestedAction === 'apply'
+            && typeof retainedMemoryRef === 'string'
+            && GOVERNANCE_REFERENCE_PATTERN.test(retainedMemoryRef);
+          const isRollbackRequest = bodyKeys.length === 1
+            && bodyKeys[0] === 'action'
+            && requestedAction === 'rollback';
+          if (
+            !isApprovalRequest
+            && !isRejectionRequest
+            && !isExpirationRequest
+            && !isApplicationWithoutSelection
+            && !isApplicationWithSelection
+            && !isRollbackRequest
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+          const preview = isApprovalRequest
+            ? await governanceQueries.getMemoryMaintenanceApprovalPreview({
+              scope,
+              proposalId: resource.resourceId,
+            })
+            : isRejectionRequest
+              ? await governanceQueries.getMemoryMaintenanceRejectionPreview({
+                scope,
+                proposalId: resource.resourceId,
+              })
+              : isExpirationRequest
+                ? await governanceQueries.getMemoryMaintenanceExpirationPreview({
+                  scope,
+                  proposalId: resource.resourceId,
+                })
+                : isRollbackRequest
+                  ? await governanceQueries.getMemoryMaintenanceRollbackPreview({
+                    scope,
+                    proposalId: resource.resourceId,
+                  })
+                  : await governanceQueries.getMemoryMaintenanceApplicationPreview({
+                    scope,
+                    proposalId: resource.resourceId,
+                    ...(isApplicationWithSelection
+                      ? { retainedMemoryRef: retainedMemoryRef as string }
+                      : {}),
+                  });
+          if (!preview) {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          const issued = governancePreviewHandles.issue({
+            sessionId: session.sessionId,
+            sessionExpiresAt: session.expiresAt,
+            actor,
+            action: isApprovalRequest
+              ? MEMORY_MAINTENANCE_APPROVAL_ACTION
+              : isRejectionRequest
+                ? MEMORY_MAINTENANCE_REJECTION_ACTION
+                : isExpirationRequest
+                  ? MEMORY_MAINTENANCE_EXPIRATION_ACTION
+                  : isRollbackRequest
+                    ? MEMORY_MAINTENANCE_ROLLBACK_ACTION
+                    : MEMORY_MAINTENANCE_APPLICATION_ACTION,
+            resourceKind: GOVERNANCE_MEMORY_REVIEW_RESOURCE_KIND,
+            resourceId: resource.resourceId,
+            scope,
+            expectedState: preview.current.lifecycleState,
+            expectedRevisionNumber: preview.current.revisionNumber,
+            previewDigest: preview.previewDigest,
+          });
+          return {
+            status: 201,
+            body: {
+              ...preview,
+              previewHandle: issued.handle,
+              previewExpiresAt: issued.expiresAt,
+            },
+          };
+        }
+        return { status: 404, body: { error: 'not_found' } };
+      },
+      handleAuthenticatedUnscopedRequest: async ({ actor, route, session, body }) => {
+        if (route.purpose === GOVERNANCE_SCOPE_DISCOVERY_PURPOSE) {
+          return {
+            status: 200,
+            body: await governanceQueries.listMemoryMaintenanceReviewScopeHandles((scope) => (
+              governanceScopeHandles.issue({
+                sessionId: session.sessionId,
+                sessionExpiresAt: session.expiresAt,
+                purpose: GOVERNANCE_MEMORY_REVIEW_PURPOSE,
+                scope,
+              })
+            )),
+          };
+        }
+        if (route.purpose === GOVERNANCE_MEMORY_SCOPE_DISCOVERY_PURPOSE) {
+          return {
+            status: 200,
+            body: await governanceQueries.listMemoryRecordScopeHandles((scope) => (
+              governanceScopeHandles.issue({
+                sessionId: session.sessionId,
+                sessionExpiresAt: session.expiresAt,
+                purpose: GOVERNANCE_MEMORY_RECORDS_PURPOSE,
+                scope,
+              })
+            )),
+          };
+        }
+        if (route.purpose === GOVERNANCE_PRIVACY_SCOPE_DISCOVERY_PURPOSE) {
+          return {
+            status: 200,
+            body: await governanceQueries.listPrivacyPreferenceScopeHandles((scope) => (
+              governanceScopeHandles.issue({
+                sessionId: session.sessionId,
+                sessionExpiresAt: session.expiresAt,
+                purpose: GOVERNANCE_PRIVACY_PREFERENCES_PURPOSE,
+                scope,
+              })
+            )),
+          };
+        }
+        if (route.purpose === GOVERNANCE_GROUP_SUMMARY_SCOPE_DISCOVERY_PURPOSE) {
+          return {
+            status: 200,
+            body: await governanceQueries.listGroupSummaryPolicyScopeHandles((scope) => (
+              governanceScopeHandles.issue({
+                sessionId: session.sessionId,
+                sessionExpiresAt: session.expiresAt,
+                purpose: GOVERNANCE_GROUP_SUMMARY_POLICY_STATUS_PURPOSE,
+                scope,
+              })
+            )),
+          };
+        }
+        if (route.purpose === GOVERNANCE_DISPLAY_PROFILE_SCOPE_DISCOVERY_PURPOSE) {
+          return {
+            status: 200,
+            body: await governanceQueries.listDisplayProfileScopeHandles((scope) => (
+              governanceScopeHandles.issue({
+                sessionId: session.sessionId,
+                sessionExpiresAt: session.expiresAt,
+                purpose: GOVERNANCE_DISPLAY_PROFILE_TARGETS_PURPOSE,
+                scope,
+              })
+            )),
+          };
+        }
+        if (
+          route.path === GOVERNANCE_PLATFORM_ACCOUNT_UNLINK_CONFIRM_PATH
+          && route.purpose === GOVERNANCE_PLATFORM_ACCOUNT_UNLINK_PURPOSE
+        ) {
+          const bodyRecord = typeof body === 'object'
+            && body !== null
+            && !Array.isArray(body)
+            ? body as Record<string, unknown>
+            : null;
+          const bodyKeys = bodyRecord ? Object.keys(bodyRecord) : [];
+          const resourceHandle = bodyRecord?.resourceHandle;
+          const previewHandle = bodyRecord?.previewHandle;
+          if (
+            bodyKeys.length !== 3
+            || !bodyKeys.includes('confirm')
+            || !bodyKeys.includes('resourceHandle')
+            || !bodyKeys.includes('previewHandle')
+            || bodyRecord?.confirm !== true
+            || typeof resourceHandle !== 'string'
+            || !GOVERNANCE_OPAQUE_HANDLE_PATTERN.test(resourceHandle)
+            || typeof previewHandle !== 'string'
+            || !GOVERNANCE_OPAQUE_HANDLE_PATTERN.test(previewHandle)
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+
+          const scope = { kind: 'system' as const };
+          const resource = governanceResourceHandles.resolve({
+            sessionId: session.sessionId,
+            handle: resourceHandle,
+            purpose: GOVERNANCE_PLATFORM_ACCOUNT_UNLINK_PURPOSE,
+            resourceKind: GOVERNANCE_PLATFORM_ACCOUNT_RESOURCE_KIND,
+            scope,
+          });
+          if (!resource || resource.kind !== GOVERNANCE_PLATFORM_ACCOUNT_RESOURCE_KIND) {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+
+          let selectorValue: unknown;
+          try {
+            selectorValue = JSON.parse(resource.resourceId);
+          } catch {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          const selector = typeof selectorValue === 'object'
+            && selectorValue !== null
+            && !Array.isArray(selectorValue)
+            ? selectorValue as Record<string, unknown>
+            : null;
+          const selectorKeys = selector ? Object.keys(selector) : [];
+          const platformAccountId = selector?.platformAccountId;
+          if (
+            selectorKeys.length !== 2
+            || !selectorKeys.includes('platform')
+            || !selectorKeys.includes('platformAccountId')
+            || selector?.platform !== 'qq'
+            || typeof platformAccountId !== 'string'
+            || !GOVERNANCE_QQ_PLATFORM_ACCOUNT_ID_PATTERN.test(platformAccountId)
+            || resource.resourceId !== JSON.stringify({
+              platform: 'qq',
+              platformAccountId,
+            })
+          ) {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+
+          const consumed = governancePreviewHandles.consumeWithOutcome({
+            sessionId: session.sessionId,
+            handle: previewHandle,
+            actor,
+            action: PLATFORM_ACCOUNT_UNLINK_ACTION,
+            resourceKind: GOVERNANCE_PLATFORM_ACCOUNT_RESOURCE_KIND,
+            resourceId: resource.resourceId,
+            scope,
+          });
+          if (consumed.outcome === 'not_found_or_denied') {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          if (consumed.outcome === 'already_consumed') {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+
+          const currentPreview = await governanceQueries.getPlatformAccountUnlinkPreview({
+            platform: 'qq',
+            platformAccountId,
+          });
+          if (
+            !currentPreview
+            || consumed.binding.expectedState
+              !== currentPreview.current.snapshotFingerprint
+            || consumed.binding.expectedRevisionNumber !== 1
+            || consumed.binding.previewDigest !== currentPreview.previewDigest
+          ) {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+
+          const result = this.governance.unlinkPlatformAccountAsLocalAdmin({
+            platform: 'qq',
+            platformAccountId,
+            expectedSnapshot: currentPreview.current,
+            reasonCode: PLATFORM_ACCOUNT_UNLINK_REASON_CODE,
+          });
+          if (result.outcome !== 'unlinked') {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+          return {
+            status: 200,
+            body: {
+              action: PLATFORM_ACCOUNT_UNLINK_ACTION,
+              outcome: 'unlinked',
+              account: {
+                ...currentPreview.account,
+                status: 'disabled',
+              },
+              affectedRows: { platformAccounts: 1 },
+              disabledAt: new Date(result.disabledAt),
+              durableEffects: [...currentPreview.expected.durableEffects],
+              identityConsequences: [...currentPreview.expected.identityConsequences],
+              privacyConsequences: [...currentPreview.expected.privacyConsequences],
+              evidence: {
+                auditEvent: 'identity.platform_account.unlinked',
+                reasonCode: PLATFORM_ACCOUNT_UNLINK_REASON_CODE,
+              },
+              rollback: { ...currentPreview.rollback },
+            },
+          };
+        }
+        if (
+          route.path === GOVERNANCE_PLATFORM_ACCOUNT_UNLINK_PATH
+          && route.purpose === GOVERNANCE_PLATFORM_ACCOUNT_UNLINK_PURPOSE
+        ) {
+          const bodyRecord = typeof body === 'object'
+            && body !== null
+            && !Array.isArray(body)
+            ? body as Record<string, unknown>
+            : null;
+          const bodyKeys = bodyRecord ? Object.keys(bodyRecord) : [];
+          const platformAccountId = bodyRecord?.platformAccountId;
+          if (
+            bodyKeys.length !== 3
+            || !bodyKeys.includes('action')
+            || !bodyKeys.includes('platform')
+            || !bodyKeys.includes('platformAccountId')
+            || bodyRecord?.action !== 'unlink'
+            || bodyRecord.platform !== 'qq'
+            || typeof platformAccountId !== 'string'
+            || !GOVERNANCE_QQ_PLATFORM_ACCOUNT_ID_PATTERN.test(platformAccountId)
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+
+          const preview = await governanceQueries.getPlatformAccountUnlinkPreview({
+            platform: 'qq',
+            platformAccountId,
+          });
+          if (!preview) {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          const scope = { kind: 'system' as const };
+          const resourceId = JSON.stringify({
+            platform: 'qq',
+            platformAccountId,
+          });
+          const resource = governanceResourceHandles.issue({
+            sessionId: session.sessionId,
+            sessionExpiresAt: session.expiresAt,
+            purpose: GOVERNANCE_PLATFORM_ACCOUNT_UNLINK_PURPOSE,
+            resourceKind: GOVERNANCE_PLATFORM_ACCOUNT_RESOURCE_KIND,
+            resourceId,
+            scope,
+          });
+          const issued = governancePreviewHandles.issue({
+            sessionId: session.sessionId,
+            sessionExpiresAt: session.expiresAt,
+            actor,
+            action: PLATFORM_ACCOUNT_UNLINK_ACTION,
+            resourceKind: GOVERNANCE_PLATFORM_ACCOUNT_RESOURCE_KIND,
+            resourceId,
+            scope,
+            expectedState: preview.current.snapshotFingerprint,
+            expectedRevisionNumber: 1,
+            previewDigest: preview.previewDigest,
+          });
+          return {
+            status: 201,
+            body: {
+              ...preview,
+              resourceHandle: resource.handle,
+              resourceExpiresAt: resource.expiresAt,
+              previewHandle: issued.handle,
+              previewExpiresAt: issued.expiresAt,
+            },
+          };
+        }
+        if (route.purpose === GOVERNANCE_EXPLAIN_SCOPE_DISCOVERY_PURPOSE) {
+          return {
+            status: 200,
+            body: await governanceQueries.listExplainConversationScopeHandles((scope) => (
+              governanceScopeHandles.issue({
+                sessionId: session.sessionId,
+                sessionExpiresAt: session.expiresAt,
+                purpose: GOVERNANCE_EXPLAIN_TURNS_PURPOSE,
+                scope,
+              })
+            )),
+          };
+        }
+        if (route.purpose === GOVERNANCE_OVERVIEW_PURPOSE) {
+          return {
+            status: 200,
+            body: await governanceQueries.summarizeGovernanceHealth(),
+          };
+        }
+        if (route.purpose === GOVERNANCE_OPERATIONS_PURPOSE) {
+          return {
+            status: 200,
+            body: governanceOperations.inspect(),
+          };
+        }
+        if (route.purpose === GOVERNANCE_OPERATIONS_BACKUP_PREVIEW_PURPOSE) {
+          if (
+            typeof body !== 'object'
+            || body === null
+            || Array.isArray(body)
+            || Object.keys(body).length !== 1
+            || (body as Record<string, unknown>).action
+              !== GOVERNANCE_OPERATIONS_BACKUP_ACTION
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+          const preview = governanceOperations.previewVerifiedBackup();
+          const issued = governancePreviewHandles.issue({
+            sessionId: session.sessionId,
+            sessionExpiresAt: session.expiresAt,
+            actor,
+            action: preview.action,
+            resourceKind: GOVERNANCE_OPERATIONS_BACKUP_RESOURCE_KIND,
+            resourceId: GOVERNANCE_OPERATIONS_BACKUP_RESOURCE_ID,
+            scope: { kind: 'system' },
+            expectedState: preview.currentState,
+            expectedRevisionNumber: preview.contractVersion,
+            previewDigest: preview.previewDigest,
+          });
+          return {
+            status: 201,
+            body: {
+              ...preview,
+              previewHandle: issued.handle,
+              previewExpiresAt: issued.expiresAt,
+            },
+          };
+        }
+        if (route.purpose === GOVERNANCE_OPERATIONS_RETENTION_PREVIEW_PURPOSE) {
+          if (
+            typeof body !== 'object'
+            || body === null
+            || Array.isArray(body)
+            || Object.keys(body).length !== 1
+            || (body as Record<string, unknown>).action
+              !== GOVERNANCE_OPERATIONS_RETENTION_ACTION
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+          const preview = governanceOperations.previewConfiguredRetention();
+          const expectedAtMs = Date.parse(preview.asOf);
+          const issued = governancePreviewHandles.issue({
+            sessionId: session.sessionId,
+            sessionExpiresAt: session.expiresAt,
+            actor,
+            action: preview.action,
+            resourceKind: GOVERNANCE_OPERATIONS_RETENTION_RESOURCE_KIND,
+            resourceId: GOVERNANCE_OPERATIONS_RETENTION_RESOURCE_ID,
+            scope: { kind: 'system' },
+            expectedState: preview.currentState,
+            expectedRevisionNumber: preview.contractVersion,
+            previewDigest: preview.previewDigest,
+            expectedAtMs,
+          });
+          return {
+            status: 201,
+            body: {
+              ...preview,
+              previewHandle: issued.handle,
+              previewExpiresAt: issued.expiresAt,
+            },
+          };
+        }
+        if (route.purpose === GOVERNANCE_OPERATIONS_RETENTION_CONFIRM_PURPOSE) {
+          const bodyRecord = typeof body === 'object'
+            && body !== null
+            && !Array.isArray(body)
+            ? body as Record<string, unknown>
+            : null;
+          const bodyKeys = bodyRecord ? Object.keys(bodyRecord) : [];
+          const previewHandle = bodyRecord?.previewHandle;
+          if (
+            bodyKeys.length !== 2
+            || !bodyKeys.includes('confirm')
+            || !bodyKeys.includes('previewHandle')
+            || bodyRecord?.confirm !== true
+            || typeof previewHandle !== 'string'
+            || !GOVERNANCE_OPAQUE_HANDLE_PATTERN.test(previewHandle)
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+
+          const consumed = governancePreviewHandles.consumeWithOutcome({
+            sessionId: session.sessionId,
+            handle: previewHandle,
+            actor,
+            action: GOVERNANCE_OPERATIONS_RETENTION_ACTION,
+            resourceKind: GOVERNANCE_OPERATIONS_RETENTION_RESOURCE_KIND,
+            resourceId: GOVERNANCE_OPERATIONS_RETENTION_RESOURCE_ID,
+            scope: { kind: 'system' },
+          });
+          if (consumed.outcome === 'not_found_or_denied') {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          if (consumed.outcome === 'already_consumed') {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+          if (consumed.binding.expectedAtMs === undefined) {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+
+          try {
+            const confirmation = governanceOperations.confirmConfiguredRetention({
+              expectedState: consumed.binding.expectedState,
+              expectedRevisionNumber: consumed.binding.expectedRevisionNumber,
+              previewDigest: consumed.binding.previewDigest,
+              expectedAtMs: consumed.binding.expectedAtMs,
+            });
+            return confirmation
+              ? { status: 200, body: confirmation }
+              : { status: 409, body: { error: 'conflict' } };
+          } catch (error) {
+            return isSqliteBusyError(error)
+              ? { status: 503, body: { error: 'temporarily_unavailable' } }
+              : { status: 500, body: { error: 'internal_error' } };
+          }
+        }
+        if (route.purpose === GOVERNANCE_OPERATIONS_RESTORE_PREVIEW_PURPOSE) {
+          const bodyRecord = typeof body === 'object'
+            && body !== null
+            && !Array.isArray(body)
+            ? body as Record<string, unknown>
+            : null;
+          const bodyKeys = bodyRecord ? Object.keys(bodyRecord) : [];
+          const backupRef = bodyRecord?.backupRef;
+          if (
+            bodyKeys.length !== 2
+            || !bodyKeys.includes('action')
+            || !bodyKeys.includes('backupRef')
+            || bodyRecord?.action !== GOVERNANCE_OPERATIONS_RESTORE_ACTION
+            || typeof backupRef !== 'string'
+            || !GOVERNANCE_OPAQUE_HANDLE_PATTERN.test(backupRef)
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+
+          const preview = governanceOperations.previewServerOwnedBackupRestore(backupRef);
+          if (!preview) {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          const issued = governancePreviewHandles.issue({
+            sessionId: session.sessionId,
+            sessionExpiresAt: session.expiresAt,
+            actor,
+            action: preview.action,
+            resourceKind: GOVERNANCE_OPERATIONS_RESTORE_RESOURCE_KIND,
+            resourceId: backupRef,
+            scope: { kind: 'system' },
+            expectedState: preview.currentState,
+            expectedRevisionNumber: preview.contractVersion,
+            previewDigest: preview.previewDigest,
+          });
+          return {
+            status: 201,
+            body: {
+              ...preview,
+              previewHandle: issued.handle,
+              previewExpiresAt: issued.expiresAt,
+            },
+          };
+        }
+        if (route.purpose === GOVERNANCE_OPERATIONS_RESTORE_CONFIRM_PURPOSE) {
+          const bodyRecord = typeof body === 'object'
+            && body !== null
+            && !Array.isArray(body)
+            ? body as Record<string, unknown>
+            : null;
+          const bodyKeys = bodyRecord ? Object.keys(bodyRecord) : [];
+          const previewHandle = bodyRecord?.previewHandle;
+          const backupRef = bodyRecord?.backupRef;
+          if (
+            bodyKeys.length !== 3
+            || !bodyKeys.includes('confirm')
+            || !bodyKeys.includes('previewHandle')
+            || !bodyKeys.includes('backupRef')
+            || bodyRecord?.confirm !== true
+            || typeof previewHandle !== 'string'
+            || !GOVERNANCE_OPAQUE_HANDLE_PATTERN.test(previewHandle)
+            || typeof backupRef !== 'string'
+            || !GOVERNANCE_OPAQUE_HANDLE_PATTERN.test(backupRef)
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+
+          const consumed = governancePreviewHandles.consumeWithOutcome({
+            sessionId: session.sessionId,
+            handle: previewHandle,
+            actor,
+            action: GOVERNANCE_OPERATIONS_RESTORE_ACTION,
+            resourceKind: GOVERNANCE_OPERATIONS_RESTORE_RESOURCE_KIND,
+            resourceId: backupRef,
+            scope: { kind: 'system' },
+          });
+          if (consumed.outcome === 'not_found_or_denied') {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          if (consumed.outcome === 'already_consumed') {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+
+          const currentPreview = governanceOperations.previewServerOwnedBackupRestore(backupRef);
+          if (
+            !currentPreview
+            || consumed.binding.expectedState !== currentPreview.currentState
+            || consumed.binding.expectedRevisionNumber !== currentPreview.contractVersion
+            || consumed.binding.previewDigest !== currentPreview.previewDigest
+          ) {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+
+          return {
+            status: 200,
+            body: prepareGovernanceRestoreHandoff({
+              databasePath: this.config.dbPath,
+              backupRef,
+              previewDigest: currentPreview.previewDigest,
+              contractVersion: currentPreview.contractVersion,
+              now: new Date(governanceNow()),
+            }),
+          };
+        }
+        if (route.purpose === GOVERNANCE_OPERATIONS_BACKUP_CONFIRM_PURPOSE) {
+          const bodyRecord = typeof body === 'object'
+            && body !== null
+            && !Array.isArray(body)
+            ? body as Record<string, unknown>
+            : null;
+          const bodyKeys = bodyRecord ? Object.keys(bodyRecord) : [];
+          const previewHandle = bodyRecord?.previewHandle;
+          if (
+            bodyKeys.length !== 2
+            || !bodyKeys.includes('confirm')
+            || !bodyKeys.includes('previewHandle')
+            || bodyRecord?.confirm !== true
+            || typeof previewHandle !== 'string'
+            || !GOVERNANCE_OPAQUE_HANDLE_PATTERN.test(previewHandle)
+          ) {
+            return { status: 400, body: { error: 'bad_request' } };
+          }
+
+          const consumed = governancePreviewHandles.consumeWithOutcome({
+            sessionId: session.sessionId,
+            handle: previewHandle,
+            actor,
+            action: GOVERNANCE_OPERATIONS_BACKUP_ACTION,
+            resourceKind: GOVERNANCE_OPERATIONS_BACKUP_RESOURCE_KIND,
+            resourceId: GOVERNANCE_OPERATIONS_BACKUP_RESOURCE_ID,
+            scope: { kind: 'system' },
+          });
+          if (consumed.outcome === 'not_found_or_denied') {
+            return { status: 404, body: { error: 'not_found' } };
+          }
+          if (consumed.outcome === 'already_consumed') {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+
+          const currentPreview = governanceOperations.previewVerifiedBackup();
+          if (
+            consumed.binding.expectedState !== currentPreview.currentState
+            || consumed.binding.expectedRevisionNumber !== currentPreview.contractVersion
+            || consumed.binding.previewDigest !== currentPreview.previewDigest
+          ) {
+            return { status: 409, body: { error: 'conflict' } };
+          }
+
+          return {
+            status: 200,
+            body: await governanceOperations.createServerOwnedVerifiedBackup(),
+          };
+        }
+        if (route.purpose === GOVERNANCE_ACTIVITY_MODEL_INVOCATIONS_PURPOSE) {
+          return {
+            status: 200,
+            body: await governanceQueries.summarizeModelInvocations(),
+          };
+        }
+        if (route.purpose === GOVERNANCE_ACTIVITY_WORKER_HEARTBEATS_PURPOSE) {
+          return {
+            status: 200,
+            body: await governanceQueries.listWorkerHeartbeats(),
+          };
+        }
+        if (route.purpose === GOVERNANCE_ACTIVITY_JOBS_PURPOSE) {
+          return {
+            status: 200,
+            body: await governanceQueries.listJobs(),
+          };
+        }
+        if (route.purpose === GOVERNANCE_ACTIVITY_JOB_ATTEMPTS_PURPOSE) {
+          return {
+            status: 200,
+            body: await governanceQueries.listJobAttempts(),
+          };
+        }
+        if (route.purpose === GOVERNANCE_ACTIVITY_TOOL_CALLS_PURPOSE) {
+          return {
+            status: 200,
+            body: await governanceQueries.listToolCalls(),
+          };
+        }
+        if (route.purpose === GOVERNANCE_ACTIVITY_ACTION_DECISIONS_PURPOSE) {
+          return {
+            status: 200,
+            body: await governanceQueries.listActionDecisions(),
+          };
+        }
+        if (route.purpose === GOVERNANCE_ACTIVITY_ACTION_EXECUTIONS_PURPOSE) {
+          return {
+            status: 200,
+            body: await governanceQueries.listActionExecutions(),
+          };
+        }
+        if (route.purpose === GOVERNANCE_ACTIVITY_EVENT_PROCESSING_FAILURES_PURPOSE) {
+          return {
+            status: 200,
+            body: await governanceQueries.listEventProcessingFailures(),
+          };
+        }
+        if (route.purpose === GOVERNANCE_ACTIVITY_AUDIT_PURPOSE) {
+          return {
+            status: 200,
+            body: await governanceQueries.listAudit(),
+          };
+        }
+        return { status: 404, body: { error: 'not_found' } };
+      },
+    });
+    this.httpServer = new ApplicationHttpServer({
+      host: this.config.lethebotHost,
+      port: this.config.lethebotPort,
+      healthPath: this.config.lethebotHealthPath,
+      readinessPath: this.config.lethebotReadinessPath,
+      metricsPath: this.config.lethebotMetricsPath,
+      eventPath: this.config.lethebotEventPath,
+      reverseHttpIngressEnabled: isReverseHttpIngressEnabled(this.config),
+    }, {
+      handleHealth: (res) => {
         const health = this.buildHealthStatus();
         res.writeHead(health.status === 'ok' ? 200 : 503, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(health));
-        return;
-      }
-
-      if (requestPath === this.config.lethebotReadinessPath && req.method === 'GET') {
+      },
+      handleReadiness: (res) => {
         const readiness = this.buildReadinessStatus();
         res.writeHead(readiness.status === 'ready' ? 200 : 503, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(readiness));
-        return;
-      }
-
-      if (requestPath === this.config.lethebotMetricsPath && req.method === 'GET') {
+      },
+      handleMetrics: (format, res) => {
         try {
           const metrics = collectOperationsMetrics(this.db);
-          if (this.getRequestFormat(req.url) === 'prometheus') {
+          if (format === 'prometheus') {
             res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
             res.end(formatOperationsMetricsPrometheus(metrics));
           } else {
@@ -477,87 +2769,21 @@ class LetheBotApp {
           res.writeHead(503, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'metrics_unavailable' }));
         }
-        return;
-      }
-
-      // OneBot 事件 endpoint
-      if (requestPath === this.config.lethebotEventPath && req.method === 'POST') {
-        if (!this.acceptingIngress) {
-          this.respondIngressUnavailable(res);
-          return;
-        }
-
-        let body = '';
-        req.on('data', (chunk) => {
-          body += chunk.toString();
-        });
-
-        req.on('end', () => {
-          try {
-            if (!this.acceptingIngress) {
-              this.respondIngressUnavailable(res);
-              return;
-            }
-
-            if (!this.adapter.validateHttpEventAuth(req.headers, body)) {
-              res.writeHead(401, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ error: 'Unauthorized' }));
-              return;
-            }
-
-            let event: unknown;
-            try {
-              event = JSON.parse(body);
-            } catch (error) {
-              logger.warn({ error }, 'Invalid OneBot event JSON');
-              res.writeHead(400, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ error: 'Invalid JSON' }));
-              return;
-            }
-
-            logger.debug({ event }, 'Received OneBot event');
-            const disposition = this.adapter.dispatchInboundEvent(event, 'http');
-            if (disposition === 'failed') {
-              res.writeHead(503, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ error: 'event_unavailable' }));
-              return;
-            }
-
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'ok' }));
-          } catch (error) {
-            logger.error({ error }, 'Failed to handle event');
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Internal server error' }));
-          }
-        });
-        return;
-      }
-
-      // 404
-      res.writeHead(404);
-      res.end('Not Found');
+      },
+      handleOneBotEvent: (req, res) => {
+        this.handleOneBotHttpEvent(req, res);
+      },
     });
-
-    await new Promise<void>((resolve, reject) => {
-      const server = this.server;
-      if (!server) {
-        reject(new Error('HTTP server was not initialized'));
-        return;
-      }
-
-      const handleListenError = (error: Error) => reject(error);
-      server.once('error', handleListenError);
-      server.listen(port, this.config.lethebotHost, () => {
-        server.off('error', handleListenError);
-        logger.info(`LetheBot listening on ${this.config.lethebotHost}:${port}`);
-        logger.info(`Health check: http://localhost:${port}${this.config.lethebotHealthPath}`);
-        logger.info(`Readiness check: http://localhost:${port}${this.config.lethebotReadinessPath}`);
-        logger.info(`Metrics snapshot: http://localhost:${port}${this.config.lethebotMetricsPath}`);
-        logger.info(`OneBot endpoint: http://localhost:${port}${this.config.lethebotEventPath}`);
-        resolve();
-      });
-    });
+    try {
+      await this.governanceHttpServer.start();
+      await this.httpServer.start();
+    } catch (error) {
+      await Promise.allSettled([
+        this.closeGovernanceHttpServer(),
+        this.closeHttpServer(),
+      ]);
+      throw error;
+    }
   }
 
   /**
@@ -572,12 +2798,14 @@ class LetheBotApp {
     logger.info('Stopping LetheBot...');
     this.acceptingIngress = false;
 
-    const schedulerDrain = this.workerScheduler.stopAndDrain();
+    const schedulerDrain = this.backgroundRuntime.stopAndDrain();
     const serverClose = this.closeHttpServer();
+    const governanceServerClose = this.closeGovernanceHttpServer();
 
     await Promise.all([
       schedulerDrain,
       serverClose,
+      governanceServerClose,
       this.waitForIdle(),
     ]);
 
@@ -589,35 +2817,172 @@ class LetheBotApp {
   }
 
   private closeHttpServer(): Promise<void> {
-    const server = this.server;
-    this.server = null;
+    const server = this.httpServer;
+    this.httpServer = null;
     if (!server) {
       return Promise.resolve();
     }
-
-    return new Promise((resolve, reject) => {
-      server.close((error) => {
-        if (error) {
-          reject(error);
-          return;
-        }
-        resolve();
-      });
-    });
+    return server.close();
   }
 
-  private respondIngressUnavailable(res: ServerResponse): void {
-    res.writeHead(503, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'event_unavailable' }));
+  private closeGovernanceHttpServer(): Promise<void> {
+    const server = this.governanceHttpServer;
+    this.governanceHttpServer = null;
+    if (!server) {
+      return Promise.resolve();
+    }
+    return server.close();
+  }
+
+  private handleOneBotHttpEvent(req: IncomingMessage, res: ServerResponse): void {
+    const chunks: Buffer[] = [];
+    let receivedBytes = 0;
+    let settled = false;
+    let bodyTimeout: ReturnType<typeof setTimeout> | undefined;
+
+    const clearBodyState = (): void => {
+      if (bodyTimeout) {
+        clearTimeout(bodyTimeout);
+        bodyTimeout = undefined;
+      }
+      chunks.length = 0;
+    };
+
+    const abandon = (): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearBodyState();
+    };
+
+    const respond = (
+      status: number,
+      payload: Record<string, string>,
+      closeConnection = false,
+    ): boolean => {
+      if (settled) {
+        return false;
+      }
+      settled = true;
+      clearBodyState();
+      res.writeHead(status, {
+        'Content-Type': 'application/json',
+        ...(closeConnection ? { Connection: 'close' } : {}),
+      });
+      res.end(JSON.stringify(payload));
+      if (closeConnection) {
+        req.resume();
+      }
+      return true;
+    };
+
+    req.once('aborted', abandon);
+    req.once('error', abandon);
+    res.once('close', () => {
+      if (!res.writableFinished) {
+        abandon();
+      }
+    });
+
+    if (!this.acceptingIngress) {
+      respond(503, { error: 'event_unavailable' }, true);
+      return;
+    }
+
+    if (!this.adapter.hasHttpEventAuthCandidate(req.headers)) {
+      respond(401, { error: 'Unauthorized' }, true);
+      return;
+    }
+
+    const contentLength = req.headers['content-length'];
+    const declaredBytes = typeof contentLength === 'string' ? Number(contentLength) : undefined;
+    if (declaredBytes !== undefined && declaredBytes > this.config.lethebotMaxEventBodyBytes) {
+      respond(413, { error: 'Payload Too Large' }, true);
+      return;
+    }
+
+    bodyTimeout = setTimeout(() => {
+      respond(408, { error: 'Request Timeout' }, true);
+    }, this.config.lethebotEventBodyTimeoutMs);
+
+    req.on('data', (chunk: Buffer | string) => {
+      if (settled) {
+        return;
+      }
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      receivedBytes += buffer.byteLength;
+      if (receivedBytes > this.config.lethebotMaxEventBodyBytes) {
+        respond(413, { error: 'Payload Too Large' }, true);
+        return;
+      }
+      chunks.push(buffer);
+    });
+
+    req.once('end', () => {
+      if (settled) {
+        return;
+      }
+
+      if (bodyTimeout) {
+        clearTimeout(bodyTimeout);
+        bodyTimeout = undefined;
+      }
+
+      try {
+        if (!this.acceptingIngress) {
+          respond(503, { error: 'event_unavailable' });
+          return;
+        }
+
+        const body = Buffer.concat(chunks, receivedBytes).toString('utf8');
+        chunks.length = 0;
+        if (!this.adapter.validateHttpEventAuth(req.headers, body)) {
+          respond(401, { error: 'Unauthorized' });
+          return;
+        }
+
+        let event: unknown;
+        try {
+          event = JSON.parse(body);
+        } catch {
+          logger.warn({
+            transport: 'http',
+            status: 'invalid_json',
+            bodyBytes: receivedBytes,
+          }, 'Rejected malformed OneBot event JSON');
+          respond(400, { error: 'Invalid JSON' });
+          return;
+        }
+
+        const disposition = this.adapter.dispatchInboundEvent(event, 'http');
+        logger.debug({
+          transport: 'http',
+          disposition,
+          bodyBytes: receivedBytes,
+        }, 'Handled OneBot event');
+        if (disposition === 'failed') {
+          respond(503, { error: 'event_unavailable' });
+          return;
+        }
+
+        respond(200, { status: 'ok' });
+      } catch {
+        logger.error({
+          transport: 'http',
+          status: 'handler_error',
+          bodyBytes: receivedBytes,
+        }, 'Failed to handle OneBot event');
+        respond(500, { error: 'Internal server error' });
+      }
+    });
   }
 
   /**
    * 等待当前已入队事件处理完成，供测试/运维检查使用。
    */
   async waitForIdle(): Promise<void> {
-    while (this.pendingEventTasks.size > 0) {
-      await Promise.allSettled(Array.from(this.pendingEventTasks));
-    }
+    await this.turnApplication.waitForIdle();
   }
 
   /**
@@ -629,7 +2994,7 @@ class LetheBotApp {
     conversationId?: string;
     errorMessage: string;
   }> {
-    return this.eventProcessingFailures;
+    return this.turnApplication.getEventProcessingFailures();
   }
 
   /**
@@ -637,7 +3002,7 @@ class LetheBotApp {
    * intentionally exercise failure observability.
    */
   clearEventProcessingFailuresForTesting(): void {
-    this.eventProcessingFailures = [];
+    this.turnApplication.clearEventProcessingFailuresForTesting();
   }
 
   /**
@@ -650,7 +3015,7 @@ class LetheBotApp {
   /**
    * Replace the Pi runtime for integration tests.
    */
-  setPiRuntimeForTesting(runtime: { runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> }): void {
+  setPiRuntimeForTesting(runtime: PiRuntime): void {
     this.pi = runtime;
   }
 
@@ -694,7 +3059,7 @@ class LetheBotApp {
    * job/attempt/heartbeat side effects without waiting for wall-clock timers.
    */
   enqueueBackgroundTaskForTesting(task: EnqueueTaskInput): string {
-    return this.backgroundWorker.enqueue(task);
+    return this.backgroundRuntime.enqueue(task);
   }
 
   /**
@@ -704,7 +3069,7 @@ class LetheBotApp {
     now?: number,
     types?: TaskType[],
   ): Promise<TaskResult | null> {
-    return this.backgroundWorker.processNext(now, types);
+    return this.backgroundRuntime.processNext(now, types);
   }
 
   /**
@@ -741,730 +3106,6 @@ class LetheBotApp {
     this.cooldowns.clear();
   }
 
-  private registerBackgroundWorkerJobs(): void {
-    this.workerScheduler.register({
-      name: 'durable-background-job-processor',
-      intervalMs: 5_000,
-      handler: async () => {
-        await this.backgroundWorker.processNext();
-      },
-    });
-
-    if (this.config.backgroundSummaryEnabled) {
-      this.workerScheduler.register({
-        name: 'summary-discovery',
-        intervalMs: 5 * 60_000,
-        handler: async () => {
-          await this.enqueueSummaryJobs();
-        },
-      });
-    }
-
-    this.workerScheduler.register({
-      name: 'retention-maintenance',
-      intervalMs: 24 * 60 * 60_000,
-      handler: async () => {
-        this.enqueueRetentionJob();
-      },
-    });
-
-    this.workerScheduler.register({
-      name: 'admin-digest-maintenance',
-      intervalMs: 24 * 60 * 60_000,
-      handler: async () => {
-        this.enqueueAdminDigestJob();
-      },
-    });
-
-    this.workerScheduler.register({
-      name: 'memory-conflict-maintenance',
-      intervalMs: 24 * 60 * 60_000,
-      handler: async () => {
-        this.enqueueConflictJob();
-      },
-    });
-
-    this.workerScheduler.register({
-      name: 'memory-decay-maintenance',
-      intervalMs: 24 * 60 * 60_000,
-      handler: async () => {
-        this.enqueueDecayJob();
-      },
-    });
-
-    this.workerScheduler.register({
-      name: 'memory-consolidation-maintenance',
-      intervalMs: 24 * 60 * 60_000,
-      handler: async () => {
-        this.enqueueConsolidationJob();
-      },
-    });
-  }
-
-  private async enqueueSummaryJobs(): Promise<void> {
-    const summaryWorker = this.createSummaryWorker();
-    const candidates = await summaryWorker.findConversationsNeedingSummary(60);
-
-    for (const candidate of candidates) {
-      try {
-        await this.groupSummaryJobService.enqueueSummary({
-          conversationId: candidate.conversationId,
-          conversationType: candidate.conversationType,
-          groupId: candidate.groupId,
-          payload: candidate.conversationType === 'group'
-            ? { source: 'summary_discovery' }
-            : {
-                timeRange: candidate.timeRange,
-                messageRange: candidate.messageRange,
-              },
-          baseIdempotencyKey: this.buildSummaryJobKey(candidate),
-        });
-      } catch (error) {
-        if (error instanceof GroupSummaryPolicyError && error.code === 'policy_disabled') {
-          continue;
-        }
-        if (error instanceof GroupSummaryWindowError && error.code === 'window_unavailable') {
-          continue;
-        }
-        throw error;
-      }
-    }
-  }
-
-  private buildSummaryJobKey(candidate: ConversationSummaryInput): string {
-    const digest = createHash('sha256')
-      .update(JSON.stringify({
-        version: 1,
-        conversationId: candidate.conversationId,
-        conversationType: candidate.conversationType,
-        groupId: candidate.groupId ?? null,
-        messageRange: candidate.messageRange ?? null,
-        timeRange: candidate.timeRange ?? null,
-      }))
-      .digest('hex')
-      .slice(0, 32);
-    return `summary:v1:${digest}`;
-  }
-
-  private createSummaryWorker(): SummaryWorker {
-    if (!this.config.test && !this.config.backgroundSummaryEnabled) {
-      throw new Error(
-        'Background summary Provider processing is disabled; set LETHEBOT_BACKGROUND_SUMMARY_ENABLED=true to opt in',
-      );
-    }
-
-    return new SummaryWorker(
-      this.db,
-      this.pi,
-      this.memoryRepo,
-      new ContextBuilder(this.memoryRepo, this.identityRepo),
-      {
-        piProvider: this.piProvider,
-        piModel: this.piModel,
-        requireDurableExecution: true,
-      },
-    );
-  }
-
-  private async handleSummaryBackgroundTask(
-    task: BackgroundTask,
-    execution?: BackgroundTaskExecutionContext,
-  ): Promise<unknown> {
-    if (!execution) {
-      throw new Error('Summary background task requires durable execution context');
-    }
-    try {
-      const payload = task.payload;
-      const conversationType = this.requireConversationType(
-        payload.conversationType,
-        task.type,
-      );
-      const summaryInput: ConversationSummaryInput = {
-        conversationId: this.requireString(payload.conversationId, 'conversationId', task.type),
-        conversationType,
-        groupId: this.optionalString(payload.groupId),
-        ...(conversationType === 'group'
-          ? { sourceChatMessageIds: this.requireSummarySourceIds(payload.sourceChatMessageIds) }
-          : {
-              messageRange: this.parseMessageRange(payload.messageRange),
-              timeRange: this.parseTimeRange(payload.timeRange),
-            }),
-      };
-      const binding = this.groupSummaryPolicyRepo.getBinding(task.id);
-      if (
-        binding
-        && (
-          summaryInput.conversationType !== 'group'
-          || summaryInput.groupId !== binding.groupId
-          || summaryInput.conversationId !== binding.conversationId
-        )
-      ) {
-        throw new GroupSummaryPolicyError(
-          'job_binding_mismatch',
-          'Group summary job binding does not match the task payload.',
-        );
-      }
-
-      const result = await this.createSummaryWorker().generateSummary(summaryInput, execution);
-      if (!result) {
-        return null;
-      }
-
-      return {
-        summaryId: result.summaryId,
-        messageCount: result.messageCount,
-        timeRange: result.timeRange,
-        confidence: result.confidence,
-      };
-    } catch (error) {
-      if (error instanceof GroupSummaryPolicyError) {
-        throw new NonRetryableBackgroundTaskError(error.message);
-      }
-      throw error;
-    }
-  }
-
-  private async handleExtractionBackgroundTask(
-    task: BackgroundTask,
-    execution?: BackgroundTaskExecutionContext,
-  ): Promise<unknown> {
-    if (!execution) {
-      throw new Error('Extraction background task requires durable execution context');
-    }
-    const payload = task.payload;
-
-    return this.memoryExtractor.extractFromChatMessage({
-      sourceChatMessageId: this.requireString(payload.sourceChatMessageId, 'sourceChatMessageId', task.type),
-      targetUserId: this.requireString(payload.targetUserId, 'targetUserId', task.type),
-      jobAttemptId: execution.jobAttemptId,
-    });
-  }
-
-  private async handleAttentionRecheckBackgroundTask(
-    task: BackgroundTask,
-    execution?: BackgroundTaskExecutionContext,
-  ): Promise<unknown> {
-    if (!execution) {
-      throw new Error('Delayed Attention background task requires durable execution context');
-    }
-
-    const { candidateId } = parseDelayedAttentionTaskPayload(task.payload);
-    const candidate = this.delayedAttention.findCandidate(candidateId);
-    if (
-      !candidate
-      || candidate.jobId !== task.id
-      || candidate.jobId !== execution.jobId
-    ) {
-      throw new Error('Delayed Attention candidate/job binding is invalid');
-    }
-
-    const event = this.readDelayedAttentionSourceEvent(candidate);
-    const signals = this.buildDelayedAttentionSignals(event);
-    const decision = this.delayedAttention.decide({
-      candidateId,
-      jobId: execution.jobId,
-      jobAttemptId: execution.jobAttemptId,
-      now: execution.now,
-    });
-
-    if (decision.outcome === 'suppress') {
-      return {
-        candidateId,
-        decisionId: decision.id,
-        outcome: decision.outcome,
-        suppressors: decision.suppressors.map((suppressor) => ({
-          id: suppressor.id,
-          code: suppressor.code,
-        })),
-      };
-    }
-
-    const existing = this.findDelayedAttentionTerminalTurn(candidate.sourceRawEventId);
-    if (existing) {
-      return this.buildDelayedAttentionRespondResult(candidateId, decision, existing);
-    }
-
-    const outcome = await this.handleEvent(event, candidate.sourceRawEventId, {
-      sourceAlreadyPersisted: true,
-      signals,
-    });
-    if (outcome !== 'completed') {
-      throw new Error('Delayed Attention response processing failed');
-    }
-
-    const completed = this.findDelayedAttentionTerminalTurn(candidate.sourceRawEventId);
-    if (!completed) {
-      throw new Error('Delayed Attention response completed without terminal turn evidence');
-    }
-    return this.buildDelayedAttentionRespondResult(candidateId, decision, completed);
-  }
-
-  private readDelayedAttentionSourceEvent(
-    candidate: DelayedAttentionCandidate,
-  ): ChatMessageReceived {
-    const row = this.db.prepare(
-      `SELECT raw.id,
-              raw.type,
-              raw.timestamp,
-              raw.source,
-              raw.platform,
-              raw.conversation_id,
-              raw.correlation_id,
-              raw.platform_event_id,
-              raw.payload,
-              raw.created_at AS raw_created_at,
-              message.id AS chat_message_id,
-              message.raw_event_id AS chat_raw_event_id,
-              message.message_id AS chat_platform_message_id,
-              message.conversation_id AS chat_conversation_id,
-              message.conversation_type AS chat_conversation_type,
-              message.group_id AS chat_group_id,
-              message.sender_id AS chat_sender_id,
-              message.sender_role AS chat_sender_role,
-              message.text AS chat_text,
-              message.mentions_bot AS chat_mentions_bot,
-              message.reply_to_message_id AS chat_reply_to_message_id
-         FROM raw_events AS raw
-         JOIN chat_messages AS message ON message.id = ?
-        WHERE raw.id = ?
-          AND message.raw_event_id = raw.id`,
-    ).get(candidate.sourceChatMessageId, candidate.sourceRawEventId) as (StoredChatEventRow & {
-      raw_created_at: number;
-      chat_message_id: string;
-      chat_raw_event_id: string;
-      chat_platform_message_id: string;
-      chat_conversation_id: string;
-      chat_conversation_type: string;
-      chat_group_id: string | null;
-      chat_sender_id: string;
-      chat_sender_role: string | null;
-      chat_text: string | null;
-      chat_mentions_bot: number;
-      chat_reply_to_message_id: string | null;
-    }) | undefined;
-    if (!row) {
-      throw new Error('Delayed Attention source event is unavailable');
-    }
-
-    const parsed = parseStoredChatMessageReceived(row);
-    if (!parsed.ok) {
-      throw new Error('Delayed Attention source event is invalid');
-    }
-    const event = parsed.event;
-    if (
-      row.raw_created_at !== candidate.observedAt
-      || row.chat_message_id !== candidate.sourceChatMessageId
-      || row.chat_raw_event_id !== candidate.sourceRawEventId
-      || row.chat_platform_message_id !== event.message.messageId
-      || row.chat_conversation_id !== candidate.conversationId
-      || row.chat_conversation_id !== event.message.conversationId
-      || row.chat_conversation_type !== candidate.conversationType
-      || event.message.conversationType !== candidate.conversationType
-      || row.chat_group_id !== candidate.groupId
-      || event.message.groupId !== candidate.groupId
-      || row.chat_sender_id !== event.message.senderId
-      || row.chat_sender_role !== (event.message.senderRole ?? null)
-      || (row.chat_text ?? '') !== (event.message.content.text ?? '')
-      || row.chat_mentions_bot !== (event.message.mentionsBot ? 1 : 0)
-      || row.chat_reply_to_message_id !== (event.message.replyToMessageId ?? null)
-    ) {
-      throw new Error('Delayed Attention source event no longer matches its chat evidence');
-    }
-
-    return event;
-  }
-
-  private buildDelayedAttentionSignals(event: ChatMessageReceived): AttentionSignals {
-    const original = this.attention.analyze({
-      conversationType: event.message.conversationType,
-      mentionsBot: event.message.mentionsBot,
-      text: event.message.content.text ?? '',
-      senderId: event.message.senderId,
-      senderRole: event.message.senderRole,
-      replyToBot: false,
-    });
-    if (
-      original.classification !== 'defer'
-      || original.recommendedPath !== 'delayed_recheck'
-    ) {
-      throw new Error('Delayed Attention source no longer matches the deferred policy');
-    }
-
-    return {
-      ...original,
-      classification: 'needs_response',
-      recommendedPath: 'reply_fast_path',
-      triggerReasons: [...new Set([...original.triggerReasons, 'delayed_recheck'])],
-    };
-  }
-
-  private findDelayedAttentionTerminalTurn(sourceRawEventId: string): {
-    turnId: string;
-    actionDecisionId?: string;
-    actionExecutionId?: string;
-    deliveryRecorded: boolean;
-  } | null {
-    const rows = this.db.prepare(
-      `SELECT turn.id AS turn_id,
-              turn.status,
-              turn.action_decision_id,
-              delivery.id AS delivery_execution_id
-         FROM agent_turns AS turn
-         LEFT JOIN action_executions AS delivery
-           ON delivery.id = (
-             SELECT execution.id
-               FROM action_executions AS execution
-              WHERE execution.action_decision_id = turn.action_decision_id
-                AND execution.executed_message_id IS NOT NULL
-                AND (
-                  (execution.status = 'success' AND execution.action_type IN (
-                    'reply_short', 'reply_full', 'reply_with_tool', 'ask_clarification'
-                  ))
-                  OR (execution.status = 'downgraded' AND execution.action_type IN (
-                    'send_folded_forward', 'react_only'
-                  ))
-                )
-              ORDER BY execution.executed_at DESC, execution.id DESC
-              LIMIT 1
-           )
-        WHERE turn.trigger_event_id = ?
-        ORDER BY turn.started_at DESC, turn.id DESC`,
-    ).all(sourceRawEventId) as Array<{
-      turn_id: string;
-      status: string;
-      action_decision_id: string | null;
-      delivery_execution_id: string | null;
-    }>;
-
-    const delivered = rows.find((row) => row.delivery_execution_id !== null);
-    if (delivered) {
-      return {
-        turnId: delivered.turn_id,
-        ...(delivered.action_decision_id
-          ? { actionDecisionId: delivered.action_decision_id }
-          : {}),
-        actionExecutionId: delivered.delivery_execution_id as string,
-        deliveryRecorded: true,
-      };
-    }
-
-    const completed = rows.find((row) => row.status === 'completed');
-    if (completed) {
-      return {
-        turnId: completed.turn_id,
-        ...(completed.action_decision_id
-          ? { actionDecisionId: completed.action_decision_id }
-          : {}),
-        deliveryRecorded: false,
-      };
-    }
-
-    const indeterminate = rows.find((row) => {
-      return row.status === 'pending'
-        || row.status === 'running'
-        || row.action_decision_id !== null;
-    });
-    if (indeterminate) {
-      throw new Error('Delayed Attention prior turn has indeterminate delivery state');
-    }
-
-    return null;
-  }
-
-  private buildDelayedAttentionRespondResult(
-    candidateId: string,
-    decision: DelayedAttentionDecision,
-    terminal: {
-      turnId: string;
-      actionDecisionId?: string;
-      actionExecutionId?: string;
-      deliveryRecorded: boolean;
-    },
-  ): object {
-    return {
-      candidateId,
-      decisionId: decision.id,
-      outcome: decision.outcome,
-      turnId: terminal.turnId,
-      ...(terminal.actionDecisionId
-        ? { actionDecisionId: terminal.actionDecisionId }
-        : {}),
-      ...(terminal.actionExecutionId
-        ? { actionExecutionId: terminal.actionExecutionId }
-        : {}),
-      deliveryRecorded: terminal.deliveryRecorded,
-    };
-  }
-
-  private enqueueConsolidationJob(): string {
-    const nowMs = Date.now();
-    const day = new Date(nowMs).toISOString().slice(0, 10);
-
-    return this.backgroundWorker.enqueue({
-      type: 'consolidation',
-      payload: {
-        nowMs,
-        minGroupSize: 2,
-      },
-      idempotencyKey: `memory_consolidation:${day}`,
-      maxAttempts: 2,
-    });
-  }
-
-  private async handleConsolidationBackgroundTask(task: BackgroundTask): Promise<unknown> {
-    const worker = new MemoryConsolidationWorker(this.db, this.auditRepo);
-
-    return worker.scan({
-      jobId: task.id,
-      nowMs: this.optionalNumber(task.payload.nowMs),
-      minGroupSize: this.optionalNumber(task.payload.minGroupSize),
-      limit: this.optionalNumber(task.payload.limit),
-      scope: this.optionalString(task.payload.scope),
-      canonicalUserId: this.optionalString(task.payload.canonicalUserId),
-      groupId: this.optionalString(task.payload.groupId),
-      conversationId: this.optionalString(task.payload.conversationId),
-    });
-  }
-
-  private enqueueConflictJob(): string {
-    const nowMs = Date.now();
-    const day = new Date(nowMs).toISOString().slice(0, 10);
-
-    return this.backgroundWorker.enqueue({
-      type: 'conflict',
-      payload: {
-        sinceMs: nowMs - 24 * 60 * 60 * 1000,
-        nowMs,
-      },
-      idempotencyKey: `memory_conflict:${day}`,
-      maxAttempts: 2,
-    });
-  }
-
-  private async handleConflictBackgroundTask(task: BackgroundTask): Promise<unknown> {
-    const worker = new MemoryConflictWorker(this.db, this.auditRepo);
-
-    return worker.detect({
-      jobId: task.id,
-      sinceMs: this.optionalNumber(task.payload.sinceMs),
-      nowMs: this.optionalNumber(task.payload.nowMs),
-      limit: this.optionalNumber(task.payload.limit),
-    });
-  }
-
-  private enqueueDecayJob(): string {
-    const nowMs = Date.now();
-    const day = new Date(nowMs).toISOString().slice(0, 10);
-
-    return this.backgroundWorker.enqueue({
-      type: 'decay',
-      payload: {
-        nowMs,
-        staleBeforeMs: nowMs - 180 * 24 * 60 * 60 * 1000,
-        maxConfidence: 0.5,
-        maxImportance: 0.3,
-      },
-      idempotencyKey: `memory_decay:${day}`,
-      maxAttempts: 2,
-    });
-  }
-
-  private async handleDecayBackgroundTask(task: BackgroundTask): Promise<unknown> {
-    const worker = new MemoryDecayWorker(this.db, this.auditRepo);
-
-    return worker.scan({
-      jobId: task.id,
-      nowMs: this.optionalNumber(task.payload.nowMs),
-      staleBeforeMs: this.optionalNumber(task.payload.staleBeforeMs),
-      maxConfidence: this.optionalNumber(task.payload.maxConfidence),
-      maxImportance: this.optionalNumber(task.payload.maxImportance),
-      limit: this.optionalNumber(task.payload.limit),
-      scope: this.optionalString(task.payload.scope),
-      canonicalUserId: this.optionalString(task.payload.canonicalUserId),
-      groupId: this.optionalString(task.payload.groupId),
-      conversationId: this.optionalString(task.payload.conversationId),
-    });
-  }
-
-  private enqueueAdminDigestJob(): string {
-    const nowMs = Date.now();
-    const day = new Date(nowMs).toISOString().slice(0, 10);
-
-    return this.backgroundWorker.enqueue({
-      type: 'admin_digest',
-      payload: {
-        sinceMs: nowMs - 24 * 60 * 60 * 1000,
-        nowMs,
-      },
-      idempotencyKey: `admin_digest:${day}`,
-      maxAttempts: 2,
-    });
-  }
-
-  private async handleAdminDigestBackgroundTask(task: BackgroundTask): Promise<unknown> {
-    const worker = new AdminDigestWorker(this.db, this.auditRepo);
-
-    return worker.generate({
-      jobId: task.id,
-      sinceMs: this.optionalNumber(task.payload.sinceMs),
-      nowMs: this.optionalNumber(task.payload.nowMs),
-      limit: this.optionalNumber(task.payload.limit),
-    });
-  }
-
-  private enqueueRetentionJob(): string | undefined {
-    const policy = this.currentRetentionPolicy();
-    if (!this.hasRetentionPolicy(policy)) {
-      return undefined;
-    }
-
-    const day = new Date().toISOString().slice(0, 10);
-    return this.backgroundWorker.enqueue({
-      type: 'retention',
-      payload: {
-        rawEventsDays: policy.rawEventsDays,
-        chatMessagesDays: policy.chatMessagesDays,
-        auditLogDays: policy.auditLogDays,
-        disabledDeletedMemoryDays: policy.disabledDeletedMemoryDays,
-        eventProcessingFailuresDays: policy.eventProcessingFailuresDays,
-      },
-      idempotencyKey: `retention:${day}`,
-      maxAttempts: 2,
-    });
-  }
-
-  private async handleRetentionBackgroundTask(task: BackgroundTask): Promise<unknown> {
-    const policy = this.retentionPolicyFromPayload(task.payload);
-    const nowMs = this.optionalNumber(task.payload.nowMs) ?? Date.now();
-    return applyRetentionPolicy(this.db, policy, nowMs);
-  }
-
-  private currentRetentionPolicy(): RetentionPolicy {
-    return {
-      rawEventsDays: this.config.rawEventRetentionDays,
-      chatMessagesDays: this.config.chatMessageRetentionDays,
-      auditLogDays: this.config.auditLogRetentionDays,
-      disabledDeletedMemoryDays: this.config.disabledDeletedMemoryRetentionDays,
-      eventProcessingFailuresDays: this.config.eventProcessingFailureRetentionDays,
-    };
-  }
-
-  private hasRetentionPolicy(policy: RetentionPolicy): boolean {
-    return [
-      policy.rawEventsDays,
-      policy.chatMessagesDays,
-      policy.auditLogDays,
-      policy.disabledDeletedMemoryDays,
-      policy.eventProcessingFailuresDays,
-    ].some((days) => typeof days === 'number' && days > 0);
-  }
-
-  private retentionPolicyFromPayload(payload: BackgroundTask['payload']): RetentionPolicy {
-    return {
-      rawEventsDays: this.optionalNumber(payload.rawEventsDays),
-      chatMessagesDays: this.optionalNumber(payload.chatMessagesDays),
-      auditLogDays: this.optionalNumber(payload.auditLogDays),
-      disabledDeletedMemoryDays: this.optionalNumber(payload.disabledDeletedMemoryDays),
-      eventProcessingFailuresDays: this.optionalNumber(payload.eventProcessingFailuresDays),
-    };
-  }
-
-  private requireString(value: unknown, field: string, taskType: string): string {
-    if (typeof value === 'string' && value.length > 0) {
-      return value;
-    }
-
-    throw new Error(`Background task ${taskType} requires string payload.${field}`);
-  }
-
-  private optionalString(value: unknown): string | undefined {
-    return typeof value === 'string' && value.length > 0 ? value : undefined;
-  }
-
-  private requireConversationType(
-    value: unknown,
-    taskType: string,
-  ): 'private' | 'group' {
-    if (value === 'private' || value === 'group') {
-      return value;
-    }
-
-    throw new Error(`Background task ${taskType} requires payload.conversationType`);
-  }
-
-  private optionalNumber(value: unknown): number | undefined {
-    return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
-  }
-
-  private parseMessageRange(value: unknown): { start: string; end: string } | undefined {
-    if (
-      typeof value === 'object' &&
-      value !== null &&
-      'start' in value &&
-      'end' in value &&
-      typeof value.start === 'string' &&
-      typeof value.end === 'string'
-    ) {
-      return { start: value.start, end: value.end };
-    }
-
-    return undefined;
-  }
-
-  private parseTimeRange(value: unknown): { startTime: number; endTime: number } | undefined {
-    if (
-      typeof value === 'object' &&
-      value !== null &&
-      'startTime' in value &&
-      'endTime' in value &&
-      typeof value.startTime === 'number' &&
-      typeof value.endTime === 'number'
-    ) {
-      return { startTime: value.startTime, endTime: value.endTime };
-    }
-
-    return undefined;
-  }
-
-  private requireSummarySourceIds(value: unknown): string[] {
-    if (!Array.isArray(value) || value.length === 0 || value.length > 50) {
-      throw new GroupSummaryPolicyError(
-        'job_binding_mismatch',
-        'Group summary job requires a bounded frozen source window.',
-      );
-    }
-    const sourceIds = value.map((sourceId) => {
-      if (
-        typeof sourceId !== 'string'
-        || sourceId.length === 0
-        || sourceId.trim() !== sourceId
-      ) {
-        throw new GroupSummaryPolicyError(
-          'job_binding_mismatch',
-          'Group summary job frozen source IDs are invalid.',
-        );
-      }
-      return sourceId;
-    });
-    if (new Set(sourceIds).size !== sourceIds.length) {
-      throw new GroupSummaryPolicyError(
-        'job_binding_mismatch',
-        'Group summary job frozen source IDs must be unique.',
-      );
-    }
-    return sourceIds;
-  }
-
-  private getRequestPath(url: string | undefined): string {
-    return new URL(url ?? '/', 'http://localhost').pathname;
-  }
-
-  private getRequestFormat(url: string | undefined): 'json' | 'prometheus' {
-    return new URL(url ?? '/', 'http://localhost').searchParams.get('format') === 'prometheus'
-      ? 'prometheus'
-      : 'json';
-  }
-
   private buildHealthStatus(): {
     status: 'ok' | 'degraded';
     version: string;
@@ -1498,10 +3139,23 @@ class LetheBotApp {
         },
         adapter,
         eventProcessing: {
-          pending: this.pendingEventTasks.size,
-          failures: this.eventProcessingFailures.length,
+          pending: this.turnApplication.pendingCount,
+          failures: this.turnApplication.failureCount,
         },
       },
+    };
+  }
+
+  private buildRuntimeStatusLocalState(): RuntimeStatusLocalState {
+    const health = this.buildHealthStatus();
+    const readiness = this.buildReadinessStatus();
+    return {
+      health: health.status,
+      readiness: readiness.status,
+      database: health.checks.database.ok ? 'ok' : 'unavailable',
+      gateway: health.checks.adapter.ready ? 'ready' : 'not_ready',
+      pendingEvents: health.checks.eventProcessing.pending,
+      eventFailures: health.checks.eventProcessing.failures,
     };
   }
 
@@ -1538,7 +3192,7 @@ class LetheBotApp {
         },
         adapter,
         eventProcessing: {
-          pending: this.pendingEventTasks.size,
+          pending: this.turnApplication.pendingCount,
         },
       },
     };
@@ -1562,306 +3216,14 @@ class LetheBotApp {
       return 'failed';
     }
 
-    const claim = this.claimRawEvent(event);
-    if (claim.disposition === 'accepted') {
-      this.enqueueEvent(event, claim.rawEventId);
+    const claim = this.eventIngressClaim.claim(event);
+    if (claim.disposition === 'accepted' && claim.acceptedAt !== undefined) {
+      this.turnApplication.enqueue(event, claim.rawEventId, claim.acceptedAt);
     }
     return claim.disposition;
   }
 
-  private enqueueEvent(event: ChatMessageReceived, rawEventId: string): void {
-    const task = this.processAdmittedEvent(event, rawEventId);
-    this.pendingEventTasks.add(task);
-    void task.then(
-      () => {
-        this.pendingEventTasks.delete(task);
-      },
-      (error: unknown) => {
-        this.pendingEventTasks.delete(task);
-        logger.error({ error: this.redactErrorForLog(error) }, 'Admission processing transition failed');
-      },
-    );
-  }
-
-  private prepareAdmissionRecovery(): Array<{
-    event: ChatMessageReceived;
-    rawEventId: string;
-  }> {
-    const rows = this.db.prepare(
-      `SELECT
-         a.raw_event_id,
-         a.state,
-         a.accepted_at,
-         re.id,
-         re.type,
-         re.timestamp,
-         re.source,
-         re.platform,
-         re.conversation_id,
-         re.correlation_id,
-         re.platform_event_id,
-         re.payload,
-         EXISTS(SELECT 1 FROM chat_messages cm WHERE cm.raw_event_id = a.raw_event_id) AS has_chat,
-         EXISTS(SELECT 1 FROM agent_turns at WHERE at.trigger_event_id = a.raw_event_id) AS has_turn,
-         EXISTS(SELECT 1 FROM event_processing_failures epf WHERE epf.raw_event_id = a.raw_event_id) AS has_failure,
-         (SELECT COUNT(*)
-             FROM event_ingress_receipts receipt
-            WHERE receipt.raw_event_id = a.raw_event_id
-              AND receipt.disposition = 'accepted') AS accepted_receipt_count,
-         (SELECT receipt.transport
-             FROM event_ingress_receipts receipt
-            WHERE receipt.raw_event_id = a.raw_event_id
-              AND receipt.disposition = 'accepted'
-            ORDER BY receipt.received_at, receipt.id
-            LIMIT 1) AS accepted_transport,
-         (SELECT receipt.received_at
-             FROM event_ingress_receipts receipt
-            WHERE receipt.raw_event_id = a.raw_event_id
-              AND receipt.disposition = 'accepted'
-            ORDER BY receipt.received_at, receipt.id
-            LIMIT 1) AS accepted_received_at
-       FROM event_processing_admissions a
-       JOIN raw_events re ON re.id = a.raw_event_id
-       WHERE a.state IN ('accepted', 'processing')
-       ORDER BY a.accepted_at, a.raw_event_id`
-    ).all() as Array<StoredChatEventRow & {
-      raw_event_id: string;
-      state: 'accepted' | 'processing';
-      accepted_at: number;
-      has_chat: number;
-      has_turn: number;
-      has_failure: number;
-      accepted_receipt_count: number;
-      accepted_transport: string | null;
-      accepted_received_at: number | null;
-    }>;
-
-    const acceptedEvents: Array<{ event: ChatMessageReceived; rawEventId: string }> = [];
-    let resetProcessing = 0;
-    let staleProcessing = 0;
-    let startedEvidence = 0;
-    let invalidStoredEvents = 0;
-
-    for (const row of rows) {
-      if (row.state === 'processing') {
-        const recoveredEvent = this.resetEvidenceEmptyProcessingAdmission(row.raw_event_id);
-        if (recoveredEvent) {
-          acceptedEvents.push({ event: recoveredEvent, rawEventId: row.raw_event_id });
-          resetProcessing += 1;
-        } else {
-          staleProcessing += this.interruptAdmission(
-            row.raw_event_id,
-            'processing',
-            'stale_processing',
-          );
-        }
-        continue;
-      }
-
-      if (row.has_chat === 1 || row.has_turn === 1 || row.has_failure === 1) {
-        startedEvidence += this.interruptAdmission(row.raw_event_id, 'accepted', 'started_evidence');
-        continue;
-      }
-
-      const parsed = parseStoredChatMessageReceived(row);
-      if (
-        !parsed.ok
-        || row.accepted_receipt_count !== 1
-        || row.accepted_transport !== parsed.event.ingress.transport
-        || row.accepted_received_at !== row.accepted_at
-      ) {
-        invalidStoredEvents += this.interruptAdmission(
-          row.raw_event_id,
-          'accepted',
-          'invalid_stored_event',
-        );
-        continue;
-      }
-
-      acceptedEvents.push({ event: parsed.event, rawEventId: row.raw_event_id });
-    }
-
-    if (rows.length > 0) {
-      logger.info({
-        acceptedForRecovery: acceptedEvents.length,
-        resetProcessing,
-        staleProcessing,
-        startedEvidence,
-        invalidStoredEvents,
-      }, 'Event admission recovery reconciled');
-    }
-
-    return acceptedEvents;
-  }
-
-  private resetEvidenceEmptyProcessingAdmission(
-    rawEventId: string,
-  ): ChatMessageReceived | undefined {
-    const resetAdmission = this.db.transaction(() => {
-      const row = this.db.prepare(
-        `SELECT
-           a.raw_event_id,
-           a.accepted_at,
-           a.processing_started_at,
-           re.id,
-           re.type,
-           re.timestamp,
-           re.source,
-           re.platform,
-           re.conversation_id,
-           re.correlation_id,
-           re.platform_event_id,
-           re.payload,
-           EXISTS(SELECT 1 FROM chat_messages cm WHERE cm.raw_event_id = a.raw_event_id) AS has_chat,
-           EXISTS(SELECT 1 FROM agent_turns at WHERE at.trigger_event_id = a.raw_event_id) AS has_turn,
-           EXISTS(SELECT 1 FROM event_processing_failures epf WHERE epf.raw_event_id = a.raw_event_id) AS has_failure,
-           (SELECT COUNT(*)
-              FROM event_ingress_receipts receipt
-             WHERE receipt.raw_event_id = a.raw_event_id
-               AND receipt.disposition = 'accepted') AS accepted_receipt_count,
-           (SELECT receipt.transport
-              FROM event_ingress_receipts receipt
-             WHERE receipt.raw_event_id = a.raw_event_id
-               AND receipt.disposition = 'accepted'
-             ORDER BY receipt.received_at, receipt.id
-             LIMIT 1) AS accepted_transport,
-           (SELECT receipt.received_at
-              FROM event_ingress_receipts receipt
-             WHERE receipt.raw_event_id = a.raw_event_id
-               AND receipt.disposition = 'accepted'
-             ORDER BY receipt.received_at, receipt.id
-             LIMIT 1) AS accepted_received_at
-         FROM event_processing_admissions a
-         JOIN raw_events re ON re.id = a.raw_event_id
-         WHERE a.raw_event_id = ? AND a.state = 'processing'`
-      ).get(rawEventId) as (StoredChatEventRow & {
-        raw_event_id: string;
-        accepted_at: number;
-        processing_started_at: number;
-        has_chat: number;
-        has_turn: number;
-        has_failure: number;
-        accepted_receipt_count: number;
-        accepted_transport: string | null;
-        accepted_received_at: number | null;
-      }) | undefined;
-
-      if (!row || row.has_chat === 1 || row.has_turn === 1 || row.has_failure === 1) {
-        return undefined;
-      }
-
-      const parsed = parseStoredChatMessageReceived(row);
-      if (
-        !parsed.ok
-        || row.accepted_receipt_count !== 1
-        || row.accepted_transport !== parsed.event.ingress.transport
-        || row.accepted_received_at !== row.accepted_at
-      ) {
-        return undefined;
-      }
-
-      const changed = this.db.prepare(
-        `UPDATE event_processing_admissions
-         SET state = 'accepted',
-             processing_started_at = NULL,
-             finished_at = NULL,
-             reason_code = NULL
-         WHERE raw_event_id = ?
-           AND state = 'processing'
-           AND accepted_at = ?
-           AND processing_started_at = ?
-           AND NOT EXISTS (
-             SELECT 1 FROM chat_messages cm
-              WHERE cm.raw_event_id = event_processing_admissions.raw_event_id
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM agent_turns at
-              WHERE at.trigger_event_id = event_processing_admissions.raw_event_id
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM event_processing_failures epf
-              WHERE epf.raw_event_id = event_processing_admissions.raw_event_id
-           )
-           AND (
-             SELECT COUNT(*)
-               FROM event_ingress_receipts receipt
-              WHERE receipt.raw_event_id = event_processing_admissions.raw_event_id
-                AND receipt.disposition = 'accepted'
-           ) = 1
-           AND EXISTS (
-             SELECT 1
-               FROM event_ingress_receipts receipt
-              WHERE receipt.raw_event_id = event_processing_admissions.raw_event_id
-                AND receipt.disposition = 'accepted'
-                AND receipt.transport = ?
-                AND receipt.received_at = event_processing_admissions.accepted_at
-           )`
-      ).run(
-        rawEventId,
-        row.accepted_at,
-        row.processing_started_at,
-        parsed.event.ingress.transport,
-      ).changes;
-
-      return changed === 1 ? parsed.event : undefined;
-    });
-
-    // The write lock keeps the strict read and guarded reset on one evidence snapshot.
-    return resetAdmission.immediate();
-  }
-
-  private interruptAdmission(
-    rawEventId: string,
-    expectedState: 'accepted' | 'processing',
-    reasonCode: 'stale_processing' | 'started_evidence' | 'invalid_stored_event',
-  ): number {
-    const completedAt = new Date();
-    return this.db.transaction(() => {
-      const changed = this.db.prepare(
-        `UPDATE event_processing_admissions
-         SET state = 'interrupted_review', finished_at = ?, reason_code = ?
-         WHERE raw_event_id = ? AND state = ?`
-      ).run(completedAt.getTime(), reasonCode, rawEventId, expectedState).changes;
-
-      if (changed === 1) {
-        this.turnRepo.markAbortedByTriggerEvent(
-          rawEventId,
-          'Startup admission recovery interrupted this turn',
-          completedAt,
-        );
-      }
-
-      return changed;
-    })();
-  }
-
-  private async processAdmittedEvent(
-    event: ChatMessageReceived,
-    rawEventId: string,
-  ): Promise<void> {
-    const processingStartedAt = Date.now();
-    const started = this.db.prepare(
-      `UPDATE event_processing_admissions
-       SET state = 'processing', processing_started_at = ?
-       WHERE raw_event_id = ? AND state = 'accepted'`
-    ).run(processingStartedAt, rawEventId).changes;
-    if (started !== 1) {
-      return;
-    }
-
-    const outcome = await this.handleEvent(event, rawEventId);
-    const reasonCode = outcome === 'failed' ? 'handler_failed' : null;
-    const terminalized = this.db.prepare(
-      `UPDATE event_processing_admissions
-       SET state = ?, finished_at = ?, reason_code = ?
-       WHERE raw_event_id = ? AND state = 'processing'`
-    ).run(outcome, Date.now(), reasonCode, rawEventId).changes;
-    if (terminalized !== 1) {
-      throw new Error('Unable to terminalize event processing admission');
-    }
-  }
-
-  private createTestPiRuntime(): { runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> } {
+  private createTestPiRuntime(): PiRuntime {
     return {
       async runTurn(input: PiAdapterInput): Promise<PiAdapterOutput> {
         return {
@@ -1874,830 +3236,6 @@ class LetheBotApp {
         };
       },
     };
-  }
-
-  /**
-   * 解析用户身份（canonical_user_id）
-   */
-  private async resolveIdentity(platformUserId: string): Promise<string | null> {
-    try {
-      const canonicalUserId = await this.identityRepo.getOrCreateCanonicalUser(
-        'qq',
-        platformUserId,
-      );
-      logger.debug({ canonicalUserId }, 'Resolved user identity');
-      return canonicalUserId;
-    } catch (error) {
-      if (error instanceof InactivePlatformAccountError) {
-        logger.info({
-          platform: 'qq',
-          accountStatus: error.status,
-        }, 'Inactive platform account denied');
-        return null;
-      }
-
-      logger.error({ error, platformUserId }, 'Failed to resolve identity');
-      throw error;
-    }
-  }
-
-  /**
-   * 存储原始事件到数据库
-   */
-  private claimRawEvent(event: ChatMessageReceived): {
-    disposition: 'accepted' | 'duplicate';
-    rawEventId: string;
-  } {
-    return this.db.transaction(() => {
-      const conversationId = event.conversationId ?? event.message.conversationId;
-      const platformEventId = event.ingress.platformEventId ?? null;
-      const receivedAt = Date.now();
-      const insert = this.db.prepare(`
-        INSERT INTO raw_events (
-          id, type, timestamp, source, platform,
-          conversation_id, correlation_id, platform_event_id, payload, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT DO NOTHING
-      `).run(
-        event.id,
-        event.type,
-        new Date(event.timestamp).getTime(),
-        event.source,
-        event.platform,
-        conversationId,
-        event.correlationId ?? null,
-        platformEventId,
-        JSON.stringify(event),
-        receivedAt,
-      );
-
-      let disposition: 'accepted' | 'duplicate';
-      let rawEventId: string;
-      if (insert.changes === 1) {
-        disposition = 'accepted';
-        rawEventId = event.id;
-      } else {
-        if (!platformEventId) {
-          throw new Error('Unable to claim OneBot event without a stable platform event id');
-        }
-        const canonical = this.db.prepare(
-          `SELECT id
-             FROM raw_events
-            WHERE source = 'gateway'
-              AND platform = ?
-              AND type = ?
-              AND conversation_id = ?
-              AND platform_event_id = ?`
-        ).get(event.platform, event.type, conversationId, platformEventId) as { id: string } | undefined;
-        if (!canonical) {
-          throw new Error('Unable to resolve canonical OneBot event after claim conflict');
-        }
-        disposition = 'duplicate';
-        rawEventId = canonical.id;
-      }
-
-      this.db.prepare(
-        `INSERT INTO event_ingress_receipts (
-          id, raw_event_id, transport, disposition, received_at
-        ) VALUES (?, ?, ?, ?, ?)`
-      ).run(
-        `ingress-receipt-${randomUUID()}`,
-        rawEventId,
-        event.ingress.transport,
-        disposition,
-        receivedAt,
-      );
-
-      if (disposition === 'accepted') {
-        this.db.prepare(
-          `INSERT INTO event_processing_admissions (
-            raw_event_id, state, accepted_at, processing_started_at, finished_at, reason_code
-          ) VALUES (?, 'accepted', ?, NULL, NULL, NULL)`
-        ).run(rawEventId, receivedAt);
-      }
-
-      logger.debug({ rawEventId, disposition }, 'OneBot ingress claimed');
-      return { disposition, rawEventId };
-    })();
-  }
-
-  /**
-   * 存储聊天消息到数据库
-   */
-  private storeChatMessage(
-    event: ChatMessageReceived,
-    rawEventId: string,
-    isFromBot: boolean = false,
-  ): void {
-    this.db.prepare(`
-      INSERT INTO chat_messages (
-        id, raw_event_id, message_id, conversation_id,
-        conversation_type, group_id, sender_id, sender_role,
-        text, has_media, has_quote, mentions_bot,
-        reply_to_message_id, timestamp
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      event.id,
-      rawEventId,
-      event.message.messageId,
-      event.conversationId,
-      event.message.conversationType,
-      event.message.groupId || null,
-      event.message.senderId,
-      event.message.senderRole || null,
-      event.message.content.text || '',
-      (event.message.content.media?.length ?? 0) > 0 ? 1 : 0,
-      event.message.content.quote ? 1 : 0,
-      event.message.mentionsBot ? 1 : 0,
-      event.message.replyToMessageId || null,
-      new Date(event.timestamp).getTime(),
-    );
-
-    logger.debug({ messageId: event.id, rawEventId, isFromBot }, 'Chat message stored');
-  }
-
-  /**
-   * 结构化保存平台提供的昵称/群名片。显示字段是不可信 UI 数据，
-   * 不进入普通记忆内容；治理 CLI 可按 display profile/nickname history 删除。
-   */
-  private async recordDisplayMetadata(
-    event: ChatMessageReceived,
-    canonicalUserId: string,
-  ): Promise<void> {
-    const displayName = event.message.senderCard ?? event.message.senderDisplayName;
-    if (!displayName) {
-      return;
-    }
-    const safeDisplayName = this.redactSensitiveText(displayName);
-
-    const sourceGroupId = event.message.conversationType === 'group'
-      ? event.message.groupId
-      : undefined;
-    const existing = await this.identityRepo.getDisplayProfile(canonicalUserId, sourceGroupId);
-
-    await this.identityRepo.upsertDisplayProfile({
-      canonicalUserId,
-      sourceGroupId,
-      currentDisplayName: safeDisplayName,
-      trust: 'platform_provided',
-    });
-
-    if (!existing || existing.currentDisplayName !== safeDisplayName) {
-      await this.identityRepo.recordNicknameHistory(canonicalUserId, safeDisplayName, sourceGroupId);
-    }
-  }
-
-  /**
-   * 存储 Bot 回复到数据库
-   */
-  private storeBotResponse(
-    conversationId: string,
-    conversationType: 'private' | 'group',
-    text: string,
-    groupId?: string,
-    sentMessageId?: string,
-  ): void {
-    const rawEventId = `evt-bot-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
-    const messageId = sentMessageId ?? `msg-bot-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
-
-    this.db.transaction(() => {
-      this.db.prepare(`
-        INSERT INTO raw_events (
-          id, type, timestamp, source, platform,
-          conversation_id, payload, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        rawEventId,
-        'bot.response',
-        Date.now(),
-        'agent',
-        'qq',
-        conversationId,
-        JSON.stringify({ messageId, conversationId, conversationType, groupId, text }),
-        Date.now(),
-      );
-
-      // 创建一个简化的 Bot 消息记录
-      this.db.prepare(`
-        INSERT INTO chat_messages (
-          id, raw_event_id, message_id, conversation_id,
-          conversation_type, group_id, sender_id, text,
-          has_media, has_quote, mentions_bot, timestamp
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        messageId,
-        rawEventId,
-        messageId, // Bot 消息使用内部 ID
-        conversationId,
-        conversationType,
-        groupId ?? null,
-        'bot-self',
-        text,
-        0,
-        0,
-        0,
-        Date.now(),
-      );
-    })();
-
-    logger.debug({ messageId, rawEventId }, 'Bot response stored');
-  }
-
-  private findSuccessfulReplyExecution(results: ActionExecutionResult[]): ActionExecutionResult | undefined {
-    return results.find((result) => {
-      if (!result.executed?.messageId) {
-        return false;
-      }
-
-      if (
-        result.status === 'success' &&
-        (result.actionType === 'reply_short' ||
-          result.actionType === 'reply_full' ||
-          result.actionType === 'reply_with_tool' ||
-          result.actionType === 'ask_clarification')
-      ) {
-        return true;
-      }
-
-      return result.status === 'downgraded' && (
-        result.actionType === 'send_folded_forward' ||
-        result.actionType === 'react_only'
-      );
-    });
-  }
-
-  private getDeliveredReplyText(
-    decision: ActionDecision,
-    execution: ActionExecutionResult,
-    fallbackText: string,
-  ): string {
-    const actionText = decision.actions.find((action) => {
-      return action.type === execution.actionType && action.payload?.text?.trim();
-    })?.payload?.text?.trim();
-    const reactionText = execution.actionType === 'react_only'
-      ? decision.actions.find((action) => action.type === 'react_only' && action.payload?.reaction?.trim())
-        ?.payload?.reaction?.trim()
-      : undefined;
-
-    return actionText ?? reactionText ?? fallbackText;
-  }
-
-  private isReplyToStoredBotMessage(event: ChatMessageReceived): boolean {
-    const replyToMessageId = event.message.replyToMessageId;
-    if (!replyToMessageId) {
-      return false;
-    }
-
-    const row = this.db
-      .prepare(
-        `SELECT COUNT(*) AS count
-         FROM chat_messages
-         WHERE message_id = ?
-           AND conversation_id = ?
-           AND conversation_type = ?
-           AND sender_id = 'bot-self'`
-      )
-      .get(
-        replyToMessageId,
-        event.conversationId ?? event.message.conversationId,
-        event.message.conversationType,
-      ) as { count: number } | undefined;
-
-    return (row?.count ?? 0) > 0;
-  }
-
-  /**
-   * 处理内部事件
-   */
-  private async handleEvent(
-    event: ChatMessageReceived,
-    rawEventId: string,
-    options: {
-      sourceAlreadyPersisted?: boolean;
-      signals?: AttentionSignals;
-    } = {},
-  ): Promise<EventHandlingOutcome> {
-    let turnId: string | undefined;
-    let turnFinalized = false;
-    let currentStage = 'identity_resolution';
-
-    try {
-      logger.info({
-        type: event.type,
-        conversationId: event.conversationId,
-        senderId: event.message.senderId,
-      }, 'Processing event');
-
-      // 0.1 解析用户身份
-      currentStage = 'identity_resolution';
-      const senderId = event.message.senderId.replace('qq-', '');
-      const canonicalUserId = await this.resolveIdentity(senderId);
-      if (!canonicalUserId) {
-        return 'completed';
-      }
-
-      if (!options.sourceAlreadyPersisted) {
-        currentStage = 'display_metadata';
-        await this.recordDisplayMetadata(event, canonicalUserId);
-      }
-
-      const parsedGovernanceCommand = parseQqGovernanceCommand(
-        event.message.content.text ?? '',
-      );
-      if (parsedGovernanceCommand.status !== 'not_command') {
-        if (options.sourceAlreadyPersisted) {
-          logger.debug('Stored governance command is not replayed through delayed Attention');
-          return 'completed';
-        }
-
-        currentStage = 'chat_message_store';
-        this.storeChatMessage(event, rawEventId, false);
-
-        currentStage = 'turn_create';
-        const conversationId = event.conversationId ?? event.message.conversationId;
-        turnId = await this.turnRepo.createPending({
-          conversationId,
-          triggerEventId: rawEventId,
-          piModel: 'qq-governance-v1',
-          piProvider: 'local',
-        });
-        const governanceTurnId = turnId;
-
-        currentStage = 'governance_command';
-        const actionType = event.message.conversationType === 'group'
-          ? 'reply_short'
-          : 'reply_full';
-        const persistGovernanceEffectAndDecision = this.db.transaction(() => {
-          const governanceResult = this.governance.handleQqCommandSync({
-            sourceEventId: rawEventId,
-            ...(this.config.botOwnerQqId === undefined
-              ? {}
-              : { botOwnerQqId: this.config.botOwnerQqId }),
-          });
-          if (!governanceResult) {
-            throw new Error('Governance command verification mismatch');
-          }
-
-          const actionDecision = this.actionRepo.createDecisionSync({
-            turnId: governanceTurnId,
-            decidedBy: 'attention',
-            actions: [
-              {
-                type: actionType,
-                priority: 100,
-                target: {
-                  conversationId,
-                  conversationType: event.message.conversationType,
-                  ...(event.message.conversationType === 'group'
-                    ? { groupId: event.message.groupId }
-                    : {
-                        userId: event.message.senderId,
-                        canonicalUserId,
-                      }),
-                },
-                payload: { text: governanceResult.responseText },
-                constraints: {
-                  evaluatorRequired: false,
-                  redactionLevel: 'strict',
-                  proactive: false,
-                },
-                reason: 'Deterministic QQ governance command',
-              },
-            ],
-            riskLevel: 'low',
-            confidence: 1,
-            reasons: ['Deterministic QQ governance command'],
-            suppressors: [],
-            evaluatorRequired: false,
-            claimActor: { canonicalUserId },
-          });
-          return { governanceResult, actionDecision };
-        });
-        const {
-          governanceResult,
-          actionDecision,
-        } = persistGovernanceEffectAndDecision.immediate();
-
-        currentStage = 'action_execution';
-        const actionResults = await this.actionExecutor.execute(actionDecision);
-        const successfulReply = this.findSuccessfulReplyExecution(actionResults);
-        const deliveredReplyText = successfulReply
-          ? this.getDeliveredReplyText(
-              actionDecision,
-              successfulReply,
-              governanceResult.responseText,
-            )
-          : undefined;
-
-        if (successfulReply && deliveredReplyText && deliveredReplyText.trim().length > 0) {
-          const completedTurnId = turnId;
-          this.db.transaction(() => {
-            currentStage = 'bot_response_persist';
-            this.storeBotResponse(
-              conversationId,
-              event.message.conversationType,
-              deliveredReplyText,
-              event.message.groupId,
-              successfulReply.executed?.messageId,
-            );
-
-            currentStage = 'turn_complete';
-            this.turnRepo.markCompleted(completedTurnId, {
-              responseText: deliveredReplyText,
-              tokensUsed: { input: 0, output: 0, total: 0 },
-            });
-          })();
-          turnFinalized = true;
-        } else {
-          currentStage = 'turn_complete';
-          this.turnRepo.markCompleted(turnId, {
-            responseText: governanceResult.responseText,
-            tokensUsed: { input: 0, output: 0, total: 0 },
-          });
-          turnFinalized = true;
-        }
-
-        return 'completed';
-      }
-
-      const hasNormalizedContent = Boolean(event.message.content.text?.trim())
-        || (event.message.content.media?.length ?? 0) > 0
-        || event.message.content.quote !== undefined
-        || (event.message.mentions?.length ?? 0) > 0
-        || event.message.mentionsBot
-        || event.message.replyToMessageId !== undefined;
-      let signals = options.signals;
-      if (hasNormalizedContent && !signals) {
-        try {
-          currentStage = 'attention_analysis';
-          signals = this.attention.analyze({
-            conversationType: event.message.conversationType,
-            mentionsBot: event.message.mentionsBot,
-            text: event.message.content.text ?? '',
-            senderId: event.message.senderId,
-            senderRole: event.message.senderRole,
-            replyToBot: this.isReplyToStoredBotMessage(event),
-          });
-
-          logger.debug({ signals }, 'Attention analysis');
-        } catch (error) {
-          logger.error({
-            error: error instanceof Error ? {
-              message: error.message,
-              stack: error.stack,
-              name: error.name,
-            } : error,
-            step: 'attention_analysis',
-            eventType: event.type,
-            conversationId: event.conversationId,
-          }, 'Attention analysis failed');
-          throw error;
-        }
-      }
-
-      if (!options.sourceAlreadyPersisted) {
-        const shouldEnqueueExtraction = isAutomaticExtractionCandidate({
-          text: event.message.content.text ?? '',
-          conversationType: event.message.conversationType,
-        });
-        currentStage = signals?.classification === 'defer'
-          ? 'delayed_attention_persist'
-          : 'chat_message_store';
-        this.db.transaction(() => {
-          this.storeChatMessage(event, rawEventId, false);
-          if (shouldEnqueueExtraction) {
-            currentStage = 'memory_extraction_enqueue';
-            this.backgroundWorker.enqueue({
-              type: 'extraction',
-              payload: {
-                sourceChatMessageId: rawEventId,
-                targetUserId: canonicalUserId,
-              },
-              idempotencyKey: `extraction:auto:${rawEventId}`,
-              maxAttempts: 3,
-            });
-          }
-          if (signals?.classification === 'defer') {
-            currentStage = 'delayed_attention_persist';
-            this.delayedAttention.enqueueCandidate({ sourceRawEventId: rawEventId });
-          }
-        }).immediate();
-      }
-
-      if (!hasNormalizedContent) {
-        logger.debug('Event has no normalized message content, skipping');
-        return 'completed';
-      }
-      if (!signals) {
-        throw new Error('Attention signals are required for normalized message content');
-      }
-      if (signals.classification === 'defer') {
-        logger.debug('Event deferred for delayed Attention recheck');
-        return 'completed';
-      }
-
-      // 如果不需要响应，直接返回
-      if (signals.classification === 'silent') {
-        logger.debug('Event classified as silent, skipping');
-        return 'completed';
-      }
-
-      currentStage = 'turn_create';
-      turnId = await this.turnRepo.createPending({
-        conversationId: event.conversationId ?? event.message.conversationId,
-        triggerEventId: rawEventId,
-        piModel: this.piModel,
-        piProvider: this.piProvider,
-      });
-
-      // 2. 构建上下文
-      const groupId = event.message.groupId;
-
-      let context;
-      try {
-        currentStage = 'context_building';
-        context = await this.contextBuilder.buildContext({
-          turnId,
-          conversationId: event.conversationId ?? event.message.conversationId,
-          conversationType: event.message.conversationType,
-          recentMessages: [
-            {
-              messageId: rawEventId,
-              senderId: event.message.senderId,
-              text: event.message.content.text ?? '',
-              timestamp: event.timestamp,
-              senderDisplayName: event.message.senderDisplayName ?? event.message.senderId,
-              isFromBot: false,
-              ...(event.message.senderRole ? { senderRole: event.message.senderRole } : {}),
-            },
-          ],
-          currentMessageId: rawEventId,
-          ...(event.message.replyToMessageId
-            ? { replyToMessageId: event.message.replyToMessageId }
-            : {}),
-          targetUserId: canonicalUserId,
-          groupId,
-        });
-
-        await this.contextTraceRepo.createFromContext(context);
-        await this.turnRepo.markRunning(turnId, context.id);
-
-        logger.debug({
-          memoryCount: context.memory.retrievedFacts.length,
-          tokenBudget: context.tokenBudget,
-        }, 'Context built');
-      } catch (error) {
-        logger.error({
-          error: error instanceof Error ? {
-            message: error.message,
-            stack: error.stack,
-            name: error.name,
-          } : error,
-          step: 'context_building',
-          canonicalUserId,
-          groupId,
-          conversationId: event.conversationId,
-        }, 'Context building failed');
-        throw error;
-      }
-
-      // 3. 调用推理核心（PiAdapter）
-      let piResult;
-      try {
-        currentStage = 'pi_inference';
-        // 动态生成 system prompt
-        const systemPrompt = buildSystemPrompt({
-          conversationType: event.message.conversationType,
-          hasMemorySystem: true,
-        });
-
-        piResult = await this.pi.runTurn({
-          contextPack: context,
-          systemPrompt,
-          actor: {
-            canonicalUserId,
-            actorClass: 'user',
-            ...(groupId ? { groupId } : {}),
-          },
-          invocationContext: event.message.conversationType === 'private' ? 'private_chat' : 'group_chat',
-          turnId,
-          sourceEventIds: [rawEventId],
-        });
-
-        logger.debug({
-          responseLength: piResult.responseText?.length ?? 0,
-          toolCallCount: piResult.toolCallIds.length,
-          status: piResult.status,
-        }, 'Pi response');
-      } catch (error) {
-        logger.error({
-          error: this.redactErrorForLog(error),
-          step: 'pi_inference',
-          canonicalUserId,
-          conversationId: event.conversationId,
-        }, 'Pi inference failed');
-        throw error;
-      }
-
-      if (piResult.status !== 'completed') {
-        await this.turnRepo.markFailed(
-          turnId,
-          piResult.errorMessage ?? `Pi turn ended with status: ${piResult.status}`
-        );
-        turnFinalized = true;
-        return 'failed';
-      }
-
-      // 4. 将 Pi 输出转换为结构化行动并通过执行器处理
-      currentStage = 'social_decision';
-      const responseText = piResult.responseText ?? '';
-      const actionDecision = await this.socialDecisionService.createDecision({
-        turnId,
-        rawEventId,
-        event,
-        responseText,
-        signals,
-        actor: {
-          canonicalUserId,
-          actorClass: event.message.conversationType === 'group'
-            && (event.message.senderRole === 'owner' || event.message.senderRole === 'admin')
-            ? 'group_admin'
-            : 'user',
-        },
-      });
-      currentStage = 'action_execution';
-      const actionResults = await this.actionExecutor.execute(actionDecision);
-      const successfulReply = this.findSuccessfulReplyExecution(actionResults);
-      const deliveredReplyText = successfulReply
-        ? this.getDeliveredReplyText(actionDecision, successfulReply, responseText)
-        : undefined;
-
-      if (successfulReply && deliveredReplyText && deliveredReplyText.trim().length > 0) {
-        try {
-          logger.info({
-            conversationId: event.conversationId,
-            responseLength: deliveredReplyText.length,
-            actionDecisionId: actionDecision.id,
-            actionExecutionId: successfulReply.id,
-          }, 'Response action executed');
-
-          if (!turnId) {
-            throw new Error('Turn identity is required before post-action persistence');
-          }
-          const completedTurnId = turnId;
-          this.db.transaction(() => {
-            currentStage = 'bot_response_persist';
-            this.storeBotResponse(
-              event.conversationId ?? event.message.conversationId,
-              event.message.conversationType,
-              deliveredReplyText,
-              event.message.groupId,
-              successfulReply.executed?.messageId,
-            );
-
-            currentStage = 'turn_complete';
-            this.turnRepo.markCompleted(completedTurnId, {
-              responseText,
-              tokensUsed: piResult.tokensUsed,
-            });
-          })();
-          turnFinalized = true;
-        } catch (error) {
-          logger.error({
-            error: error instanceof Error ? {
-              message: error.message,
-              stack: error.stack,
-              name: error.name,
-            } : error,
-            step: currentStage,
-            conversationType: event.message.conversationType,
-            conversationId: event.conversationId,
-            senderId: event.message.senderId,
-            groupId: event.message.groupId,
-            responseLength: responseText.length,
-          }, 'Failed to persist post-action side effects');
-          throw error;
-        }
-      }
-
-      if (!turnFinalized) {
-        currentStage = 'turn_complete';
-        await this.turnRepo.markCompleted(turnId, {
-          responseText,
-          tokensUsed: piResult.tokensUsed,
-        });
-        turnFinalized = true;
-      }
-      return 'completed';
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      const redactedErrorMessage = this.redactSensitiveText(errorMessage);
-
-      if (turnId && !turnFinalized) {
-        try {
-          await this.turnRepo.markFailed(turnId, redactedErrorMessage);
-          turnFinalized = true;
-        } catch (markFailedError) {
-          logger.error({
-            error: this.redactErrorForLog(markFailedError),
-            turnId,
-          }, 'Failed to mark agent turn as failed');
-        }
-      }
-
-      this.eventProcessingFailures.push({
-        eventId: event.id,
-        messageId: event.message.messageId,
-        conversationId: event.conversationId,
-        errorMessage: redactedErrorMessage,
-      });
-
-      this.recordEventProcessingFailure({
-        event,
-        rawEventId,
-        turnId,
-        stage: currentStage,
-        error,
-      });
-
-      logger.error({
-        error: this.redactErrorForLog(error),
-        event: {
-          type: event.type,
-          conversationId: event.conversationId,
-          senderId: event.message.senderId,
-          conversationType: event.message.conversationType,
-          messageId: event.message.messageId,
-          timestamp: event.timestamp,
-        },
-      }, 'Failed to handle event');
-      return 'failed';
-    }
-  }
-
-  private recordEventProcessingFailure(input: {
-    event: ChatMessageReceived;
-    rawEventId?: string;
-    turnId?: string;
-    stage: string;
-    error: unknown;
-  }): void {
-    const errorName = input.error instanceof Error ? input.error.name : typeof input.error;
-    const errorMessage = input.error instanceof Error ? input.error.message : String(input.error);
-    const errorMessageHash = this.hashForDiagnostics(errorMessage);
-    const messageIdHash = this.hashForDiagnostics(input.event.message.messageId);
-    const senderIdHash = this.hashForDiagnostics(input.event.message.senderId);
-    const conversationId = input.event.conversationId ?? input.event.message.conversationId;
-    const conversationIdHash = this.hashForDiagnostics(conversationId);
-    const now = Date.now();
-
-    try {
-      this.db.prepare(
-        `INSERT INTO event_processing_failures (
-          id, raw_event_id, turn_id, occurred_at, stage, conversation_type,
-          error_name, error_message_hash, message_id_hash, sender_id_hash,
-          conversation_id_hash, details
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        `event-failure-${randomUUID()}`,
-        input.rawEventId ?? null,
-        input.turnId ?? null,
-        now,
-        input.stage,
-        input.event.message.conversationType,
-        errorName,
-        errorMessageHash,
-        messageIdHash ?? null,
-        senderIdHash ?? null,
-        conversationIdHash ?? null,
-        JSON.stringify({
-          redaction: 'hashes_only_no_message_text_no_platform_ids_no_raw_error',
-          rawEventStored: Boolean(input.rawEventId),
-          turnStarted: Boolean(input.turnId),
-          stage: input.stage,
-          conversationType: input.event.message.conversationType,
-          error: {
-            name: errorName,
-            messageHash: errorMessageHash,
-          },
-          hashes: {
-            messageId: messageIdHash,
-            senderId: senderIdHash,
-            conversationId: conversationIdHash,
-          },
-        }),
-      );
-    } catch (recordError) {
-      logger.error({ error: recordError }, 'Failed to persist event processing failure record');
-    }
-  }
-
-  private hashForDiagnostics(value: string | undefined): string | undefined {
-    if (!value) {
-      return undefined;
-    }
-
-    return createHash('sha256').update(value).digest('hex');
   }
 
   private redactErrorForLog(error: unknown): unknown {

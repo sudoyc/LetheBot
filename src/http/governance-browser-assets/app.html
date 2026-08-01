@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>LetheBot Governance</title>
+  <link rel="stylesheet" href="/governance/app.css">
+  <script type="module" src="/governance/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <header class="app-header">
+    <div class="brand-lockup" aria-label="LetheBot Governance">
+      <span class="brand-mark" aria-hidden="true">LB</span>
+      <span class="brand-name">LetheBot</span>
+      <span class="brand-section">Governance</span>
+    </div>
+    <div id="session-summary" class="session-summary" hidden>
+      <span class="status-label"><span class="status-dot" aria-hidden="true"></span>Local admin</span>
+      <span id="session-expiry" class="session-expiry"></span>
+      <button id="logout-button" class="button button-secondary" type="button">Sign out</button>
+    </div>
+  </header>
+
+  <div class="app-layout">
+    <nav id="primary-navigation" class="primary-navigation" aria-label="Primary" hidden>
+      <button
+        id="overview-nav"
+        class="nav-item"
+        type="button"
+        aria-current="page"
+        aria-controls="overview-view"
+      >Overview</button>
+      <button
+        id="activity-nav"
+        class="nav-item"
+        type="button"
+        aria-controls="activity-view"
+      >Activity</button>
+    </nav>
+
+    <main id="main-content" tabindex="-1">
+      <section id="login-view" class="login-view" aria-labelledby="login-title">
+        <div class="login-panel">
+          <header class="login-header">
+            <p class="eyebrow">Local administration</p>
+            <h1 id="login-title">LetheBot Governance</h1>
+          </header>
+          <form id="login-form" novalidate>
+            <label for="admin-token">Admin token</label>
+            <div class="login-controls">
+              <input
+                id="admin-token"
+                name="token"
+                type="password"
+                autocomplete="current-password"
+                required
+                maxlength="512"
+                aria-describedby="login-error"
+              >
+              <button id="login-button" class="button button-primary" type="submit">Sign in</button>
+            </div>
+            <p id="login-error" class="inline-error" role="alert" hidden></p>
+          </form>
+        </div>
+      </section>
+
+      <section id="overview-view" class="overview-view" aria-labelledby="overview-title" hidden>
+        <header class="view-toolbar">
+          <div>
+            <p class="eyebrow">System status</p>
+            <h1 id="overview-title">Overview</h1>
+          </div>
+          <button id="refresh-button" class="button button-secondary" type="button">Refresh</button>
+        </header>
+
+        <section id="attention-band" class="attention-band" aria-labelledby="attention-title">
+          <div>
+            <p class="eyebrow">Current state</p>
+            <h2 id="attention-title">Attention</h2>
+          </div>
+          <div class="attention-result">
+            <span id="attention-state" class="state-badge state-unavailable">Unavailable</span>
+            <strong id="attention-total" class="attention-total">--</strong>
+            <span class="attention-caption">open signals</span>
+          </div>
+          <p id="generated-at" class="generated-at">Updated: unavailable</p>
+        </section>
+
+        <div id="overview-loading" class="skeleton-grid" aria-hidden="true" hidden>
+          <div class="skeleton-group"><span></span><span></span><span></span></div>
+          <div class="skeleton-group"><span></span><span></span><span></span></div>
+          <div class="skeleton-group"><span></span><span></span><span></span></div>
+        </div>
+
+        <section id="overview-error" class="error-band" role="alert" hidden>
+          <h2>Overview unavailable</h2>
+          <p>Refresh the local status.</p>
+        </section>
+
+        <div id="metric-grid" class="metric-grid" aria-busy="false">
+          <section class="metric-group" aria-labelledby="memory-metrics-title">
+            <h2 id="memory-metrics-title">Memory reviews</h2>
+            <dl>
+              <div><dt>Total</dt><dd id="memory-total">--</dd></div>
+              <div><dt>Unresolved</dt><dd id="memory-unresolved">--</dd></div>
+              <div><dt>Resolved</dt><dd id="memory-resolved">--</dd></div>
+            </dl>
+          </section>
+
+          <section class="metric-group" aria-labelledby="job-metrics-title">
+            <h2 id="job-metrics-title">Jobs</h2>
+            <dl>
+              <div><dt>Pending</dt><dd id="jobs-pending">--</dd></div>
+              <div><dt>Running</dt><dd id="jobs-running">--</dd></div>
+              <div><dt>Failed</dt><dd id="jobs-failed">--</dd></div>
+            </dl>
+          </section>
+
+          <section class="metric-group" aria-labelledby="worker-metrics-title">
+            <h2 id="worker-metrics-title">Workers</h2>
+            <dl>
+              <div><dt>Total</dt><dd id="workers-total">--</dd></div>
+              <div><dt>Errors</dt><dd id="workers-error">--</dd></div>
+              <div><dt>Expired leases</dt><dd id="workers-expired">--</dd></div>
+            </dl>
+          </section>
+
+          <section class="metric-group" aria-labelledby="action-metrics-title">
+            <h2 id="action-metrics-title">Actions</h2>
+            <dl>
+              <div><dt>Decisions</dt><dd id="actions-decisions">--</dd></div>
+              <div><dt>Executions</dt><dd id="actions-executions">--</dd></div>
+              <div><dt>Failed or rejected</dt><dd id="actions-failed">--</dd></div>
+            </dl>
+          </section>
+
+          <section class="metric-group" aria-labelledby="tool-metrics-title">
+            <h2 id="tool-metrics-title">Tools</h2>
+            <dl>
+              <div><dt>Total</dt><dd id="tools-total">--</dd></div>
+              <div><dt>Failed or rejected</dt><dd id="tools-failed">--</dd></div>
+              <div><dt>Secrets redacted</dt><dd id="tools-redacted">--</dd></div>
+            </dl>
+          </section>
+
+          <section class="metric-group" aria-labelledby="event-metrics-title">
+            <h2 id="event-metrics-title">Event processing</h2>
+            <dl>
+              <div><dt>Failures</dt><dd id="events-failed">--</dd></div>
+              <div><dt>Audit events</dt><dd id="audit-total">--</dd></div>
+              <div><dt>High risk</dt><dd id="audit-high-risk">--</dd></div>
+            </dl>
+          </section>
+        </div>
+      </section>
+
+      <section id="activity-view" class="activity-view" aria-labelledby="activity-title" hidden>
+        <header class="activity-header">
+          <p class="eyebrow">Operational evidence</p>
+          <h1 id="activity-title">Activity</h1>
+        </header>
+
+        <div class="activity-tabs" role="tablist" aria-label="Activity views">
+          <button
+            id="model-invocations-tab"
+            class="activity-tab"
+            type="button"
+            role="tab"
+            aria-selected="true"
+            aria-controls="model-invocations-panel"
+          >Model invocations</button>
+        </div>
+
+        <section
+          id="model-invocations-panel"
+          class="activity-panel"
+          role="tabpanel"
+          aria-labelledby="model-invocations-tab"
+        >
+          <header class="view-toolbar activity-panel-toolbar">
+            <div>
+              <p class="eyebrow">Model activity</p>
+              <h2>Model invocations</h2>
+            </div>
+            <button
+              id="activity-refresh-button"
+              class="button button-secondary"
+              type="button"
+            >Refresh</button>
+          </header>
+
+          <section class="activity-summary" aria-labelledby="activity-summary-title">
+            <div>
+              <p class="eyebrow">Recorded activity</p>
+              <h2 id="activity-summary-title">Total invocations</h2>
+            </div>
+            <div class="activity-total-result">
+              <strong id="activity-total" class="activity-total">--</strong>
+              <span>invocations</span>
+            </div>
+            <p id="activity-generated-at" class="generated-at">Updated: unavailable</p>
+          </section>
+
+          <div id="activity-loading" class="skeleton-grid" aria-hidden="true" hidden>
+            <div class="skeleton-group"><span></span><span></span><span></span></div>
+            <div class="skeleton-group"><span></span><span></span><span></span></div>
+            <div class="skeleton-group"><span></span><span></span><span></span></div>
+            <div class="skeleton-group"><span></span><span></span><span></span></div>
+          </div>
+
+          <section id="activity-error" class="error-band" role="alert" hidden>
+            <h2>Activity unavailable</h2>
+            <p>Refresh the local activity.</p>
+          </section>
+
+          <section id="activity-empty" class="empty-band" role="status" hidden>
+            <h2>No model invocations recorded</h2>
+            <p>Recorded model activity will appear here.</p>
+          </section>
+
+          <div id="activity-content" class="metric-grid activity-grid" aria-busy="false" hidden>
+            <section class="metric-group" aria-labelledby="purpose-metrics-title">
+              <h2 id="purpose-metrics-title">Purpose</h2>
+              <dl>
+                <div><dt>Pi turns</dt><dd id="purpose-pi-turn">--</dd></div>
+                <div><dt>Summaries</dt><dd id="purpose-summary">--</dd></div>
+                <div><dt>Evaluations</dt><dd id="purpose-evaluator">--</dd></div>
+              </dl>
+            </section>
+
+            <section class="metric-group" aria-labelledby="status-metrics-title">
+              <h2 id="status-metrics-title">Status</h2>
+              <dl>
+                <div><dt>Running</dt><dd id="status-running">--</dd></div>
+                <div><dt>Completed</dt><dd id="status-completed">--</dd></div>
+                <div><dt>Failed</dt><dd id="status-failed">--</dd></div>
+                <div><dt>Aborted</dt><dd id="status-aborted">--</dd></div>
+              </dl>
+            </section>
+
+            <section class="metric-group" aria-labelledby="usage-metrics-title">
+              <h2 id="usage-metrics-title">Completed usage</h2>
+              <dl>
+                <div><dt>Known</dt><dd id="usage-known">--</dd></div>
+                <div><dt>Unknown</dt><dd id="usage-unknown">--</dd></div>
+              </dl>
+            </section>
+
+            <section class="metric-group" aria-labelledby="latency-metrics-title">
+              <h2 id="latency-metrics-title">Provider latency</h2>
+              <dl>
+                <div><dt>Samples</dt><dd id="latency-count">--</dd></div>
+                <div><dt>Total</dt><dd id="latency-sum">--</dd></div>
+                <div><dt>Maximum</dt><dd id="latency-max">--</dd></div>
+              </dl>
+            </section>
+          </div>
+        </section>
+
+      </section>
+    </main>
+  </div>
+
+  <p id="live-region" class="sr-only" aria-live="polite"></p>
+</body>
+</html>

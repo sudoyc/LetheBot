@@ -42,10 +42,15 @@ describe('group summary application wiring', () => {
 
   it('shares one governed enqueuer across action execution and summary discovery', async () => {
     const db = app.getDatabase();
-    const summaryJobs = Reflect.get(app, 'groupSummaryJobService') as GroupSummaryJobService;
+    const backgroundRuntime = Reflect.get(app, 'backgroundRuntime') as object;
+    const summaryJobs = Reflect.get(
+      backgroundRuntime,
+      'groupSummaryJobService',
+    ) as GroupSummaryJobService;
     const jobRepository = Reflect.get(app, 'jobRepo') as object;
     const initialExecutor = Reflect.get(app, 'actionExecutor') as object;
 
+    expect(Reflect.get(app, 'groupSummaryJobService')).toBe(summaryJobs);
     expect(Reflect.get(summaryJobs, 'jobs')).toBe(jobRepository);
     expect(Reflect.get(initialExecutor, 'options')).toMatchObject({
       jobRepository,
@@ -73,7 +78,7 @@ describe('group summary application wiring', () => {
       },
     ];
     let plannedSourceIds: string[] = [];
-    Reflect.set(app, 'createSummaryWorker', () => ({
+    Reflect.set(backgroundRuntime, 'createSummaryWorker', () => ({
       findConversationsNeedingSummary: async () => candidates,
       planGroupSummaryWindow: async () => plannedSourceIds.length === 0
         ? null
@@ -82,9 +87,12 @@ describe('group summary application wiring', () => {
             candidateCount: plannedSourceIds.length,
           },
     }));
-    const enqueueSummaryJobs = Reflect.get(app, 'enqueueSummaryJobs') as () => Promise<void>;
+    const enqueueSummaryJobs = Reflect.get(
+      backgroundRuntime,
+      'enqueueSummaryJobs',
+    ) as () => Promise<void>;
 
-    await enqueueSummaryJobs.call(app);
+    await enqueueSummaryJobs.call(backgroundRuntime);
 
     const privateJobs = db.prepare(
       'SELECT id, payload, idempotency_key FROM jobs WHERE type = ? ORDER BY id',
@@ -127,7 +135,7 @@ describe('group summary application wiring', () => {
       startTime: now + 1,
     });
 
-    await enqueueSummaryJobs.call(app);
+    await enqueueSummaryJobs.call(backgroundRuntime);
 
     const binding = db.prepare(
       `SELECT binding.job_id, binding.group_id, binding.conversation_id, binding.generation,
@@ -165,7 +173,7 @@ describe('group summary application wiring', () => {
           SET status = 'failed', completed_at = ?, updated_at = ?, error = 'terminal failure'
         WHERE id = ?`,
     ).run(now + 1, now + 1, binding.job_id);
-    await expect(enqueueSummaryJobs.call(app)).resolves.toBeUndefined();
+    await expect(enqueueSummaryJobs.call(backgroundRuntime)).resolves.toBeUndefined();
     expect(db.prepare('SELECT status FROM jobs WHERE id = ?').get(binding.job_id))
       .toEqual({ status: 'failed' });
     expect(db.prepare('SELECT COUNT(*) AS count FROM jobs WHERE type = ?').get('summary'))
@@ -175,7 +183,11 @@ describe('group summary application wiring', () => {
 
   it('rejects a group binding changed to private payload scope before Provider access', async () => {
     const db = app.getDatabase();
-    const summaryJobs = Reflect.get(app, 'groupSummaryJobService') as GroupSummaryJobService;
+    const backgroundRuntime = Reflect.get(app, 'backgroundRuntime') as object;
+    const summaryJobs = Reflect.get(
+      backgroundRuntime,
+      'groupSummaryJobService',
+    ) as GroupSummaryJobService;
     const now = Date.now() - 100;
     new GroupSummaryPolicyRepository(db).setEnabled({
       groupId: 'group-bound',
@@ -255,7 +267,11 @@ describe('group summary application wiring', () => {
     expectedError,
   }) => {
     const db = app.getDatabase();
-    const summaryJobs = Reflect.get(app, 'groupSummaryJobService') as GroupSummaryJobService;
+    const backgroundRuntime = Reflect.get(app, 'backgroundRuntime') as object;
+    const summaryJobs = Reflect.get(
+      backgroundRuntime,
+      'groupSummaryJobService',
+    ) as GroupSummaryJobService;
     const policies = new GroupSummaryPolicyRepository(db);
     const base = Date.now() - 1_000;
     const groupId = 'group-disable-during-provider';
