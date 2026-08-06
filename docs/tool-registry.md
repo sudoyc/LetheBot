@@ -192,24 +192,46 @@ standard linked terminal `tool_calls` and redacted audit evidence.
 
 Built-in `runtime.tools` is a read-only catalog inspector available only to
 `owner` and `admin` actors in `private_chat`. It uses `read_local`, bypasses
-evaluator review, uses `redacted_full` audit, declares `secret_possible`
-output, and has no filesystem or network access. In-process execution is
-limited to 1,000 ms and 8,192 output bytes. Empty-object input returns at most
-32 entries in deterministic canonical-name order. Each entry contains only a
-bounded redacted tool name, declared capabilities, current actor/context
-availability, and whether evaluator review is required. Aggregate fields give
-registered, available, and listed counts plus truncation and redaction flags.
+evaluator review, uses `redacted_full` audit, declares `secret_possible` output,
+and has no filesystem or network access. In-process execution is limited to
+1,000 ms and 8,192 output bytes. Empty-object input returns at most 32 entries
+in deterministic canonical-name order. Each entry contains only a bounded
+redacted tool name, declared capabilities, current enablement, current actor /
+context availability, and whether evaluator review is required. Aggregate
+fields give registered, available, and listed counts plus truncation and
+redaction flags.
+
+`enabled=false` is a local configuration state, not a permission grant. A
+disabled registered entry remains visible to owner inspection and rollback,
+but `ToolRegistry.checkPermission`, `getHandler`, `PolicyGate`, and Pi's
+provider catalog all fail closed for new calls. In-flight handler calls are not
+interrupted; `LETHEBOT_DISABLED_TOOLS` takes effect on the next application
+composition/startup. Removing a name from that setting re-enables it on the
+next startup.
 
 The same result reports only coarse optional registration state: workspace is
-enabled when both reviewed workspace tools are registered, and web fetch is
-enabled when its bounded origin metadata is present, with only the origin count
-returned. Workspace roots, origin values, permission identifier lists,
-descriptions, handlers, payloads, credentials, private identifiers, and
-diagnostics are never returned. The handler does not mutate the registry,
-configuration, filesystem, network, or durable domain state and has no
-prepared effect, retry, or compensation path. Static environment configuration
-remains the enable/disable boundary; ordinary Pi execution adds only the
-standard linked terminal `tool_calls` and redacted audit evidence.
+`enabled` only when both reviewed workspace tools are registered and enabled,
+and web fetch is `enabled` only when its bounded origin metadata is present and
+the tool is enabled; only the origin count is returned. Workspace roots, origin
+values, permission identifier lists, descriptions, handlers, payloads,
+credentials, private identifiers, and diagnostics are never returned. The
+handler does not mutate the registry, configuration, filesystem, network, or
+durable domain state and has no prepared effect, retry, or compensation path.
+
+Owner controls are restart-scoped and explicit:
+
+```bash
+pnpm cli list-tools --env-file .env
+pnpm cli tool-status memory.search --env-file .env
+pnpm cli disable-tool memory.search --env-file .env
+pnpm cli enable-tool memory.search --env-file .env
+```
+
+The mutation commands update only the named `LETHEBOT_DISABLED_TOOLS` setting
+in the explicitly supplied launcher env file, preserve unrelated settings, and
+write atomically. They never hot-mutate a running process; restart the process
+after a change. The same variable may be supplied directly by Docker,
+systemd, or another process manager when no editable env file is appropriate.
 
 Built-in `workspace.list` is absent by default and is registered only when
 `LETHEBOT_WORKSPACE_ROOT` names an absolute existing directory. The resolved

@@ -172,11 +172,15 @@ Tests should preserve these P0 boundaries.
   visible only to private owner/admin turns and returns fixed aggregate output
   or a diagnostic-free unavailable shape without durable domain writes.
   `runtime.tools` is likewise private owner/admin and returns only a bounded,
-  redacted registry projection plus coarse optional-tool state. An unset
+  redacted registry projection plus coarse optional-tool state. Each projection
+  includes explicit `enabled` and current-context availability flags. An unset
   workspace root and empty origin list preserve that six-tool catalog; an
   explicit absolute root produces eight tools, an independently configured
   exact HTTPS-origin list produces seven, and both options compose to nine.
-  No catalog includes a legacy read/write/delete or general `network_request`
+  `LETHEBOT_DISABLED_TOOLS` keeps disabled entries inspectable but removes them
+  from Pi's permitted provider catalog and handler path on the next startup;
+  list/status/enable/disable CLI tests cover the owner control boundary. No
+  catalog includes a legacy read/write/delete or general `network_request`
   entry.
 - Output limits and cooperative deadlines remain bounded; tests cover
   pre-abort, timer expiry, synchronous elapsed overruns, wait-for-settlement,

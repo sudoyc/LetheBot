@@ -160,6 +160,16 @@ pnpm cli delete-memory <memory-id>
 pnpm cli enable-memory <memory-id>
 ```
 
+Inspect and change the restart-scoped reviewed tool catalog (the mutation
+commands require the env file used by the launcher):
+
+```bash
+pnpm cli list-tools --env-file .env
+pnpm cli tool-status memory.search --env-file .env
+pnpm cli disable-tool memory.search --env-file .env
+pnpm cli enable-tool memory.search --env-file .env
+```
+
 ## Recommended Initial Stack
 
 - Runtime: TypeScript / Node.js

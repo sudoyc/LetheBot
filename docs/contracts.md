@@ -1250,6 +1250,17 @@ interface ToolHandlerRequest {
 type ToolHandler = (request: ToolHandlerRequest) => Promise<unknown>;
 ```
 
+`ToolRegistry` maintains a separate local enablement state. The canonical
+`LETHEBOT_DISABLED_TOOLS` configuration names only reviewed tools and is
+validated before database initialization. A disabled entry remains registered
+so owner inspection and rollback can identify it, but `isEnabled` is false,
+permission checks and handler lookup fail closed, and Pi excludes it from the
+current provider catalog. Configuration changes apply only at the next
+application composition; in-flight handler calls are not interrupted.
+Owner-facing `list-tools`, `tool-status`, `disable-tool`, and `enable-tool`
+commands inspect or atomically update an explicitly supplied launcher env file;
+the mutation commands never hot-mutate a running process.
+
 Optional `maxRuntimeMs` and `maxOutputBytes` metadata must be positive safe
 integers, and `maxRuntimeMs` may not exceed the host timer maximum
 `2147483647`. Immediately before handler invocation, after policy and evaluator

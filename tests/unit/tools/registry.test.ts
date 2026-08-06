@@ -390,6 +390,56 @@ describe('ToolRegistry', () => {
     });
   });
 
+  describe('enablement lifecycle', () => {
+    it('disables new calls, re-enables, and unregisters without leaving state', async () => {
+      const lifecycleRegistry = new ToolRegistry();
+      const handler: ToolRegistryEntry['handler'] = async () => ({ ok: true });
+      lifecycleRegistry.register({
+        name: 'lifecycle-tool',
+        version: '1.0.0',
+        description: 'Enablement lifecycle',
+        capabilities: ['read_context'],
+        permissions: { allowedActors: ['owner'], allowedContexts: ['private_chat'] },
+        evaluatorPolicy: 'required',
+        auditLevel: 'summary',
+        sandboxPolicy: createSandboxPolicy(),
+        outputSensitivity: 'normal',
+        piSchema: { input: {}, output: {} },
+        handler,
+      });
+
+      expect(lifecycleRegistry.isEnabled('lifecycle-tool')).toBe(true);
+      expect(lifecycleRegistry.checkPermission(
+        'lifecycle-tool',
+        { actorClass: 'owner' },
+        'private_chat',
+      )).toBe(true);
+      expect(lifecycleRegistry.requiresEvaluator('lifecycle-tool')).toBe(true);
+      expect(lifecycleRegistry.getHandler('lifecycle-tool')).toBe(handler);
+
+      lifecycleRegistry.disable('lifecycle-tool');
+      expect(lifecycleRegistry.isEnabled('lifecycle-tool')).toBe(false);
+      expect(lifecycleRegistry.get('lifecycle-tool')).toBeDefined();
+      expect(lifecycleRegistry.checkPermission(
+        'lifecycle-tool',
+        { actorClass: 'owner' },
+        'private_chat',
+      )).toBe(false);
+      expect(lifecycleRegistry.requiresEvaluator('lifecycle-tool')).toBe(false);
+      expect(lifecycleRegistry.getHandler('lifecycle-tool')).toBeUndefined();
+
+      lifecycleRegistry.enable('lifecycle-tool');
+      expect(lifecycleRegistry.isEnabled('lifecycle-tool')).toBe(true);
+      expect(lifecycleRegistry.getHandler('lifecycle-tool')).toBe(handler);
+
+      expect(lifecycleRegistry.unregister('lifecycle-tool')).toBe(true);
+      expect(lifecycleRegistry.unregister('lifecycle-tool')).toBe(false);
+      expect(lifecycleRegistry.get('lifecycle-tool')).toBeUndefined();
+      expect(lifecycleRegistry.isEnabled('lifecycle-tool')).toBe(false);
+      expect(() => lifecycleRegistry.disable('lifecycle-tool')).toThrow('not registered');
+    });
+  });
+
   describe('checkPermission', () => {
     let restrictedRegistry: ToolRegistry;
 

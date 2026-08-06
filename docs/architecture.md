@@ -878,6 +878,11 @@ extension points and are not runtime-registered by the main application. Tools a
 through metadata described in `tool-registry.md`: capabilities, permissions,
 evaluator policy, audit level, sandbox policy, and output sensitivity. Tool
 availability is separate from evaluator review policy.
+The reviewed `LETHEBOT_DISABLED_TOOLS` setting is a restart-scoped enablement
+boundary: disabled entries remain registered for owner inspection and rollback,
+but registry permission/handler lookup and Pi provider exposure fail closed for
+new calls. In-flight calls are allowed to finish; removing a name re-enables it
+on the next composition.
 
 ### Background Workers
 

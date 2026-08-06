@@ -22,6 +22,7 @@ export interface ActorContext {
 
 export class ToolRegistry {
   private tools = new Map<string, ToolRegistryEntry>();
+  private disabledTools = new Set<string>();
 
   /**
    * 注册工具
@@ -56,6 +57,45 @@ export class ToolRegistry {
   }
 
   /**
+   * Unregister a tool and discard its local enablement state.
+   * Returns false when the tool was not registered.
+   */
+  unregister(name: string): boolean {
+    const removed = this.tools.delete(name);
+    this.disabledTools.delete(name);
+    return removed;
+  }
+
+  /**
+   * Disable a registered tool. In-flight handler calls are not interrupted.
+   */
+  disable(name: string): void {
+    this.assertRegistered(name);
+    this.disabledTools.add(name);
+  }
+
+  /**
+   * Re-enable a previously disabled registered tool.
+   */
+  enable(name: string): void {
+    this.assertRegistered(name);
+    this.disabledTools.delete(name);
+  }
+
+  /**
+   * Return whether a registered tool can be selected for a new invocation.
+   */
+  isEnabled(name: string): boolean {
+    return this.tools.has(name) && !this.disabledTools.has(name);
+  }
+
+  private assertRegistered(name: string): void {
+    if (!this.tools.has(name)) {
+      throw new Error('Tool is not registered');
+    }
+  }
+
+  /**
    * 获取工具元数据
    */
   get(name: string): ToolRegistryEntry | undefined {
@@ -81,7 +121,7 @@ export class ToolRegistry {
    */
   getHandler(name: string): ToolHandler | undefined {
     const tool = this.tools.get(name);
-    return tool?.handler;
+    return tool && this.isEnabled(name) ? tool.handler : undefined;
   }
 
   /**
@@ -93,10 +133,9 @@ export class ToolRegistry {
     context: InvocationContext
   ): boolean {
     const tool = this.tools.get(toolName);
-    if (!tool) {
+    if (!tool || !this.isEnabled(toolName)) {
       return false;
     }
-
     const { permissions } = tool;
 
     // 检查 actor 权限
@@ -143,7 +182,7 @@ export class ToolRegistry {
    */
   requiresEvaluator(toolName: string): boolean {
     const tool = this.tools.get(toolName);
-    return tool?.evaluatorPolicy === 'required';
+    return Boolean(tool && this.isEnabled(toolName) && tool.evaluatorPolicy === 'required');
   }
 }
 

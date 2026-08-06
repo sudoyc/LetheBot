@@ -30,6 +30,7 @@ type OptionalRegistrationStatus = 'enabled' | 'disabled' | 'inconsistent';
 export interface RuntimeToolsCatalogItem {
   name: string;
   capabilities: ToolCapability[];
+  enabled: boolean;
   availableHere: boolean;
   evaluatorRequired: boolean;
 }
@@ -65,7 +66,7 @@ export function createRuntimeToolsTool(
   return {
     name: 'runtime.tools',
     version: '1.0.0',
-    description: 'Inspect the bounded enabled tool catalog and coarse optional-tool state.',
+    description: 'Inspect the bounded registered tool catalog and coarse optional-tool state.',
     capabilities: ['read_local'],
     permissions: {
       allowedActors: ['owner', 'admin'],
@@ -106,10 +107,11 @@ export function createRuntimeToolsTool(
                   maxItems: KNOWN_CAPABILITIES.size,
                   items: { type: 'string' },
                 },
+                enabled: { type: 'boolean' },
                 availableHere: { type: 'boolean' },
                 evaluatorRequired: { type: 'boolean' },
               },
-              required: ['name', 'capabilities', 'availableHere', 'evaluatorRequired'],
+              required: ['name', 'capabilities', 'enabled', 'availableHere', 'evaluatorRequired'],
               additionalProperties: false,
             },
           },
@@ -162,12 +164,13 @@ function createRuntimeToolsHandler(
       const projected = sorted.map((entry) => projectCatalogItem(
         entry,
         dependencies.registry.checkPermission(entry.name, request.actor, request.context),
+        dependencies.registry.isEnabled(entry.name),
       ));
       const availableHereCount = projected.reduce(
         (count, entry) => count + (entry.item.availableHere ? 1 : 0),
         0,
       );
-      const optionalConfiguration = inspectOptionalConfiguration(sorted);
+      const optionalConfiguration = inspectOptionalConfiguration(sorted, dependencies.registry);
       let selected = projected.slice(0, MAX_CATALOG_ENTRIES);
       let truncated = selected.length < projected.length;
 
@@ -206,6 +209,7 @@ function createRuntimeToolsHandler(
 function projectCatalogItem(
   entry: ToolRegistryEntry,
   availableHere: boolean,
+  enabled: boolean,
 ): ProjectedCatalogItem {
   if (typeof entry.name !== 'string') {
     throw new RuntimeToolsError('runtime.tools is unavailable');
@@ -220,6 +224,7 @@ function projectCatalogItem(
     item: {
       name: boundedName,
       capabilities,
+      enabled,
       availableHere,
       evaluatorRequired: entry.evaluatorPolicy === 'required',
     },
@@ -229,15 +234,18 @@ function projectCatalogItem(
 
 function inspectOptionalConfiguration(
   entries: readonly ToolRegistryEntry[],
+  registry: ToolRegistry,
 ): RuntimeToolsOutput['optionalConfiguration'] {
   const names = new Set(entries.map((entry) => entry.name));
-  const workspaceList = names.has('workspace.list');
-  const workspaceRead = names.has('workspace.read_text');
-  const workspace = workspaceList && workspaceRead
-    ? 'enabled'
-    : !workspaceList && !workspaceRead
-      ? 'disabled'
-      : 'inconsistent';
+  const workspaceListRegistered = names.has('workspace.list');
+  const workspaceReadRegistered = names.has('workspace.read_text');
+  const workspace = !workspaceListRegistered && !workspaceReadRegistered
+    ? 'disabled'
+    : !workspaceListRegistered || !workspaceReadRegistered
+      ? 'inconsistent'
+      : registry.isEnabled('workspace.list') && registry.isEnabled('workspace.read_text')
+        ? 'enabled'
+        : 'disabled';
 
   const webFetch = entries.find((entry) => entry.name === 'web.fetch_text');
   if (!webFetch) {
@@ -263,7 +271,7 @@ function inspectOptionalConfiguration(
   }
   return {
     workspace,
-    webFetch: 'enabled',
+    webFetch: registry.isEnabled('web.fetch_text') ? 'enabled' : 'disabled',
     webFetchAllowedOriginCount: origins.length,
   };
 }

@@ -120,6 +120,29 @@ allow only origins they intend the bot to contact. No additional container
 network permission is created by the setting; existing runtime egress controls
 remain independently authoritative.
 
+`LETHEBOT_DISABLED_TOOLS` accepts a comma-separated subset of the reviewed
+canonical tool names. The setting is validated before the application opens its
+SQLite database; unknown names and duplicates fail startup. A disabled tool
+remains in the owner catalog for inspection but is omitted from Pi exposure and
+blocked by the registry/policy handler path. The setting is restart-scoped:
+in-flight calls are not interrupted, and removing a name re-enables it only at
+the next application composition.
+
+For an env-file based launcher, owners can inspect or change this setting
+without editing unrelated secrets:
+
+```bash
+pnpm cli list-tools --env-file .env
+pnpm cli tool-status web.fetch_text --env-file .env
+pnpm cli disable-tool web.fetch_text --env-file .env
+pnpm cli enable-tool web.fetch_text --env-file .env
+```
+
+The mutation commands require an explicit env-file path, update only the
+`LETHEBOT_DISABLED_TOOLS` assignment atomically, and do not hot-mutate a running
+process. Docker, systemd, and other process managers can provide the variable
+directly when their environment is managed outside a file.
+
 `LETHEBOT_GOVERNANCE_ENABLED` only accepts literal `true` or `false`. When it is
 `true`, the governance host must be exact `127.0.0.1` or `::1`, its port must be
 an integer in `1..65535` different from `LETHEBOT_PORT`, the session TTL must be

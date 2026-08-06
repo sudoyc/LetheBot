@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -19,6 +19,7 @@ const { EvaluatorDecisionRepository } = await import(
   '../../src/storage/evaluator-decision-repository.js'
 );
 const { ToolRegistry } = await import('../../src/tools/registry.js');
+const { KNOWN_TOOL_NAMES } = await import('../../src/tools/known-tools.js');
 
 describe('Pi runtime configuration wiring', () => {
   it('registers only the reviewed production tool catalog', async () => {
@@ -45,16 +46,10 @@ describe('Pi runtime configuration wiring', () => {
       app = new LetheBotApp();
       const registry = Reflect.get(app, 'toolRegistry');
       expect(registry).toBeInstanceOf(ToolRegistry);
+      const optionalNames = new Set(['workspace.list', 'workspace.read_text', 'web.fetch_text']);
       expect((registry as InstanceType<typeof ToolRegistry>).list()
         .map((entry) => entry.name)
-        .sort()).toEqual([
-        'group.recent_summary',
-        'memory.disable',
-        'memory.propose',
-        'memory.search',
-        'runtime.status',
-        'runtime.tools',
-      ]);
+        .sort()).toEqual(KNOWN_TOOL_NAMES.filter((name) => !optionalNames.has(name)).sort());
       expect((registry as InstanceType<typeof ToolRegistry>).get('runtime.tools')).toMatchObject({
         capabilities: ['read_local'],
         permissions: {
@@ -81,6 +76,71 @@ describe('Pi runtime configuration wiring', () => {
       ]) {
         expect((registry as InstanceType<typeof ToolRegistry>).get(dormantName)).toBeUndefined();
       }
+    } finally {
+      await app?.stop();
+      process.env = originalEnv;
+      resetConfig();
+      rmSync(testDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects unknown disabled tools before opening the configured database', () => {
+    const originalEnv = process.env;
+    const testDir = mkdtempSync(join(tmpdir(), 'lethebot-disabled-tool-config-'));
+    const dbPath = join(testDir, 'lethebot.db');
+
+    try {
+      process.env = {
+        ...originalEnv,
+        LETHEBOT_DB_PATH: dbPath,
+        LETHEBOT_DISABLED_TOOLS: 'not.a.reviewed.tool',
+      };
+      resetConfig();
+
+      expect(() => new LetheBotApp()).toThrow('Invalid configuration');
+      expect(existsSync(dbPath)).toBe(false);
+    } finally {
+      process.env = originalEnv;
+      resetConfig();
+      rmSync(testDir, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts disabled optional tools when their prerequisites are absent', async () => {
+    const originalEnv = process.env;
+    const testDir = mkdtempSync(join(tmpdir(), 'lethebot-disabled-optional-tools-'));
+    let app: InstanceType<typeof LetheBotApp> | undefined;
+
+    try {
+      process.env = {
+        ...originalEnv,
+        LETHEBOT_TEST: 'true',
+        LETHEBOT_DB_PATH: join(testDir, 'lethebot.db'),
+        LETHEBOT_DISABLED_TOOLS: 'memory.search, workspace.list, workspace.read_text, web.fetch_text',
+        LOG_LEVEL: 'fatal',
+        ONEBOT_TRANSPORT: 'http',
+        PI_PROVIDER: 'mock',
+        PI_MODEL: 'mock',
+        EVALUATOR_PROVIDER: 'mock',
+        EVALUATOR_MODEL: 'mock',
+      };
+      delete process.env.LETHEBOT_WORKSPACE_ROOT;
+      delete process.env.LETHEBOT_WEB_FETCH_ALLOWED_ORIGINS;
+      resetConfig();
+
+      app = new LetheBotApp();
+      const registry = Reflect.get(app, 'toolRegistry') as InstanceType<typeof ToolRegistry>;
+      expect(registry.get('memory.search')).toBeDefined();
+      expect(registry.isEnabled('memory.search')).toBe(false);
+      expect(registry.checkPermission(
+        'memory.search',
+        { actorClass: 'user' },
+        'private_chat',
+      )).toBe(false);
+      expect(registry.getHandler('memory.search')).toBeUndefined();
+      expect(registry.get('workspace.list')).toBeUndefined();
+      expect(registry.get('workspace.read_text')).toBeUndefined();
+      expect(registry.get('web.fetch_text')).toBeUndefined();
     } finally {
       await app?.stop();
       process.env = originalEnv;

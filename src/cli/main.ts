@@ -25,6 +25,12 @@ import {
   type ModelInvocationStatus,
 } from './governance.js';
 import { loadConfig } from '../config/index.js';
+import {
+  inspectToolConfiguration,
+  listToolConfiguration,
+  readDisabledToolsEnvFile,
+  updateToolEnvFile,
+} from './tool-config.js';
 import { redactSecretsInText } from '../memory/secret-scan.js';
 import type {
   PrivacyPreferenceState,
@@ -659,6 +665,55 @@ program
   .version(VERSION)
   .hook('preAction', (_thisCommand, actionCommand) => {
     rejectEmptyStringOptionValues(actionCommand);
+  });
+
+program
+  .command('list-tools')
+  .description('List reviewed tool enablement from process config or an explicit env file')
+  .option('--env-file <path>', 'Inspect LETHEBOT_DISABLED_TOOLS in this env file')
+  .action((options: { envFile?: string }) => {
+    const disabledTools = options.envFile === undefined
+      ? loadConfig().disabledTools
+      : readDisabledToolsEnvFile(options.envFile);
+    printJson({
+      source: options.envFile === undefined ? 'process_environment' : 'env_file',
+      restartScoped: true,
+      tools: listToolConfiguration(disabledTools),
+    });
+  });
+
+program
+  .command('tool-status')
+  .description('Inspect one reviewed tool enablement state')
+  .argument('<toolName>', 'Canonical reviewed tool name')
+  .option('--env-file <path>', 'Inspect LETHEBOT_DISABLED_TOOLS in this env file')
+  .action((toolName: string, options: { envFile?: string }) => {
+    const disabledTools = options.envFile === undefined
+      ? loadConfig().disabledTools
+      : readDisabledToolsEnvFile(options.envFile);
+    printJson({
+      source: options.envFile === undefined ? 'process_environment' : 'env_file',
+      restartScoped: true,
+      tool: inspectToolConfiguration(disabledTools, toolName),
+    });
+  });
+
+program
+  .command('disable-tool')
+  .description('Persistently disable one reviewed tool in an explicit launcher env file')
+  .argument('<toolName>', 'Canonical reviewed tool name')
+  .requiredOption('--env-file <path>', 'Env file passed explicitly to the LetheBot launcher')
+  .action((toolName: string, options: { envFile: string }) => {
+    printJson(updateToolEnvFile(options.envFile, toolName, 'disable'));
+  });
+
+program
+  .command('enable-tool')
+  .description('Persistently enable one reviewed tool in an explicit launcher env file')
+  .argument('<toolName>', 'Canonical reviewed tool name')
+  .requiredOption('--env-file <path>', 'Env file passed explicitly to the LetheBot launcher')
+  .action((toolName: string, options: { envFile: string }) => {
+    printJson(updateToolEnvFile(options.envFile, toolName, 'enable'));
   });
 
 program

@@ -29,13 +29,45 @@ describe('local acceptance evidence template', () => {
       .replaceAll('<completed|failed>', 'completed')
       .replaceAll('<success|failed|rejected>', 'success')
       .replaceAll('<pass|fail>', 'pass')
-      .replaceAll('<positive-number>', '1')
+      .replaceAll('<positive-number>', '10')
       .replaceAll('<verified|failed>', 'verified')
       .replaceAll('<milliseconds-at-most-15000>', '12000')
       .replaceAll('<number>', '0')
       .replaceAll('<redacted steps>', 'redacted local steps')
       .replaceAll('<fix|rerun|document local environment issue>', 'fix')
       .replaceAll('<redacted-or-internal-name>', 'internal-operator')
+      .replaceAll('<sha256>', `sha256:${'a'.repeat(64)}`)
+      .replaceAll('<internal-release-ref>', 'release:prior-reviewed')
+      .replace(
+        `- [x] Scenario ID: LIVE-GRP-01
+  - Scenario result: pass
+  - Participant count: 10
+  - Observed exact-mention turns: 10
+  - Accepted turns: 10
+  - Terminal turns: 10
+  - Delivered turns: 10
+  - Speaker or scope errors: 0`,
+        `- [x] Scenario ID: LIVE-GRP-01
+  - Scenario result: pass
+  - Participant count: 10
+  - Observed exact-mention turns: 20
+  - Accepted turns: 20
+  - Terminal turns: 20
+  - Delivered turns: 20
+  - Speaker or scope errors: 0`,
+      )
+      .replace(
+        `- [x] Scenario ID: LIVE-QUOTE-01
+  - Scenario result: pass
+  - Observed quote turns: 10
+  - Exact target matches: 10
+  - Outside-window targets: 10`,
+        `- [x] Scenario ID: LIVE-QUOTE-01
+  - Scenario result: pass
+  - Observed quote turns: 12
+  - Exact target matches: 12
+  - Outside-window targets: 10`,
+      )
       .replaceAll('<YYYY-MM-DD>', '2026-07-08');
   }
 
@@ -168,6 +200,32 @@ describe('local acceptance evidence template', () => {
     });
   });
 
+  it('generates immutable release identity and every controlled P4 live evidence scenario', () => {
+    const template = buildLocalAcceptanceEvidenceTemplate({
+      generatedAt: '2026-07-03T14:20:00.000Z',
+    });
+
+    expect(template).toContain('- [ ] Candidate release SHA-256: <sha256>');
+    expect(template).toContain('- [ ] Prior rollback release reference: <internal-release-ref>');
+    expect(template).toContain('- [ ] Candidate DB integrity: <ok|degraded>');
+    expect(template).toContain('- [ ] Candidate DB foreign-key violations: <number>');
+    expect(template).toContain('- [ ] Candidate deployment outcome: <verified|failed>');
+    expect(template).toContain('- [ ] Candidate restart outcome: <verified|failed>');
+
+    for (const scenarioId of [
+      'LIVE-PRI-01',
+      'LIVE-GRP-01',
+      'LIVE-QUOTE-01',
+      'LIVE-RAPID-01',
+      'LIVE-MEM-01',
+      'LIVE-GOV-01',
+      'LIVE-TOOL-01',
+      'LIVE-OPS-01',
+    ]) {
+      expect(template).toContain(`- [ ] Scenario ID: ${scenarioId}`);
+    }
+  });
+
   it('supports opt-in complete acceptance validation without changing default share-safe validation', () => {
     const template = buildLocalAcceptanceEvidenceTemplate({
       generatedAt: '2026-07-03T14:20:00.000Z',
@@ -249,6 +307,95 @@ describe('local acceptance evidence template', () => {
     expect(slowResult.valid).toBe(false);
     expect(slowResult.findings.map((finding) => finding.ruleId)).toContain(
       'invalid-complete-latency',
+    );
+  });
+
+  it.each([
+    {
+      label: 'a private-turn shortfall',
+      from: '  - Observed turns: 10',
+      to: '  - Observed turns: 9',
+    },
+    {
+      label: 'a dropped exact-mention delivery',
+      from: '  - Observed exact-mention turns: 20',
+      to: '  - Observed exact-mention turns: 19',
+    },
+    {
+      label: 'an inexact quote target',
+      from: '  - Exact target matches: 12',
+      to: '  - Exact target matches: 11',
+    },
+    {
+      label: 'a rapid-turn shortfall',
+      from: '  - Overlapping turns: 10',
+      to: '  - Overlapping turns: 9',
+    },
+    {
+      label: 'a private-in-group memory leak',
+      from: '  - Private-in-group leaks: 0',
+      to: '  - Private-in-group leaks: 1',
+    },
+    {
+      label: 'an unauthorized governance effect',
+      from: '  - Unauthorized effects: 0',
+      to: '  - Unauthorized effects: 1',
+    },
+    {
+      label: 'a tool payload leak',
+      from: '  - Payload leaks: 0',
+      to: '  - Payload leaks: 1',
+    },
+    {
+      label: 'a foreign-key violation',
+      from: '  - Foreign-key violations: 0',
+      to: '  - Foreign-key violations: 1',
+    },
+  ])('rejects $label in controlled P4 live evidence', ({ from, to }) => {
+    const evidence = buildCompleteRedactedEvidence().replace(from, to);
+    expect(evidence).toContain(to);
+
+    const result = validateLocalAcceptanceEvidence(evidence, { requireComplete: true });
+
+    expect(result.valid).toBe(false);
+    expect(result.findings.map((finding) => finding.ruleId)).toContain(
+      'invalid-complete-live-scenario-evidence',
+    );
+  });
+
+  it.each([
+    'Candidate release SHA-256',
+    'Prior rollback release reference',
+    'Candidate DB integrity',
+    'Candidate DB foreign-key violations',
+    'Candidate deployment outcome',
+    'Candidate restart outcome',
+  ])('requires checked complete release evidence for %s', (label) => {
+    const evidence = buildCompleteRedactedEvidence().replace(`- [x] ${label}:`, `- [ ] ${label}:`);
+
+    const result = validateLocalAcceptanceEvidence(evidence, { requireComplete: true });
+
+    expect(result.valid).toBe(false);
+    expect(result.findings.map((finding) => finding.ruleId)).toContain(
+      'incomplete-required-checklist',
+    );
+  });
+
+  it('rejects malformed candidate digests and failed candidate activation outcomes', () => {
+    const invalidDigest = buildCompleteRedactedEvidence().replace(
+      `sha256:${'a'.repeat(64)}`,
+      'sha256:abc',
+    );
+    expect(validateLocalAcceptanceEvidence(invalidDigest, { requireComplete: true }).valid).toBe(false);
+
+    const failedDeployment = buildCompleteRedactedEvidence().replace(
+      '- [x] Candidate deployment outcome: verified',
+      '- [x] Candidate deployment outcome: failed',
+    );
+    const result = validateLocalAcceptanceEvidence(failedDeployment, { requireComplete: true });
+    expect(result.valid).toBe(false);
+    expect(result.findings.map((finding) => finding.ruleId)).toContain(
+      'invalid-complete-status',
     );
   });
 

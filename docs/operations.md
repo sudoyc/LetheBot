@@ -42,6 +42,31 @@ such as `api_key=sk-...-qq-...` preserve both
 `[REDACTED:api_key_assignment]` and `[REDACTED:platform_id]` marker evidence in
 formatted smoke errors while omitting raw values and stack paths.
 
+## Tool Catalog Lifecycle
+
+The production tool catalog is explicit and restart-scoped. `runtime.tools`
+provides owner/admin list and current-context status without returning paths,
+origins, handlers, payloads, or identifiers. Operators can inspect and change
+the config-backed enablement boundary for an env-file based launcher:
+
+```bash
+pnpm cli list-tools --env-file .env
+pnpm cli tool-status memory.search --env-file .env
+pnpm cli disable-tool memory.search --env-file .env
+pnpm cli enable-tool memory.search --env-file .env
+```
+
+The mutation commands validate canonical reviewed names, preserve unrelated env
+settings, and atomically update only `LETHEBOT_DISABLED_TOOLS`. Restart the
+application after a change. Existing in-flight calls finish under their
+admitted state; new turns use the updated catalog. A disabled entry remains
+registered for inspection and rollback but is absent from Pi's provider tools,
+has no resolved handler, and fails the policy gate.
+
+For Docker, systemd, or another process manager that does not use an editable
+env file, set `LETHEBOT_DISABLED_TOOLS` in that manager's configuration and
+perform its normal controlled restart instead.
+
 ## Configured Retention
 
 The canonical configured policy defaults are raw events 90 days, chat messages

@@ -123,36 +123,42 @@ describe('built-in runtime.tools tool', () => {
           name: 'group.recent_summary',
           capabilities: ['read_local'],
           availableHere: false,
+          enabled: true,
           evaluatorRequired: false,
         },
         {
           name: 'memory.search',
           capabilities: ['read_local'],
           availableHere: true,
+          enabled: true,
           evaluatorRequired: false,
         },
         {
           name: 'runtime.tools',
           capabilities: ['read_local'],
           availableHere: true,
+          enabled: true,
           evaluatorRequired: false,
         },
         {
           name: 'web.fetch_text',
           capabilities: ['read_local'],
           availableHere: true,
+          enabled: true,
           evaluatorRequired: false,
         },
         {
           name: 'workspace.list',
           capabilities: ['read_local'],
           availableHere: true,
+          enabled: true,
           evaluatorRequired: false,
         },
         {
           name: 'workspace.read_text',
           capabilities: ['read_local'],
           availableHere: true,
+          enabled: true,
           evaluatorRequired: false,
         },
       ],
@@ -199,6 +205,39 @@ describe('built-in runtime.tools tool', () => {
           webFetchAllowedOriginCount: null,
         },
       });
+  });
+
+  it('keeps disabled tools inspectable while excluding them from current availability', async () => {
+    const registry = new ToolRegistry();
+    registry.register(fakeTool('memory.search'));
+    registry.register(fakeTool('workspace.list'));
+    registry.register(fakeTool('workspace.read_text'));
+    registry.register(fakeTool('web.fetch_text', {
+      sandbox: { allowedOrigins: ['https://docs.example.invalid'] },
+    }));
+    registry.register(createRuntimeToolsTool({ registry }));
+    for (const name of [
+      'memory.search',
+      'workspace.list',
+      'workspace.read_text',
+      'web.fetch_text',
+    ]) {
+      registry.disable(name);
+    }
+
+    const catalog = await registry.get('runtime.tools')?.handler(toolRequest({})) as RuntimeToolsOutput;
+
+    expect(catalog.registeredCount).toBe(5);
+    expect(catalog.availableHereCount).toBe(1);
+    expect(catalog.tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'memory.search', enabled: false, availableHere: false }),
+      expect.objectContaining({ name: 'runtime.tools', enabled: true, availableHere: true }),
+    ]));
+    expect(catalog.optionalConfiguration).toEqual({
+      workspace: 'disabled',
+      webFetch: 'disabled',
+      webFetchAllowedOriginCount: 1,
+    });
   });
 
   it('redacts and bounds a large catalog after deterministic sorting', async () => {

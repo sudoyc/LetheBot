@@ -1201,6 +1201,48 @@ describe('PiAdapter', () => {
       toolRegistry.register(testTool);
     });
 
+    it('omits a registered disabled tool from the provider catalog and execution path', async () => {
+      const baseEntry = toolRegistry.get('test_tool');
+      if (!baseEntry) {
+        throw new Error('Expected test tool registration');
+      }
+      const disabledHandler = vi.fn(async () => ({ result: 'must not execute' }));
+      toolRegistry.register({
+        ...baseEntry,
+        name: 'memory.search',
+        handler: disabledHandler,
+      });
+      toolRegistry.disable('memory.search');
+
+      expect(toolRegistry.get('memory.search')).toBeDefined();
+      expect(toolRegistry.isEnabled('memory.search')).toBe(false);
+      expect(toolRegistry.checkPermission(
+        'memory.search',
+        { actorClass: 'user' },
+        'private_chat',
+      )).toBe(false);
+      expect(toolRegistry.getHandler('memory.search')).toBeUndefined();
+      expect(policyGate.checkToolCall({
+        toolName: 'memory.search',
+        actor: { actorClass: 'user' },
+        context: 'private_chat',
+      })).toMatchObject({ allowed: false });
+
+      await adapter.runTurn({
+        contextPack: createMinimalContextPack(),
+        systemPrompt: 'Test system prompt',
+        actor: { actorClass: 'user' },
+        invocationContext: 'private_chat',
+        turnId: 'turn-disabled-tool-catalog',
+        sourceEventIds: [],
+      });
+
+      const providerToolNames = mockAgent.state.tools.map((tool: { name: string }) => tool.name);
+      expect(providerToolNames).toContain(toProviderToolName('test_tool'));
+      expect(providerToolNames).not.toContain(toProviderToolName('memory.search'));
+      expect(disabledHandler).not.toHaveBeenCalled();
+    });
+
     it('should convert allowed tools to Pi AgentTool format', async () => {
       const contextPack = createMinimalContextPack();
       const input: PiAdapterInput = {
@@ -4752,12 +4794,14 @@ describe('PiAdapter', () => {
                 name: 'policy_test_tool',
                 capabilities: ['read_context'],
                 availableHere: false,
+                enabled: true,
                 evaluatorRequired: false,
               },
               {
                 name: 'runtime.tools',
                 capabilities: ['read_local'],
                 availableHere: true,
+                enabled: true,
                 evaluatorRequired: false,
               },
             ],

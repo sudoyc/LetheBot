@@ -804,13 +804,17 @@ reasons, and filesystem error messages. Adjacent `sk-...-qq-...` fragments in
 file contents or assignment-shaped filenames must preserve both marker classes
 without returning raw platform IDs or bare numeric platform-like IDs.
 The private owner/admin `runtime.tools` inspector exposes only bounded redacted
-tool names, capabilities, current-context availability, evaluator requirements,
-counts, truncation/redaction flags, coarse workspace/web-fetch registration
-state, and the configured origin count. It never returns workspace roots,
-origin values, permission identifier lists, descriptions, handlers, payloads,
-credentials, private identifiers, or diagnostics. Inspection does not mutate
-the registry, configuration, filesystem, network, or durable domain state;
-static environment configuration remains the optional-tool authority.
+tool names, capabilities, current enablement and current-context availability,
+evaluator requirements, counts, truncation/redaction flags, coarse
+workspace/web-fetch registration state, and the configured origin count. It
+never returns workspace roots, origin values, permission identifier lists,
+descriptions, handlers, payloads, credentials, private identifiers, or
+diagnostics. Inspection does not mutate the registry, configuration,
+filesystem, network, or durable domain state. `LETHEBOT_DISABLED_TOOLS` is the
+restart-scoped local authority: a disabled entry remains inspectable but is
+removed from Pi exposure and handler lookup for new calls; in-flight calls are
+not interrupted. Owner CLI mutations require an explicit env-file path and
+preserve unrelated settings.
 Production workspace access is absent unless one absolute existing root is
 configured. `workspace.list` exposes bounded non-recursive metadata only;
 `workspace.read_text` reads at most 2,048 bytes from one strict UTF-8 regular

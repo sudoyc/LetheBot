@@ -249,6 +249,122 @@ const TARGET_COMPLETE_EVIDENCE_ITEMS = [
     verificationCommand: 'pnpm vitest run tests/integration/context-history.test.ts tests/integration/e2e-conversation.test.ts',
   },
 ] as const;
+type CompleteLiveAcceptanceFieldValidation =
+  | { kind: 'literal'; expected: string }
+  | { kind: 'integer'; minimum: number; maximum?: number };
+
+interface CompleteLiveAcceptanceField {
+  label: string;
+  templateValue: string;
+  validation: CompleteLiveAcceptanceFieldValidation;
+}
+
+interface CompleteLiveAcceptanceScenario {
+  id: string;
+  requirement: string;
+  fields: readonly CompleteLiveAcceptanceField[];
+}
+
+const P4_LIVE_EVIDENCE_ITEMS: readonly CompleteLiveAcceptanceScenario[] = [
+  {
+    id: 'LIVE-PRI-01',
+    requirement: '10 private direct turns are accepted, terminal, delivered, and linked to consistent conversation/source/action/turn evidence.',
+    fields: [
+      { label: 'Scenario result', templateValue: '<pass|fail>', validation: { kind: 'literal', expected: 'pass' } },
+      { label: 'Observed turns', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 10, maximum: 10 } },
+      { label: 'Accepted turns', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 10, maximum: 10 } },
+      { label: 'Terminal turns', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 10, maximum: 10 } },
+      { label: 'Delivered turns', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 10, maximum: 10 } },
+      { label: 'Linkage violations', templateValue: '<number>', validation: { kind: 'integer', minimum: 0, maximum: 0 } },
+    ],
+  },
+  {
+    id: 'LIVE-GRP-01',
+    requirement: 'At least two participants send 20 exact-mention turns; every direct trigger is accepted, terminal, and delivered with no speaker or scope error.',
+    fields: [
+      { label: 'Scenario result', templateValue: '<pass|fail>', validation: { kind: 'literal', expected: 'pass' } },
+      { label: 'Participant count', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 2 } },
+      { label: 'Observed exact-mention turns', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 20, maximum: 20 } },
+      { label: 'Accepted turns', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 20, maximum: 20 } },
+      { label: 'Terminal turns', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 20, maximum: 20 } },
+      { label: 'Delivered turns', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 20, maximum: 20 } },
+      { label: 'Speaker or scope errors', templateValue: '<number>', validation: { kind: 'integer', minimum: 0, maximum: 0 } },
+    ],
+  },
+  {
+    id: 'LIVE-QUOTE-01',
+    requirement: '12 same-conversation reply-to-bot/quote turns, including an older target outside the rolling window, resolve exact targets without proximity or cross-group matching.',
+    fields: [
+      { label: 'Scenario result', templateValue: '<pass|fail>', validation: { kind: 'literal', expected: 'pass' } },
+      { label: 'Observed quote turns', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 12, maximum: 12 } },
+      { label: 'Exact target matches', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 12, maximum: 12 } },
+      { label: 'Outside-window targets', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 1 } },
+      { label: 'Proximity guesses', templateValue: '<number>', validation: { kind: 'integer', minimum: 0, maximum: 0 } },
+      { label: 'Cross-group matches', templateValue: '<number>', validation: { kind: 'integer', minimum: 0, maximum: 0 } },
+    ],
+  },
+  {
+    id: 'LIVE-RAPID-01',
+    requirement: '10 overlapping turns span at least three conversations; each conversation stays ordered and no state, tool, or context crosses boundaries.',
+    fields: [
+      { label: 'Scenario result', templateValue: '<pass|fail>', validation: { kind: 'literal', expected: 'pass' } },
+      { label: 'Conversation count', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 3 } },
+      { label: 'Overlapping turns', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 10, maximum: 10 } },
+      { label: 'Same-conversation order violations', templateValue: '<number>', validation: { kind: 'integer', minimum: 0, maximum: 0 } },
+      { label: 'State tool or context crossovers', templateValue: '<number>', validation: { kind: 'integer', minimum: 0, maximum: 0 } },
+      { label: 'Cross-conversation overlap observed', templateValue: '<true|false>', validation: { kind: 'literal', expected: 'true' } },
+    ],
+  },
+  {
+    id: 'LIVE-MEM-01',
+    requirement: 'Private proposal/approval/restart/recall and opted-in exact-group continuity pass; disable/delete removes memory immediately with no private-in-group leak.',
+    fields: [
+      { label: 'Scenario result', templateValue: '<pass|fail>', validation: { kind: 'literal', expected: 'pass' } },
+      { label: 'Private proposal approval restart recall', templateValue: '<verified|failed>', validation: { kind: 'literal', expected: 'verified' } },
+      { label: 'Exact-group continuity', templateValue: '<verified|failed>', validation: { kind: 'literal', expected: 'verified' } },
+      { label: 'Disable immediate', templateValue: '<verified|failed>', validation: { kind: 'literal', expected: 'verified' } },
+      { label: 'Delete immediate', templateValue: '<verified|failed>', validation: { kind: 'literal', expected: 'verified' } },
+      { label: 'Private-in-group leaks', templateValue: '<number>', validation: { kind: 'integer', minimum: 0, maximum: 0 } },
+    ],
+  },
+  {
+    id: 'LIVE-GOV-01',
+    requirement: 'Memory, why, group-summary policy, and unauthorized attempts obey exact authority/scope; unauthorized attempts have zero effect and audits stay complete and redacted.',
+    fields: [
+      { label: 'Scenario result', templateValue: '<pass|fail>', validation: { kind: 'literal', expected: 'pass' } },
+      { label: 'Memory command', templateValue: '<verified|failed>', validation: { kind: 'literal', expected: 'verified' } },
+      { label: 'Why command', templateValue: '<verified|failed>', validation: { kind: 'literal', expected: 'verified' } },
+      { label: 'Group-summary policy', templateValue: '<verified|failed>', validation: { kind: 'literal', expected: 'verified' } },
+      { label: 'Audit redaction', templateValue: '<verified|failed>', validation: { kind: 'literal', expected: 'verified' } },
+      { label: 'Unauthorized attempts', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 1 } },
+      { label: 'Unauthorized effects', templateValue: '<number>', validation: { kind: 'integer', minimum: 0, maximum: 0 } },
+    ],
+  },
+  {
+    id: 'LIVE-TOOL-01',
+    requirement: 'At least one allowed Pi tool succeeds and one denied tool fails closed; both retain turn/evaluator/tool/audit chains with no payload leak.',
+    fields: [
+      { label: 'Scenario result', templateValue: '<pass|fail>', validation: { kind: 'literal', expected: 'pass' } },
+      { label: 'Allowed successes', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 1 } },
+      { label: 'Denied attempts', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 1 } },
+      { label: 'Both durable chains', templateValue: '<verified|failed>', validation: { kind: 'literal', expected: 'verified' } },
+      { label: 'Payload leaks', templateValue: '<number>', validation: { kind: 'integer', minimum: 0, maximum: 0 } },
+    ],
+  },
+  {
+    id: 'LIVE-OPS-01',
+    requirement: 'Readiness, DB integrity/FK, invocation usage, and restart remain healthy; the main Pi ledger is non-empty with truthful usage accounting.',
+    fields: [
+      { label: 'Scenario result', templateValue: '<pass|fail>', validation: { kind: 'literal', expected: 'pass' } },
+      { label: 'Readiness', templateValue: '<ready|not_ready>', validation: { kind: 'literal', expected: 'ready' } },
+      { label: 'Integrity', templateValue: '<ok|degraded>', validation: { kind: 'literal', expected: 'ok' } },
+      { label: 'Foreign-key violations', templateValue: '<number>', validation: { kind: 'integer', minimum: 0, maximum: 0 } },
+      { label: 'Main Pi invocations', templateValue: '<positive-number>', validation: { kind: 'integer', minimum: 1 } },
+      { label: 'Usage aggregation', templateValue: '<verified|failed>', validation: { kind: 'literal', expected: 'verified' } },
+      { label: 'Restart', templateValue: '<verified|failed>', validation: { kind: 'literal', expected: 'verified' } },
+    ],
+  },
+];
 
 const TARGET_COMPLETE_LATENCY_ITEM = 'R4 direct delivered-reply p95 milliseconds';
 const COMPLETE_TEMPLATE_REFERENCE_TIME = '2000-01-01T00:00:00.000Z';
@@ -319,6 +435,20 @@ pnpm --silent acceptance:validate-evidence -- /tmp/lethebot-acceptance-evidence.
 - [ ] Required acceptance DB hints confirm one successful Pi tool call with an approving evaluator decision linked to one completed Provider invocation, matching audit, and delivered action evidence.
 - [ ] Required command output summaries omit tokens, payloads, raw messages, QQ IDs, group IDs, local secret-file contents, and DB row contents.
 
+## Candidate / rollback evidence
+
+Use immutable aggregate identifiers only. Do not include deployment paths,
+registry credentials, service names that expose private hosts, or mutable tags.
+
+- [ ] Candidate release SHA-256: <sha256>
+- [ ] Prior rollback release reference: <internal-release-ref>
+- [ ] Prior rollback release SHA-256: <sha256>
+- [ ] Candidate DB integrity: <ok|degraded>
+- [ ] Candidate DB foreign-key violations: <number>
+- [ ] Candidate deployment outcome: <verified|failed>
+- [ ] Candidate restart outcome: <verified|failed>
+
+
 ## R0-R8 / TARGET_COMPLETE behavior matrix
 
 Each checked row means its named deterministic gate passed and, where the
@@ -336,6 +466,17 @@ ${TARGET_COMPLETE_EVIDENCE_ITEMS.map((item) => `- [ ] Scenario ID: ${item.id}
   - Verification command: \`${item.verificationCommand}\`
   - Required behavior: ${item.requirement}`).join('\n')}
 - [ ] ${TARGET_COMPLETE_LATENCY_ITEM}: <milliseconds-at-most-15000>
+
+## P4 controlled live acceptance matrix
+
+Each checked row attests the exact bounded aggregate fields below. The complete
+validator enforces document shape and thresholds only; it does not query the
+acceptance DB, contact QQ/Provider systems, or authenticate the observations.
+
+${P4_LIVE_EVIDENCE_ITEMS.map((item) => `- [ ] Scenario ID: ${item.id}
+${item.fields.map((field) => `  - ${field.label}: ${field.templateValue}`).join('\n')}
+  - Required behavior: ${item.requirement}`).join('\n')}
+
 
 ## Health / metrics evidence
 
@@ -504,6 +645,16 @@ function validateCompleteness(
     ...TARGET_COMPLETE_EVIDENCE_ITEMS.map((item) => ({
       pattern: new RegExp(`Scenario ID:\\s*${escapeRegExp(item.id)}$`),
     })),
+    ...P4_LIVE_EVIDENCE_ITEMS.map((item) => ({
+      pattern: new RegExp(`Scenario ID:\\s*${escapeRegExp(item.id)}$`),
+    })),
+    { pattern: /Candidate release SHA-256:/ },
+    { pattern: /Prior rollback release reference:/ },
+    { pattern: /Prior rollback release SHA-256:/ },
+    { pattern: /Candidate DB integrity:/ },
+    { pattern: /Candidate DB foreign-key violations:/ },
+    { pattern: /Candidate deployment outcome:/ },
+    { pattern: /Candidate restart outcome:/ },
     { pattern: new RegExp(`${escapeRegExp(TARGET_COMPLETE_LATENCY_ITEM)}:`) },
     { pattern: /\/healthz status:/ },
     { pattern: /\/healthz database ok:/ },
@@ -612,8 +763,10 @@ function validateCompleteness(
   });
 
   validateCompleteStatusValues(lines, addFinding);
+  validateCompleteReleaseEvidence(lines, addFinding);
   validateCompleteScenarioEvidence(lines, addFinding);
   validateCompleteLatency(lines, addFinding);
+  validateCompleteP4LiveEvidence(lines, addFinding);
   validateExclusiveCompleteOptions(lines, addFinding);
   validateCompleteProviderSelection(lines, addFinding);
   validateCompleteDocumentShape(lines, addFinding);
@@ -699,6 +852,59 @@ function validateCompleteScenarioEvidence(
       'Complete scenario evidence requires passing actual/result values, equal positive check counts, verified durable linkage, and the generated verification command.',
     );
   }
+}
+
+function validateCompleteP4LiveEvidence(
+  lines: string[],
+  addFinding: (line: number, ruleId: string, message: string) => void,
+): void {
+  for (const scenario of P4_LIVE_EVIDENCE_ITEMS) {
+    const scenarioIndex = lines.findIndex((line) =>
+      new RegExp(`^\\s*-\\s*\\[[ xX]\\]\\s+Scenario ID:\\s*${escapeRegExp(scenario.id)}$`).test(line),
+    );
+    if (scenarioIndex < 0) {
+      continue;
+    }
+
+    const valid = isCheckedChecklistLine(lines[scenarioIndex] ?? '')
+      && scenario.fields.every((field, fieldIndex) => {
+        const value = readStructuredScenarioValue(
+          lines[scenarioIndex + fieldIndex + 1],
+          field.label,
+        );
+        return isCompleteLiveAcceptanceFieldValid(value, field.validation);
+      });
+    if (valid) {
+      continue;
+    }
+
+    addFinding(
+      scenarioIndex + 1,
+      'invalid-complete-live-scenario-evidence',
+      'Complete P4 live evidence requires the generated scenario fields, exact bounded counts, passing states, and zero-tolerance outcomes.',
+    );
+  }
+}
+
+function isCompleteLiveAcceptanceFieldValid(
+  value: string | undefined,
+  validation: CompleteLiveAcceptanceFieldValidation,
+): boolean {
+  if (value === undefined) {
+    return false;
+  }
+
+  if (validation.kind === 'literal') {
+    return value === validation.expected;
+  }
+
+  if (!/^(?:0|[1-9]\d*)$/.test(value)) {
+    return false;
+  }
+  const numericValue = Number(value);
+  return Number.isSafeInteger(numericValue)
+    && numericValue >= validation.minimum
+    && (validation.maximum === undefined || numericValue <= validation.maximum);
 }
 
 function readStructuredScenarioValue(line: string | undefined, label: string): string | undefined {
@@ -797,6 +1003,10 @@ function completeEvidencePlaceholderPattern(placeholder: string): string | undef
       return '(?:ok|degraded)';
     case '<ready|not_ready>':
       return '(?:ready|not_ready)';
+    case '<sha256>':
+      return 'sha256:[0-9a-f]{64}';
+    case '<internal-release-ref>':
+      return '(?:release:[A-Za-z0-9][A-Za-z0-9._-]{0,63}|git:[0-9a-f]{7,40})';
     case '<redacted steps>':
       return '(?:redacted local steps|internal-step-summary)';
     case '<redacted-db-path-or-disposable-path>':
@@ -942,6 +1152,8 @@ function validateCompleteStatusValues(
     { pattern: /\/readyz readiness status:/, allowed: ['ready'] },
     { pattern: /agent_turns row exists with status:/, allowed: ['completed'] },
     { pattern: /action_executions row exists with status:/, allowed: ['success'] },
+    { pattern: /Candidate deployment outcome:/, allowed: ['verified'] },
+    { pattern: /Candidate restart outcome:/, allowed: ['verified'] },
   ];
 
   for (const [index, line] of lines.entries()) {
@@ -963,6 +1175,33 @@ function validateCompleteStatusValues(
         index + 1,
         'invalid-complete-status',
         'Checked completion evidence must record a successful ready/completed status value.',
+      );
+    }
+  }
+}
+
+function validateCompleteReleaseEvidence(
+  lines: string[],
+  addFinding: (line: number, ruleId: string, message: string) => void,
+): void {
+  for (const [index, line] of lines.entries()) {
+    if (!isCheckedChecklistLine(line)) {
+      continue;
+    }
+
+    if (/Candidate DB integrity:/.test(line) && readChecklistValue(line) !== 'ok') {
+      addFinding(
+        index + 1,
+        'invalid-complete-release-evidence',
+        'Candidate release evidence must report an intact database and zero foreign-key violations.',
+      );
+    }
+
+    if (/Candidate DB foreign-key violations:/.test(line) && readChecklistValue(line) !== '0') {
+      addFinding(
+        index + 1,
+        'invalid-complete-release-evidence',
+        'Candidate release evidence must report an intact database and zero foreign-key violations.',
       );
     }
   }

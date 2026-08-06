@@ -7,11 +7,17 @@
 
 import { z } from 'zod';
 import { isAbsolute } from 'node:path';
+import { isKnownToolName } from '../tools/known-tools.js';
 
 const ExactHttpsOriginSchema = z.string().min(1).max(2048).refine(
   isExactHttpsOrigin,
   { message: 'LETHEBOT_WEB_FETCH_ALLOWED_ORIGINS must contain exact HTTPS origins' },
 ).transform((value) => new URL(value).origin);
+
+const DisabledToolNameSchema = z.string().min(1).max(128).refine(
+  (value) => value === value.trim() && !hasControlCharacter(value),
+  { message: 'LETHEBOT_DISABLED_TOOLS must contain bounded tool names' },
+);
 
 const GovernanceAdminTokenSchema = z.string().refine(
   isValidGovernanceAdminToken,
@@ -29,6 +35,7 @@ const ConfigSchema = z.object({
     { message: 'LETHEBOT_WORKSPACE_ROOT must be an absolute path' },
   ).optional(),
   webFetchAllowedOrigins: z.array(ExactHttpsOriginSchema).max(16).default([]),
+  disabledTools: z.array(DisabledToolNameSchema).max(32).default([]),
   rawEventRetentionDays: z.number().int().min(0).default(90),
   chatMessageRetentionDays: z.number().int().min(0).default(90),
   auditLogRetentionDays: z.number().int().min(0).default(365),
@@ -74,6 +81,22 @@ const ConfigSchema = z.object({
       code: z.ZodIssueCode.custom,
       path: ['webFetchAllowedOrigins'],
       message: 'LETHEBOT_WEB_FETCH_ALLOWED_ORIGINS must not contain duplicates',
+    });
+  }
+
+  if (new Set(config.disabledTools).size !== config.disabledTools.length) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['disabledTools'],
+      message: 'LETHEBOT_DISABLED_TOOLS must not contain duplicates',
+    });
+  }
+
+  if (config.disabledTools.some((name) => !isKnownToolName(name))) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['disabledTools'],
+      message: 'LETHEBOT_DISABLED_TOOLS must contain only known reviewed tools',
     });
   }
 
@@ -131,6 +154,13 @@ function isExactHttpsOrigin(value: string): boolean {
 
 function hasUrlControlOrBackslash(value: string): boolean {
   return value.includes('\\') || Array.from(value).some((character) => {
+    const codePoint = character.codePointAt(0);
+    return codePoint !== undefined && (codePoint <= 31 || codePoint === 127);
+  });
+}
+
+function hasControlCharacter(value: string): boolean {
+  return Array.from(value).some((character) => {
     const codePoint = character.codePointAt(0);
     return codePoint !== undefined && (codePoint <= 31 || codePoint === 127);
   });
@@ -218,6 +248,7 @@ export function loadConfig(): Config {
     webFetchAllowedOrigins: parseWebFetchAllowedOriginsEnvironment(
       process.env.LETHEBOT_WEB_FETCH_ALLOWED_ORIGINS,
     ),
+    disabledTools: parseDisabledToolsEnvironment(process.env.LETHEBOT_DISABLED_TOOLS),
     rawEventRetentionDays: process.env.LETHEBOT_RAW_EVENT_RETENTION_DAYS
       ? parseInt(process.env.LETHEBOT_RAW_EVENT_RETENTION_DAYS, 10)
       : undefined,
@@ -322,6 +353,16 @@ function parseWebFetchAllowedOriginsEnvironment(value: string | undefined): stri
     return [];
   }
   return value.split(',').map((origin) => origin.trim());
+}
+
+export function parseDisabledToolsEnvironment(value: string | undefined): string[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value.trim() === '') {
+    return [];
+  }
+  return value.split(',').map((name) => name.trim());
 }
 
 /**

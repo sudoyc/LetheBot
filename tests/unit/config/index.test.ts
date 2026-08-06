@@ -8,6 +8,7 @@ describe('Config Loader', () => {
     process.env = { ...originalEnv };
     delete process.env.LETHEBOT_WORKSPACE_ROOT;
     delete process.env.LETHEBOT_WEB_FETCH_ALLOWED_ORIGINS;
+    delete process.env.LETHEBOT_DISABLED_TOOLS;
     delete process.env.LETHEBOT_GOVERNANCE_ENABLED;
     delete process.env.LETHEBOT_GOVERNANCE_HOST;
     delete process.env.LETHEBOT_GOVERNANCE_PORT;
@@ -66,6 +67,7 @@ describe('Config Loader', () => {
     expect(config.eventProcessingFailureRetentionDays).toBe(90);
     expect(config.workspaceRoot).toBeUndefined();
     expect(config.webFetchAllowedOrigins).toEqual([]);
+    expect(config.disabledTools).toEqual([]);
     expect(config.piTurnTimeoutMs).toBe(120_000);
     expect(config.piMaxConcurrentTurns).toBe(2);
     expect(config.piMaxQueuedTurns).toBe(128);
@@ -120,6 +122,7 @@ describe('Config Loader', () => {
     process.env.LETHEBOT_WORKSPACE_ROOT = '/tmp/lethebot-synthetic-workspace';
     process.env.LETHEBOT_WEB_FETCH_ALLOWED_ORIGINS =
       'https://docs.example.invalid, https://api.example.invalid:8443/';
+    process.env.LETHEBOT_DISABLED_TOOLS = 'memory.search, runtime.tools';
     process.env.LETHEBOT_GOVERNANCE_ENABLED = 'true';
     process.env.LETHEBOT_GOVERNANCE_HOST = '::1';
     process.env.LETHEBOT_GOVERNANCE_PORT = '16701';
@@ -143,6 +146,7 @@ describe('Config Loader', () => {
       'https://docs.example.invalid',
       'https://api.example.invalid:8443',
     ]);
+    expect(config.disabledTools).toEqual(['memory.search', 'runtime.tools']);
     expect(config.piTurnTimeoutMs).toBe(45_000);
     expect(config.piMaxConcurrentTurns).toBe(7);
     expect(config.piMaxQueuedTurns).toBe(64);
@@ -178,6 +182,31 @@ describe('Config Loader', () => {
     process.env.LETHEBOT_WEB_FETCH_ALLOWED_ORIGINS = '   ';
 
     expect(loadConfig().webFetchAllowedOrigins).toEqual([]);
+  });
+
+  test('treats an empty disabled-tool list as no disabled tools', () => {
+    process.env.LETHEBOT_DISABLED_TOOLS = '   ';
+
+    expect(loadConfig().disabledTools).toEqual([]);
+  });
+
+  test('accepts known optional tools even when their registration prerequisites are absent', () => {
+    process.env.LETHEBOT_DISABLED_TOOLS = 'workspace.list, web.fetch_text';
+
+    expect(loadConfig().disabledTools).toEqual(['workspace.list', 'web.fetch_text']);
+  });
+
+  test.each([
+    ',memory.search',
+    'memory.search,',
+    'memory.search,,runtime.tools',
+    'memory.search,memory.search',
+    'memory\tsearch',
+    'not.a.reviewed.tool',
+  ])('rejects invalid disabled-tool configuration %j', (value) => {
+    process.env.LETHEBOT_DISABLED_TOOLS = value;
+
+    expect(() => loadConfig()).toThrow('Invalid configuration');
   });
 
   test.each([

@@ -329,6 +329,11 @@ class LetheBotApp {
     this.toolRegistry.register(createRuntimeToolsTool({
       registry: this.toolRegistry,
     }));
+    for (const name of this.config.disabledTools) {
+      if (this.toolRegistry.get(name)) {
+        this.toolRegistry.disable(name);
+      }
+    }
     this.policyGate = new PolicyGate(this.toolRegistry);
 
     // 初始化核心模块

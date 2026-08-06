@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type Database from 'better-sqlite3';
@@ -334,6 +334,54 @@ describe('CLI main command parser', () => {
     );
   }
 
+
+  it('spawns owner tool configuration list/status/disable/enable controls', () => {
+    const envPath = join(testDir, 'tools.env');
+    writeFileSync(envPath, 'LETHEBOT_DISABLED_TOOLS=runtime.tools\n', 'utf8');
+
+    const listed = runCli(['list-tools', '--env-file', envPath]);
+    expect(listed.status, listed.stderr).toBe(0);
+    expect(listed.stderr).toBe('');
+    expect(JSON.parse(listed.stdout)).toMatchObject({
+      source: 'env_file',
+      restartScoped: true,
+    });
+    expect(JSON.parse(listed.stdout).tools).toEqual(expect.arrayContaining([
+      { name: 'memory.search', enabled: true },
+      { name: 'runtime.tools', enabled: false },
+    ]));
+
+    const disabled = runCli(['disable-tool', 'memory.search', '--env-file', envPath]);
+    expect(disabled.status, disabled.stderr).toBe(0);
+    expect(JSON.parse(disabled.stdout)).toMatchObject({
+      name: 'memory.search',
+      enabled: false,
+      changed: true,
+      restartRequired: true,
+      disabledTools: ['memory.search', 'runtime.tools'],
+    });
+    expect(readFileSync(envPath, 'utf8')).toBe(
+      'LETHEBOT_DISABLED_TOOLS=memory.search,runtime.tools\n',
+    );
+
+    const status = runCli(['tool-status', 'memory.search', '--env-file', envPath]);
+    expect(status.status, status.stderr).toBe(0);
+    expect(JSON.parse(status.stdout)).toMatchObject({
+      source: 'env_file',
+      restartScoped: true,
+      tool: { name: 'memory.search', enabled: false },
+    });
+
+    const enabled = runCli(['enable-tool', 'memory.search', '--env-file', envPath]);
+    expect(enabled.status, enabled.stderr).toBe(0);
+    expect(JSON.parse(enabled.stdout)).toMatchObject({
+      name: 'memory.search',
+      enabled: true,
+      changed: true,
+      restartRequired: true,
+      disabledTools: ['runtime.tools'],
+    });
+  });
   it('spawns show-memory and export-memory against a migrated SQLite database', async () => {
     const memoryId = await memoryRepo.create({
       id: 'mem-cli-parser',
@@ -16389,4 +16437,4 @@ describe('CLI main command parser', () => {
     expect(db.prepare('SELECT COUNT(*) AS count FROM model_invocations').get()).toEqual({ count: 2 });
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
-});
+}, 30_000);
