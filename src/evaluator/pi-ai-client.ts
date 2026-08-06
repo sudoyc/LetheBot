@@ -132,6 +132,11 @@ export class PiAiEvaluatorClient implements EvaluatorCompletionClient {
         input: response.usage.input,
         output: response.usage.output,
         total: response.usage.totalTokens,
+        cacheRead: response.usage.cacheRead,
+        cacheWrite: response.usage.cacheWrite,
+        ...(response.usage.reasoning === undefined
+          ? {}
+          : { reasoning: response.usage.reasoning }),
       },
     };
   }

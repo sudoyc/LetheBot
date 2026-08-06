@@ -783,10 +783,10 @@ interface RehearsalLifecycle {
 async function runApplicationReleaseRehearsal(): Promise<RehearsalResult> {
   const workspace = mkdtempSync(join(tmpdir(), 'lethebot-application-release-rehearsal-'));
   let result: Omit<RehearsalResult, 'cleanup'> | undefined;
-  let cleanupBeforeRemoval = { lockRemoved: false, temporaryLinksRemoved: false };
+  let cleanupBeforeRemoval: { lockRemoved: boolean; temporaryLinksRemoved: boolean };
   let activationLifecycle: RehearsalLifecycle | undefined;
   let rollbackLifecycle: RehearsalLifecycle | undefined;
-  let processesStopped = false;
+  let processesStopped: boolean;
   const forceKillChildren = (): void => {
     activationLifecycle?.forceKillNow();
     rollbackLifecycle?.forceKillNow();
@@ -994,8 +994,8 @@ async function runCrossVersionRehearsal(
   const workspace = mkdtempSync(join(tmpdir(), 'lethebot-cross-version-rehearsal-'));
   const lifecycles: RehearsalLifecycle[] = [];
   let result: Omit<CrossVersionRehearsalResult, 'cleanup'> | undefined;
-  let operationArtifactsRemoved = false;
-  let processesStopped = false;
+  let operationArtifactsRemoved: boolean;
+  let processesStopped: boolean;
   const forceKillChildren = (): void => {
     for (const lifecycle of lifecycles) {
       lifecycle.forceKillNow();

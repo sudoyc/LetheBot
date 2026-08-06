@@ -1,8 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
+  convertToolToPiFormat,
   convertToolsToPiFormat,
   createMockPiTool,
+  createProviderToolNameMap,
+  enrichToolWithMetadata,
+  getToolMetadata,
   toProviderToolName,
+  validateToolConversion,
 } from '../../../src/pi/tool-adapter';
 import type { ToolHandler, ToolRegistryEntry } from '../../../src/types/tool';
 
@@ -91,6 +96,122 @@ describe('tool-adapter provider names', () => {
     expect(tool.name).toBe(toProviderToolName('memory.search'));
     expect(tool.name).toMatch(/^[A-Za-z0-9_-]{1,64}$/);
   });
+});
+
+describe('tool-adapter conversion contracts', () => {
+  const context = {
+    turnId: 'turn-tool-conversion',
+    actor: { actorClass: 'user' as const },
+    invocationContext: 'private_chat' as const,
+  };
+
+  it('rejects empty canonical names and duplicate provider names', () => {
+    expect(() => toProviderToolName('')).toThrow('non-empty string');
+    expect(() => toProviderToolName(undefined as unknown as string)).toThrow('non-empty string');
+    expect(() => createProviderToolNameMap(['same', 'same'])).toThrow('collision');
+  });
+
+  it.each([
+    ['plain string', 'plain result', 'plain result', false],
+    ['summary', { summary: 'summary result' }, 'summary result', false],
+    ['message', { message: 'message result' }, 'message result', false],
+    ['string output', { output: 'output result' }, 'output result', false],
+    ['text', { text: 'text result' }, 'text result', false],
+    ['structured output', { output: { count: 2 } }, '{\n  "count": 2\n}', false],
+    ['structured object', { count: 3 }, '{\n  "count": 3\n}', false],
+    ['null', null, 'null', false],
+    ['terminating result', { summary: 'done', terminate: true }, 'done', true],
+  ] as const)(
+    'formats %s results for Pi while preserving structured details',
+    async (_caseName, rawResult, expectedText, expectedTerminate) => {
+      const entry = createEntry('result_formatter');
+      const handler: ToolHandler = async () => rawResult;
+      const tool = convertToolToPiFormat(entry, handler, context);
+
+      const result = await tool.execute('tc-result-format', {});
+
+      expect(result.content).toEqual([{ type: 'text', text: expectedText }]);
+      expect(result.details).toBe(rawResult);
+      expect(result.terminate).toBe(expectedTerminate);
+      expect(tool.label).toBe('Result Formatter');
+      expect(tool.parameters).toBe(entry.piSchema.input);
+    },
+  );
+
+  it('creates executable mock tools and preserves registry metadata only when enriched', async () => {
+    const entry = createEntry('metadata_tool');
+    const baseTool = convertToolToPiFormat(entry, entry.handler, context);
+    expect(getToolMetadata(baseTool)).toBeUndefined();
+
+    const enriched = enrichToolWithMetadata(baseTool, entry);
+    expect(getToolMetadata(enriched)).toEqual({
+      version: entry.version,
+      capabilities: entry.capabilities,
+      evaluatorPolicy: entry.evaluatorPolicy,
+      auditLevel: entry.auditLevel,
+      outputSensitivity: entry.outputSensitivity,
+      sandboxPolicy: entry.sandboxPolicy,
+      permissions: entry.permissions,
+    });
+
+    const mock = createMockPiTool('mock.tool_name', 'Mock tool', ({ value }) => value);
+    const mockResult = await mock.execute('tc-mock', { value: 42 });
+    expect(mock.label).toBe('Mock Tool Name');
+    expect(mockResult).toEqual({
+      content: [{ type: 'text', text: '42' }],
+      details: 42,
+    });
+  });
+
+  it('reports required fields and every risky capability warning without weakening validation', () => {
+    const invalid = createEntry('invalid_tool');
+    invalid.name = ' ';
+    invalid.description = ' ';
+    invalid.piSchema = undefined as unknown as ToolRegistryEntry['piSchema'];
+    invalid.handler = undefined as unknown as ToolHandler;
+    invalid.capabilities = [
+      'shell_exec',
+      'credential_access',
+      'write_local',
+      'external_side_effect',
+      'platform_admin',
+    ];
+    invalid.auditLevel = 'full';
+    invalid.outputSensitivity = 'secret_possible';
+    invalid.evaluatorPolicy = 'bypass';
+
+    expect(validateToolConversion(invalid)).toEqual({
+      valid: false,
+      errors: [
+        'Tool name is required',
+        'Tool description is required',
+        'Tool piSchema.input is required for Pi integration',
+        'Tool handler is required',
+        'credential_access tools cannot use auditLevel=full',
+      ],
+      warnings: [
+        'shell_exec capability requires careful sandbox configuration',
+        'credential_access tools must never use auditLevel=full',
+        'secret_possible outputs require scanning before LLM consumption',
+        'Risky capabilities with evaluatorPolicy=bypass should be reviewed',
+      ],
+    });
+  });
+
+  it.each(['read_context', 'external_side_effect', 'platform_admin'] as const)(
+    'validates %s capability combinations independently',
+    (capability) => {
+      const entry = createEntry(`validate_${capability}`);
+      entry.capabilities = [capability];
+      entry.evaluatorPolicy = capability === 'read_context' ? 'bypass' : 'required';
+
+      expect(validateToolConversion(entry)).toEqual({
+        valid: true,
+        errors: [],
+        warnings: [],
+      });
+    },
+  );
 });
 
 describe('tool-adapter diagnostics', () => {

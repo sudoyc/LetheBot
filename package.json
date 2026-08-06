@@ -37,7 +37,8 @@
     "release:check": "pnpm typecheck && pnpm typecheck:test && pnpm lint && pnpm build && pnpm release:preflight && pnpm release:pack-check && pnpm test:run && git diff --check",
     "test": "vitest",
     "test:run": "vitest run",
-    "test:coverage": "vitest run --coverage",
+    "test:coverage": "LETHEBOT_SUBPROCESS_COVERAGE=1 vitest run --coverage && pnpm test:coverage:subprocess",
+    "test:coverage:subprocess": "tsx scripts/check-subprocess-coverage.ts",
     "test:ui": "vitest --ui",
     "smoke": "tsx scripts/smoke-test.ts",
     "cli": "tsx src/cli/main.ts",
@@ -83,9 +84,9 @@
     "url": "https://github.com/sudoyc/LetheBot/issues"
   },
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.19.0"
   },
-  "packageManager": "pnpm@9.0.0",
+  "packageManager": "pnpm@11.18.0",
   "lethebotSchema": {
     "contractVersion": 1,
     "targetVersion": 8,
@@ -94,27 +95,28 @@
     "adoptsLegacyUnversioned": true
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "^0.80.2",
-    "@earendil-works/pi-ai": "^0.80.2",
-    "better-sqlite3": "^12.11.1",
+    "@earendil-works/pi-agent-core": "^0.83.0",
+    "@earendil-works/pi-ai": "^0.83.0",
+    "better-sqlite3": "^13.0.3",
     "commander": "^15.0.0",
-    "minimatch": "^10.2.5",
-    "pino": "^9.5.0",
+    "minimatch": "^10.2.6",
+    "pino": "^10.3.1",
     "pino-pretty": "^13.0.0",
     "ulidx": "^2.4.1",
-    "zod": "^3.23.8"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@eslint/js": "^9.39.4",
-    "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^22.10.2",
-    "@typescript-eslint/eslint-plugin": "^8.18.2",
-    "@typescript-eslint/parser": "^8.18.2",
-    "@vitest/coverage-v8": "^2.1.8",
-    "@vitest/ui": "^2.1.8",
-    "eslint": "^9.17.0",
-    "tsx": "^4.19.2",
-    "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
+    "@eslint/js": "^10.0.1",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^22.20.1",
+    "@typescript-eslint/eslint-plugin": "^8.66.0",
+    "@typescript-eslint/parser": "^8.66.0",
+    "@vitest/coverage-v8": "^4.1.10",
+    "@vitest/ui": "^4.1.10",
+    "c8": "^12.0.0",
+    "eslint": "^10.8.0",
+    "tsx": "^4.23.9",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10"
   }
 }

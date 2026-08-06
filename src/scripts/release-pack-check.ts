@@ -51,7 +51,7 @@ const PackMetadataSchema = z.object({
 }).passthrough();
 const PackManifestSchema = z.union([
   z.array(PackMetadataSchema).length(1).transform(([metadata]) => metadata),
-  z.record(PackMetadataSchema).refine(
+  z.record(z.string(), PackMetadataSchema).refine(
     (manifest) => Object.keys(manifest).length === 1,
   ).transform((manifest) => Object.values(manifest)[0]),
 ]);

@@ -941,7 +941,7 @@ function handleActivityTabKeydown(event) {
     return;
   }
 
-  let nextIndex = currentIndex;
+  let nextIndex;
   if (event.key === 'ArrowRight') {
     nextIndex = (currentIndex + 1) % tabs.length;
   } else if (event.key === 'ArrowLeft') {
@@ -973,7 +973,7 @@ function handleMemoryTabKeydown(event) {
   if (currentIndex < 0) {
     return;
   }
-  let nextIndex = currentIndex;
+  let nextIndex;
   if (event.key === 'ArrowRight') {
     nextIndex = (currentIndex + 1) % tabs.length;
   } else if (event.key === 'ArrowLeft') {

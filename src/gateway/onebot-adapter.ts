@@ -7,7 +7,7 @@
 import { EventEmitter } from 'node:events';
 import type { IncomingHttpHeaders } from 'node:http';
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { redactSecretsInText } from '../memory/secret-scan.js';
+import { createRedactedError, redactSecretsInText } from '../memory/secret-scan.js';
 import type { MessageContent, MessageTarget } from './adapter.js';
 import type {
   ChatMessageReceived,
@@ -679,7 +679,7 @@ export class OneBotAdapter extends EventEmitter {
       const message = error instanceof Error ? error.message : 'Unknown OneBot API error';
       const redactedMessage = this.redactDiagnosticText(message);
       this.lastError = redactedMessage;
-      throw new Error(redactedMessage);
+      throw createRedactedError(redactedMessage);
     }
   }
 
@@ -711,7 +711,7 @@ export class OneBotAdapter extends EventEmitter {
         : `OneBot WebSocket API send failed: ${action}`;
       const redactedMessage = this.redactDiagnosticText(message);
       this.lastError = redactedMessage;
-      throw new Error(redactedMessage);
+      throw createRedactedError(redactedMessage);
     }
 
     try {
@@ -723,7 +723,7 @@ export class OneBotAdapter extends EventEmitter {
       const message = error instanceof Error ? error.message : 'Unknown OneBot WebSocket API error';
       const redactedMessage = this.redactDiagnosticText(message);
       this.lastError = redactedMessage;
-      throw new Error(redactedMessage);
+      throw createRedactedError(redactedMessage);
     }
   }
 

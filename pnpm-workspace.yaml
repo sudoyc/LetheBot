@@ -1,0 +1,11 @@
+overrides:
+  brace-expansion: 5.0.9
+  protobufjs: 7.6.5
+allowBuilds:
+  '@google/genai': true
+  better-sqlite3: true
+  esbuild: true
+  protobufjs: true
+minimumReleaseAgeExclude:
+  - '@types/better-sqlite3@9.6.0'
+  - tsx@4.23.9

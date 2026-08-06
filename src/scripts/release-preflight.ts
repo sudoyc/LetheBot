@@ -22,7 +22,7 @@ export type ReleasePreflightDiagnosticCode =
   | 'invalid-schema-contract'
   | 'dist-version-mismatch'
   | 'invalid-lockfile-version'
-  | 'package-lock-major-mismatch';
+  | 'package-lock-version-incompatible';
 
 export interface ReleasePreflightDiagnostic {
   code: ReleasePreflightDiagnosticCode;
@@ -60,11 +60,16 @@ const DIAGNOSTIC_MESSAGES: Record<ReleasePreflightDiagnosticCode, string> = {
   'dist-version-mismatch': 'Built entrypoint version does not match the package manifest.',
   'invalid-schema-contract': 'Package manifest schema compatibility contract is invalid.',
   'invalid-lockfile-version': 'Pnpm lockfile version is missing or invalid.',
-  'package-lock-major-mismatch': 'Pnpm and lockfile major versions do not match.',
+  'package-lock-version-incompatible': 'Pnpm and lockfile versions are not compatible.',
 };
 
 const EXACT_PNPM_SEMVER = /^pnpm@(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const TOP_LEVEL_LOCKFILE_VERSION = /^lockfileVersion:\s*['"]?(0|[1-9]\d*)(?:\.\d+)?['"]?\s*(?:#.*)?$/m;
+const PNPM_LOCKFILE_MAJOR_COMPATIBILITY: Readonly<Record<string, string>> = {
+  '9': '9',
+  '10': '9',
+  '11': '9',
+};
 const MAX_CLI_DIAGNOSTICS = 8;
 const ENTRYPOINT_LOAD_TIMEOUT_MS = 10_000;
 
@@ -153,6 +158,10 @@ function packageManagerMajor(content: string): string | undefined {
 
 function lockfileMajor(content: string): string | undefined {
   return TOP_LEVEL_LOCKFILE_VERSION.exec(content)?.[1];
+}
+
+function isPnpmLockfileCompatible(pnpmMajor: string, lockMajor: string): boolean {
+  return PNPM_LOCKFILE_MAJOR_COMPATIBILITY[pnpmMajor] === lockMajor;
 }
 
 function parseReleaseSchemaContract(content: string): ReleaseSchemaContract | undefined {
@@ -299,8 +308,8 @@ export function runReleasePreflight(projectRoot: string): ReleasePreflightResult
     }
   }
 
-  if (pnpmMajor && lockMajor && pnpmMajor !== lockMajor) {
-    addDiagnostic(diagnostics, 'package-lock-major-mismatch');
+  if (pnpmMajor && lockMajor && !isPnpmLockfileCompatible(pnpmMajor, lockMajor)) {
+    addDiagnostic(diagnostics, 'package-lock-version-incompatible');
   }
 
   return {

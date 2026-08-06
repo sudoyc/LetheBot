@@ -88,9 +88,11 @@ transport-internal retry cannot disappear behind one application-visible row.
 The matching typed `AssistantMessage` terminalizes that row. Safe nonnegative
 input, output, cache-read, cache-write, and total counts are persisted only when
 the reported total equals their sum and the dimensions are not all zero;
-otherwise every token column remains `NULL` (unknown). Pi Agent Core `0.80.2`
-does not expose a separate reasoning-token dimension, so that column remains
-`NULL`. Completed rows persist only a SHA-256 digest and UTF-8 byte count of the
+otherwise every token column remains `NULL` (unknown). Pi `0.83.0` can also
+report reasoning tokens as an optional subset of output tokens. LetheBot stores
+that breakdown when present, nonnegative, and no greater than output; providers
+that do not expose it leave only the reasoning column `NULL`. Completed rows
+persist only a SHA-256 digest and UTF-8 byte count of the
 response content, never the response, prompt, tool payload, or Provider error
 text. Failures use fixed codes: `provider_error`, `provider_aborted`,
 `turn_timeout`, or `runtime_exception`.

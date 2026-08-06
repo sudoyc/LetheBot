@@ -114,8 +114,6 @@ export async function runWorkerSchedulerSoak(
   const leaseMs = Math.max(intervalMs * 4, 40);
   const runId = randomUUID();
   const setupAtMs = Date.now();
-  let startedAtMs = 0;
-  let loadDeadlineMs = 0;
   const jobRepository = new JobRepository(options.db);
   const scheduler = new WorkerScheduler({ logger: silentSchedulerLogger });
   const outcomes: TaskResult[] = [];
@@ -266,8 +264,8 @@ export async function runWorkerSchedulerSoak(
     },
   });
 
-  startedAtMs = Date.now();
-  loadDeadlineMs = startedAtMs + durationMs;
+  const startedAtMs = Date.now();
+  const loadDeadlineMs = startedAtMs + durationMs;
   scheduler.start();
   try {
     await sleep(durationMs);

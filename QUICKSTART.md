@@ -6,8 +6,8 @@
 
 ## 前置条件
 
-- Node.js >= 22.0.0
-- pnpm >= 9.0.0
+- Node.js >= 22.19.0
+- pnpm 11.18.0（按 `packageManager` 固定）
 - Provider API key（可选；仅在显式 opt-in 的真实 Provider 测试/运行中通过环境变量注入）
 - NapCat 运行中（可选，用于 QQ 集成）
 

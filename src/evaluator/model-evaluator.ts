@@ -79,7 +79,7 @@ const decisionSchemaFields = {
 const toolDecisionSchema = z.object({
   domain: z.literal('tool'),
   ...decisionSchemaFields,
-  modifiedToolInput: z.record(z.unknown()).optional(),
+  modifiedToolInput: z.record(z.string(), z.unknown()).optional(),
   alternativeTool: z.string().min(1).max(256).optional(),
   additionalConstraints: z.object({
     maxRuntimeMs: z.number().int().min(1).max(MAX_TIMER_DELAY_MS).optional(),
@@ -155,7 +155,7 @@ const toolCallSchema = z.object({
   id: z.string().min(1).max(256),
   turnId: z.string().min(1).max(256),
   toolName: z.string().min(1).max(256),
-  input: z.record(z.unknown()),
+  input: z.record(z.string(), z.unknown()),
   requestedBy: z.enum(['pi', 'evaluator', 'user', 'system']),
   actor: z.object({
     canonicalUserId: z.string().min(1).max(512).optional(),
@@ -186,7 +186,7 @@ const backgroundTaskSchema = z.object({
     'admin_digest',
     'retention',
   ]),
-  payload: z.record(z.unknown()).optional(),
+  payload: z.record(z.string(), z.unknown()).optional(),
   idempotencyKey: z.string().min(1).max(512).optional(),
   scheduledAt: z.number().finite().optional(),
   maxAttempts: z.number().int().min(1).max(100).optional(),
@@ -430,7 +430,7 @@ export class ModelEvaluator implements IEvaluator {
         if (callNumber === 1 && failure.code === 'invalid_structured_output') {
           continue;
         }
-        throw new Error(failure.publicMessage);
+        throw failure;
       }
     }
 

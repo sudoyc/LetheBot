@@ -1,13 +1,16 @@
 FROM node:22-alpine AS build
 
+# Build-only toolchain for native dependencies such as better-sqlite3.
+RUN apk add --no-cache python3 make g++
+
 # Install pnpm
-RUN corepack enable && corepack prepare pnpm@9.0.0 --activate
+RUN corepack enable && corepack prepare pnpm@11.18.0 --activate
 
 # Create app directory
 WORKDIR /app
 
 # Copy dependency files
-COPY package.json pnpm-lock.yaml ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 
 # Install dependencies
 RUN pnpm install --frozen-lockfile --prod=false

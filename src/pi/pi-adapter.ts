@@ -49,7 +49,7 @@ import {
   startToolRuntimeGuard,
 } from '../tools/runtime-limit.js';
 import { isSupportedToolExecution } from '../tools/sandbox-policy.js';
-import { redactSecretsInText } from '../memory/secret-scan.js';
+import { createRedactedError, redactSecretsInText } from '../memory/secret-scan.js';
 import type {
   IEvaluator,
   ToolEvaluationRequest,
@@ -138,8 +138,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function readPiInvocationUsage(message: AssistantMessage): ModelInvocationTokens | undefined {
-  const { input, output, cacheRead, cacheWrite, totalTokens } = message.usage;
-  const values = [input, output, cacheRead, cacheWrite, totalTokens];
+  const { input, output, cacheRead, cacheWrite, reasoning, totalTokens } = message.usage;
+  const values = [input, output, cacheRead, cacheWrite, totalTokens, reasoning]
+    .filter((value): value is number => value !== undefined);
   if (values.some((value) => !Number.isSafeInteger(value) || value < 0)) {
     return undefined;
   }
@@ -149,12 +150,16 @@ function readPiInvocationUsage(message: AssistantMessage): ModelInvocationTokens
   if (totalTokens !== input + output + cacheRead + cacheWrite) {
     return undefined;
   }
+  if (reasoning !== undefined && reasoning > output) {
+    return undefined;
+  }
   return {
     input,
     output,
     total: totalTokens,
     cacheRead,
     cacheWrite,
+    ...(reasoning === undefined ? {} : { reasoning }),
   };
 }
 
@@ -906,7 +911,7 @@ export class PiAdapter {
               preparedEffect ? { atomicTerminal: true } : undefined,
             );
             this.recordToolCallId(session, toolCallId);
-            throw new Error(redactedMessage.text);
+            throw createRedactedError(redactedMessage.text);
           }
         },
       };

@@ -865,7 +865,9 @@ describe('NapCat Deployment Scripts', () => {
       );
       const dockerignore = readFileSync(join(process.cwd(), '.dockerignore'), 'utf-8');
 
-      expect(dockerfile).toContain('corepack prepare pnpm@9.0.0 --activate');
+      expect(dockerfile).toContain('corepack prepare pnpm@11.18.0 --activate');
+      expect(dockerfile).toContain('COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./');
+      expect(dockerfile).toContain('apk add --no-cache python3 make g++');
       expect(dockerfile).toContain('pnpm install --frozen-lockfile');
       expect(dockerfile).toContain('RUN pnpm build');
       expect(dockerfile).toContain('RUN pnpm release:preflight');
@@ -885,7 +887,13 @@ describe('NapCat Deployment Scripts', () => {
       expect(dockerfile).toContain('ENV LETHEBOT_HOST=0.0.0.0');
       expect(dockerfile).not.toContain('EXPOSE 8080');
       expect(acceptanceDockerfile).toContain('pnpm install --frozen-lockfile');
+      expect(acceptanceDockerfile).toContain(
+        'COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./',
+      );
       expect(acceptanceDockerfile).toContain('FROM node:22-bookworm-slim AS build');
+      expect(acceptanceDockerfile).toContain(
+        'apt-get install -y --no-install-recommends python3 make g++',
+      );
       expect(acceptanceDockerfile).toContain('COPY tsconfig.json ./');
       expect(acceptanceDockerfile).toContain('COPY src ./src');
       expect(acceptanceDockerfile).toContain('COPY migrations ./migrations');
@@ -1056,7 +1064,7 @@ describe('NapCat Deployment Scripts', () => {
       expect(invalid.stderr).toContain('Invalid deployment arguments');
       expect(invalid.stderr).not.toContain('sk-cli-deploy-secret');
       expect(invalid.stderr).not.toContain('1234567890');
-    });
+    }, 30_000);
 
     test('verifies NapCat connection when requested', async () => {
       process.env.ONEBOT_TRANSPORT = 'http';

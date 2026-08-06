@@ -51,6 +51,7 @@ function createResponse(content: AssistantMessage['content']): AssistantMessage 
       output: 1,
       cacheRead: 0,
       cacheWrite: 0,
+      reasoning: 1,
       totalTokens: 2,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     },
@@ -77,7 +78,7 @@ describe('PiAiEvaluatorClient', () => {
 
     expect(completion).toEqual({
       text: '{"domain":"tool"}\n',
-      tokens: { input: 1, output: 1, total: 2 },
+      tokens: { input: 1, output: 1, total: 2, cacheRead: 0, cacheWrite: 0, reasoning: 1 },
     });
     expect(modelLookup).toHaveBeenCalledWith('openai', 'gpt-4');
     expect(complete).toHaveBeenCalledTimes(1);

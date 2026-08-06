@@ -36,6 +36,25 @@ pnpm ci:check
 completion evidence use `pnpm test:run`, `pnpm release:check`, or
 `pnpm ci:check`. The CI workflow also builds both maintained Dockerfiles.
 
+`pnpm test:coverage` is one gate with two explicit measurements. Vitest applies
+the repository-wide thresholds to every `src/**/*.ts` module except the two
+process-only command modules, `src/cli/main.ts` and
+`src/scripts/ops-maintenance.ts`. Its thresholds are 82% statements/lines/branches
+and 93% functions. Application release and local acceptance evidence remain in
+this denominator because their imported APIs are exercised in-process.
+
+The same run creates a fresh Node V8 coverage directory, enables collection only
+inside test workers, and lets launched CLI children inherit it. After Vitest,
+`scripts/check-subprocess-coverage.ts` independently remaps child-process data
+for all four command entrypoints: CLI main, application release, local acceptance
+evidence, and operations maintenance. It writes the checked summary to
+`coverage/subprocess/coverage-summary.json`. Every file must appear with non-zero
+statement, line, function, and branch coverage; the entrypoint aggregate must
+meet 82% statements/lines/functions and 75% branches. This denominator split is
+intentional, not a claim that process tests equal Vitest instrumentation: `tsx`
+runtime source maps are checked separately instead of being silently omitted or
+merged with incompatible in-process mappings.
+
 Do not hardcode pass counts in stable documentation. Counts change as focused
 regressions are added; command exit status and the current output are evidence.
 

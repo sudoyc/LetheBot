@@ -79,7 +79,11 @@ const createMockAgent = (options: AgentOptions) => {
   };
 };
 
-const MockAgent = vi.fn(createMockAgent);
+function createMockAgentConstructor(options: AgentOptions) {
+  return createMockAgent(options);
+}
+
+const MockAgent = vi.fn(createMockAgentConstructor);
 const mockStreamSimple = vi.fn();
 
 type MockAgentInstance = ReturnType<typeof createMockAgent>;
@@ -318,6 +322,7 @@ describe('PiAdapter', () => {
           output: 8,
           cacheRead: 4,
           cacheWrite: 1,
+          reasoning: 3,
           totalTokens: 34,
         },
       });
@@ -409,7 +414,7 @@ describe('PiAdapter', () => {
       expect(invocationRepository.completePiTurnInvocation).toHaveBeenNthCalledWith(
         1,
         'invocation:turn-ledger-a:1',
-        { input: 21, output: 8, total: 34, cacheRead: 4, cacheWrite: 1 },
+        { input: 21, output: 8, total: 34, cacheRead: 4, cacheWrite: 1, reasoning: 3 },
         JSON.stringify(firstMessage.content),
       );
       expect(invocationRepository.completePiTurnInvocation).toHaveBeenNthCalledWith(
@@ -7593,7 +7598,7 @@ function createAssistantMessage(input: {
   errorMessage?: string;
   usage?: Pick<
     AssistantMessage['usage'],
-    'input' | 'output' | 'cacheRead' | 'cacheWrite' | 'totalTokens'
+    'input' | 'output' | 'cacheRead' | 'cacheWrite' | 'reasoning' | 'totalTokens'
   >;
 }): AssistantMessage {
   const usage = input.usage ?? {

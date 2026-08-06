@@ -18,8 +18,8 @@
 
 ### 前置条件
 
-- **Node.js**: >= 22.0.0
-- **包管理器**: pnpm 9.0.0
+- **Node.js**: >= 22.19.0
+- **包管理器**: pnpm 11.18.0
 - **TypeScript**: 由 `pnpm-lock.yaml` 锁定；用 `pnpm exec tsc --version` 查看当前版本
 
 ### 快速启动

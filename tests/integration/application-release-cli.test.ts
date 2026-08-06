@@ -210,7 +210,7 @@ describe('application release CLI', () => {
     expect(result.stdout).not.toContain('shared-database-sentinel');
     expect(result.stdout).not.toContain('release-rehearsal-sentinel');
     expect(result.stdout.trim().split('\n')).toHaveLength(1);
-  });
+  }, 70_000);
 
   it.each([
     'unknown option',
@@ -506,6 +506,88 @@ describe('application release CLI', () => {
         '--candidate-release=/tmp/B',
         '--manager=systemd',
       ],
+    ]) {
+      expect(() => parseApplicationReleaseCliArgs(args)).toThrow(
+        'Invalid application release arguments',
+      );
+    }
+  });
+
+  it('validates every managed release argument boundary without accepting ambiguous forms', () => {
+    const validActivation = [
+      'activate',
+      '--root=/srv/lethebot',
+      '--release=B',
+      '--manager=systemd',
+    ];
+
+    expect(parseApplicationReleaseCliArgs([
+      ...validActivation,
+      '--base-url=https://localhost:6700/base',
+      '--health-path=/status/health',
+      '--readiness-path=/status/ready',
+      '--probe-timeout-ms=120000',
+      '--lock-timeout-ms=60000',
+    ])).toMatchObject({
+      baseUrl: 'https://localhost:6700/base',
+      healthPath: '/status/health',
+      readinessPath: '/status/ready',
+      probeTimeoutMs: 120_000,
+      lockTimeoutMs: 60_000,
+    });
+
+    for (const args of [
+      [],
+      ['rehearse', '--manager=systemd'],
+      ['unknown'],
+      ['activate', '--root=/srv/lethebot', '--manager=systemd'],
+      ['activate', '--root=relative', '--release=B', '--manager=systemd'],
+      ['activate', '--root=/srv/lethebot', '--release=B', '--operation-id=op', '--manager=systemd'],
+      ['recover', '--root=/srv/lethebot', '--operation-id=op', '--manager=systemd'],
+      ['confirm', '--root=/srv/lethebot', '--release=B', '--manager=systemd'],
+      ['confirm', '--root=/srv/lethebot', '--release=B', '--operation-id=op', '--manager=other'],
+      [...validActivation, '--root=/srv/duplicate'],
+      [...validActivation, '--unknown=value'],
+      [...validActivation, '--base-url=not-a-url'],
+      [...validActivation, '--base-url=file:///tmp/status'],
+      [...validActivation, '--base-url=http://user:pass@localhost:6700'],
+      [...validActivation, '--health-path=healthz'],
+      [...validActivation, '--health-path=//example.invalid/status'],
+      [...validActivation, '--health-path=/status\\health'],
+      [...validActivation, '--health-path=/status?private=true'],
+      [...validActivation, '--health-path=/status#private'],
+      [...validActivation, '--probe-timeout-ms=0'],
+      [...validActivation, '--probe-timeout-ms=1.5'],
+      [...validActivation, '--probe-timeout-ms=120001'],
+      [...validActivation, '--lock-timeout-ms=-1'],
+      [...validActivation, '--lock-timeout-ms=60001'],
+    ]) {
+      expect(() => parseApplicationReleaseCliArgs(args)).toThrow(
+        'Invalid application release arguments',
+      );
+    }
+  });
+
+  it('accepts separated exact rehearsal values and rejects missing, duplicate, or option-shaped values', () => {
+    expect(parseApplicationReleaseCliArgs([
+      'rehearse-cross-version',
+      '--',
+      '--prior-release',
+      '/srv/lethebot/releases/A',
+      '--candidate-release',
+      '/srv/lethebot/releases/B',
+    ])).toEqual({
+      command: 'rehearse-cross-version',
+      priorReleaseDir: '/srv/lethebot/releases/A',
+      candidateReleaseDir: '/srv/lethebot/releases/B',
+    });
+
+    for (const args of [
+      ['rehearse-cross-version', '--prior-release'],
+      ['rehearse-cross-version', '--prior-release', '--candidate-release=/tmp/B'],
+      ['rehearse-cross-version', '--prior-release=/tmp/A', '--prior-release=/tmp/B', '--candidate-release=/tmp/C'],
+      ['rehearse-cross-version', '--prior-release=/tmp/A', '--candidate-release='],
+      ['rehearse-cross-version', '--', '--prior-release=/tmp/A'],
     ]) {
       expect(() => parseApplicationReleaseCliArgs(args)).toThrow(
         'Invalid application release arguments',

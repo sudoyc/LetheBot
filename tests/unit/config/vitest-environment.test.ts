@@ -34,6 +34,8 @@ describe('Vitest environment isolation', () => {
     const repositoryRoot = process.cwd();
     const childEnv = { ...process.env };
     delete childEnv[sentinelName];
+    delete childEnv.LETHEBOT_SUBPROCESS_COVERAGE;
+    delete childEnv.NODE_V8_COVERAGE;
     const result = spawnSync(
       process.execPath,
       [
@@ -44,7 +46,6 @@ describe('Vitest environment isolation', () => {
         '--config',
         join(repositoryRoot, 'vitest.config.ts'),
         '--maxWorkers=1',
-        '--minWorkers=1',
         '--silent',
       ],
       {

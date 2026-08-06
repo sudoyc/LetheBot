@@ -38,7 +38,7 @@ function createProjectFixture(options: {
     options.packageJson ?? JSON.stringify({
       type: 'module',
       version: '0.1.0',
-      packageManager: 'pnpm@9.0.0',
+      packageManager: 'pnpm@11.18.0',
       lethebotSchema: schemaContract,
     }),
     'utf8',
@@ -55,7 +55,7 @@ afterEach(() => {
 });
 
 describe('release preflight', () => {
-  it('accepts the required artifacts and matching exact pnpm metadata', () => {
+  it('accepts the required artifacts and compatible exact pnpm metadata', () => {
     const result = runReleasePreflight(createProjectFixture());
 
     expect(result).toEqual({
@@ -65,6 +65,22 @@ describe('release preflight', () => {
       schemaContract,
     });
   });
+
+  it.each(['pnpm@9.0.0', 'pnpm@10.1.2'])(
+    'accepts supported %s metadata with a version 9 lockfile',
+    (packageManager) => {
+      const result = runReleasePreflight(createProjectFixture({
+        packageJson: JSON.stringify({
+          type: 'module',
+          version: '0.1.0',
+          packageManager,
+          lethebotSchema: schemaContract,
+        }),
+      }));
+
+      expect(result.ok).toBe(true);
+    },
+  );
 
   it('rejects a built entrypoint whose ESM dependency graph cannot load', () => {
     const projectRoot = createProjectFixture();
@@ -198,20 +214,20 @@ describe('release preflight', () => {
     expect(result.diagnostics.map((diagnostic) => diagnostic.code)).toContain('invalid-package-manager');
   });
 
-  it('rejects a pnpm major that differs from the lockfile version major', () => {
+  it('rejects a pnpm and lockfile version pair outside the reviewed compatibility map', () => {
     const result = runReleasePreflight(
       createProjectFixture({
         packageJson: JSON.stringify({
-          packageManager: 'pnpm@10.1.2',
+          packageManager: 'pnpm@11.18.0',
           lethebotSchema: schemaContract,
         }),
-        lockfile: "lockfileVersion: '9.0'\n",
+        lockfile: "lockfileVersion: '8.0'\n",
       }),
     );
 
     expect(result.ok).toBe(false);
     expect(result.diagnostics.map((diagnostic) => diagnostic.code)).toContain(
-      'package-lock-major-mismatch',
+      'package-lock-version-incompatible',
     );
   });
 

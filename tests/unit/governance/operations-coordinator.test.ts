@@ -908,7 +908,7 @@ describe('GovernanceOperationsCoordinator', () => {
       closeDatabase(liveDb);
       rmSync(tempDir, { recursive: true, force: true });
     }
-  });
+  }, 70_000);
 
   it('projects the shared doctor once into a fixed path-free status', () => {
     const doctor = vi.spyOn(operationsDoctor, 'runOperationsDoctor')

@@ -61,3 +61,8 @@ export function redactSecretsInText(text: string): SecretRedactionResult {
 
   return { text: redacted, findings };
 }
+
+export function createRedactedError(redactedMessage: string): Error {
+  // Deliberately omit the raw cause: provider and tool errors may contain secrets.
+  return new Error(redactedMessage);
+}
