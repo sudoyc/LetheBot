@@ -1,7 +1,7 @@
 # Long-Running Goal State
 
 **State type:** active checkpoint, not a completion certificate
-**Updated:** 2026-08-07 02:11 CST (+0800)
+**Updated:** 2026-08-07 02:51 CST (+0800)
 **Program:** repair-and-long-term-development goal
 **Program verdict:** `LOCAL_COMPLETE_EXTERNAL_BLOCKED`
 **Product verdict:** `DETERMINISTIC_READY`; production/live acceptance is not complete
@@ -34,16 +34,22 @@ absent. Those boundaries remain fail-closed.
 
 ## 2. Verified Candidate Snapshot
 
-- Verified base commit: `6bf92ab` (`main`, tracking `origin/main`).
+- Verified candidate source commit before this checkpoint update: `65fde07` (`main`, tracking `origin/main`); the worktree was clean.
 - Pi dependencies: `@earendil-works/pi-agent-core 0.83.0` and
   `@earendil-works/pi-ai 0.83.0`.
 - Candidate scope: reviewed tool-catalog configuration plus the accumulated local
   program changes listed in section 6.
 - No live Provider, QQ, deployment restart, production restore, or private-data
-  operation was performed for this checkpoint.
+  operation was performed. The Framework Compose path was not started, stopped,
+  rebuilt, or recreated during this audit; its persistent SnowLuma/QQ bind
+  directories and shared ports remain protected.
+- The source-stack images were built successfully with `--env-file /dev/null` and
+  `--pull=false`; no Compose service was started by this audit.
+- Both Compose files passed `config --quiet` with `/dev/null`; this is config
+  inspection only, not runtime or QQ evidence.
 
 Current deterministic release gate, run against the candidate at
-2026-08-07 02:04 CST:
+2026-08-07 02:47 CST:
 
 ```text
 pnpm release:check
@@ -54,25 +60,31 @@ pnpm release:check
   package dry run: passed (606 files)
   Vitest: 140 passed, 1 skipped files
           2957 passed, 10 skipped tests
-  total elapsed: 230.53s
+  total elapsed: 159.54s
 ```
 
-Additional current evidence:
+Additional current deterministic evidence:
 
 ```text
-focused tool/config/Pi suite:
-  7 files passed
-  175 tests passed, 254 skipped by focused selection
-
-tool owner CLI smoke:
-  list-tools: exit 0
-  tool-status runtime.tools: exit 0
-  disable-tool memory.search: exit 0, persisted restart-scoped state
-  enable-tool memory.search: exit 0, restored state
-
-pnpm --silent cli --help: exit 0
-pnpm exec eslint src tests --ext .ts: exit 0
+pnpm smoke: all smoke checks passed.
+pnpm --silent ops:worker-soak -- --duration-ms=15000 --interval-ms=1000:
+  success=true; 22 attempts (21 completed, 1 planned retry); 21 jobs completed;
+  lease extension observed; scheduler errors=0; isolation clean; FK violations=0.
+pnpm --silent ops:rehearse-maintenance: success=true; disposable backup/restore/
+  retention rehearsal; integrity and foreign-key checks clean.
+pnpm --silent ops:rehearse-rollback: success=true; disposable rollback rehearsal;
+  integrity and foreign-key checks clean.
+pnpm --silent acceptance:db-summary on a disposable restored DB:
+  integrity=true, foreign-key violations=0; --require-acceptance-hints exited 1
+  because populated live acceptance rows are absent.
+pnpm --silent ops:doctor on the same disposable DB:
+  overall=ok; 25/25 required tables; foreign-key violations=0.
+Fresh acceptance template plus default validator: valid=true, findingCount=0.
+The same template with --require-complete exited 1 with findingCount=119;
+this is the expected incomplete-live-evidence result, not a product-gate failure.
 ```
+
+No live Provider/QQ/runtime claim is inferred from these deterministic results.
 
 ## 3. P0–P9 Contract Audit
 
@@ -194,14 +206,23 @@ is not fully completed because these required acceptance items are absent:
    effect, privacy leak, or unbounded growth.
 5. Production browser accessibility/visual operator sign-off.
 6. Share-safe validation and complete validation of the populated current-candidate
-   evidence set.
+   evidence set. A fresh empty template is share-safe (`valid=true`, zero findings),
+   but `--require-complete` exits 1 with 119 findings because populated live
+   evidence is absent.
 
 Historic samples, deterministic harness results, the one-hour synthetic soak,
 and empty/template evidence cannot satisfy these items.
 
 ## 8. Exact Resume Action
 
-Do not open another speculative local feature slice. The next valid action is:
+Do not open another speculative local feature slice. Before any runtime acceptance,
+keep `docker-compose.snowluma-framework.yml` off-limits without fresh live
+authority: it references the real SnowLuma image, `restart: unless-stopped`,
+persistent framework bind directories, `SNOWLUMA_HOOK_AUTOLOAD=1`, and ports shared
+with the source stack. This audit used only `/dev/null` config checks and a
+source-stack image build; it did not start any stack or stop/recreate any service.
+
+The next valid action is:
 
 1. obtain fresh, explicit `LIVE_PROVIDER`, `LIVE_QQ`, and
    `LIVE_DEPLOYMENT_OR_RESTART` authority plus a controlled runtime and test
