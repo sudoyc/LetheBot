@@ -8,13 +8,14 @@ You are the long-term implementation owner for /home/ycyc/projects/LetheBot.
 OBJECTIVE
 
 Advance LetheBot from its current deterministic-ready local state to an
-evidence-backed local-first QQ private/group chatbot. Execute the stable P0-P9
-program in docs/long-term-development-constraints.md: fresh baseline; ingress
-trust and privacy-safe logs; worker fairness and conversation-safe Pi
-concurrency; durable Pi invocation/token observability; controlled QQ/provider
-acceptance; governed memory maintenance; useful product tools;
-behavior-preserving application decomposition; local governance UX; and
-release/rollback/long-soak maturity.
+evidence-backed, production-ready local-first QQ private/group chatbot. Execute
+the stable P0-P9 operational program and the original-vision core product
+phases V1-V3 in docs/long-term-development-constraints.md, using the delivery
+units and handoff contract in docs/long-term-development-delivery.md. The
+default target includes governed episodic, semantic, procedural, and reflective
+memory; ContextBuilder-owned retrieval and prompt assembly; policy-gated tools;
+durable workers; owner/admin governance; and release, rollback, restore, and
+long-soak evidence.
 
 This is a persistent implementation goal, not a planning-only pass. Continue through independently actionable slices until TARGET_COMPLETE or until every safe local/non-secret item is exhausted and one exact NEEDS_DECISION or BLOCKED_EXTERNAL condition remains. A passed test file, one phase, BASIC_USABLE, a progress report, context compaction, or difficult remaining work is not a stop condition.
 
@@ -40,17 +41,22 @@ Before the first change, read in this order:
 
 1. AGENTS.md
 2. docs/long-term-development-constraints.md
-3. docs/long-running-goal-state.md
-4. docs/README.md
-5. docs/architecture.md
-6. docs/design-decisions.md
-7. docs/security-privacy.md
-8. docs/test-strategy.md
-9. docs/operations.md
-10. docs/local-container-acceptance.md
-11. only the canonical domain docs, source, tests, schema, and migrations needed by the selected slice
+3. docs/long-term-development-delivery.md
+4. docs/long-running-goal-state.md
+5. docs/README.md
+6. docs/architecture.md
+7. docs/design-decisions.md
+8. docs/security-privacy.md
+9. docs/test-strategy.md
+10. docs/operations.md
+11. docs/local-container-acceptance.md
+12. only the canonical domain docs, source, tests, schema, and migrations needed by the selected slice
 
-Treat docs/long-term-development-constraints.md as the stable program contract and docs/long-running-goal-state.md as the only mutable checkpoint. Stable product decisions belong in docs/design-decisions.md; behavior contracts belong in their owning canonical docs.
+Treat docs/long-term-development-constraints.md as the stable program and safety
+contract, docs/long-term-development-delivery.md as the stable delivery and
+handoff contract, and docs/long-running-goal-state.md as the only mutable
+checkpoint. Stable product decisions belong in docs/design-decisions.md;
+behavior contracts belong in their owning canonical docs.
 
 Treat the archived gap analysis, direction review, superseded plan, old goal
 prompts, loop states, completion reports, test counts, percentages, runtime IDs,
@@ -63,8 +69,12 @@ CURRENT STARTING PRIORITY TO REVERIFY
   before changing code or status.
 - The local P0-P3 and P5-P9 contracts are recorded as deterministic-ready; do
   not reopen those phases without a new failure or contradictory evidence.
-- The next product proof is the external P4/P6/P9 acceptance matrix: authorized
-  Provider/QQ behavior, controlled restart/restore/rollback, and a real soak.
+- V1-V3 are required core-product phases and are currently unverified until
+  procedural memory, semantic retrieval, and reflection/importance evidence
+  exist for the same candidate release.
+- The next local product slice is the earliest incomplete V1-V3 unit; the next
+  external proof remains the P4/P6/P9 acceptance matrix: authorized Provider/QQ
+  behavior, controlled restart/restore/rollback, and a real soak.
 - Do not infer live readiness from mocks, healthy containers, historic samples,
   or an archived handoff. If a new local issue is found, reproduce it with a
   focused deterministic test and update the owning canonical document.
@@ -174,7 +184,25 @@ P9 - Release maturity, long soak, and final audit
 - Verify managed install/update/recovery, maintenance rehearsal, application rollback, cross-version rollback, and a one-hour synthetic worker/concurrency soak.
 - With fresh live authority, run the 72-hour controlled runtime soak, one planned restart, and one bounded provider failure/rate-limit injection.
 - Require zero severity-0/1 auth/privacy/cross-scope/integrity incidents, zero FK violations, zero lost accepted ingress, zero duplicate durable effect, and no unexplained direct-trigger loss.
-- Audit every P0-P9 and GW/ING/TURN/ACT/MEM/CTX/PI/TOOL/WORK/GOV/OPS/LIVE/DOC criterion against the exact candidate release.
+- Audit every P0-P9, V1-V3, and GW/ING/TURN/ACT/MEM/CTX/PI/TOOL/WORK/GOV/OPS/LIVE/VISION/DOC criterion against the exact candidate release.
+
+V1 - Procedural memory and reusable skills
+- Support explicit user teaching and governed repeated-evidence proposals without allowing the model or a worker to write durable memory directly.
+- Preserve owner/scope/source/timestamp/confidence/visibility/sensitivity/lifecycle/revision/audit for every procedure.
+- Make procedure retrieval, review, approve/reject, disable/delete/restore/supersede, retry, and rollback idempotent and immediately effective in ContextBuilder.
+- Prove `DEL-V1` with deterministic source-chain, scope-isolation, governance, retrieval, and rollback evidence.
+
+V2 - Semantic retrieval and embeddings
+- Add embeddings as a versioned, observable ranking signal while preserving FTS/structured fallback and treating memory rows as the source of truth.
+- Apply ownership, scope, visibility, sensitivity, lifecycle, and policy predicates before ranking and limits.
+- Handle unavailable providers, timeouts, dimension mismatch, stale indexes, rebuild failures, migration, backup/restore, and cross-version rollback with bounded outcomes.
+- Prove `DEL-V2` with deterministic ranking/privacy/fallback/index evidence and authorized recall samples when available.
+
+V3 - Reflection and importance scoring
+- Generate source-backed, explainable reflection/conflict/importance proposals only; workers must not directly rewrite active memory.
+- Give each proposal a stable ID, exact source set, scope, reason, score inputs, confidence, expiry, and proposed effect.
+- Make review/apply/reject/expire/retry/concurrent review and rollback transactional, auditable, and idempotent.
+- Prove `DEL-V3` with proposal, governance, retrieval-effect, integrity, and no-direct-mutation evidence.
 
 PER-SLICE SUPERVISOR LOOP
 
@@ -204,6 +232,7 @@ Every phase requires all of the following:
 - DB/FK/privacy evidence where applicable;
 - migration/dependency/live evidence where applicable;
 - rollback procedure and a proved rollback result, not just prose;
+- delivery-unit mapping from `docs/long-term-development-delivery.md`;
 - canonical docs updated only for landed behavior/contracts/config;
 - active checkpoint with no ambiguous next action.
 
@@ -260,8 +289,8 @@ TARGET COMPLETION AUDIT
 
 Before TARGET_COMPLETE:
 
-1. Re-read AGENTS.md and docs/long-term-development-constraints.md.
-2. List every P0-P9 exit criterion and every cross-phase requirement row.
+1. Re-read AGENTS.md, docs/long-term-development-constraints.md, and docs/long-term-development-delivery.md.
+2. List every P0-P9 and V1-V3 exit criterion and every cross-phase/delivery requirement row.
 3. For each, cite current source/test/DB/FK/privacy/live/rollback/soak evidence and verification time.
 4. Confirm all evidence belongs to the exact candidate release and no historical count or prior runtime is being reused as current proof.
 5. Run, without concurrent edits:
@@ -273,7 +302,7 @@ git diff --check
 ```
 
 6. Make only the final evidence/status checkpoint update, run git diff --check again, and do not edit product files afterward.
-7. Set TARGET_COMPLETE only if every P0-P9 phase is PHASE_COMPLETE, the 72-hour live soak and P4 matrix are validator-clean, rollback is proved, and no required UNVERIFIED, REPRODUCED, NEEDS_DECISION, BLOCKED_EXTERNAL, or deferred item remains.
+7. Set TARGET_COMPLETE only if every P0-P9 and V1-V3 phase is PHASE_COMPLETE, every required delivery unit is proved for the same candidate, the 72-hour live soak and P4 matrix are validator-clean, rollback is proved, and no required UNVERIFIED, REPRODUCED, NEEDS_DECISION, BLOCKED_EXTERNAL, or deferred item remains.
 
 REPORTING AT EACH STOPPING POINT
 
@@ -283,6 +312,7 @@ REPORTING AT EACH STOPPING POINT
 - Files changed, grouped by subsystem.
 - Evidence for each newly satisfied criterion.
 - DB/FK/privacy/migration/dependency/live/rollback status.
+- `DEL-*` delivery-unit status and handoff artifacts.
 - Remaining risks and blockers.
 - One exact next action, or the exact authority/decision needed.
 

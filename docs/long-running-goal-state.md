@@ -1,16 +1,18 @@
 # Long-Running Goal State
 
 **State type:** active checkpoint, not a completion certificate
-**Updated:** 2026-09-05 16:41 CST (+0800)
+**Updated:** 2026-09-05 17:06 CST (+0800)
 **Program:** repair-and-long-term-development goal
-**Program verdict:** `LOCAL_COMPLETE_EXTERNAL_BLOCKED`
+**Program verdict:** `ACTIVE`
+**Operational baseline:** `LOCAL_COMPLETE_EXTERNAL_BLOCKED` for P0-P9; required V1-V3 vision phases remain unverified
 **Product verdict:** `DETERMINISTIC_READY`; production/live acceptance is not complete
 
 This file is intentionally concise. It replaces the former append-only execution
-journal. Canonical requirements live in
-`docs/long-term-development-constraints.md`; historical detail remains available
-in Git history and `docs/archive/`. Resume work from this checkpoint, current
-code, and current verification output—not from old completion claims.
+journal. Canonical requirements live in `docs/long-term-development-constraints.md`,
+and the required delivery units and handoff format live in
+`docs/long-term-development-delivery.md`; historical detail remains available in
+Git history and `docs/archive/`. Resume work from this checkpoint, current code,
+and current verification output—not from old completion claims.
 
 ## 1. Authority And Proof Boundary
 
@@ -130,6 +132,7 @@ must not be promoted from local tests or synthetic evidence.
 | `GOV` | `PROVED` | CLI, QQ commands, governance HTTP/browser workflows, scope/preview handles, privacy, maintenance, and local accessibility/security contracts pass. | Production operator sign-off. |
 | `OPS` | `DETERMINISTIC_READY` | Doctor, metrics, backup/restore handoff, retention, release activation/rollback, packaging, and validators are implemented and locally exercised. | Actual stopped-service restore and controlled deployment rollback. |
 | `LIVE` | `BLOCKED_EXTERNAL` | Templates and validators exist; current-candidate live records do not. | Fresh authority, then complete every required evidence cell. |
+| `VISION` | `UNVERIFIED` | Required V1-V3 delivery units are specified but procedural memory, semantic retrieval, and reflection/importance are not yet evidenced for this candidate. | Complete `DEL-V1`, `DEL-V2`, and `DEL-V3` with source, governance, retrieval, rollback, and handoff evidence. |
 | `DOC` | `PROVED` | Canonical architecture/contracts/security/deployment/operations/test/tool docs match the current implementation; this checkpoint is current and concise. | Update only after new verified behavior or live evidence. |
 
 ## 5. Completed Final Local Slice: Reviewed Tool Configuration
@@ -195,9 +198,12 @@ No dependency or migration file is changed by this final slice.
 
 ## 7. Remaining Blockers
 
-The repository is locally complete under the deterministic contract. The product
-is not fully completed because these required acceptance items are absent:
+The repository is locally complete under the P0-P9 deterministic contract. The
+expanded product target is not complete because these required items are absent:
 
+0. V1-V3 procedural memory, semantic retrieval, and reflection/importance
+   delivery units have not been implemented and evidenced for the current
+   candidate release.
 1. Complete real Provider/QQ matrix: private and group turns, reply-to-bot and
    ordinary mentions, silence/response decisions, allowed/denied tools, memory
    extraction/recall/privacy, cancellation, timeouts, provider and delivery
@@ -218,14 +224,15 @@ and empty/template evidence cannot satisfy these items.
 
 ## 8. Exact Resume Action
 
-Do not open another speculative local feature slice. Before any runtime acceptance,
+The next local product slice is V1 procedural memory, followed by V2 semantic
+retrieval and V3 reflection/importance. Before any runtime acceptance,
 keep `docker-compose.snowluma-framework.yml` off-limits without fresh live
 authority: it references the real SnowLuma image, `restart: unless-stopped`,
 persistent framework bind directories, `SNOWLUMA_HOOK_AUTOLOAD=1`, and ports shared
 with the source stack. This audit used only `/dev/null` config checks and a
 source-stack image build; it did not start any stack or stop/recreate any service.
 
-The next valid action is:
+After the local V1-V3 slices, the next external action is:
 
 1. obtain fresh, explicit `LIVE_PROVIDER`, `LIVE_QQ`, and
    `LIVE_DEPLOYMENT_OR_RESTART` authority plus a controlled runtime and test
@@ -236,6 +243,7 @@ The next valid action is:
 5. run share-safety and completeness validators;
 6. update this checkpoint and the affected canonical docs from observed results.
 
-Without that authority and infrastructure, status remains
-`LOCAL_COMPLETE_EXTERNAL_BLOCKED`; do not fabricate completion, read private
-artifacts, or substitute synthetic evidence.
+Without that authority and infrastructure, the operational baseline remains
+`LOCAL_COMPLETE_EXTERNAL_BLOCKED`; until V1-V3 are also proved, the program
+remains `ACTIVE`. Do not fabricate completion, read private artifacts, or
+substitute synthetic evidence.

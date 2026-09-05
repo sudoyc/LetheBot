@@ -1,12 +1,12 @@
 # Long-Term Development Program And Constraints
 
-**Purpose:** 本文档定义 LetheBot 下一阶段长期开发的稳定执行合同、阶段路线、验收证据和回滚边界。它补充 `AGENTS.md` 和各领域 canonical docs；当前事实、当前 phase 和下一步只记录在 `docs/long-running-goal-state.md`。
+**Purpose:** 本文档定义 LetheBot 下一阶段长期开发的稳定执行合同、阶段路线、验收证据和回滚边界。它补充 `AGENTS.md` 和各领域 canonical docs；当前事实、当前 phase 和下一步只记录在 `docs/long-running-goal-state.md`。最终交付物和交接格式见 `docs/long-term-development-delivery.md`。
 
 本文档不是完成证明。阶段编号和退出条件保持稳定，状态随当前 worktree 和新证据变化。
 
 ## 0. Program Objective
 
-目标是把 LetheBot 推进到可验证的本地优先 QQ 私聊/群聊产品：
+目标是把 LetheBot 推进到可验证、可交付的本地优先 QQ 私聊/群聊产品，并完成原始愿景中属于默认核心范围的记忆能力：
 
 - OneBot 入口具备明确的信任边界、请求上限和隐私安全日志；
 - 不同会话可以受控并发，同会话保持有序，队列等待受 deadline 约束；
@@ -16,6 +16,7 @@
 - 工具目录对实际用户有用，同时保持 registry、policy、sandbox、audit 和 redaction 边界；
 - `src/index.ts` 的组合、入口、turn orchestration 和 worker runtime 被渐进拆分，不改变行为；
 - owner/admin 可以通过同一 governance service 检查和控制记忆、上下文、模型调用、工具和任务；
+- procedural memory、semantic retrieval、reflection/importance scoring 形成受治理、可回滚的端到端闭环；
 - 发布、升级、回滚、备份、恢复和长时间 soak 有当前证据。
 
 ## 1. Authority And Document Control
@@ -41,6 +42,7 @@
 - 稳定产品决策写入 `docs/design-decisions.md`。
 - 领域 contract 随实现更新到其 owning canonical doc。
 - `docs/prompts/repair-and-long-term-development-goal.md` 是本 program 的执行 prompt。
+- `docs/long-term-development-delivery.md` 是稳定的交付契约、交接材料清单和最终验收矩阵。
 - `docs/group-chat-reliability-constraints.md` 继续约束相关行为，但它不是完整产品路线。
 - `docs/archive/plans/one-shot-full-completion-constraints.md`、
   `docs/archive/prompts/` 下的旧 goal prompts 和
@@ -59,7 +61,7 @@
 | `PHASE_COMPLETE` | 本 phase 的 outcome、tests、evidence、rollback proof 和全部 exit criteria 当前都成立。 |
 | `NEEDS_DECISION` | 唯一剩余阻碍是明确的产品/架构选择，且其他独立工作已完成。 |
 | `BLOCKED_EXTERNAL` | 唯一剩余阻碍是明确的外部授权、凭据、session、服务或 runtime 状态。 |
-| `TARGET_COMPLETE` | P0-P9 全部 `PHASE_COMPLETE`，最终矩阵无 required gap，最终 gates 与 live/soak 证据当前有效。 |
+| `TARGET_COMPLETE` | P0-P9 和 V1-V3 全部 `PHASE_COMPLETE`，最终交付矩阵无 required gap，最终 gates 与 live/soak 证据当前有效。 |
 
 `pnpm release:check` 通过只支持 `DETERMINISTIC_READY`。健康容器、HTTP 200、成功发送一条消息、历史 live 结果都不能单独支持 `LIVE_PROVED` 或 `TARGET_COMPLETE`。
 
@@ -511,7 +513,7 @@ pnpm release:check
 - 在 disposable data 上演练 backup/restore/retention、application rollback 和 cross-version rollback。
 - 运行至少 1 小时 synthetic worker/concurrency soak；在 fresh live authority 下运行 72 小时 controlled runtime soak，包含一次 planned restart 和一次 bounded provider failure/rate-limit injection。
 - 定义并检查 auth failure、body rejection、queue wait、turn latency、invocation tokens/status、job age/retry、delivery、memory mutation/retrieval 和 privacy counters。
-- 最后逐条审计 P0-P9 和 `GW/ING/TURN/ACT/MEM/CTX/PI/TOOL/WORK/GOV/OPS/LIVE/DOC`。
+- 最后逐条审计 P0-P9、V1-V3 和 `GW/ING/TURN/ACT/MEM/CTX/PI/TOOL/WORK/GOV/OPS/LIVE/VISION/DOC`。
 
 **Deterministic operations commands:**
 
@@ -543,6 +545,62 @@ summaries above, tied to the exact candidate/prior release digests.
 
 **Exit criteria:** deterministic rehearsals、72h live soak、P4 matrix、rollback proof、current release gate 和 final audit 全部成立。否则保持最精确的 `DETERMINISTIC_READY`、`NEEDS_DECISION` 或 `BLOCKED_EXTERNAL`，不得写 `TARGET_COMPLETE`。
 
+### V1: Procedural Memory And Reusable Skills
+
+**Outcome:** 用户可以明确教给 LetheBot 一套可复用的工作流程，或在受控
+重复证据下形成 procedure proposal；该知识经过现有 evaluator/policy、source、
+revision、audit 和 lifecycle 边界后，能够被 ContextBuilder 按权限检索并解释。
+
+**Implementation scope:**
+
+- procedure candidate 只能来自明确用户意图或满足重复证据阈值的受治理路径；模型不能直接写 durable memory。
+- procedure 必须保留 owner/scope/source/timestamp/confidence/visibility/sensitivity/lifecycle/revision/audit。
+- procedure retrieval 不得改变 tool permission、platform authority 或 action target；治理操作复用现有 CLI/QQ/UI service。
+- approve、reject、expire、disable、delete、restore、supersede、retry 和 rollback 都必须幂等且可审计。
+
+**Required evidence:** explicit teaching、重复证据、跨会话 scope isolation、ContextPack trace、治理查看和立即删除/禁用排除。
+
+**Rollback:** procedure writer 和 retrieval 可以独立 disable；已写记录只能通过 governed revision/lifecycle transition 回滚，不删除来源历史。
+
+**Exit criteria:** procedure 从 candidate 到 retrieval、governance、disable/delete/restore 的完整链路 deterministic-ready，并通过交付矩阵 `DEL-V1`。
+
+### V2: Semantic Retrieval And Embeddings
+
+**Outcome:** 语义相似度成为可版本化的额外检索信号，同时保留 FTS/structured
+fallback 和全部现有可见性、生命周期、敏感度和 owner 约束。
+
+**Implementation scope:**
+
+- embedding provider、模型版本、维度、索引版本和生成时间必须显式记录；不能把向量作为 memory truth。
+- visibility/scope/lifecycle/sensitivity/ownership predicates 必须在 ranking 和 limit 之前执行。
+- provider unavailable、timeout、dimension mismatch、stale index 和 rebuild failure 都要有 bounded、observable、可恢复的结果。
+- embedding schema/migration 单独交付，必须证明 fresh DB、sequential upgrade、backup/restore、old/new compatibility 和 cross-version rollback。
+- 默认测试继续 credential-free；没有 embedding 时 FTS 路径必须保持可用且结果可解释。
+
+**Required evidence:** deterministic ranking/fallback/visibility tests、index rebuild/rollback、bounded provider failure、context trace retrieval method，以及授权后的真实 recall/privacy 样本。
+
+**Rollback:** 关闭 embedding retrieval 后回退到 FTS/structured ranking；删除向量索引不得删除或改变 memory_records、sources、revisions 或 audit truth。
+
+**Exit criteria:** 语义检索在同一候选 release 上通过交付矩阵 `DEL-V2`，且不存在以向量绕过治理边界的路径。
+
+### V3: Reflection And Importance Scoring
+
+**Outcome:** 后台可以从有来源的长期交互中提出 reflection、冲突解释或 importance
+调整建议，但不会无监督改写 active memory。
+
+**Implementation scope:**
+
+- 每个 proposal 具有稳定 ID、精确 source set、scope、reason、score inputs、confidence、expiry 和 proposed effect。
+- worker 只生成 proposal/review evidence；apply 需要 exact governance authority、transactional revision/source/audit 和 rollback。
+- scoring 必须可解释、可版本化、可重跑；重复运行、并发 review、过期 proposal 和 provider failure 必须幂等。
+- reflection 只能影响后续 retrieval/prompt 的受治理排序，不能直接提升 visibility、权限或 action capability。
+
+**Required evidence:** source-backed proposal、explainable score、review/apply/reject/expire/rollback、immediate retrieval effect、FK/integrity 和 no-direct-worker-mutation。
+
+**Rollback:** 关闭 scoring/apply 后保留历史 proposal；已应用变化通过新 revision/supersede transition 恢复，不重写或删除历史来源。
+
+**Exit criteria:** reflection 和 importance 的 proposal-to-governance-to-retrieval 链路 deterministic-ready，并通过交付矩阵 `DEL-V3`。
+
 ## 8. Cross-Phase Acceptance Matrix
 
 最终审计至少覆盖：
@@ -559,17 +617,18 @@ summaries above, tied to the exact candidate/prior release digests.
 | `GOV` | QQ/CLI/UI service parity、exact authority/scope、inspect/delete/review/why、redacted output。 |
 | `OPS` | managed release、migration compatibility、backup/restore/retention、health/metrics、rollback rehearsal。 |
 | `LIVE` | P4 matrix and P9 soak on the exact candidate release with validator-clean aggregate evidence。 |
+| `VISION` | `DEL-V1` procedural memory、`DEL-V2` semantic retrieval、`DEL-V3` reflection/importance 的完整链路和同一候选 release 证据。 |
 | `DOC` | canonical contracts/runbooks describe observed behavior；checkpoint contains exact current gap and no stale authority conflict。 |
 
 ## 9. Target Completion Contract
 
 `TARGET_COMPLETE` 只在以下条件同时成立时使用：
 
-1. P0-P9 全部 `PHASE_COMPLETE`。
+1. P0-P9 以及 V1-V3 全部 `PHASE_COMPLETE`；这组阶段构成默认 QQ 核心产品目标。
 2. final cross-phase matrix 每个 required row 都有当前 file/test/DB/live/rollback evidence。
 3. `pnpm release:check` 在无人并发编辑的最终 worktree 上通过。
 4. 真实 Provider、QQ、tool、memory、restart 和 72h soak 证据对应同一 reviewed release。
 5. 没有 required `UNVERIFIED`、`REPRODUCED`、`NEEDS_DECISION`、`BLOCKED_EXTERNAL` 或 user-deferred item。
 6. 最终 checkpoint 仅做 evidence/status 更新，随后 `git diff --check` 通过且不再修改 product files。
 
-缺少 live authority 时，可以准确声明 deterministic phases 已完成，并将 P4/P9 标为 `BLOCKED_EXTERNAL`；不能把它表述为 production-ready。
+缺少 live authority 时，可以准确声明本地 deterministic phases 已完成，并将 P4/P9/LIVE 标为 `BLOCKED_EXTERNAL`；如果 V1-V3 尚未完成，必须保持 goal 为 `ACTIVE`，不能把它表述为 production-ready。多平台、multi-agent、知识图谱 UI 和分布式基础设施只有在用户显式扩展 scope 后才进入 required matrix。

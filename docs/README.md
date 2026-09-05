@@ -5,8 +5,9 @@ This directory is the implementation-facing documentation set for LetheBot.
 Current docs are organized into four classes:
 
 1. **Canonical architecture and constraints** — must be read before changing related code.
-2. **Active operational state** — the mutable long-running checkpoint and its
-   execution constraints; this is current coordination state, not completion proof.
+2. **Active operational state and delivery contract** — the mutable long-running
+   checkpoint plus stable execution, delivery, evidence, and handoff contracts;
+   current status is coordination state, not completion proof.
 3. **Scoped execution guidance** — the active long-term and group-reliability
    prompts that point back to the canonical control plane.
 4. **Archive** — historical prompts, loop states, completion reports, discussion logs, and retired plans. Archive files are useful context only; they are not completion evidence.
@@ -17,30 +18,34 @@ Current docs are organized into four classes:
 2. [Architecture](architecture.md)
 3. [Design Decisions](design-decisions.md)
 4. [Long-Term Development Program And Constraints](long-term-development-constraints.md)
-5. [Contracts](contracts.md)
-6. [Data Model](data-model.md)
-7. [SQLite Schema](sqlite-schema.md)
-8. [Memory System](memory-system.md)
-9. [Identity Model](identity-model.md)
-10. [Context Orchestration](context-orchestration.md)
-11. [Social Action Model](social-action-model.md)
-12. [Agent Governance](agent-governance.md)
-13. [Local Governance Experience](governance-ui.md)
-14. [Tool Registry](tool-registry.md)
-15. [Pi Integration](pi-integration.md)
-16. [Security and Privacy](security-privacy.md)
-17. [Tech Stack](tech-stack.md)
-18. [Deployment](deployment.md)
-19. [Local Container Acceptance](local-container-acceptance.md)
-20. [Operations](operations.md)
-21. [Troubleshooting](troubleshooting.md)
-22. [Test Strategy](test-strategy.md)
+5. [Long-Term Development Delivery Contract](long-term-development-delivery.md)
+6. [Contracts](contracts.md)
+7. [Data Model](data-model.md)
+8. [SQLite Schema](sqlite-schema.md)
+9. [Memory System](memory-system.md)
+10. [Identity Model](identity-model.md)
+11. [Context Orchestration](context-orchestration.md)
+12. [Social Action Model](social-action-model.md)
+13. [Agent Governance](agent-governance.md)
+14. [Local Governance Experience](governance-ui.md)
+15. [Tool Registry](tool-registry.md)
+16. [Pi Integration](pi-integration.md)
+17. [Security and Privacy](security-privacy.md)
+18. [Tech Stack](tech-stack.md)
+19. [Deployment](deployment.md)
+20. [Local Container Acceptance](local-container-acceptance.md)
+21. [Operations](operations.md)
+22. [Troubleshooting](troubleshooting.md)
+23. [Test Strategy](test-strategy.md)
 
 ## Focus Documents
 
 - [Long-Term Development Program And Constraints](long-term-development-constraints.md)
-  — active P0-P9 roadmap and the stable evidence, architecture, privacy,
-  verification, rollback, checkpoint, Git, and completion contract.
+  — active P0-P9 and V1-V3 program plus stable evidence, architecture, privacy,
+  verification, rollback, checkpoint, Git, and completion constraints.
+- [Long-Term Development Delivery Contract](long-term-development-delivery.md)
+  — required delivery units, original-vision capability acceptance, evidence
+  rules, handoff package, and final report shape.
 - [Long-Term Development `/goal` Prompt](prompts/repair-and-long-term-development-goal.md)
   — active umbrella execution prompt for the next-stage program.
 - [Long-Running Goal State](long-running-goal-state.md) — mutable current
@@ -54,7 +59,9 @@ Current docs are organized into four classes:
   umbrella roadmap.
 
 Do not create a second current roadmap, gap-analysis log, or loop-state file.
-The stable phase contract belongs in `long-term-development-constraints.md`;
+The stable phase and safety contract belongs in `long-term-development-constraints.md`;
+the stable delivery and handoff contract belongs in
+`long-term-development-delivery.md`;
 stable product decisions belong in `design-decisions.md`; current evidence,
 phase status, and the exact next slice belong only in
 `long-running-goal-state.md`.
@@ -66,8 +73,8 @@ Historical development material is preserved under [`archive/`](archive/):
 - previous `/goal` prompts: [`archive/prompts/`](archive/prompts/);
 - gap analyses and direction reviews: [`archive/reviews/`](archive/reviews/).
 
-The active root set intentionally contains only canonical domain docs, the
-current checkpoint, and the two scoped execution prompts above.
+The active root set intentionally contains canonical domain docs, the delivery
+contract, the current checkpoint, and the two scoped execution prompts above.
 
 ## Supporting References
 

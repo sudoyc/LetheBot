@@ -1724,10 +1724,12 @@ as `unknown`.
 
 ## 11. Implementation Guidance
 
-For current implementation evidence, sequencing, tests, and acceptance criteria, see:
+For current implementation evidence, sequencing, delivery, tests, and acceptance criteria, see:
 
+- **`docs/long-term-development-constraints.md`** - active phase, safety, evidence, rollback, and completion constraints
+- **`docs/long-term-development-delivery.md`** - required delivery units and final handoff contract
+- **`docs/prompts/repair-and-long-term-development-goal.md`** - active long-running execution prompt
 - **`docs/long-running-goal-state.md`** - active requirement/evidence checkpoint
-- **`docs/archive/plans/one-shot-full-completion-constraints.md`** - historical long-horizon execution and proof rules
 - **`docs/test-strategy.md`** - deterministic regression tests and acceptance criteria
 - **`docs/fake-gateway-design.md`** - test harness interface and test scenarios
 - **`docs/sqlite-schema.md`** - complete database schema with indexes
