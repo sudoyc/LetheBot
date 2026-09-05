@@ -7,7 +7,14 @@ You are the long-term implementation owner for /home/ycyc/projects/LetheBot.
 
 OBJECTIVE
 
-Advance LetheBot from its current EXPERIMENTAL_NOT_NORMAL state to an evidence-backed local-first QQ private/group chatbot. Execute the stable P0-P9 program in docs/long-term-development-constraints.md: fresh baseline; ingress trust and privacy-safe logs; worker fairness and conversation-safe Pi concurrency; durable Pi invocation/token observability; controlled QQ/provider acceptance; governed memory maintenance; useful product tools; behavior-preserving application decomposition; local governance UX; and release/rollback/long-soak maturity.
+Advance LetheBot from its current deterministic-ready local state to an
+evidence-backed local-first QQ private/group chatbot. Execute the stable P0-P9
+program in docs/long-term-development-constraints.md: fresh baseline; ingress
+trust and privacy-safe logs; worker fairness and conversation-safe Pi
+concurrency; durable Pi invocation/token observability; controlled QQ/provider
+acceptance; governed memory maintenance; useful product tools;
+behavior-preserving application decomposition; local governance UX; and
+release/rollback/long-soak maturity.
 
 This is a persistent implementation goal, not a planning-only pass. Continue through independently actionable slices until TARGET_COMPLETE or until every safe local/non-secret item is exhausted and one exact NEEDS_DECISION or BLOCKED_EXTERNAL condition remains. A passed test file, one phase, BASIC_USABLE, a progress report, context compaction, or difficult remaining work is not a stop condition.
 
@@ -45,14 +52,22 @@ Before the first change, read in this order:
 
 Treat docs/long-term-development-constraints.md as the stable program contract and docs/long-running-goal-state.md as the only mutable checkpoint. Stable product decisions belong in docs/design-decisions.md; behavior contracts belong in their owning canonical docs.
 
-Treat docs/full-project-gap-analysis.md, docs/long-term-development-direction-review.md, docs/next-full-implementation-plan.md, docs/one-shot-full-completion-constraints.md, all old goal prompts, archive files, old loop states, historical completion reports, test counts, percentages, runtime IDs, and prior summaries as hypotheses or historical evidence only. Never create a second current roadmap, status log, or checkpoint.
+Treat the archived gap analysis, direction review, superseded plan, old goal
+prompts, loop states, completion reports, test counts, percentages, runtime IDs,
+and prior summaries under `docs/archive/` as hypotheses or historical evidence
+only. Never create a second current roadmap, status log, or checkpoint.
 
 CURRENT STARTING PRIORITY TO REVERIFY
 
-- The committed deterministic suite was previously reported green, but run a fresh baseline.
-- The reliability R1-R8 implementation is largely deterministic-ready and still needs fresh live proof.
-- Before live deployment, inspect and reproduce the higher-priority local risks: tokenless non-loopback reverse HTTP ingress, unbounded request buffering before auth, raw event debug logging and short QQ-ID redaction drift, worker FIFO starvation, one global serialized Pi Agent with queue wait outside timeout, zero/absent main-Pi usage ledger, and src/index.ts responsibility concentration.
-- Do not blindly implement these statements. Reproduce or disprove each against the current worktree and record the result.
+- Reconcile `docs/long-running-goal-state.md` with a fresh deterministic gate
+  before changing code or status.
+- The local P0-P3 and P5-P9 contracts are recorded as deterministic-ready; do
+  not reopen those phases without a new failure or contradictory evidence.
+- The next product proof is the external P4/P6/P9 acceptance matrix: authorized
+  Provider/QQ behavior, controlled restart/restore/rollback, and a real soak.
+- Do not infer live readiness from mocks, healthy containers, historic samples,
+  or an archived handoff. If a new local issue is found, reproduce it with a
+  focused deterministic test and update the owning canonical document.
 
 COLD START AND RESUME
 

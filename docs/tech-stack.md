@@ -1,59 +1,48 @@
 # Tech Stack
 
-## Recommendation
-
-Use TypeScript / Node.js as the main runtime.
-
-Reasons:
-
-- Pi SDK is TypeScript-native.
-- Gateway, tool registry, web UI, and agent event streaming fit Node well.
-- The project values fast experimentation.
-- Python can still be used as a worker sidecar for ML-heavy tasks.
-
-## Initial Stack
+## Current Implementation
 
 | Area | Choice |
 |---|---|
-| Runtime | Node.js 22+ |
+| Runtime | Node.js 22.19+ |
 | Language | TypeScript |
-| API server | Fastify or Hono |
-| Bot protocol | NapCat / OneBot v11 WebSocket |
+| API server | Node `http` with dedicated application and governance servers |
+| Bot protocol | NapCat / OneBot v11 WebSocket and optional reverse HTTP |
 | Database | SQLite with WAL |
-| ORM | Drizzle ORM |
+| Database driver | `better-sqlite3` with explicit repositories and migrations |
 | Keyword search | SQLite FTS |
-| Vector search | sqlite-vec, LanceDB, or Qdrant later |
-| Jobs | SQLite job table first; BullMQ + Redis later |
-| Agent core | Pi SDK |
-| UI | React + Vite when needed |
-| Observability | structured logs + OpenTelemetry-ready spans |
-| Sandbox | Docker first; stronger isolation later |
+| Jobs | SQLite-backed durable workers |
+| Agent core | Pi SDK (`@earendil-works/pi-agent-core` and `pi-ai`) |
+| Governance UI | Bundled HTML/CSS/JavaScript browser assets over the governance server |
+| Observability | Structured Pino logs, SQLite audit rows, and Prometheus metrics |
+| Sandbox | In-process policy boundary with bounded output; Docker is a future backend |
+
+The runtime does not currently use Fastify, Hono, Drizzle, React, Vite, a
+vector database, Redis, BullMQ, or a Python sidecar. Those remain possible
+future choices only after a documented requirement and acceptance plan.
 
 ## Storage Strategy
 
-SQLite should be the source of truth for MVP:
+SQLite is the source of truth for the current runtime:
 
 - Easy local deployment.
 - Simple backups.
 - Good enough for early QQ group volume.
 - Works well with WAL mode.
 
-Vector and graph storage can start as side tables:
+Vector and graph storage are not part of the current runtime. If retrieval
+quality or scale later requires them, they can start as side tables:
 
 - `memory_embeddings`
 - `graph_nodes`
 - `graph_edges`
 
-Move to dedicated services only after retrieval quality or scale requires it.
+Move to dedicated services only after an acceptance-backed design decision.
 
-## Python Sidecar
+## Deferred Integrations
 
-Use Python only for tasks that benefit clearly from Python libraries:
+Python may be used later for a clearly justified embedding, reranking, speech,
+image, or experimental extraction sidecar:
 
-- Local embedding models.
-- Rerankers.
-- Speech or image preprocessing.
-- Experimental memory extraction pipelines.
-
-Keep sidecar communication explicit through HTTP, RPC, or job queues.
-
+- sidecar communication must remain explicit through HTTP, RPC, or durable jobs;
+- it must not bypass memory provenance or governance rules.

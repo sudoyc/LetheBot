@@ -31,7 +31,7 @@ Read, in order:
 5. docs/design-decisions.md
 6. the canonical domain documents and tests for the current slice
 
-Also obey docs/one-shot-full-completion-constraints.md for checkpoint, evidence,
+Also obey docs/long-term-development-constraints.md for checkpoint, evidence,
 worktree, verification, escalation, and stop discipline. This prompt has a
 separate `group_reliability_status`; its scoped completion rules below replace
 the umbrella goal-status completion rule. The scoped reliability constraints

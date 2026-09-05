@@ -6,7 +6,7 @@
 
 ## 0. Program Objective
 
-目标是把 LetheBot 从 `EXPERIMENTAL_NOT_NORMAL` 推进到可验证的本地优先 QQ 私聊/群聊产品：
+目标是把 LetheBot 推进到可验证的本地优先 QQ 私聊/群聊产品：
 
 - OneBot 入口具备明确的信任边界、请求上限和隐私安全日志；
 - 不同会话可以受控并发，同会话保持有序，队列等待受 deadline 约束；
@@ -42,7 +42,9 @@
 - 领域 contract 随实现更新到其 owning canonical doc。
 - `docs/prompts/repair-and-long-term-development-goal.md` 是本 program 的执行 prompt。
 - `docs/group-chat-reliability-constraints.md` 继续约束相关行为，但它不是完整产品路线。
-- `docs/one-shot-full-completion-constraints.md`、旧 goal prompts 和 `docs/next-full-implementation-plan.md` 仅作历史/方法参考。
+- `docs/archive/plans/one-shot-full-completion-constraints.md`、
+  `docs/archive/prompts/` 下的旧 goal prompts 和
+  `docs/archive/plans/next-full-implementation-plan.md` 仅作历史/方法参考。
 
 ### 1.3 Evidence Status Vocabulary
 

@@ -2,13 +2,13 @@
 
 This directory is the implementation-facing documentation set for LetheBot.
 
-Current docs are split into four classes:
+Current docs are organized into four classes:
 
 1. **Canonical architecture and constraints** — must be read before changing related code.
 2. **Active operational state** — the mutable long-running checkpoint and its
    execution constraints; this is current coordination state, not completion proof.
-3. **Planning references** — useful hypotheses and sequencing ideas that must be
-   revalidated against current code/tests before use.
+3. **Scoped execution guidance** — the active long-term and group-reliability
+   prompts that point back to the canonical control plane.
 4. **Archive** — historical prompts, loop states, completion reports, discussion logs, and retired plans. Archive files are useful context only; they are not completion evidence.
 
 ## Canonical Reading Order
@@ -52,19 +52,22 @@ Current docs are split into four classes:
 - [Group Chat Reliability `/goal` Prompt](prompts/group-chat-reliability-goal.md)
   — retained scoped prompt for a reliability-only objective, not the active
   umbrella roadmap.
-- [Long-Horizon Full Completion Constraints](one-shot-full-completion-constraints.md)
-  and [its `/goal` prompt](prompts/one-shot-full-completion-goal.md) — superseded
-  umbrella methodology retained as planning history; the active program uses
-  the long-term constraints and prompt above.
-- [Next Full Implementation Plan](next-full-implementation-plan.md) — superseded
-  2026-07-03 planning snapshot; use only as a hypothesis after checking current
-  implementation, tests, and the active requirement matrix.
 
-Do not maintain a second current roadmap, gap-analysis log, or loop-state file.
+Do not create a second current roadmap, gap-analysis log, or loop-state file.
 The stable phase contract belongs in `long-term-development-constraints.md`;
 stable product decisions belong in `design-decisions.md`; current evidence,
 phase status, and the exact next slice belong only in
 `long-running-goal-state.md`.
+
+Historical development material is preserved under [`archive/`](archive/):
+
+- retired handoffs and loop checkpoints: [`archive/loop/`](archive/loop/);
+- superseded plans and execution contracts: [`archive/plans/`](archive/plans/);
+- previous `/goal` prompts: [`archive/prompts/`](archive/prompts/);
+- gap analyses and direction reviews: [`archive/reviews/`](archive/reviews/).
+
+The active root set intentionally contains only canonical domain docs, the
+current checkpoint, and the two scoped execution prompts above.
 
 ## Supporting References
 

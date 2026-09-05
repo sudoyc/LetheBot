@@ -1727,10 +1727,11 @@ as `unknown`.
 For current implementation evidence, sequencing, tests, and acceptance criteria, see:
 
 - **`docs/long-running-goal-state.md`** - active requirement/evidence checkpoint
-- **`docs/one-shot-full-completion-constraints.md`** - long-horizon execution and proof rules
+- **`docs/archive/plans/one-shot-full-completion-constraints.md`** - historical long-horizon execution and proof rules
 - **`docs/test-strategy.md`** - deterministic regression tests and acceptance criteria
 - **`docs/fake-gateway-design.md`** - test harness interface and test scenarios
 - **`docs/sqlite-schema.md`** - complete database schema with indexes
 
-`docs/next-full-implementation-plan.md` and historical phase-by-phase task lists
-are planning context only and must not be treated as current completion evidence.
+`docs/archive/plans/next-full-implementation-plan.md` and historical
+phase-by-phase task lists are planning context only and must not be treated as
+current completion evidence.

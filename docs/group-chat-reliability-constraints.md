@@ -2,8 +2,7 @@
 
 **Status:** scoped normative supplement for the active reliability repair.
 **Authority:** this file supplements `AGENTS.md`, `docs/design-decisions.md`,
-`docs/long-term-development-constraints.md`, and
-`docs/one-shot-full-completion-constraints.md`. It does not replace them and is
+`docs/long-term-development-constraints.md`. It does not replace them and is
 not a mutable project-status document.
 
 ## 1. Objective And Milestones

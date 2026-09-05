@@ -13,6 +13,12 @@ Archive files may explain why decisions were made, but they are not completion e
 - `reviews/` — audits, baseline metrics, and direction reviews.
 - `discussions/` — raw discussion logs and answer reviews.
 - `artifacts/` — generated diagrams or HTML artifacts.
-- `integrations/` — superseded integration notes.
+- `integrations/` — superseded integration notes and quick-start snapshots.
 
 Use current code, current command output, and canonical docs under `docs/` for implementation decisions.
+
+The 2026-09 documentation cleanup moved the remaining root-level development
+handoffs and superseded planning material into this archive. The active root set
+now consists of canonical domain docs, `long-running-goal-state.md`, and the
+current scoped prompts; archived files retain their original content for
+historical lookup only.

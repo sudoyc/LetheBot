@@ -4,8 +4,8 @@
 
 ## 前置要求
 
-- Node.js 22+
-- pnpm 9+
+- Node.js 22.19+
+- pnpm 11.18.0
 - SQLite 3.35+
 - （可选）SnowLuma 或其它 OneBot v11 兼容运行时（用于真实 QQ 连接）
 - （可选）Pi/API provider 凭据（用于真实推理能力）

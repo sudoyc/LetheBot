@@ -92,19 +92,16 @@ The only mutable evidence/status checkpoint is
 old loop-state files, gap analyses, prompt files, or historical test counts as
 current completion evidence.
 
-The latest recorded controlled audit found the OneBot transport, SQLite
-persistence, outbound delivery, and extraction worker operational, but the
-overall product verdict remains `EXPERIMENTAL_NOT_NORMAL`. The audited live
-runtime delivered 57 of 65 group mentions and 8 of 12 reply-to-bot turns.
-Speaker/quote, evaluator, delayed Attention, governance, restart-memory, and
-retrieval fixes are substantially deterministic-ready, but the audited live
-runtime predates those fixes.
+The latest recorded deterministic audit has the local product at
+`DETERMINISTIC_READY`; production/live acceptance remains incomplete. A historic
+live runtime sample predates the deterministic speaker/quote, evaluator,
+delayed Attention, governance, restart-memory, retrieval, and tool-catalog
+fixes, so it is retained as context rather than current completion evidence.
 
-The active next-stage program first closes ingress trust, request bounding,
-logging privacy, worker fairness, Pi concurrency, and Pi invocation accounting;
-it then proceeds through controlled live acceptance, governed memory
-maintenance, product tools, application decomposition, governance UX, and
-release soak:
+The active program is currently `LOCAL_COMPLETE_EXTERNAL_BLOCKED`: deterministic
+local work is complete, while fresh Provider/QQ acceptance, controlled restart
+and restore evidence, rollback evidence, and the real runtime soak remain
+external gates:
 
 - [Long-Term Development Program And Constraints](docs/long-term-development-constraints.md)
 - [Long-Term Development Goal Prompt](docs/prompts/repair-and-long-term-development-goal.md)
@@ -170,15 +167,15 @@ pnpm cli disable-tool memory.search --env-file .env
 pnpm cli enable-tool memory.search --env-file .env
 ```
 
-## Recommended Initial Stack
+## Current Stack
 
-- Runtime: TypeScript / Node.js
-- Agent core: Pi SDK first, Pi RPC as fallback
-- Gateway: NapCat / OneBot adapter
-- Storage: SQLite WAL as source of truth
-- Search: SQLite FTS plus vector sidecar or sqlite-vec
-- Background jobs: SQLite-backed queue first, Redis/BullMQ later if needed
-- Governance UI: lightweight web UI after the first CLI tools exist
+- Runtime: Node.js 22.19+ / TypeScript
+- Agent core: Pi SDK behind LetheBot's adapter boundary
+- Gateway: NapCat / OneBot v11 WebSocket with optional reverse HTTP
+- Storage: SQLite WAL with `better-sqlite3` repositories
+- Search: SQLite FTS
+- Background jobs: SQLite-backed durable workers
+- Governance UI: bundled browser assets served by the local governance server
 
 See [Tech Stack](docs/tech-stack.md) for details.
 

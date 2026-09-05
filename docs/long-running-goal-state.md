@@ -1,7 +1,7 @@
 # Long-Running Goal State
 
 **State type:** active checkpoint, not a completion certificate
-**Updated:** 2026-08-07 02:51 CST (+0800)
+**Updated:** 2026-09-05 16:00 CST (+0800)
 **Program:** repair-and-long-term-development goal
 **Program verdict:** `LOCAL_COMPLETE_EXTERNAL_BLOCKED`
 **Product verdict:** `DETERMINISTIC_READY`; production/live acceptance is not complete
@@ -34,11 +34,12 @@ absent. Those boundaries remain fail-closed.
 
 ## 2. Verified Candidate Snapshot
 
-- Verified candidate source commit before this checkpoint update: `65fde07` (`main`, tracking `origin/main`); the worktree was clean.
-- Pi dependencies: `@earendil-works/pi-agent-core 0.83.0` and
-  `@earendil-works/pi-ai 0.83.0`.
-- Candidate scope: reviewed tool-catalog configuration plus the accumulated local
-  program changes listed in section 6.
+- Verified candidate source commit before this checkpoint update: `ba342e8` (`main`, tracking `origin/main`); the worktree was clean.
+- `origin` is the canonical GitHub repository; no separate `upstream` remote is configured.
+- After `git fetch origin --prune`, `main...origin/main` is `0 0`: the source tree has no commit drift from the remote default branch.
+- The repository resolves `@earendil-works/pi-agent-core` and `@earendil-works/pi-ai` at `0.83.0`; the upstream Pi repository latest release is `v0.85.0` from 2026-09-04, while the current npm registry check reports `0.84.4` as the latest package available to pnpm. This documentation cleanup does not change those dependencies; verify publication and compatibility before a separate upgrade.
+- Candidate scope: the accumulated local program changes listed in section 6,
+  plus this repository-sync and documentation-archive cleanup.
 - No live Provider, QQ, deployment restart, production restore, or private-data
   operation was performed. The Framework Compose path was not started, stopped,
   rebuilt, or recreated during this audit; its persistent SnowLuma/QQ bind
@@ -49,7 +50,7 @@ absent. Those boundaries remain fail-closed.
   inspection only, not runtime or QQ evidence.
 
 Current deterministic release gate, run against the candidate at
-2026-08-07 02:47 CST:
+2026-09-05 16:02 CST:
 
 ```text
 pnpm release:check
