@@ -12,7 +12,6 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   formatFatalErrorForConsole,
-  hello,
   isMainModuleInvocation,
   resolvePiApiKey,
   VERSION,
@@ -25,7 +24,6 @@ describe('runtime version metadata', () => {
     ) as { version: string };
 
     expect(VERSION).toBe(manifest.version);
-    expect(hello()).toBe(`LetheBot v${manifest.version}`);
   });
 });
 

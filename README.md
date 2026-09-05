@@ -69,7 +69,6 @@ LetheBot/
 ├── tests/
 │   ├── unit/           # Unit tests
 │   ├── fakes/          # Test harness (FakeOneBot)
-│   └── phase-acceptance/  # Phase gate tests
 ├── migrations/         # SQLite schema migrations
 └── docs/               # Architecture and design docs
 ```

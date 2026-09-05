@@ -95,8 +95,8 @@
     "adoptsLegacyUnversioned": true
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "^0.83.0",
-    "@earendil-works/pi-ai": "^0.83.0",
+    "@earendil-works/pi-agent-core": "^0.85.0",
+    "@earendil-works/pi-ai": "^0.85.0",
     "better-sqlite3": "^13.0.3",
     "commander": "^15.0.0",
     "minimatch": "^10.2.6",

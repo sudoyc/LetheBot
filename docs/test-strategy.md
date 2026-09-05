@@ -64,7 +64,6 @@ regressions are added; command exit status and the current output are evidence.
 
 `tests/unit/` covers module contracts and edge behavior, including:
 
-- event, memory, context, action, audit, tool, identity, and agent types;
 - repositories and SQLite migration compatibility;
 - attention, policy, action execution, evaluator, Pi, and tool boundaries;
 - worker leases, attempts, retries, heartbeats, and idempotency;
@@ -106,12 +105,6 @@ in `tests/e2e/deepseek-real-api.test.ts`.
 
 `tests/e2e/pi-real-api.test.ts` is opt-in and skipped by default. Its presence
 in a default Vitest run is not real-provider evidence.
-
-### Phase Acceptance Scaffold
-
-`tests/phase-acceptance/phase-a.test.ts` retains the repository-foundation
-acceptance check. Current completion evidence comes from the focused suites and
-`pnpm release:check`, not from nonexistent per-phase package scripts.
 
 ## Critical Regression Invariants
 

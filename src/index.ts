@@ -111,13 +111,6 @@ type PublicAdapterStatus = Pick<
   'ready' | 'mode' | 'wsConnected' | 'pendingWsRequests' | 'hasToken' | 'botIdConfigured'
 >;
 
-/**
- * 测试导出函数
- */
-export function hello(): string {
-  return `LetheBot v${VERSION}`;
-}
-
 export function formatFatalErrorForConsole(error: unknown): string {
   const sanitized = sanitizeFatalDiagnosticValue(error, []);
 
