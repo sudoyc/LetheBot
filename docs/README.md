@@ -45,7 +45,8 @@ Current docs are organized into four classes:
   verification, rollback, checkpoint, Git, and completion constraints.
 - [Long-Term Development Delivery Contract](long-term-development-delivery.md)
   — required delivery units, original-vision capability acceptance, evidence
-  rules, handoff package, and final report shape.
+  coverage, candidate identity, executable gates, handoff package, and final
+  report shape. Final P4/P9 acceptance follows completion of V1-V3.
 - [Long-Term Development `/goal` Prompt](prompts/repair-and-long-term-development-goal.md)
   — active umbrella execution prompt for the next-stage program.
 - [Long-Running Goal State](long-running-goal-state.md) — mutable current

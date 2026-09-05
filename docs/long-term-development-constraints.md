@@ -105,6 +105,8 @@ P0 必须逐项重现或推翻这些假设，并把结果写入 active checkpoin
 | destructive or incompatible migration on a non-disposable DB | fresh explicit authority required |
 
 一种授权不推导另一种授权。read-only live inspection 不等于 deploy、Provider call 或 QQ send 授权。
+同一 goal 中仍适用的用户授权在续接、压缩和中断后继续有效，不应重复索取。
+归档任务的授权或旧验收结果不自动授权一个新的 runtime 或操作范围。
 
 ### 3.2 Sensitive Data
 
@@ -224,9 +226,25 @@ pnpm release:check
 
 ## 7. Phase Roadmap
 
+### Execution Dependencies
+
+阶段编号用于稳定引用，实际执行遵循以下依赖顺序：
+
+1. P0 核对当前代码和证据，补齐 P1-P3、P5-P8 中仍存在的基础缺口；已证明的
+   行为不因重新启动 goal 而重做。没有 P1 缺口时直接选择最早未完成项。
+2. 完成 V1、V2、V3 及其治理、检索和运维集成。P4 的外部阻塞不阻止这些本地工作。
+3. 冻结包含全部默认功能的 candidate，再完成 P4、P6 的 live 部分和 P9。
+   前期 canary 可以及早发现问题，但不能作为后续不同 build 的最终证据。
+4. 对同一 candidate 执行最终审计；验收期间 runtime/schema/dependency/effective
+   config 变更后重新标识 candidate，并重新完成最终验收和 soak。
+
+P9 的准备和 disposable rehearsal 可以提前进行，P9 的最终退出必须在 V1-V3
+之后。交付矩阵、候选标识和 validator 的覆盖边界见
+`docs/long-term-development-delivery.md` 第 1、4 节。
+
 ### P0: Fresh Baseline And Failure Reproduction
 
-**Outcome:** 建立当前可信基线，逐项确认或推翻第 2 节假设，选定第一个 P1 slice。
+**Outcome:** 建立当前可信基线，逐项确认或推翻第 2 节假设，选定最早未完成的 slice。
 
 **Implementation scope:**
 
@@ -371,7 +389,8 @@ pnpm release:check
 ```bash
 pnpm release:check
 pnpm acceptance:evidence-template -- --out=/tmp/lethebot-next-stage-acceptance.md
-pnpm ops:doctor
+pnpm ops:doctor -- --db="${LETHEBOT_ACCEPTANCE_DB:?set the authorized acceptance database path}"
+pnpm acceptance:db-summary -- --db="${LETHEBOT_ACCEPTANCE_DB:?set the authorized acceptance database path}" --require-acceptance-hints
 pnpm acceptance:validate-evidence -- /tmp/lethebot-next-stage-acceptance.md
 pnpm acceptance:validate-evidence -- /tmp/lethebot-next-stage-acceptance.md --require-complete
 ```
@@ -523,12 +542,14 @@ pnpm ops:rehearse-maintenance
 pnpm ops:rehearse-rollback
 pnpm ops:rehearse-application-rollback
 pnpm --silent ops:rehearse-cross-version -- \
-  --prior-release=<PRIOR_RELEASE> \
-  --candidate-release=<CANDIDATE_RELEASE>
+  --prior-release="${LETHEBOT_PRIOR_RELEASE:?set the immutable prior release directory}" \
+  --candidate-release="${LETHEBOT_CANDIDATE_RELEASE:?set the immutable candidate release directory}"
 pnpm ops:worker-soak -- --duration-ms=3600000 --interval-ms=1000
 ```
 
-`<PRIOR_RELEASE>` 和 `<CANDIDATE_RELEASE>` 必须是已构建的 immutable managed releases，不得用 placeholder 执行。
+两个 release 变量必须指向已构建且不同的 immutable managed release 目录。
+这些变量以及 P4 的 `LETHEBOT_ACCEPTANCE_DB` 仅为命令的 shell 输入，
+不是新增应用配置。rehearsal/soak 不指定 `--db`，由命令创建 disposable DB。
 
 **Required evidence:** the following soak acceptance conditions and the command
 summaries above, tied to the exact candidate/prior release digests.
@@ -559,6 +580,8 @@ revision、audit 和 lifecycle 边界后，能够被 ContextBuilder 按权限检
 - approve、reject、expire、disable、delete、restore、supersede、retry 和 rollback 都必须幂等且可审计。
 
 **Required evidence:** explicit teaching、重复证据、跨会话 scope isolation、ContextPack trace、治理查看和立即删除/禁用排除。
+完整场景还包括重启、并发/重试、全部治理生命周期及独立 writer/retrieval
+控制，以交付契约第 3 节为准，不得只凭 extraction 单测退出。
 
 **Rollback:** procedure writer 和 retrieval 可以独立 disable；已写记录只能通过 governed revision/lifecycle transition 回滚，不删除来源历史。
 
@@ -578,6 +601,9 @@ fallback 和全部现有可见性、生命周期、敏感度和 owner 约束。
 - 默认测试继续 credential-free；没有 embedding 时 FTS 路径必须保持可用且结果可解释。
 
 **Required evidence:** deterministic ranking/fallback/visibility tests、index rebuild/rollback、bounded provider failure、context trace retrieval method，以及授权后的真实 recall/privacy 样本。
+交付契约第 3 节要求固定语料下 FTS/semantic 的 recall@k 对照，并区分 synthetic
+vector 排序测试与实际 embedding 模型质量证据；远程 embedding 的文本出站边界
+必须明确，不能因配置了聊天 Provider 就默认外发全部记忆。
 
 **Rollback:** 关闭 embedding retrieval 后回退到 FTS/structured ranking；删除向量索引不得删除或改变 memory_records、sources、revisions 或 audit truth。
 
@@ -596,6 +622,8 @@ fallback 和全部现有可见性、生命周期、敏感度和 owner 约束。
 - reflection 只能影响后续 retrieval/prompt 的受治理排序，不能直接提升 visibility、权限或 action capability。
 
 **Required evidence:** source-backed proposal、explainable score、review/apply/reject/expire/rollback、immediate retrieval effect、FK/integrity 和 no-direct-worker-mutation。
+按交付契约第 3 节证明实际长期交互窗口、source/revision 重新校验及后续
+ContextPack 的受治理变化；已有 maintenance scan 或固定 importance 常量不等于本 phase 完成。
 
 **Rollback:** 关闭 scoring/apply 后保留历史 proposal；已应用变化通过新 revision/supersede transition 恢复，不重写或删除历史来源。
 

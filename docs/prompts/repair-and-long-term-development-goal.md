@@ -1,6 +1,9 @@
 # Long-Term Development `/goal` Prompt
 
 下面整段可直接作为 LetheBot 下一阶段长期开发 `/goal`。默认允许本地代码、测试和文档工作；commit、push、真实 Provider/QQ、部署和 private data 操作分别需要明确授权。
+启动时使用下方完整 prompt，并按实际授权调整 flags；后续恢复同一 goal 时保留
+仍适用的用户授权。生成本文不等于启动实现，完成标准见
+[交付契约](../long-term-development-delivery.md)。
 
 ````text
 You are the long-term implementation owner for /home/ycyc/projects/LetheBot.
@@ -32,8 +35,13 @@ Use these defaults unless the user who launches or updates this goal explicitly 
 - LIVE_DEPLOYMENT_OR_RESTART=NOT_AUTHORIZED
 - PRIVATE_DB_OR_RAW_CHAT_READ=NOT_AUTHORIZED
 - DESTRUCTIVE_CLEANUP_OR_REVERT=NOT_AUTHORIZED
+- SCOPE_EXPANSION=NOT_AUTHORIZED
 
 One authorization never implies another. Commit authorization does not imply push. Read-only runtime inspection does not imply provider, QQ, container, deployment, credential, or private-row access. Never print or persist credential values while proving that configuration exists.
+Preserve applicable explicit user authorization across continuation, compaction,
+and interruption of this goal. Unrelated archived tasks and old runtime evidence
+do not authorize new actions. Missing publication or live authority does not
+prevent independent local implementation and verification.
 
 CONTROL PLANE AND READING ORDER
 
@@ -69,9 +77,9 @@ CURRENT STARTING PRIORITY TO REVERIFY
   before changing code or status.
 - The local P0-P3 and P5-P9 contracts are recorded as deterministic-ready; do
   not reopen those phases without a new failure or contradictory evidence.
-- V1-V3 are required core-product phases and are currently unverified until
-  procedural memory, semantic retrieval, and reflection/importance evidence
-  exist for the same candidate release.
+- V1-V3 are required core-product phases. Reverify their actual state using the
+  checkpoint, code, and the scenario contract in the delivery document;
+  do not assume an earlier partial implementation completes a phase.
 - The next local product slice is the earliest incomplete V1-V3 unit; the next
   external proof remains the P4/P6/P9 acceptance matrix: authorized Provider/QQ
   behavior, controlled restart/restore/rollback, and a real soak.
@@ -112,12 +120,24 @@ Use only UNVERIFIED, REPRODUCED, DETERMINISTIC_READY, LIVE_PROVED, PHASE_COMPLET
 
 PHASE PROGRAM
 
-Execute in this order, while continuing independent local phases when P4 live authority is unavailable:
+Use phase IDs as stable references, with this dependency order:
+
+1. Reconcile P0, then repair any remaining P1-P3 and P5-P8 foundation gaps.
+2. Complete V1 -> V2 -> V3 and their integration into governance and operations.
+3. Freeze the full candidate, then finish P4, P6 live checks, and P9 acceptance.
+4. Audit and deliver that same candidate. Product/schema/dependency/effective
+   configuration changes require a new candidate and final acceptance/soak.
+
+Preparatory P4 canaries and P9 disposable rehearsals may run earlier when their
+prerequisites are satisfied. P9 cannot finish before V1-V3. Missing P4 authority
+never blocks independent local V1-V3 work. The sections below retain their IDs;
+they are not instructions to redo already-proved phases.
 
 P0 - Fresh baseline and failure reproduction
 - Rebaseline the repository.
 - Reproduce or disprove each starting risk.
-- Build a compact requirement/gap matrix and select one P1 regression.
+- Build a compact requirement/gap matrix and select the earliest incomplete
+  requirement; select a P1 regression only when an actual security gap remains.
 - Make no production, schema, dependency, or live change in this phase.
 
 P1 - Ingress trust, request bounds, and privacy-safe logs
@@ -204,6 +224,11 @@ V3 - Reflection and importance scoring
 - Make review/apply/reject/expire/retry/concurrent review and rollback transactional, auditable, and idempotent.
 - Prove `DEL-V3` with proposal, governance, retrieval-effect, integrity, and no-direct-mutation evidence.
 
+For V1-V3, execute every required scenario in section 3 of the delivery
+contract. In particular, distinguish fixed-vector ranking tests from actual
+embedding recall quality, preserve pre-ranking privacy filters, and prove
+learning through the production wiring and governed lifecycle.
+
 PER-SLICE SUPERVISOR LOOP
 
 Repeat for every slice:
@@ -244,22 +269,35 @@ GIT AND CHECKPOINT POLICY
 - If COMMITS is not authorized, do not commit; report suggested commit groups only.
 - If COMMITS is authorized, commit only after a verified reversible slice or phase boundary. Stage explicit paths, review staged diff, and keep migrations, dependencies, runtime behavior, refactors, UI, and docs-only changes in separate commits where applicable.
 - Never use git add . and never commit .env, logs, DBs, credentials, private identifiers, raw chats, live evidence, generated runtime state, or unknown scratch files.
-- If PUSH is not independently authorized, stop after local commits. If PUSH is authorized, push only reviewed commits after rechecking branch/upstream and a green required gate.
+- If PUSH is not independently authorized, keep commits local and continue the
+  implementation. If PUSH is authorized, push only reviewed commits after
+  rechecking branch/upstream and a green required gate.
 - The checkpoint must survive context loss, but it is evidence metadata, not a chronological diary. Replace stale sections rather than appending long transcripts.
 
 LIVE AND PRIVATE DATA BOUNDARY
 
-Before every provider call, QQ send/login, live container/service change, or private DB/raw-chat read, verify the corresponding current authority flag. Historical authority is not reusable.
+Before every provider call, QQ send/login, live container/service change, or
+private DB/raw-chat read, verify the applicable user authorization and target.
+Reconcile flags with grants already made in this continuing goal; do not ask
+again solely because the goal resumed.
 
 For authorized acceptance:
 
 ```bash
 pnpm release:check
 pnpm acceptance:evidence-template -- --out=/tmp/lethebot-next-stage-acceptance.md
-pnpm ops:doctor
+pnpm ops:doctor -- --db="${LETHEBOT_ACCEPTANCE_DB:?set the authorized acceptance database path}"
+pnpm acceptance:db-summary -- --db="${LETHEBOT_ACCEPTANCE_DB:?set the authorized acceptance database path}" --require-acceptance-hints
 pnpm acceptance:validate-evidence -- /tmp/lethebot-next-stage-acceptance.md
 pnpm acceptance:validate-evidence -- /tmp/lethebot-next-stage-acceptance.md --require-complete
 ```
+
+Set the command's database variable only for the selected authorized acceptance
+target. Fill the evidence from observed scenario results before complete-mode
+validation; a fresh template should pass the default validator and fail
+--require-complete. Run the full local, cross-version, and soak gates in section
+4 of the delivery contract. The validator checks its checklist, not V1-V3 or
+elapsed soak duration; retain separate linked evidence for those requirements.
 
 Do not put raw output, credentials, raw messages, display names, QQ/group/message IDs, screenshots containing them, live DB rows, or private file paths into the repository or shared report. Use counts, booleans, status enums, hashes, timings, redaction markers, and neutral /tmp paths.
 
@@ -292,7 +330,7 @@ Before TARGET_COMPLETE:
 1. Re-read AGENTS.md, docs/long-term-development-constraints.md, and docs/long-term-development-delivery.md.
 2. List every P0-P9 and V1-V3 exit criterion and every cross-phase/delivery requirement row.
 3. For each, cite current source/test/DB/FK/privacy/live/rollback/soak evidence and verification time.
-4. Confirm all evidence belongs to the exact candidate release and no historical count or prior runtime is being reused as current proof.
+4. Confirm all evidence belongs to the exact candidate release and no historical count or prior runtime is being reused as current proof. A dirty worktree's HEAD is insufficient; use the frozen source/build and configuration identity required by the delivery contract.
 5. Run, without concurrent edits:
 
 ```bash

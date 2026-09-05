@@ -97,13 +97,16 @@ live runtime sample predates the deterministic speaker/quote, evaluator,
 delayed Attention, governance, restart-memory, retrieval, and tool-catalog
 fixes, so it is retained as context rather than current completion evidence.
 
-The active program is currently `LOCAL_COMPLETE_EXTERNAL_BLOCKED`: deterministic
-local work is complete, while fresh Provider/QQ acceptance, controlled restart
-and restore evidence, rollback evidence, and the real runtime soak remain
-external gates:
+`LOCAL_COMPLETE_EXTERNAL_BLOCKED` describes the recorded P0-P9 operational
+baseline, not completion of the original product vision. The full delivery
+contract also requires procedural memory, semantic retrieval, and
+reflection/importance scoring (V1-V3). Their current implementation and evidence
+status belong in the checkpoint. Fresh Provider/QQ acceptance, controlled
+restart/restore/rollback, and the real runtime soak remain required final gates:
 
 - [Long-Term Development Program And Constraints](docs/long-term-development-constraints.md)
 - [Long-Term Development Goal Prompt](docs/prompts/repair-and-long-term-development-goal.md)
+- [Long-Term Development Delivery Contract](docs/long-term-development-delivery.md)
 - [Current Goal State](docs/long-running-goal-state.md)
 - [Test Strategy Behavior Matrix](docs/test-strategy.md#conversation-reliability-matrix)
 - [Local Container Behavior Canary](docs/local-container-acceptance.md#验收步骤)
@@ -120,7 +123,8 @@ Start here:
 - [Documentation Index](docs/README.md) - All design docs
 - [Architecture](docs/architecture.md) - System design
 - [Current Goal State](docs/long-running-goal-state.md) - Current evidence, phase, and exact next slice
-- [Long-Term Development Constraints](docs/long-term-development-constraints.md) - Active P0-P9 program and completion contract
+- [Long-Term Development Constraints](docs/long-term-development-constraints.md) - P0-P9 and V1-V3 program and completion contract
+- [Long-Term Development Delivery Contract](docs/long-term-development-delivery.md) - Capability acceptance, release evidence, and handoff
 - [Reliability Constraints](docs/group-chat-reliability-constraints.md) - Scoped conversation invariants reused by the program
 - [Deployment Guide](docs/deployment.md) - Production setup
 
