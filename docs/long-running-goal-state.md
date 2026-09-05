@@ -1,7 +1,7 @@
 # Long-Running Goal State
 
 **State type:** active checkpoint, not a completion certificate
-**Updated:** 2026-09-05 16:00 CST (+0800)
+**Updated:** 2026-09-05 16:41 CST (+0800)
 **Program:** repair-and-long-term-development goal
 **Program verdict:** `LOCAL_COMPLETE_EXTERNAL_BLOCKED`
 **Product verdict:** `DETERMINISTIC_READY`; production/live acceptance is not complete
@@ -34,12 +34,13 @@ absent. Those boundaries remain fail-closed.
 
 ## 2. Verified Candidate Snapshot
 
-- Verified candidate source commit before this checkpoint update: `ba342e8` (`main`, tracking `origin/main`); the worktree was clean.
+- Verified candidate source commit before this checkpoint update: `4e9dcff` (`chore/sync-pi-and-prune-tests`, tracking `origin/chore/sync-pi-and-prune-tests`); the worktree was clean.
 - `origin` is the canonical GitHub repository; no separate `upstream` remote is configured.
 - After `git fetch origin --prune`, `main...origin/main` is `0 0`: the source tree has no commit drift from the remote default branch.
-- The repository resolves `@earendil-works/pi-agent-core` and `@earendil-works/pi-ai` at `0.83.0`; the upstream Pi repository latest release is `v0.85.0` from 2026-09-04, while the current npm registry check reports `0.84.4` as the latest package available to pnpm. This documentation cleanup does not change those dependencies; verify publication and compatibility before a separate upgrade.
+- The repository now resolves `@earendil-works/pi-agent-core` and `@earendil-works/pi-ai` at `0.85.0`, matching the upstream Pi repository release `v0.85.0` from 2026-09-04; the dependency lockfile and runtime compatibility checks pass.
 - Candidate scope: the accumulated local program changes listed in section 6,
-  plus this repository-sync and documentation-archive cleanup.
+  plus the Pi 0.85.0 dependency sync, redundant-test cleanup, and archived
+  development-document cleanup on this branch.
 - No live Provider, QQ, deployment restart, production restore, or private-data
   operation was performed. The Framework Compose path was not started, stopped,
   rebuilt, or recreated during this audit; its persistent SnowLuma/QQ bind
@@ -49,19 +50,20 @@ absent. Those boundaries remain fail-closed.
 - Both Compose files passed `config --quiet` with `/dev/null`; this is config
   inspection only, not runtime or QQ evidence.
 
-Current deterministic release gate, run against the candidate at
-2026-09-05 16:02 CST:
+Current deterministic gate components, run against the candidate at
+2026-09-05 16:41 CST:
 
 ```text
-pnpm release:check
-  typecheck + test typecheck: passed
-  eslint: passed
-  build: passed
-  release preflight: passed (5 required files)
-  package dry run: passed (606 files)
-  Vitest: 140 passed, 1 skipped files
-          2957 passed, 10 skipped tests
-  total elapsed: 159.54s
+pnpm typecheck: passed
+pnpm typecheck:test: passed
+pnpm lint: passed
+pnpm build: passed
+pnpm release:preflight: passed (5 required files)
+pnpm release:pack-check: passed (606 files)
+pnpm exec vitest run --silent
+  128 passed, 1 skipped files
+  2830 passed, 10 skipped tests
+git diff --check: passed
 ```
 
 Additional current deterministic evidence:
