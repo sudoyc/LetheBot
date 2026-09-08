@@ -1,7 +1,7 @@
 # Long-Running Goal State
 
 **State type:** active checkpoint, not a completion certificate
-**Updated:** 2026-09-08 22:32 CST (+0800)
+**Updated:** 2026-09-08 22:47 CST (+0800)
 **Program:** repair-and-long-term-development goal
 **Program verdict:** `ACTIVE`
 **User goal verdict:** `DEL-V3 PHASE_COMPLETE` (local deterministic scope)
@@ -171,8 +171,10 @@ performed.
 
 `LOCAL_CODE_TEST_DOCS=AUTHORIZED`, `SYNTHETIC_TMP_EVIDENCE=AUTHORIZED`.
 `COMMITS=AUTHORIZED`, `PUSH=AUTHORIZED` by the September 8 user request to
-organize and maintain Git and push the current work. This authorizes the
-existing branch's normal commit/push handoff.
+organize and maintain Git and push the current work. The subsequent September 8
+request authorizes merging into `main` and branch housekeeping: remove fully
+merged branches, prune metadata for missing worktrees, and preserve unmerged
+historical commits under `archive/*`.
 `LIVE_PROVIDER`, `LIVE_QQ`,
 `LIVE_DEPLOYMENT_OR_RESTART`, `PRIVATE_DB_OR_RAW_CHAT_READ`,
 `DESTRUCTIVE_CLEANUP_OR_REVERT`, and `SCOPE_EXPANSION` remain `NOT_AUTHORIZED`.
@@ -181,7 +183,7 @@ been performed by this implementation goal.
 
 ## 2. Candidate And Current Evidence
 
-- Branch: `chore/sync-pi-and-prune-tests`, tracking the same branch on `origin`.
+- Working branch: `main`, tracking `origin/main`. Resume development from here.
 - Source baseline: `88c587a`. Commit `c259bf7` contains the isolated 56-case
   test pruning and its guidance. Commit `bd53699` contains the integrated
   V1-V3 implementation, migrations, dependencies, tests and owning docs,
@@ -190,11 +192,27 @@ been performed by this implementation goal.
   Git handoff. Only this checkpoint was subsequently edited; runtime, tests,
   dependencies and the frozen corpus are unchanged from the verified snapshot.
   Reuse the final release/coverage evidence above for those committed contents.
-- `git fetch --prune origin` succeeded before the handoff commits. The branch
-  and fetched tracking ref both pointed to `88c587a`, with no divergence.
-  This checkpoint accompanies the two implementation/test commits in the
-  user-authorized normal push to the same branch. Check current Git status and
-  the remote branch SHA for the completed handoff result.
+- The initial Git handoff completed at `9f0d899`: the topic branch was pushed
+  and its local, tracking and remote SHAs matched, with a clean worktree.
+- Before consolidation, a fresh fetch confirmed `main` at `ba342e8` was eight
+  commits behind the topic branch with no divergence. Local `main` was
+  fast-forwarded to `9f0d899`, preserving all commits without conflict or
+  runtime changes. Six fully merged local branches were deleted, and five
+  stale worktree registrations were pruned after confirming their directories
+  no longer existed.
+- Two June 30 commits are not ancestors of `main` and have no equivalent patch
+  in its history. They remain preserved as `archive/legacy-memory-regex-fix`
+  (`1803ec2`) and `archive/legacy-eslint-fixes` (`46a8048`); their old code is
+  not part of the mainline merge.
+- Remote handoff scope: publish `main` and both archive refs, and remove the
+  fully merged `chore/sync-pi-and-prune-tests` and
+  `docs/archive-development-notes` remote refs. Check current Git status and
+  remote SHAs for the completed handoff result.
+- Pre-merge GitHub checks: no run exists for `9f0d899`, since CI triggers on
+  `main` pushes and pull requests. Historical run `31126628249` was cancelled
+  before any test step because no hosted runner acquired the job. It is not a
+  code-test failure or passing evidence; the local verified snapshot remains
+  the acceptance evidence for this merge.
 - Historical September 8 audit: HEAD was five commits ahead of the locally
   cached `origin/main`, without a fetch at that time. The pre-V3 pruning
   snapshot had 47 modified tracked files, 3 deleted test files and 20 untracked
