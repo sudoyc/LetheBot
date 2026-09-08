@@ -2288,7 +2288,10 @@ Recommended local install/update sequence:
    copies that same reviewed build into A and B release slots, invokes
    `node current/dist/index.js` through the managed symlink, and uses mock Pi
    plus loopback-isolated HTTP OneBot. Real health/readiness probes cover
-   successful A-to-B slot activation. A second B uses a deliberately mismatched
+   successful A-to-B slot activation. Health probes use the normal 30-second
+   startup budget to include cold process initialization and migrations;
+   readiness probes retain a 2.5-second budget for deliberate failure injection.
+   A second B uses a deliberately mismatched
    readiness route, so fixed `/readyz` fails and the activator must stop B,
    restore pointers, and restart/probe A. Aggregate output also requires
    empty-ledger v10 adoption, stable v1-v10 timestamps, preserved

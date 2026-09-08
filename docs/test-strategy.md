@@ -43,6 +43,8 @@ skipping it. An explicitly configured missing executable also fails. Local
 runs without either setting may skip browser cases when neither is installed.
 Each browser uses a disposable profile and is reaped even when startup or the
 test fails. CDP startup has a bounded wait and reports the browser's stderr.
+Browser cases have a 30-second budget with at most 15 seconds for cold startup;
+ordinary tests retain the default 10-second timeout.
 
 `pnpm test:coverage` is one gate with two explicit measurements. Vitest applies
 the repository-wide thresholds to every `src/**/*.ts` module except the two

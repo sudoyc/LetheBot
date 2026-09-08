@@ -1547,10 +1547,18 @@ function createRehearsalLifecycle(
 ): RehearsalLifecycle {
   const events: string[] = [];
   const startedReleases: string[] = [];
-  const realProbe = createApplicationProbe({
+  const probeOptions = {
     baseUrl: `http://127.0.0.1:${port}`,
     healthPath: '/healthz',
     readinessPath: '/readyz',
+  };
+  // Cold startup includes migration; keep the injected readiness failure short.
+  const healthProbe = createApplicationProbe({
+    ...probeOptions,
+    timeoutMs: DEFAULT_PROBE_TIMEOUT_MS,
+  });
+  const readinessProbe = createApplicationProbe({
+    ...probeOptions,
     timeoutMs: REHEARSAL_PROBE_TIMEOUT_MS,
   });
   let child: ChildProcess | undefined;
@@ -1633,7 +1641,7 @@ function createRehearsalLifecycle(
       const releaseId = readCurrentRelease(rootDir);
       events.push(`probe:${kind}:${releaseId}`);
       onProbe?.(kind, releaseId);
-      await realProbe.check(kind);
+      await (kind === 'health' ? healthProbe : readinessProbe).check(kind);
     },
   };
 

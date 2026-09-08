@@ -102,8 +102,8 @@ async function connectCdp(browser: ChildProcessWithoutNullStreams): Promise<CdpC
       finish(new Error(`Chromium exited before CDP endpoint (${code ?? signal}): ${output}`));
     };
     const timer = setTimeout(() => {
-      finish(new Error(`Chromium did not expose a CDP endpoint within 5 seconds: ${output}`));
-    }, 5000);
+      finish(new Error(`Chromium did not expose a CDP endpoint within 15 seconds: ${output}`));
+    }, 15_000);
     browser.stderr.on('data', onData);
     browser.once('error', onError);
     browser.once('exit', onExit);
@@ -2049,6 +2049,7 @@ describe('governance HTTP security boundary', () => {
 
   it.skipIf(!CHROMIUM_PATH)(
     'executes Privacy, Group-summary, and Display-profile controllers in Chromium',
+    { timeout: 30_000 },
     async () => {
       const harness = await startHarness();
       const client = await startChromium();
@@ -2351,6 +2352,7 @@ describe('governance HTTP security boundary', () => {
 
   it.skipIf(!CHROMIUM_PATH)(
     'executes read-only Explain catalog and detail in Chromium',
+    { timeout: 30_000 },
     async () => {
       const harness = await startHarness();
       const client = await startChromium();
@@ -2537,6 +2539,7 @@ describe('governance HTTP security boundary', () => {
 
   it.skipIf(!CHROMIUM_PATH)(
     'executes memory record mutation controllers in Chromium',
+    { timeout: 30_000 },
     async () => {
       const harness = await startHarness();
       const client = await startChromium();
@@ -2759,6 +2762,7 @@ describe('governance HTTP security boundary', () => {
 
   it.skipIf(!CHROMIUM_PATH)(
     'executes strict application preview projection in Chromium',
+    { timeout: 30_000 },
     async () => {
       const harness = await startHarness();
       const client = await startChromium();
@@ -2859,6 +2863,7 @@ describe('governance HTTP security boundary', () => {
 
   it.skipIf(!CHROMIUM_PATH)(
     'executes application preview and confirmation controller in Chromium',
+    { timeout: 30_000 },
     async () => {
       const harness = await startHarness();
       const client = await startChromium();
@@ -3104,6 +3109,7 @@ describe('governance HTTP security boundary', () => {
 
   it.skipIf(!CHROMIUM_PATH)(
     'executes rollback and expiration preview-confirmation controllers in Chromium',
+    { timeout: 30_000 },
     async () => {
       const harness = await startHarness();
       const client = await startChromium();
@@ -3420,6 +3426,7 @@ describe('governance HTTP security boundary', () => {
 
   it.skipIf(!CHROMIUM_PATH)(
     'executes the rejection preview and confirmation controller in Chromium',
+    { timeout: 30_000 },
     async () => {
     const harness = await startHarness();
     const client = await startChromium();
@@ -3668,6 +3675,7 @@ describe('governance HTTP security boundary', () => {
   );
   it.skipIf(!CHROMIUM_PATH)(
     'executes unscoped Identity and Operations controllers in Chromium',
+    { timeout: 30_000 },
     async () => {
       const harness = await startHarness();
       const client = await startChromium();
@@ -3903,6 +3911,7 @@ describe('governance HTTP security boundary', () => {
 
   it.skipIf(!CHROMIUM_PATH)(
     'keeps every governance view accessible and bounded at desktop and mobile widths',
+    { timeout: 30_000 },
     async () => {
       const harness = await startHarness();
       const client = await startChromium();
