@@ -525,7 +525,7 @@ describe('GovernanceOperationsCoordinator', () => {
         `${second.backupRef}.db`,
       ].sort());
       expect(statSync(backupDirectory).mode & 0o777).toBe(0o700);
-      expect(readFileSync(liveDbPath)).toEqual(sourceBefore);
+      expect(readFileSync(liveDbPath).equals(sourceBefore)).toBe(true);
       expect(liveDb.prepare('SELECT total_changes()').pluck().get()).toBe(changesBefore);
       expect(liveDb.prepare('PRAGMA integrity_check').pluck().get()).toBe('ok');
       expect(liveDb.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
@@ -620,7 +620,7 @@ describe('GovernanceOperationsCoordinator', () => {
       expect(failureRaw).not.toContain(backupDirectory);
       expect(failureRaw).not.toContain(secret);
       expect(failureRaw).not.toContain(platformId);
-      expect(readFileSync(liveDbPath)).toEqual(sourceBefore);
+      expect(readFileSync(liveDbPath).equals(sourceBefore)).toBe(true);
       expect(liveDb.prepare('SELECT total_changes()').pluck().get()).toBe(changesBefore);
       expect(liveDb.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
     } finally {
@@ -824,7 +824,7 @@ describe('GovernanceOperationsCoordinator', () => {
       rmSync(firstPath);
       symlinkSync(outsideArtifact, firstPath, 'file');
       expect(callPreview(firstRef)).toBeNull();
-      expect(readFileSync(outsideArtifact)).toEqual(firstBytes);
+      expect(readFileSync(outsideArtifact).equals(firstBytes)).toBe(true);
       restoreFirstArtifact();
 
       const outsideHardlink = join(tempDir, 'outside-hardlink.db');
@@ -832,7 +832,7 @@ describe('GovernanceOperationsCoordinator', () => {
       rmSync(firstPath);
       linkSync(outsideHardlink, firstPath);
       expect(callPreview(firstRef)).toBeNull();
-      expect(readFileSync(outsideHardlink)).toEqual(firstBytes);
+      expect(readFileSync(outsideHardlink).equals(firstBytes)).toBe(true);
       restoreFirstArtifact();
 
       writeFileSync(firstPath, `corrupt ${secret}`);
@@ -891,12 +891,12 @@ describe('GovernanceOperationsCoordinator', () => {
 
       expect(callPreview(firstRef)).toEqual(expectedPreview(firstRef, firstBytes));
       expect(readdirSync(backupDirectory).sort()).toEqual(filesBefore);
-      expect(readFileSync(firstPath)).toEqual(firstBytes);
-      expect(readFileSync(secondPath)).toEqual(secondBytes);
+      expect(readFileSync(firstPath).equals(firstBytes)).toBe(true);
+      expect(readFileSync(secondPath).equals(secondBytes)).toBe(true);
       expect(statSync(backupDirectory).mode & 0o777).toBe(0o700);
       expect(statSync(firstPath).mode & 0o777).toBe(0o600);
       expect(statSync(secondPath).mode & 0o777).toBe(0o600);
-      expect(readFileSync(liveDbPath)).toEqual(sourceBefore);
+      expect(readFileSync(liveDbPath).equals(sourceBefore)).toBe(true);
       expect(liveDb.prepare('SELECT total_changes()').pluck().get()).toBe(changesBefore);
       expect(liveDb.prepare('SELECT COUNT(*) FROM audit_log').pluck().get()).toBe(auditsBefore);
       expect(liveDb.prepare('PRAGMA integrity_check').pluck().get()).toBe('ok');

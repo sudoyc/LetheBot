@@ -106,7 +106,7 @@ describe('governance restore handoff consumer', () => {
       .toBe('attention_required');
     expect(readdirSync(fixture.handoffDirectory)).toEqual(['completed.json']);
     expect(lstatSync(join(fixture.handoffDirectory, 'completed.json')).mode & 0o7777).toBe(0o600);
-    expect(readFileSync(fixture.backupPath)).toEqual(fixture.backupBytes);
+    expect(readFileSync(fixture.backupPath).equals(fixture.backupBytes)).toBe(true);
     expect(lstatSync(fixture.backupPath).mode).toBe(fixture.backupMode);
     expect(readFileSync(fixture.unrelatedPath, 'utf8')).toBe('unrelated-must-survive\n');
 

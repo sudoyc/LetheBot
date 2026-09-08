@@ -142,7 +142,7 @@ describe('SQLite operations maintenance', () => {
 
       expect([databaseBytes[18], databaseBytes[19]]).toEqual([2, 2]);
       expect(verifySqliteSnapshotIntegrity(databaseBytes)).toEqual({ ok: true, result: 'ok' });
-      expect(databaseBytes).toEqual(bytesBefore);
+      expect(databaseBytes.equals(bytesBefore)).toBe(true);
       expect(readdirSync(dir).sort()).toEqual(filesBefore);
 
       const invalidHeader = Buffer.from(databaseBytes);
@@ -188,7 +188,7 @@ describe('SQLite operations maintenance', () => {
     await expect(backupSqliteDatabase({ sourcePath, backupPath }))
       .rejects.toThrow(/Backup database already exists/);
 
-    expect(readFileSync(backupPath)).toEqual(backupBefore);
+    expect(readFileSync(backupPath).equals(backupBefore)).toBe(true);
     expect(readdirSync(dir).filter((entry) => entry.startsWith('.lethebot-backup-'))).toEqual([]);
   });
 
@@ -292,7 +292,7 @@ describe('SQLite operations maintenance', () => {
 
     expect(() => restoreSqliteDatabase({ backupPath, targetPath, overwrite: true }))
       .toThrow(/foreign key check failed: 1 violation/);
-    expect(readFileSync(targetPath)).toEqual(targetBefore);
+    expect(readFileSync(targetPath).equals(targetBefore)).toBe(true);
     expect(readdirSync(dir).filter((entry) => entry.startsWith('.lethebot-restore-'))).toEqual([]);
 
     const preserved = initDatabase({ path: targetPath, readonly: true });
@@ -324,7 +324,7 @@ describe('SQLite operations maintenance', () => {
       targetPath: backupPath,
       overwrite: true,
     })).toThrow(/must be different files/);
-    expect(readFileSync(backupPath)).toEqual(backupBefore);
+    expect(readFileSync(backupPath).equals(backupBefore)).toBe(true);
 
     const aliases = [
       { path: join(dir, 'hardlink-target.db'), create: linkSync },
@@ -339,7 +339,7 @@ describe('SQLite operations maintenance', () => {
         targetPath: alias.path,
         overwrite: true,
       })).toThrow(/must be different files/);
-      expect(readFileSync(backupPath)).toEqual(backupBefore);
+      expect(readFileSync(backupPath).equals(backupBefore)).toBe(true);
       expect(existsSync(alias.path)).toBe(true);
 
       rmSync(alias.path);
@@ -369,7 +369,7 @@ describe('SQLite operations maintenance', () => {
 
     expect(() => restoreSqliteDatabase({ backupPath, targetPath, overwrite: true }))
       .toThrow(/sidecar exists/);
-    expect(readFileSync(targetPath)).toEqual(targetBefore);
+    expect(readFileSync(targetPath).equals(targetBefore)).toBe(true);
     expect(readFileSync(sidecarPath, 'utf8')).toBe('sidecar-must-survive');
     expect(readdirSync(dir).filter((entry) => entry.startsWith('.lethebot-restore-'))).toEqual([]);
   });

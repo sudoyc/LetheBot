@@ -1294,7 +1294,7 @@ describe('LetheBot governance HTTP lifecycle wiring', () => {
     expect(restore).not.toHaveBeenCalled();
     expect(retention).not.toHaveBeenCalled();
     expect(readdirSync(backupDirectory).sort()).toEqual(filesAfterBackup);
-    expect(readFileSync(backupFile)).toEqual(backupBytes);
+    expect(readFileSync(backupFile).equals(backupBytes)).toBe(true);
     expect(lstatSync(backupDirectory).mode & 0o7777).toBe(0o700);
     expect(lstatSync(backupFile).mode & 0o7777).toBe(0o600);
     expect(db.prepare('SELECT total_changes()').pluck().get()).toBe(changesAfterBackup);

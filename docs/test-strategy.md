@@ -80,6 +80,9 @@ regressions are added; command exit status and the current output are evidence.
   add a distinct interaction, source chain, restart or application boundary.
   When removing duplicate CRUD cases, retain any unique assertion in the owning
   repository suite.
+- Compare database snapshots with `Buffer.equals()` for exact byte preservation.
+  Deep object comparisons enumerate large binary buffers and can dominate
+  restore tests under CI coverage without checking additional behavior.
 - Retain privacy, authorization, lifecycle, atomicity, retry and application
   wiring regressions. Similar assertions at different enforcement boundaries
   can be necessary; coverage percentages alone do not prove duplication.
