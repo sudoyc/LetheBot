@@ -47,7 +47,7 @@ describe('schema v8 memory maintenance proposal migration', () => {
     try {
       runMigrations(db, migrationDirectory);
 
-      expect(getSchemaVersion(db)).toBe(8);
+      expect(getSchemaVersion(db)).toBe(10);
       expect(db.prepare(
         'SELECT version, description FROM schema_version ORDER BY version',
       ).all()).toEqual([
@@ -59,6 +59,8 @@ describe('schema v8 memory maintenance proposal migration', () => {
         { version: 6, description: 'Group summary policy' },
         { version: 7, description: 'Pi turn model invocations' },
         { version: 8, description: 'Memory maintenance proposals' },
+        { version: 9, description: 'Memory embeddings' },
+        { version: 10, description: 'Memory importance' },
       ]);
       expect(db.prepare(
         `SELECT name FROM sqlite_schema
@@ -107,7 +109,7 @@ describe('schema v8 memory maintenance proposal migration', () => {
 
       runMigrations(db, migrationDirectory);
 
-      expect(getSchemaVersion(db)).toBe(8);
+      expect(getSchemaVersion(db)).toBe(10);
       expect(db.prepare(
         `SELECT rowid FROM memory_records WHERE id = 'memory-v7-preserved'`,
       ).pluck().get()).toBe(recordRowId);
@@ -530,7 +532,7 @@ describe('schema v8 memory maintenance proposal migration', () => {
     const candidate = initDatabase({ path: databasePath });
     try {
       runMigrations(candidate, migrationDirectory);
-      expect(getSchemaVersion(candidate)).toBe(8);
+      expect(getSchemaVersion(candidate)).toBe(10);
       seedAudit(candidate, 'audit-v8-rollback-proposal', 'memory.maintenance.proposed');
       insertProposal(candidate, {
         id: 'proposal-v8-rollback',

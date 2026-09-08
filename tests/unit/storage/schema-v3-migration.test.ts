@@ -72,6 +72,14 @@ function createFailingV3MigrationDirectory(): string {
     join(migrationDirectory, '008_memory_maintenance_proposals.sql'),
     join(directory, '008_memory_maintenance_proposals.sql'),
   );
+  copyFileSync(
+    join(migrationDirectory, '009_memory_embeddings.sql'),
+    join(directory, '009_memory_embeddings.sql'),
+  );
+  copyFileSync(
+    join(migrationDirectory, '010_memory_importance.sql'),
+    join(directory, '010_memory_importance.sql'),
+  );
   return directory;
 }
 
@@ -201,7 +209,7 @@ describe('schema v3 evaluator invocation migration through the current schema', 
 
       runMigrations(db, migrationDirectory);
 
-      expect(getSchemaVersion(db)).toBe(8);
+      expect(getSchemaVersion(db)).toBe(10);
       expect(db.prepare(
         'SELECT version, description FROM schema_version ORDER BY version',
       ).all()).toEqual([
@@ -213,6 +221,8 @@ describe('schema v3 evaluator invocation migration through the current schema', 
         { version: 6, description: 'Group summary policy' },
         { version: 7, description: 'Pi turn model invocations' },
         { version: 8, description: 'Memory maintenance proposals' },
+        { version: 9, description: 'Memory embeddings' },
+        { version: 10, description: 'Memory importance' },
       ]);
       expect(db.prepare(
         'SELECT applied_at FROM schema_version WHERE version = 1',

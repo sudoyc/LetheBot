@@ -28,6 +28,16 @@ const ConfigSchema = z.object({
   logLevel: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
   test: z.boolean().default(false),
   backgroundSummaryEnabled: z.boolean().default(false),
+  procedureWritesEnabled: z.boolean().default(true),
+  procedureRetrievalEnabled: z.boolean().default(true),
+  embeddingWritesEnabled: z.boolean().default(false),
+  embeddingRetrievalEnabled: z.boolean().default(false),
+  importanceLearningEnabled: z.boolean().default(false),
+  importanceApplicationEnabled: z.boolean().default(false),
+  embeddingModelDirectory: z.string().min(1).max(4096).refine(
+    (value) => isAbsolute(value) && !value.includes('\0'),
+    { message: 'LETHEBOT_EMBEDDING_MODEL_DIRECTORY must be an absolute path' },
+  ).optional(),
   botOwnerQqId: z.string().regex(/^[1-9][0-9]{4,11}$/).optional(),
   dbPath: z.string().default('./data/lethebot.db'),
   workspaceRoot: z.string().min(1).max(4096).refine(
@@ -75,6 +85,10 @@ const ConfigSchema = z.object({
   governanceSessionTtlMs: z.number().finite().int().min(60_000).max(3_600_000).default(900_000),
 }).superRefine((config, context) => {
   const hasUsableToken = Boolean(config.onebotToken?.trim());
+  if ((config.embeddingWritesEnabled || config.embeddingRetrievalEnabled) && !config.embeddingModelDirectory) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['embeddingModelDirectory'],
+      message: 'Local embedding controls require LETHEBOT_EMBEDDING_MODEL_DIRECTORY' });
+  }
 
   if (new Set(config.webFetchAllowedOrigins).size !== config.webFetchAllowedOrigins.length) {
     context.addIssue({
@@ -227,6 +241,10 @@ export function resetConfig(): void {
   cachedConfig = null;
 }
 
+function parseOptionalBooleanEnvironment(value: string | undefined): boolean | string | undefined {
+  return value === 'true' ? true : value === 'false' ? false : value;
+}
+
 export function loadConfig(): Config {
   if (cachedConfig) {
     return cachedConfig;
@@ -235,6 +253,13 @@ export function loadConfig(): Config {
   const raw = {
     logLevel: process.env.LOG_LEVEL,
     test: process.env.LETHEBOT_TEST === 'true',
+    procedureWritesEnabled: parseOptionalBooleanEnvironment(process.env.LETHEBOT_PROCEDURE_WRITES_ENABLED),
+    procedureRetrievalEnabled: parseOptionalBooleanEnvironment(process.env.LETHEBOT_PROCEDURE_RETRIEVAL_ENABLED),
+    embeddingWritesEnabled: parseOptionalBooleanEnvironment(process.env.LETHEBOT_EMBEDDING_WRITES_ENABLED),
+    embeddingRetrievalEnabled: parseOptionalBooleanEnvironment(process.env.LETHEBOT_EMBEDDING_RETRIEVAL_ENABLED),
+    importanceLearningEnabled: parseOptionalBooleanEnvironment(process.env.LETHEBOT_IMPORTANCE_LEARNING_ENABLED),
+    importanceApplicationEnabled: parseOptionalBooleanEnvironment(process.env.LETHEBOT_IMPORTANCE_APPLICATION_ENABLED),
+    embeddingModelDirectory: process.env.LETHEBOT_EMBEDDING_MODEL_DIRECTORY,
     backgroundSummaryEnabled: process.env.LETHEBOT_BACKGROUND_SUMMARY_ENABLED === undefined
       ? undefined
       : process.env.LETHEBOT_BACKGROUND_SUMMARY_ENABLED === 'true'

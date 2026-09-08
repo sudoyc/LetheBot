@@ -201,7 +201,7 @@ export class ContextTraceRepository {
 }
 
 const MEMORY_QUERY_SOURCES = ['current_message', 'quoted_message', 'recent_thread'] as const;
-const MEMORY_RETRIEVAL_METHODS = ['scoped_rank', 'fts'] as const;
+const MEMORY_RETRIEVAL_METHODS = ['scoped_rank', 'fts', 'semantic'] as const;
 const MEMORY_SCOPE_AFFINITIES = ['exact_conversation', 'exact_group', 'same_user', 'global'] as const;
 const MEMORY_SELECTION_REASONS = ['profile_priority', 'query_match', 'ranked_fallback'] as const;
 
@@ -238,6 +238,15 @@ function validateMemorySelections(
     if (!Number.isSafeInteger(selection.retrievalRank) || selection.retrievalRank < 1) {
       throw new Error('Context memory selection evidence has an invalid retrieval rank');
     }
+    const semantic = selection.semantic;
+    if (selection.retrievalMethods.includes('semantic') !== (semantic !== undefined)
+      || (semantic && (
+        !Number.isFinite(semantic.score) || semantic.score < -1 || semantic.score > 1
+        || typeof semantic.model !== 'string' || !/^[A-Za-z0-9._/-]{1,256}$/.test(semantic.model)
+        || !/^[0-9a-f]{64}$/.test(semantic.modelRevision)
+        || !Number.isInteger(semantic.dimensions) || semantic.dimensions < 1 || semantic.dimensions > 4096
+        || !Number.isSafeInteger(semantic.indexVersion) || semantic.indexVersion < 1
+      ))) throw new Error('Context memory selection has invalid semantic evidence');
 
     return {
       memoryId: selection.memoryId,
@@ -246,6 +255,7 @@ function validateMemorySelections(
       scopeAffinity: selection.scopeAffinity,
       retrievalRank: selection.retrievalRank,
       selectionReason: selection.selectionReason,
+      ...(semantic ? { semantic: { ...semantic } } : {}),
     };
   });
 }

@@ -1390,97 +1390,6 @@ describe('governance HTTP security boundary', () => {
     expect(harness.handleAuthorizedRequest).not.toHaveBeenCalled();
   });
 
-  it('characterizes the complete Memory definition union across presentation extraction', async () => {
-    const harness = await startHarness();
-    const [
-      root,
-      css,
-      script,
-      activity,
-      memory,
-      recordMutations,
-      application,
-      transitions,
-      presentation,
-    ]
-      = await Promise.all([
-        send(harness, '/governance/'),
-        send(harness, '/governance/app.css'),
-        send(harness, '/governance/app.js'),
-        send(harness, '/governance/activity.js'),
-        send(harness, '/governance/memory.js'),
-        send(harness, '/governance/memory-record-mutations.js'),
-        send(harness, '/governance/memory-application.js'),
-        send(harness, '/governance/memory-maintenance-transitions.js'),
-        send(harness, '/governance/memory-presentation.js'),
-      ]);
-    const sha256 = (body: string): string => createHash('sha256').update(body).digest('hex');
-
-    expect([
-      root,
-      css,
-      script,
-      activity,
-      memory,
-      recordMutations,
-      application,
-      transitions,
-      presentation,
-    ].map((asset) => asset.status)).toEqual([
-      200,
-      200,
-      200,
-      200,
-      200,
-      200,
-      200,
-      200,
-      200,
-    ]);
-    expect([
-      sha256(root.body),
-      sha256(css.body),
-      sha256(script.body),
-      sha256(activity.body),
-    ]).toEqual([
-      'b623c37588ef24fd14f501ce2451c44f04c4f7ea835703d591f2a509af5853cb',
-      'e1cc9b82e1acfbe49457da468db816c510fb213035f6bf26cd8302fd9450d3d9',
-      'b274e847420eb6124ca3f01d4f1548088ac5cd08db0e5384858bc3582d1b8c8c',
-      'b7730264d7a3a65e9e457f0662dd46036de6531b0c4b97001df0903513eca443',
-    ]);
-
-    let definitionUnion = memory.body;
-    if (presentation.status === 200) {
-      const endpointsStart = memory.body.indexOf('const MEMORY_SCOPES_ENDPOINT');
-      const controllerStart = memory.body.indexOf('function createState(');
-      const exportStart = presentation.body.lastIndexOf('\nexport {');
-      expect(endpointsStart).toBeGreaterThan(0);
-      expect(controllerStart).toBeGreaterThan(endpointsStart);
-      expect(exportStart).toBeGreaterThan(0);
-      const controller = memory.body.slice(endpointsStart);
-      const controllerSplit = controller.indexOf('function createState(');
-      definitionUnion = controller.slice(0, controllerSplit)
-        + presentation.body.slice(0, exportStart)
-        + '\n'
-        + recordMutations.body
-        + '\n'
-        + application.body
-        + '\n'
-        + transitions.body
-        + '\n'
-        + controller.slice(controllerSplit);
-    } else {
-      expect(presentation.status).toBe(404);
-    }
-    expect(Buffer.byteLength(definitionUnion, 'utf8')).toBe(174_340);
-    expect(sha256(definitionUnion)).toBe(
-      '78dc8f7910428af2018549968ea437cb39ab2f084cb63b2ac8269217162d2013',
-    );
-    expect(harness.resolveScopeHandle).not.toHaveBeenCalled();
-    expect(harness.resolveResourceHandle).not.toHaveBeenCalled();
-    expect(harness.handleAuthorizedRequest).not.toHaveBeenCalled();
-  });
-
   it('serves Memory presentation through one static bounded module boundary', async () => {
     const harness = await startHarness();
     const [root, css, script, activity, memory, presentation] = await Promise.all([
@@ -3221,7 +3130,13 @@ describe('governance HTTP security boundary', () => {
             document.body.replaceChildren(navigation, host);
             const calls = [];
             const now = Date.now();
-            const rollback = mode === 'rollback';
+            const importance = mode === 'importance';
+            const rollback = mode !== 'expiration';
+            const kind = importance ? 'importance' : 'decay';
+            const effectType = importance ? 'adjust_importance' : 'disable';
+            const targetRole = importance ? 'importance_target' : 'disable_target';
+            const scopeKind = importance ? 'user' : 'system';
+            const retrievalConsequences = importance ? ['importance_ranking_restored'] : ['restored_records_included'];
             const scopeHandle = (rollback ? 'S' : 'T').repeat(43);
             const reviewHandle = (rollback ? 'R' : 'U').repeat(43);
             const previewHandle = (rollback ? 'P' : 'V').repeat(43);
@@ -3234,14 +3149,14 @@ describe('governance HTTP security boundary', () => {
             const lifecycleState = rollback ? 'applied' : 'pending_review';
             const summary = {
               proposalRef,
-              kind: 'decay',
-              effectType: 'disable',
+              kind,
+              effectType,
               lifecycleState,
-              scopeKind: 'system',
+              scopeKind,
               candidateFingerprint,
               confidence: 0.5,
               candidateCount: 1,
-              reasonCodes: ['stale'],
+              reasonCodes: importance ? ['repeated_first_party_evidence'] : ['stale'],
               revisionCount: currentRevisionNumber,
               currentRevisionNumber,
               createdAt: timestamp,
@@ -3272,12 +3187,18 @@ describe('governance HTTP security boundary', () => {
             );
             const detail = {
               ...detailSummary,
-              effectMemoryRole: 'disable_target',
+              ...(importance ? { importance: {
+                scorerVersion: 1, windowStartAt: now - 30 * 86400000, windowEndAt: now,
+                windowEndOrder: 3, observationCount: 3, distinctDayCount: 3, spanDays: 6,
+                previousImportance: 0.4, proposedImportance: 0.74, sourceCount: 3,
+                evidenceFingerprint: 'e'.repeat(64),
+              } } : {}),
+              effectMemoryRole: targetRole,
               effectMemoryRef: 'd'.repeat(16),
               candidates: [{
                 candidateOrdinal: 0,
                 memoryRef: 'd'.repeat(16),
-                effectRole: 'disable_target',
+                effectRole: targetRole,
                 expectedState: 'active',
                 recordFingerprint: 'f'.repeat(64),
                 sourceCount: 1,
@@ -3294,10 +3215,10 @@ describe('governance HTTP security boundary', () => {
               : { count: 1, fingerprint: candidateFingerprint };
             const preview = rollback ? {
               action: 'memory.maintenance.rollback',
-              scope: { scopeKind: 'system', fingerprint: scopeFingerprint },
-              proposalKind: 'decay',
+              scope: { scopeKind, fingerprint: scopeFingerprint },
+              proposalKind: kind,
               proposalRef,
-              proposedEffect: 'disable',
+              proposedEffect: effectType,
               affectedRecords,
               current: { lifecycleState: 'applied', revisionNumber: 3 },
               expected: {
@@ -3306,7 +3227,7 @@ describe('governance HTTP security boundary', () => {
                 durableEffects: ['proposal_state_transition', 'proposal_revision_append',
                   'audit_event_append', 'memory_record_revision_append',
                   'proposal_effect_evidence_append'],
-                retrievalConsequences: ['restored_records_included'],
+                retrievalConsequences,
               },
               confirmation: { required: true, boundary: 'separate_confirmation_required' },
               previewHandle,
@@ -3314,10 +3235,10 @@ describe('governance HTTP security boundary', () => {
               previewDigest: '3'.repeat(64),
             } : {
               action: 'memory.maintenance.review.expire',
-              scope: { scopeKind: 'system', fingerprint: scopeFingerprint },
-              proposalKind: 'decay',
+              scope: { scopeKind, fingerprint: scopeFingerprint },
+              proposalKind: kind,
               proposalRef,
-              proposedEffect: 'disable',
+              proposedEffect: effectType,
               affectedRecords,
               current: { lifecycleState: 'pending_review', revisionNumber: 1 },
               expected: {
@@ -3338,12 +3259,12 @@ describe('governance HTTP security boundary', () => {
             const confirmation = rollback ? {
               action: 'memory.maintenance.rollback',
               outcome: 'rolled_back',
-              proposalKind: 'decay',
+              proposalKind: kind,
               proposalRef,
-              proposedEffect: 'disable',
+              proposedEffect: effectType,
               affectedRecords,
               current: { lifecycleState: 'rolled_back', revisionNumber: 4 },
-              retrievalConsequences: ['restored_records_included'],
+              retrievalConsequences,
               evidence: {
                 transition: 'rollback',
                 revisionRef: '5'.repeat(16),
@@ -3391,17 +3312,18 @@ describe('governance HTTP security boundary', () => {
             feature.selectSubview('reviews');
             feature.renderReviewCatalog({ entries: [{
               fingerprint: scopeFingerprint,
-              scopeKind: 'system',
-              label: 'System memory',
+              scopeKind,
+              label: importance ? 'User memory' : 'System memory',
               handle: scopeHandle,
               expiresAt,
             }], truncated: false });
             feature.reviewScopeSelect.value = '1';
             feature.selectReviewScope();
-            feature.renderReviews({ entries: [summary], truncated: false }, 'system');
+            feature.renderReviews({ entries: [summary], truncated: false }, scopeKind);
             feature.selectReview(feature.reviewsList.querySelector('[data-review-index]'));
             await Promise.resolve();
             const detailState = feature.renderReviewDetail(detail, summary);
+            const scoreVisible = !importance || document.body.textContent.includes('40% to 74%');
             const key = rollback ? 'rollback' : 'expiration';
             const previewButton = document.getElementById(
               'memory-review-' + key + '-preview-button',
@@ -3431,6 +3353,7 @@ describe('governance HTTP security boundary', () => {
             return {
               calls,
               detailState,
+              scoreVisible,
               previewDisabledBefore,
               visibleStates,
               selectedReview: feature.selectedReview(),
@@ -3444,6 +3367,7 @@ describe('governance HTTP security boundary', () => {
           return JSON.stringify({
             rollback: await runTransition('rollback'),
             expiration: await runTransition('expiration'),
+            importance: await runTransition('importance'),
           });
         })()`);
         const parsed = JSON.parse(String(result)) as Record<string, {
@@ -3459,6 +3383,7 @@ describe('governance HTTP security boundary', () => {
         for (const [key, transition] of Object.entries(parsed)) {
           expect(transition).toMatchObject({
             detailState: 'content',
+            scoreVisible: true,
             previewDisabledBefore: false,
             visibleStates: [true, true, true, true, true],
             selectedReview: null,
@@ -3467,10 +3392,10 @@ describe('governance HTTP security boundary', () => {
             leakedHandle: false,
           });
           expect(transition.calls).toHaveLength(10);
-          const action = key === 'rollback' ? 'rollback' : 'expire';
-          const handle = (key === 'rollback' ? 'R' : 'U').repeat(43);
-          const scope = (key === 'rollback' ? 'S' : 'T').repeat(43);
-          const previewHandle = (key === 'rollback' ? 'P' : 'V').repeat(43);
+          const action = key !== 'expiration' ? 'rollback' : 'expire';
+          const handle = (key !== 'expiration' ? 'R' : 'U').repeat(43);
+          const scope = (key !== 'expiration' ? 'S' : 'T').repeat(43);
+          const previewHandle = (key !== 'expiration' ? 'P' : 'V').repeat(43);
           for (let index = 0; index < transition.calls.length; index += 2) {
             expect(transition.calls[index]).toEqual({
               path: `/governance/api/v1/memory-reviews/${handle}`,

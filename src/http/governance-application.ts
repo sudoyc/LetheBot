@@ -25,7 +25,7 @@ export function createGovernanceApplication(
     const governanceScopeHandles = new GovernanceScopeHandleRegistry({ now: governanceNow });
     const governanceResourceHandles = new GovernanceResourceHandleRegistry({ now: governanceNow });
     const governancePreviewHandles = new GovernancePreviewHandleRegistry({ now: governanceNow });
-    const governanceQueries = new GovernanceQueryService(db);
+    const governanceQueries = new GovernanceQueryService(db, { importanceApplicationEnabled: config.importanceApplicationEnabled });
     const governanceOperations = new GovernanceOperationsCoordinator({
       db,
       dbPath: config.dbPath,

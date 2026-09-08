@@ -538,6 +538,66 @@ describe('built-in memory.search tool', () => {
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
   });
 
+  it.each([
+    ['explicit teaching', 'Remember this procedure: summarize files with conclusions, then risks.', true],
+    ['ordinary request', 'Summarize files with conclusions, then risks.', false],
+    ['reported teaching', 'Someone said: Remember this procedure: summarize files.', false],
+  ] as const)('requires current first-party intent for a procedure: %s', async (_label, text, allowed) => {
+    db.prepare('UPDATE chat_messages SET text = ? WHERE id = ?').run(text, 'msg-private-source');
+    const output = await executeMemoryPropose({
+      title: 'File summary workflow', content: 'List conclusions, then risks.', kind: 'procedure',
+    }, 'private_chat', undefined, 'user-alice', 'tc-memory-propose-test',
+    [PROPOSAL_SOURCE_EVENT_ID], PROPOSAL_EVALUATOR_DECISION_ID);
+    expect(output.status).toBe(allowed ? 'proposed' : 'rejected');
+    expect(db.prepare('SELECT COUNT(*) AS count FROM memory_records').get()).toEqual({ count: allowed ? 1 : 0 });
+  });
+
+  it.each([
+    "UPDATE chat_messages SET sender_id = 'qq-user-bob' WHERE id = 'msg-private-source'",
+    "UPDATE chat_messages SET conversation_id = 'other-conversation' WHERE id = 'msg-private-source'",
+    "UPDATE raw_events SET source = 'agent' WHERE id = 'raw-memory-tool-source'",
+    "UPDATE platform_accounts SET status = 'disabled' WHERE canonical_user_id = 'user-alice'",
+  ])('rejects procedure teaching without canonical actor/context authority: %s', async (mutation) => {
+    db.prepare('UPDATE chat_messages SET text = ? WHERE id = ?')
+      .run('Remember this procedure: summarize files with conclusions, then risks.', 'msg-private-source');
+    db.exec(mutation);
+    const output = await executeMemoryPropose({
+      title: 'File summary workflow', content: 'List conclusions, then risks.', kind: 'procedure',
+    }, 'private_chat', undefined, 'user-alice', 'tc-memory-propose-test',
+    [PROPOSAL_SOURCE_EVENT_ID], PROPOSAL_EVALUATOR_DECISION_ID);
+    expect(output.status).toBe('rejected');
+    expect(db.prepare('SELECT COUNT(*) AS count FROM memory_records').get()).toEqual({ count: 0 });
+  });
+
+  it('keeps taught tool proposals disabled by the procedure writer control', async () => {
+    memoryRepo = new MemoryRepository(db, { procedureWritesEnabled: false });
+    db.prepare('UPDATE chat_messages SET text = ? WHERE id = ?')
+      .run('Remember this procedure: summarize files.', 'msg-private-source');
+    const output = await executeMemoryPropose({
+      title: 'File summary workflow', content: 'List conclusions, then risks.', kind: 'procedure',
+    }, 'private_chat', undefined, 'user-alice', 'tc-memory-propose-test',
+    [PROPOSAL_SOURCE_EVENT_ID], PROPOSAL_EVALUATOR_DECISION_ID);
+    expect(output).toMatchObject({ status: 'rejected', reason: 'Procedure writes are disabled' });
+    expect(db.prepare('SELECT COUNT(*) AS count FROM memory_records').get()).toEqual({ count: 0 });
+  });
+
+  it('rechecks explicit teaching when the prepared procedure effect commits', async () => {
+    db.prepare('UPDATE chat_messages SET text = ? WHERE id = ?')
+      .run('Remember this procedure: summarize files with conclusions, then risks.', 'msg-private-source');
+    const prepared = await createMemoryProposeTool(memoryRepo, db).handler({
+      toolCallId: 'tc-memory-propose-test', turnId: 'turn-memory-propose-test', toolName: 'memory.propose',
+      signal: new AbortController().signal,
+      sourceEventIds: [PROPOSAL_SOURCE_EVENT_ID], evaluatorDecisionId: PROPOSAL_EVALUATOR_DECISION_ID,
+      input: { title: 'File summary workflow', content: 'List conclusions, then risks.', kind: 'procedure' },
+      actor: { actorClass: 'user', canonicalUserId: 'user-alice' }, context: 'private_chat',
+    });
+    if (!isPreparedLocalToolEffect(prepared)) throw new Error('Expected a prepared procedure proposal');
+    db.prepare('UPDATE chat_messages SET text = ? WHERE id = ?').run('Ordinary text', 'msg-private-source');
+    expect(() => db.transaction(() => applyPreparedLocalToolEffect(prepared))())
+      .toThrow('explicit procedure teaching');
+    expect(db.prepare('SELECT COUNT(*) AS count FROM memory_records').get()).toEqual({ count: 0 });
+  });
+
   it('creates only proposed source-linked memory through memory.propose without returning ids', async () => {
     const output = await executeMemoryPropose({
       title: 'Tool proposed preference',

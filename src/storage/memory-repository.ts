@@ -73,6 +73,11 @@ export interface MemoryFilters {
   limit?: number;
 }
 
+export interface MemoryRepositoryOptions {
+  procedureWritesEnabled?: boolean;
+  procedureRetrievalEnabled?: boolean;
+}
+
 export class MemoryPolicyError extends Error {
   constructor(
     message: string,
@@ -134,9 +139,13 @@ type MemoryBoundaryEvidence = {
  */
 export class MemoryRepository {
   private readonly groupSummaryPolicies: GroupSummaryPolicyRepository;
+  readonly procedureWritesEnabled: boolean;
+  readonly procedureRetrievalEnabled: boolean;
 
-  constructor(private readonly _db: Database.Database) {
+  constructor(private readonly _db: Database.Database, options: MemoryRepositoryOptions = {}) {
     this.groupSummaryPolicies = new GroupSummaryPolicyRepository(_db);
+    this.procedureWritesEnabled = options.procedureWritesEnabled ?? true;
+    this.procedureRetrievalEnabled = options.procedureRetrievalEnabled ?? true;
   }
 
   private get db(): Database.Database {
@@ -276,6 +285,7 @@ export class MemoryRepository {
   async retrieve(filters: MemoryFilters): Promise<MemoryRecord[]> {
     const params: unknown[] = [];
     let query = 'SELECT * FROM memory_records WHERE 1=1';
+    if (!this.procedureRetrievalEnabled) query += " AND kind <> 'procedure'";
 
     const state = filters.state ?? 'active';
     query += ' AND state = ?';
@@ -523,6 +533,7 @@ export class MemoryRepository {
       JOIN memory_records ON memory_fts.rowid = memory_records.rowid
       WHERE memory_fts MATCH ?
     `;
+    if (!this.procedureRetrievalEnabled) sql += " AND memory_records.kind <> 'procedure'";
     const state = filters.state ?? 'active';
     sql += ' AND state = ?';
     params.push(state);
@@ -732,6 +743,9 @@ export class MemoryRepository {
     input: MemoryRecordInput;
     adjustments: string[];
   } {
+    if (input.kind === 'procedure' && !this.procedureWritesEnabled) {
+      throw new Error('Procedure writes are disabled');
+    }
     const adjustments: string[] = [];
     let governedInput = input;
 

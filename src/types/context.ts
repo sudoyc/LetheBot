@@ -40,7 +40,7 @@ export interface MemoryBlock {
 }
 
 export type MemoryQuerySource = 'current_message' | 'quoted_message' | 'recent_thread';
-export type MemoryRetrievalMethod = 'scoped_rank' | 'fts';
+export type MemoryRetrievalMethod = 'scoped_rank' | 'fts' | 'semantic';
 export type MemoryScopeAffinity = 'exact_conversation' | 'exact_group' | 'same_user' | 'global';
 export type MemorySelectionReason = 'profile_priority' | 'query_match' | 'ranked_fallback';
 
@@ -48,6 +48,13 @@ export interface MemorySelectionEvidence {
   memoryId: string;
   querySources: MemoryQuerySource[];
   retrievalMethods: MemoryRetrievalMethod[];
+  semantic?: {
+    score: number;
+    model: string;
+    modelRevision: string;
+    dimensions: number;
+    indexVersion: number;
+  };
   scopeAffinity: MemoryScopeAffinity;
   retrievalRank: number;
   selectionReason: MemorySelectionReason;

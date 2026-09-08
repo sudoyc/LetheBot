@@ -864,7 +864,7 @@ export function createGovernanceAuthorizedHandler(
           return {
             status: 200,
             body: await governanceQueries.listMemoryMaintenanceReviewResourceHandlePage(
-              { scope },
+              { scope, states: ['pending_review', 'approved', 'applied'] },
               ({ scope: proposalScope, proposalId }) => governanceResourceHandles.issue({
                 sessionId: session.sessionId,
                 sessionExpiresAt: session.expiresAt,

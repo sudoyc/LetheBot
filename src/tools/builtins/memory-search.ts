@@ -10,6 +10,7 @@ import {
 import { PrivacyPreferenceRepository } from '../../storage/privacy-preference-repository.js';
 import { redactSecretsInText } from '../../memory/secret-scan.js';
 import { toSafeMemoryFtsQuery } from '../../memory/fts-query.js';
+import { isExplicitProcedureTeaching, readProcedureSource } from '../../memory/procedure.js';
 import type { ToolRegistry } from '../registry.js';
 import {
   prepareLocalToolEffect,
@@ -529,6 +530,13 @@ function createMemoryProposeHandler(
       };
     }
 
+    if (input.value.kind === 'procedure' && memoryRepository.procedureWritesEnabled === false) {
+      return { status: 'rejected', reason: 'Procedure writes are disabled' };
+    }
+    if (input.value.kind === 'procedure' && !hasProcedureTeaching(database, trustedRequest)) {
+      return { status: 'rejected', reason: 'current explicit procedure teaching is required' };
+    }
+
     const buildMemoryInput = (
       sourceTimestamps: Map<string, number>,
     ): MemoryRecordInput => ({
@@ -599,9 +607,27 @@ function createMemoryProposeHandler(
       if (!currentEvidence.ok) {
         throw new Error('matching evaluator approval evidence is required to propose memory');
       }
+      if (input.value.kind === 'procedure' && !hasProcedureTeaching(database, trustedRequest)) {
+        throw new Error('current explicit procedure teaching is required');
+      }
       memoryRepository.createSync(buildMemoryInput(currentEvidence.sourceTimestamps));
     });
   };
+}
+
+function hasProcedureTeaching(database: Database.Database, request: ToolHandlerRequest): boolean {
+  if (!request.actor.canonicalUserId) return false;
+  const row = database.prepare(`SELECT chat.id
+    FROM agent_turns turn JOIN chat_messages chat ON chat.raw_event_id = turn.trigger_event_id
+    WHERE turn.id = ? AND turn.conversation_id = chat.conversation_id`).get(request.turnId) as
+    { id: string } | undefined;
+  if (!row) return false;
+  const source = readProcedureSource(database, row.id, request.actor.canonicalUserId);
+  return source !== undefined
+    && request.sourceEventIds?.includes(source.rawEventId) === true
+    && source.conversationType === (request.context === 'group_chat' ? 'group' : 'private')
+    && source.groupId === (request.actor.groupId ?? null)
+    && isExplicitProcedureTeaching(source.text);
 }
 
 function validateMemoryProposalEvidence(

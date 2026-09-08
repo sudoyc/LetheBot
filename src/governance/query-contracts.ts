@@ -545,6 +545,7 @@ export type MemoryMaintenanceReviewResourceHandleIssuer = (input: {
 
 export interface MemoryMaintenanceReviewDetailInspectionRecord
   extends MemoryMaintenanceReviewInspectionRecord {
+  importance?: MemoryMaintenanceProposalRecord['importance'];
   effectMemoryRef?: string;
   effectMemoryRole: MemoryMaintenanceProposalRecord['effectMemoryRole'];
   candidates: Array<{
@@ -689,7 +690,7 @@ export interface MemoryMaintenanceApplicationPreviewProjection {
     count: number;
     fingerprint: string;
     roles: Array<{
-      role: 'retained' | 'superseded' | 'disabled';
+      role: 'retained' | 'superseded' | 'disabled' | 'importance_adjusted';
       count: number;
       fingerprint: string;
     }>;
@@ -715,6 +716,7 @@ export interface MemoryMaintenanceApplicationPreviewProjection {
     retrievalConsequences: Array<
       | 'superseded_records_excluded'
       | 'disabled_records_excluded'
+      | 'importance_ranking_adjusted'
     >;
   };
   rollback: {
@@ -757,7 +759,7 @@ export interface MemoryMaintenanceRollbackPreviewProjection {
       | 'memory_record_revision_append'
       | 'proposal_effect_evidence_append'
     >;
-    retrievalConsequences: Array<'restored_records_included'>;
+    retrievalConsequences: Array<'restored_records_included' | 'importance_ranking_restored'>;
   };
   confirmation: {
     required: true;

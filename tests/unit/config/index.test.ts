@@ -9,6 +9,13 @@ describe('Config Loader', () => {
     delete process.env.LETHEBOT_WORKSPACE_ROOT;
     delete process.env.LETHEBOT_WEB_FETCH_ALLOWED_ORIGINS;
     delete process.env.LETHEBOT_DISABLED_TOOLS;
+    delete process.env.LETHEBOT_PROCEDURE_WRITES_ENABLED;
+    delete process.env.LETHEBOT_PROCEDURE_RETRIEVAL_ENABLED;
+    delete process.env.LETHEBOT_EMBEDDING_WRITES_ENABLED;
+    delete process.env.LETHEBOT_EMBEDDING_RETRIEVAL_ENABLED;
+    delete process.env.LETHEBOT_EMBEDDING_MODEL_DIRECTORY;
+    delete process.env.LETHEBOT_IMPORTANCE_LEARNING_ENABLED;
+    delete process.env.LETHEBOT_IMPORTANCE_APPLICATION_ENABLED;
     delete process.env.LETHEBOT_GOVERNANCE_ENABLED;
     delete process.env.LETHEBOT_GOVERNANCE_HOST;
     delete process.env.LETHEBOT_GOVERNANCE_PORT;
@@ -21,6 +28,28 @@ describe('Config Loader', () => {
     process.env = originalEnv;
     resetConfig();
   });
+
+  test('keeps local embedding disabled independently of the chat provider', () => {
+    process.env.PI_PROVIDER = 'openai';
+    expect(loadConfig()).toMatchObject({ embeddingWritesEnabled: false, embeddingRetrievalEnabled: false });
+  });
+
+  test.each(['LETHEBOT_EMBEDDING_WRITES_ENABLED', 'LETHEBOT_EMBEDDING_RETRIEVAL_ENABLED'])(
+    'requires explicit local assets and a boolean value for %s', (variable) => {
+      process.env[variable] = 'true';
+      expect(() => loadConfig()).toThrow();
+      process.env.LETHEBOT_EMBEDDING_MODEL_DIRECTORY = 'relative-model';
+      expect(() => loadConfig()).toThrow();
+      process.env.LETHEBOT_EMBEDDING_MODEL_DIRECTORY = '/tmp/synthetic-embedding-model';
+      expect(loadConfig()).toMatchObject({
+        embeddingWritesEnabled: variable === 'LETHEBOT_EMBEDDING_WRITES_ENABLED',
+        embeddingRetrievalEnabled: variable === 'LETHEBOT_EMBEDDING_RETRIEVAL_ENABLED',
+      });
+      resetConfig();
+      process.env[variable] = 'yes';
+      expect(() => loadConfig()).toThrow();
+    },
+  );
 
   test('loads default config when no env vars set', () => {
     delete process.env.LOG_LEVEL;
@@ -318,6 +347,23 @@ describe('Config Loader', () => {
   test('validates retention days are non-negative', () => {
     process.env.LETHEBOT_AUDIT_LOG_RETENTION_DAYS = '-1';
 
+    expect(() => loadConfig()).toThrow('Invalid configuration');
+  });
+
+  test.each([
+    ['LETHEBOT_PROCEDURE_WRITES_ENABLED', 'procedureWritesEnabled', true],
+    ['LETHEBOT_PROCEDURE_RETRIEVAL_ENABLED', 'procedureRetrievalEnabled', true],
+    ['LETHEBOT_IMPORTANCE_LEARNING_ENABLED', 'importanceLearningEnabled', false],
+    ['LETHEBOT_IMPORTANCE_APPLICATION_ENABLED', 'importanceApplicationEnabled', false],
+  ] as const)('validates restart-scoped memory control %s', (environmentName, field, defaultValue) => {
+    expect(loadConfig()[field]).toBe(defaultValue);
+    for (const value of ['true', 'false']) {
+      process.env[environmentName] = value;
+      resetConfig();
+      expect(loadConfig()[field]).toBe(value === 'true');
+    }
+    process.env[environmentName] = 'yes';
+    resetConfig();
     expect(() => loadConfig()).toThrow('Invalid configuration');
   });
 

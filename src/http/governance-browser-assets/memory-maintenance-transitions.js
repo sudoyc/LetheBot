@@ -8,6 +8,7 @@ const EFFECT_BY_KIND = {
 conflict: 'resolve_conflict',
 consolidation: 'consolidate',
 decay: 'disable',
+importance: 'adjust_importance',
 };
 const COMMON_DURABLE_EFFECTS = [
 'proposal_state_transition',
@@ -101,7 +102,8 @@ now,
 || value.expected.lifecycleState !== 'rolled_back'
 || value.expected.revisionNumber !== value.current.revisionNumber + 1
 || !exactList(value.expected.durableEffects, ROLLBACK_DURABLE_EFFECTS)
-|| !exactList(value.expected.retrievalConsequences, ['restored_records_included'])
+|| !exactList(value.expected.retrievalConsequences, value.proposalKind === 'importance'
+? ['importance_ranking_restored'] : ['restored_records_included'])
 || value.confirmation.required !== true
 || value.confirmation.boundary !== 'separate_confirmation_required'
 || !Array.isArray(value.affectedRecords.roles)
@@ -221,7 +223,8 @@ expected,
 || !FINGERPRINT_PATTERN.test(value.affectedRecords.fingerprint)
 || !Array.isArray(value.affectedRecords.roles)
 || value.affectedRecords.roles.length !== 1
-|| !exactList(value.retrievalConsequences, ['restored_records_included'])
+|| !exactList(value.retrievalConsequences, value.proposalKind === 'importance'
+? ['importance_ranking_restored'] : ['restored_records_included'])
 || value.rollback.boundary !== 'rollback_is_terminal') return null;
 const role = value.affectedRecords.roles[0];
 const wanted = expected.affectedRecords.roles[0];

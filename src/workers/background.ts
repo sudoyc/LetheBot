@@ -11,6 +11,8 @@ import type { JobRepository, JobRecord } from '../storage/job-repository.js';
 export type TaskType =
   | 'summary'
   | 'extraction'
+  | 'embedding'
+  | 'importance'
   | 'attention_recheck'
   | 'consolidation'
   | 'decay'
@@ -408,9 +410,9 @@ export class BackgroundWorker {
       return handler(task, executionContext);
     }
 
-    if (task.type === 'attention_recheck') {
+    if (task.type === 'attention_recheck' || task.type === 'embedding' || task.type === 'importance') {
       throw new NonRetryableBackgroundTaskError(
-        'Background task attention_recheck requires a registered handler',
+        `Background task ${task.type} requires a registered handler`,
       );
     }
 
@@ -471,6 +473,8 @@ function isKnownTaskType(value: string): value is TaskType {
   return (
     value === 'summary' ||
     value === 'extraction' ||
+    value === 'embedding' ||
+    value === 'importance' ||
     value === 'attention_recheck' ||
     value === 'consolidation' ||
     value === 'decay' ||

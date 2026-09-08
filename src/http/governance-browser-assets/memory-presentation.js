@@ -34,13 +34,14 @@ const REVISION_CHANGES = ['create', 'update', 'approve', 'reject', 'supersede', 
 const PROVENANCE_ACTORS = ['user', 'evaluator', 'tool', 'worker', 'admin', 'human', 'system', 'local_admin', 'other', 'unknown'];
 const AUDIT_LEVELS = ['summary', 'redacted_full', 'full', 'other'];
 const RISK_LEVELS = ['low', 'medium', 'high', 'prohibited', 'other'];
-const REVIEW_KINDS = ['conflict', 'consolidation', 'decay'];
-const REVIEW_EFFECTS = ['resolve_conflict', 'consolidate', 'disable'];
+const REVIEW_KINDS = ['conflict', 'consolidation', 'decay', 'importance'];
+const REVIEW_EFFECTS = ['resolve_conflict', 'consolidate', 'disable', 'adjust_importance'];
 const REVIEW_STATES = ['pending_review', 'approved', 'rejected', 'expired', 'applied', 'rolled_back'];
 const REVIEW_EFFECT_BY_KIND = {
 conflict: 'resolve_conflict',
 consolidation: 'consolidate',
 decay: 'disable',
+importance: 'adjust_importance',
 };
 const REVIEW_REVISION_BY_STATE = {
 pending_review: 1,
@@ -56,13 +57,15 @@ const REVIEW_REASONS = [
 'stale',
 'low_confidence',
 'low_importance',
+'repeated_first_party_evidence',
 ];
-const REVIEW_EFFECT_ROLES = [null, 'retained', 'disable_target'];
+const REVIEW_EFFECT_ROLES = [null, 'retained', 'disable_target', 'importance_target'];
 const REVIEW_CANDIDATE_ROLES = [
 'conflict_candidate',
 'retained',
 'supersede',
 'disable_target',
+'importance_target',
 ];
 const REVIEW_TRANSITIONS = ['propose', 'approve', 'reject', 'expire', 'apply', 'rollback'];
 const REVIEW_ACTORS = [
@@ -529,7 +532,7 @@ if (!exactObject(value, REVIEW_KEYS, ['expiresAt'])
 || value.confidence > 1
 || !safeCount(value.candidateCount)
 || value.candidateCount === 0
-|| (value.kind === 'decay' ? value.candidateCount !== 1 : value.candidateCount < 2)
+|| (['decay', 'importance'].includes(value.kind) ? value.candidateCount !== 1 : value.candidateCount < 2)
 || !Array.isArray(value.reasonCodes)
 || value.reasonCodes.length > REVIEW_REASONS.length
 || value.reasonCodes.some((reason) => !REVIEW_REASONS.includes(reason))
@@ -563,7 +566,8 @@ return { entries, truncated: value.truncated };
 }
 
 function normalizeMemoryReviewDetail(value) {
-if (!exactObject(value, REVIEW_DETAIL_KEYS, ['expiresAt', 'effectMemoryRef'])) return null;
+if (!exactObject(value, REVIEW_DETAIL_KEYS, ['expiresAt', 'effectMemoryRef', 'importance'])) return null;
+if (value.kind === 'importance' ? !validImportance(value.importance) : Object.hasOwn(value, 'importance')) return null;
 const summary = Object.fromEntries(REVIEW_SUMMARY_KEYS.map((key) => [key, value[key]]));
 if (Object.hasOwn(value, 'expiresAt')) summary.expiresAt = value.expiresAt;
 summary.handle = 'A'.repeat(43);
@@ -610,6 +614,11 @@ value.effectMemoryRole !== 'disable_target'
 || candidates.length !== 1
 || candidates[0].effectRole !== 'disable_target'
 || candidates[0].memoryRef !== value.effectMemoryRef
+)) || (value.kind === 'importance' && (
+value.effectMemoryRole !== 'importance_target'
+|| candidates.length !== 1
+|| candidates[0].effectRole !== 'importance_target'
+|| candidates[0].memoryRef !== value.effectMemoryRef
 ))) return null;
 const firstRevisionNumber = value.revisionCount - value.revisions.length + 1;
 const revisions = value.revisions.map((revision, index) => {
@@ -638,6 +647,24 @@ revision.previousState !== revisions[index - 1].newState
 || revisions[revisions.length - 1].newState !== value.lifecycleState
 || revisions[revisions.length - 1].createdAt !== value.updatedAt) return null;
 return { ...value, candidates, revisions };
+}
+
+function validImportance(value) {
+return exactObject(value, ['scorerVersion', 'windowStartAt', 'windowEndAt', 'windowEndOrder',
+'observationCount', 'distinctDayCount', 'spanDays', 'previousImportance', 'proposedImportance',
+'evidenceFingerprint', 'sourceCount'])
+&& value.scorerVersion === 1
+&& safeCount(value.windowStartAt) && safeCount(value.windowEndAt)
+&& value.windowStartAt <= value.windowEndAt
+&& safeCount(value.windowEndOrder) && value.windowEndOrder > 0
+&& safeCount(value.observationCount) && value.observationCount >= 3
+&& safeCount(value.distinctDayCount) && value.distinctDayCount >= 3
+&& value.distinctDayCount <= value.observationCount
+&& safeCount(value.sourceCount) && value.sourceCount >= value.observationCount && value.sourceCount <= 200
+&& Number.isFinite(value.spanDays) && value.spanDays >= 2 && value.spanDays <= 30
+&& Number.isFinite(value.previousImportance) && value.previousImportance >= 0 && value.previousImportance <= 1
+&& Number.isFinite(value.proposedImportance) && value.proposedImportance > value.previousImportance && value.proposedImportance <= 0.95
+&& FINGERPRINT_PATTERN.test(value.evidenceFingerprint);
 }
 
 function reviewSummariesAgree(detail, selectedReview) {
@@ -832,7 +859,8 @@ if (!exactObject(value, APPLICATION_PREVIEW_KEYS)
 || value.expected.lifecycleState !== 'applied'
 || value.expected.revisionNumber !== value.current.revisionNumber + 1
 || !exactList(value.expected.durableEffects, APPLICATION_DURABLE_EFFECTS)
-|| !exactList(value.expected.retrievalConsequences, value.proposalKind === 'decay'
+|| !exactList(value.expected.retrievalConsequences, value.proposalKind === 'importance'
+? ['importance_ranking_adjusted'] : value.proposalKind === 'decay'
 ? ['disabled_records_excluded'] : ['superseded_records_excluded'])
 || value.rollback.supported !== true
 || value.rollback.boundary !== 'separate_confirmation_required'
@@ -841,13 +869,13 @@ if (!exactObject(value, APPLICATION_PREVIEW_KEYS)
 || !FINGERPRINT_PATTERN.test(value.previewDigest)) return { state: 'malformed' };
 const roles = value.affectedRecords.roles.map((role) => {
 if (!exactObject(role, APPLICATION_ROLE_KEYS)
-|| !['retained', 'superseded', 'disabled'].includes(role.role)
+|| !['retained', 'superseded', 'disabled', 'importance_adjusted'].includes(role.role)
 || !safeCount(role.count)
 || role.count === 0
 || !FINGERPRINT_PATTERN.test(role.fingerprint)) return null;
 return { ...role };
 });
-const expectedRoles = value.proposalKind === 'decay'
+const expectedRoles = value.proposalKind === 'importance' ? ['importance_adjusted'] : value.proposalKind === 'decay'
 ? ['disabled'] : ['retained', 'superseded'];
 if (roles.some((role) => role === null)
 || !exactList(roles.map((role) => role.role), expectedRoles)
@@ -1270,6 +1298,16 @@ lines(evidence, [
 ? 'Reasons: ' + detail.reasonCodes.map(valueLabel).join(' / ')
 : 'No reason codes'],
 ]);
+if (detail.importance) {
+const score = detail.importance;
+lines(evidence, [
+[PRIMARY_NUMBER, Math.round(score.previousImportance * 100) + '% to '
++ Math.round(score.proposedImportance * 100) + '%'],
+[SECONDARY_NUMBER, score.observationCount + ' observations / ' + score.distinctDayCount + ' days'],
+[SECONDARY_NUMBER, 'Span: ' + score.spanDays.toFixed(1) + ' days / v' + score.scorerVersion],
+[SECONDARY, formatDate(score.windowStartAt) + ' to ' + formatDate(score.windowEndAt)],
+]);
+}
 const dates = append(row, 'td', { 'data-label': 'Dates' });
 lines(dates, [
 [PRIMARY, 'Updated: ' + formatDate(detail.updatedAt)],

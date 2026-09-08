@@ -498,7 +498,7 @@ Do not publish this loopback listener through a reverse proxy.
 ## 数据库迁移
 
 生产环境首次启动前创建数据目录。当前应用启动时会先验证完整的
-`001 -> 002 -> 003 -> 004 -> 005 -> 006 -> 007 -> 008` 连续迁移集合，再自动迁移：
+`001 -> 002 -> 003 -> 004 -> 005 -> 006 -> 007 -> 008 -> 009 -> 010` 连续迁移集合，再自动迁移：
 
 ```bash
 mkdir -p ./data
@@ -508,13 +508,15 @@ mkdir -p ./data
 the runner applies v1 compatibility work, the v2 evaluator-owner migration, the
 v3 evaluator Provider-invocation migration, the v4 correction-attempt migration,
 the v5 delayed-Attention migration, the v6 group-summary policy migration, the
-v7 Pi-turn invocation migration, and the v8 normalized memory-maintenance
-proposal ledger. It validates each migration-derived structure and foreign-key
-data and records ledger rows `[1,2,3,4,5,6,7,8]` in the same transaction.
-Existing legacy databases with no ledger and v1-v7 databases are
+v7 Pi-turn invocation migration, the v8 normalized memory-maintenance
+proposal ledger, the v9 derived embedding index, and v10 importance proposal
+scores/sources. It validates each
+migration-derived structure and foreign-key data and records ledger rows
+`[1,2,3,4,5,6,7,8,9,10]` in the same transaction.
+Existing legacy databases with no ledger and v1-v9 databases are
 adopted only when their LetheBot-owned objects can be migrated to that contract;
 an incompatible same-name table/index/trigger or FK violation rolls the
-transaction back. A malformed ledger or a valid version above 8 is rejected
+transaction back. A malformed ledger or a valid version above 10 is rejected
 before migration schema/data writes; do not edit the ledger by hand to bypass
 that guard.
 Known early-v1 memory CHECK constraints are rebuilt transactionally to the
@@ -526,16 +528,26 @@ definition, so additional UNIQUE/STRICT/COLLATE/conflict/deferrable semantics
 are not silently erased. If the external-content `memory_fts` table was absent,
 startup recreates and rebuilds it from existing memory rows in the same
 transaction.
-This runtime targets v8 and can activate against a v1 through v8 shared
-database, so release preflight requires target 8 with readable range 1 through
-8. Widening only the package manifest or omitting any required migration is
+This runtime targets v10 and can activate against a v1 through v10 shared
+database, so release preflight requires target 10 with readable range 1 through
+10. Widening only the package manifest or omitting any required migration is
 rejected. Migration `007_pi_turn_model_invocations.sql` adds exact-turn
 `pi_turn` Provider-call capacity plus nullable cache/reasoning usage while
 preserving summary/evaluator evidence. Migration
 `008_memory_maintenance_proposals.sql` adds normalized proposal, candidate,
 reason, lifecycle-revision, and memory-revision-link tables; it creates no
 proposal state from historical audit JSON and does not enable apply behavior.
-Take and retain a verified v7 backup before activating the first v8 release.
+Migration `009_memory_embeddings.sql` adds a bounded, versioned local vector
+index referencing memory records. It performs no inference or network calls
+and never rewrites governed memory. Take and retain a verified v8 backup before
+activating the first v9 release; restore it before restarting the prior v8 code.
+Migration `010_memory_importance.sql` preserves the existing maintenance
+proposal ledger while adding importance effects, versioned scores and exact
+source evidence with deletion tombstones. It does not learn or change active
+memory. Retain a verified v9 backup before activating v10; restore it before
+restarting the prior v9 code. Importance learning and application default to
+disabled; enable their independent launcher controls only when needed, as
+described in [Operations](operations.md#importance-learning-and-rollback).
 
 ## 启动服务
 

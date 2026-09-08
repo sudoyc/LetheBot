@@ -1,5 +1,11 @@
 import type Database from 'better-sqlite3';
 import { redactSecretsInText } from '../memory/secret-scan.js';
+import {
+  isExplicitProcedureTeaching,
+  readProcedureSource,
+  readRepeatedProcedureSources,
+  type ProcedureSource,
+} from '../memory/procedure.js';
 import type {
   MemoryEvaluationRequest,
   MemoryEvaluationResult,
@@ -24,6 +30,7 @@ interface ExtractionAuthority {
   jobAttemptId: string;
   sourceChatMessageId: string;
   sourceRawEventId: string;
+  procedureSources?: ProcedureSource[];
   targetUserId: string;
   groupId: string | null;
   sourceContext: string;
@@ -89,6 +96,15 @@ export class EvaluatorDecisionRepository {
         throw new Error('Memory decision effect must be synchronous');
       }
       assertActiveExtractionLeaseAuthority(this.db, authority, this.now());
+      if (authority.procedureSources) {
+        const current = readCandidateProcedureSources(this.db, authority.sourceChatMessageId, evidence.request);
+        if (current.length !== authority.procedureSources.length
+          || current.some((source, index) => source.id !== authority.procedureSources?.[index]?.id
+            || source.rawEventId !== authority.procedureSources?.[index]?.rawEventId
+            || source.timestamp !== authority.procedureSources?.[index]?.timestamp)) {
+          throw new Error('Procedure evidence changed during memory effect');
+        }
+      }
       if (isNonEmptyString(result)) {
         validateMemoryDecisionEffect(this.db, evidence, authority, result);
         return result;
@@ -252,10 +268,16 @@ function validateMemoryEvaluatorEvidence(
     throw new Error('Memory evaluator actor and candidate must match the extraction target user');
   }
 
-  if (request.sourceEventIds.length !== 1) {
-    throw new Error('Memory evaluator evidence must contain exactly one raw event source');
+  const procedureSources = request.memoryCandidate.kind === 'procedure'
+    ? readCandidateProcedureSources(db, source.id, request)
+    : undefined;
+  const expectedSourceEventIds = procedureSources?.map((item) => item.rawEventId) ?? [source.raw_event_id];
+  if (request.sourceEventIds.length !== expectedSourceEventIds.length) {
+    throw new Error(procedureSources
+      ? 'Procedure evaluator evidence must contain the exact source set'
+      : 'Memory evaluator evidence must contain exactly one raw event source');
   }
-  if (request.sourceEventIds[0] !== source.raw_event_id) {
+  if (request.sourceEventIds.some((id, index) => id !== expectedSourceEventIds[index])) {
     throw new Error('Memory evaluator source must be the exact extraction raw event');
   }
 
@@ -279,10 +301,31 @@ function validateMemoryEvaluatorEvidence(
     jobAttemptId,
     sourceChatMessageId: source.id,
     sourceRawEventId: source.raw_event_id,
+    procedureSources,
     targetUserId: payload.targetUserId,
     groupId: source.group_id,
     sourceContext,
   };
+}
+
+function readCandidateProcedureSources(
+  db: Database.Database,
+  chatMessageId: string,
+  request: MemoryEvaluationRequest,
+): ProcedureSource[] {
+  const userId = request.memoryCandidate.canonicalUserId;
+  const source = userId ? readProcedureSource(db, chatMessageId, userId) : undefined;
+  const sourceContext = source?.conversationType === 'group'
+    ? 'group_chat' : `chat:${source?.conversationId}:${source?.id}`;
+  if (!source || source.text.trim() !== request.memoryCandidate.content
+    || source.groupId !== (request.memoryCandidate.groupId ?? null)
+    || sourceContext !== request.memoryCandidate.sourceContext) {
+    throw new Error('Procedure candidate requires exact canonical teaching or repeated source evidence');
+  }
+  if (isExplicitProcedureTeaching(source.text)) return [source];
+  const repeated = readRepeatedProcedureSources(db, chatMessageId, source.canonicalUserId);
+  if (!repeated) throw new Error('Procedure candidate requires three exact repeated source events');
+  return repeated;
 }
 
 function assertActiveExtractionLeaseAuthority(
@@ -449,7 +492,7 @@ function validateMemoryDecisionEffect(
 ): void {
   const candidate = evidence.request.memoryCandidate;
   const memory = db.prepare(
-    `SELECT scope, canonical_user_id, group_id, kind, title, content,
+    `SELECT scope, canonical_user_id, group_id, kind, title, content, state, authority,
             confidence, source_context, evaluator_decision_id
        FROM memory_records WHERE id = ?`
   ).get(memoryId) as {
@@ -457,6 +500,8 @@ function validateMemoryDecisionEffect(
     canonical_user_id: string | null;
     group_id: string | null;
     kind: string;
+    state: string;
+    authority: string;
     title: string;
     content: string;
     confidence: number;
@@ -496,6 +541,24 @@ function validateMemoryDecisionEffect(
   ) as number;
   if (linkedSourceCount !== 1) {
     throw new Error('Memory decision effect does not preserve the exact extraction source');
+  }
+
+  if (authority.procedureSources) {
+    for (const source of authority.procedureSources) {
+      const linked = db.prepare(`SELECT COUNT(*) FROM memory_sources
+        WHERE memory_id = ? AND source_type = 'chat_message' AND chat_message_id = ?
+          AND source_id = ? AND source_timestamp = ?`).pluck()
+        .get(memoryId, source.id, source.id, source.timestamp);
+      if (linked !== 1) throw new Error('Procedure effect is missing exact source evidence');
+    }
+    const sourceCount = db.prepare('SELECT COUNT(*) FROM memory_sources WHERE memory_id = ?').pluck().get(memoryId);
+    if (sourceCount !== authority.procedureSources.length) {
+      throw new Error('Procedure effect source set does not match evaluator evidence');
+    }
+    if (authority.procedureSources.length > 1 && (memory.authority !== 'inferred'
+      || memory.state !== (evidence.result.decision === 'reject' ? 'rejected' : 'proposed'))) {
+      throw new Error('Repeated procedure evidence must remain a governed proposal');
+    }
   }
 
   const revisionCount = db.prepare(
@@ -548,6 +611,8 @@ function validateMemoryRejectionEffect(
     throw new Error('Memory rejection effect must create exactly one evaluator-linked audit');
   }
   const details = parseAuditDetails(row.details);
+  const expectedSourceIds = authority.procedureSources?.map((source) => source.id)
+    ?? [authority.sourceChatMessageId];
   if (
     row.actor_user_id !== authority.targetUserId
     || row.actor_class !== 'system_worker'
@@ -557,8 +622,8 @@ function validateMemoryRejectionEffect(
     || details.requestId !== evidence.request.requestId
     || details.sourceContext !== redactEvaluatorText(authority.sourceContext)
     || !Array.isArray(details.sourceIds)
-    || details.sourceIds.length !== 1
-    || details.sourceIds[0] !== redactEvaluatorText(authority.sourceChatMessageId)
+    || details.sourceIds.length !== expectedSourceIds.length
+    || details.sourceIds.some((sourceId, index) => sourceId !== redactEvaluatorText(expectedSourceIds[index] ?? ''))
   ) {
     throw new Error('Memory rejection effect audit does not match evaluator evidence');
   }

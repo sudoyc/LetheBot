@@ -478,7 +478,7 @@ export class MemoryProposalService {
     evaluation: MemoryEvaluationResult | undefined,
     initialRiskLevel: Exclude<MemoryRiskLevel, 'prohibited'>
   ): GovernedMemoryPolicy {
-    let visibility = this.isGroupChatDerivedUserMemory(candidate)
+    let visibility = this.isGroupChatDerivedUserMemory(candidate) || candidate.kind === 'procedure'
       ? candidate.visibility
       : evaluation?.recommendedVisibility ?? candidate.visibility;
     const sensitivity = evaluation?.recommendedSensitivity ?? candidate.sensitivity;

@@ -47,6 +47,8 @@ import { MemoryConflictWorker } from '../workers/memory-conflict.js';
 import { MemoryConsolidationWorker } from '../workers/memory-consolidation.js';
 import { MemoryDecayWorker } from '../workers/memory-decay.js';
 import { MemoryExtractionWorker } from '../workers/memory-extraction.js';
+import type { MemoryEmbeddingWorker } from '../workers/memory-embedding.js';
+import { MemoryImportanceWorker } from '../workers/memory-importance.js';
 import { WorkerScheduler } from '../workers/scheduler.js';
 import { SummaryWorker, type ConversationSummaryInput } from '../workers/summary-worker.js';
 import type {
@@ -67,6 +69,9 @@ export interface BackgroundRuntimeServiceOptions {
   turnAdmissionController: TurnAdmissionController;
   test: boolean;
   backgroundSummaryEnabled: boolean;
+  embeddingWritesEnabled?: boolean;
+  embeddingWorker?: MemoryEmbeddingWorker;
+  importanceLearningEnabled?: boolean;
   piProvider: string;
   piModel: string;
   piTurnTimeoutMs: number;
@@ -90,6 +95,11 @@ export class BackgroundRuntimeService {
     const backgroundTaskHandlers = {
       summary: (task, execution) => this.handleSummaryBackgroundTask(task, execution),
       extraction: (task, execution) => this.handleExtractionBackgroundTask(task, execution),
+      embedding: (task, execution) => this.handleEmbeddingTask(task, execution),
+      importance: async (_task, execution) => {
+        if (!execution) throw new NonRetryableBackgroundTaskError('Importance job requires a durable attempt');
+        return new MemoryImportanceWorker(this.options.db, this.options.importanceLearningEnabled).run(execution);
+      },
       attention_recheck: (task, execution) => (
         this.handleAttentionRecheckBackgroundTask(task, execution)
       ),
@@ -123,6 +133,27 @@ export class BackgroundRuntimeService {
   }
 
   registerJobs(): void {
+    if (this.options.importanceLearningEnabled) {
+      const enqueue = () => {
+        this.options.db.transaction(() => {
+          const windowEndAt = Date.now();
+          const windowEndOrder = this.options.db.prepare('SELECT COALESCE(MAX(rowid), 0) FROM raw_events').pluck().get() as number;
+          this.enqueue({ type: 'importance', payload: { windowEndAt, windowEndOrder },
+            idempotencyKey: `importance-discovery:${Math.floor(windowEndAt / 3_600_000)}:${windowEndOrder}` });
+        }).immediate();
+      };
+      enqueue();
+      this.workerScheduler.register({ name: 'importance-discovery', intervalMs: 3_600_000, handler: async () => { enqueue(); } });
+    }
+    if (this.options.embeddingWritesEnabled) {
+      this.enqueue({ type: 'embedding', payload: {}, idempotencyKey: `embedding-discovery:${Math.floor(Date.now() / 60_000)}` });
+      this.workerScheduler.register({
+        name: 'embedding-discovery', intervalMs: 60_000,
+        handler: async () => {
+          this.enqueue({ type: 'embedding', payload: {}, idempotencyKey: `embedding-discovery:${Math.floor(Date.now() / 60_000)}` });
+        },
+      });
+    }
     this.workerScheduler.register({
       name: 'durable-interactive-job-processor',
       intervalMs: 5_000,
@@ -234,6 +265,27 @@ export class BackgroundRuntimeService {
         throw error;
       }
     }
+  }
+
+  private async handleEmbeddingTask(task: BackgroundTask, execution?: BackgroundTaskExecutionContext): Promise<unknown> {
+    const worker = this.options.embeddingWorker;
+    if (!this.options.embeddingWritesEnabled || !worker) return { status: 'disabled', indexed: 0 };
+    if (!execution) throw new NonRetryableBackgroundTaskError('Embedding job requires a durable attempt');
+    const cursor = task.payload.afterMemoryId;
+    if (cursor !== undefined && (typeof cursor !== 'string' || cursor.length > 256)) {
+      throw new NonRetryableBackgroundTaskError('Invalid embedding cursor');
+    }
+    const result = await worker.run(execution, cursor);
+    if (result.nextCursor !== undefined) {
+      this.options.db.transaction(() => {
+        worker.assertExecution(execution);
+        this.enqueue({
+          type: 'embedding', payload: { afterMemoryId: result.nextCursor },
+          idempotencyKey: `embedding-next:${task.id}:${result.nextCursor}`,
+        });
+      }).immediate();
+    }
+    return result;
   }
 
   private buildSummaryJobKey(candidate: ConversationSummaryInput): string {

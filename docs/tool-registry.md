@@ -151,6 +151,15 @@ back; a linked error tool-call/audit pair is attempted afterward in a separate
 transaction. The handler cannot activate memory and its public result does not
 return memory, source, evaluator, or tool-call IDs.
 
+For `kind=procedure`, the current turn's canonical trigger message must explicitly
+teach a workflow. The handler verifies the active canonical sender, inbound
+QQ event, exact conversation/private/group boundary and bounded teaching form,
+then repeats that check when the prepared effect commits. A teaching quote from
+another actor or an unrelated old source does not authorize a new procedure.
+Repeated-workflow learning is owned by the extraction worker's three-source
+path; the tool cannot manufacture a repetition count. Tool-created procedures
+remain proposed and do not change tool or platform permissions.
+
 Built-in `memory.disable` also uses chat actor/context permissions with
 `modifies_memory`, `evaluatorPolicy=required`, `redacted_full` audit, no
 filesystem/network access, in-process execution with declared limit metadata,

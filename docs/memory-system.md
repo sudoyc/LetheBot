@@ -66,6 +66,58 @@ Reusable process knowledge:
 - Which tools work well for a recurring task.
 - Common troubleshooting procedures.
 
+Explicit teaching currently enters the durable extraction path. Supported
+first-party forms include `请记住这个流程：...`, `记住流程：...`,
+`以后帮我总结文件时，请先...`, and `Remember this procedure: ...`
+(`workflow` is also accepted). Teaching must start the message, contain a
+nonempty workflow, be at most 1,000 characters and not end as a question.
+Multiline steps are retained together; embedded fact/preference examples are
+not extracted separately. The title is a bounded, single-line projection of
+the original workflow, while the content and canonical chat source retain the
+teaching text.
+
+These procedures are user-owned and `user_stated`. Private teaching follows
+the normal evaluation/activation policy. Group teaching stays `proposed` and
+`same_group_only`, even if the evaluator recommends activation. Existing
+governance inspection, approval, disable/delete/restore and scoped context
+retrieval apply; job retries never restore a deleted or disabled procedure.
+Procedures provide context only and do not grant tool or platform permissions.
+An evaluator cannot broaden a procedure's source-derived visibility.
+
+Repeated learning accepts bounded requests such as
+`帮我总结文件：先列结论，再列风险。`. The supported request starts with
+`帮我`/`为我` (optionally `请`), names a task before a colon, and gives `先`
+and `再`/`然后`/`最后` steps. It uses the same length and question limits as
+teaching. Three distinct, valid canonical inbound events must have identical
+text, the same canonical user and the same private/group visibility boundary;
+private conversations may differ, while a group must match exactly. Replays,
+other speakers, other groups and different step order do not count.
+
+The current source and the two most recent earlier matches in local raw-event
+ingress order form the bounded evidence set. Earlier jobs cannot consume later
+events. The workflow's versioned effect key uses its user, private/group boundary
+and content, so concurrent jobs converge on one candidate. Later matching jobs
+reuse the first committed source/revision/audit chain and lifecycle rather than
+creating another record. This also permits initial learning after a writer
+disable/reenable interval, while preserving deleted or rejected candidates.
+The candidate has
+`authority=inferred`, confidence `0.8`, importance `0.7`, and requires review
+even if the evaluator recommends activation. All three chat sources, their
+raw-event evaluator/invocation links and the create revision/audit are validated
+in one transaction. Source/identity changes during evaluation or the effect
+roll back that transaction. Retry retains owner lifecycle changes.
+
+`LETHEBOT_PROCEDURE_WRITES_ENABLED=false` stops new procedure admission and
+creation through extraction and tools, including queued extraction jobs; it
+does not fall back to extracting embedded examples as facts. A disabled queued
+procedure job completes without evaluating or writing its candidate. Raw/chat
+retention and ordinary fact extraction retain their normal behavior.
+`LETHEBOT_PROCEDURE_RETRIEVAL_ENABLED=false` excludes procedures from repository
+retrieval, FTS, ContextBuilder and `memory.search` before limits and ranking.
+Both strict booleans default to true and take effect at application startup.
+Inspection and governed lifecycle changes remain available, and reenabling
+retrieval uses the original records without rebuilding or rewriting history.
+
 ## Memory Lifecycle
 
 ```mermaid
@@ -111,8 +163,13 @@ Current record fields include:
 - Lifecycle state.
 - Policy/evaluator decision ID when the route supplies one.
 
-Retrieval tags and embedding references remain future extensions; they are not
-current `memory_records` fields.
+Retrieval tags are not current `memory_records` fields. Schema v9 stores derived
+vectors in `memory_embeddings`, separately from memory truth. Each row references
+one memory and records the local provider, model, model-file SHA-256 revision,
+dimensions (1-4096), index version, content fingerprint, memory revision and
+generation time. Vectors are bounded float32 blobs. The migration creates an
+empty index without inference or network activity; deleting this index never
+deletes memory, sources, revisions or audits.
 
 ## Boundary Fields
 
@@ -192,14 +249,15 @@ source explicitly sets `external=true` and both actor and source context are
 cannot be resolved safely remain `legacy_unresolved`; new governed writes never
 use that state.
 
-Automatic fact extraction is a durable, reference-only effect. A deterministic
+Automatic fact and explicit-procedure extraction is a durable, reference-only effect. A deterministic
 candidate check runs after the raw claim and admits the job in the same
 transaction as the canonical chat row, so silent, suppressed, failed, or
 undelivered reply paths do not lose a matching source. Private admission retains
-the existing first-person patterns. Group auto-admission accepts only bounded
+the existing first-person patterns plus the explicit teaching forms above.
+Group auto-admission accepts explicit teaching, repeated-workflow candidates or bounded
 exact name, attribute, like, and dislike statements; generic identity, embedded
 reports, questions, hypotheticals, wants, and needs do not enqueue automatic
-group extraction. The job payload contains the canonical `chat_messages.id` and
+group fact extraction. The job payload contains the canonical `chat_messages.id` and
 canonical target user ID, while the worker reloads chat content and provenance
 from SQLite and requires an inbound QQ gateway event plus a matching active
 platform account. Candidate
@@ -264,7 +322,8 @@ memory transaction.
 
 Extraction uses the configured evaluator, schema v4's job-attempt-owned
 Provider invocation, the
-canonical raw event as evaluator evidence, and one atomic decision plus
+canonical raw event (or the exact three repeated-procedure events) as evaluator
+evidence, and one atomic decision plus
 governed-memory transaction. A model-backed decision must link the exact
 completed invocation; stub/local-policy decisions remain unlinked.
 The owner must still be the exact current attempt with matching worker/lease
@@ -351,7 +410,7 @@ become permanent or unreliable memory.
 
 ## Maintenance Proposal Review, Apply, And Rollback
 
-Conflict, consolidation, and decay scanners persist normalized
+Conflict, consolidation, decay, and importance workers persist normalized
 `pending_review` proposals but retain no review or memory lifecycle authority.
 The shared `GovernanceService` lists and reads those proposals through scope
 predicates applied before the bounded FIFO limit. Trusted caller context maps to
@@ -383,7 +442,8 @@ same verified scope authority. It recomputes the frozen record/source
 fingerprints, active state, and shared boundary inside one immediate
 transaction. Conflict requires an explicit retained candidate; consolidation
 uses the normalized retained candidate; decay uses the normalized disable
-target. Retained, superseded, and disabled candidates each receive a memory
+target; importance uses its versioned source-window score. Retained,
+superseded, disabled, and importance-adjusted candidates each receive a memory
 revision and audit linked from the proposal apply revision. Records and source
 links are preserved, while existing active-state retrieval filters exclude
 superseded/disabled candidates immediately. Exact retry/reopen adds no rows;
@@ -402,6 +462,63 @@ candidate. All earlier records, sources, revisions, audits, and apply evidence
 remain intact, and restored candidates are immediately visible to active-state
 retrieval. Exact retry/reopen adds no rows; drift or a competing rollback has
 zero effects; any child-write failure rolls back every mutation.
+
+### Source-Backed Importance Learning
+
+The optional local importance worker proposes increases for existing active,
+user-stated user preferences. It does not create facts, call a Provider, change
+visibility, or write active memory. The memory must have confidence at least
+0.6, normal/personal sensitivity, one unique latest revision, and canonical
+raw/chat sources from its current owner in the exact conversation/group.
+Association opt-out, expired memory, revoked accounts, missing sources, and
+contradictory or ambiguous evidence disqualify it.
+
+Scorer version 1 supports short, explicit first-person statements: English
+`I like/prefer/need/want ...`, `I do not/don't/no longer ...`, and Chinese
+`我喜欢/需要/想要...`, optionally negated by `不` or `不再`. It normalizes case,
+width, whitespace and trailing sentence punctuation; it does not translate
+objects or infer paraphrases. Quotes, replies, media, questions, reported or
+conditional statements are not supporting observations. A same-topic mention
+that is not an exact supporting statement invalidates the window.
+
+Each discovery freezes a 30-day window using local ingress time and a raw-event
+rowid ceiling. At most 200 owner messages in that exact boundary are examined;
+overflow fails closed. At least three observations on three UTC calendar days,
+spanning two days, are required. With observation count `n`, distinct days `d`
+and elapsed days `s`, the proposed importance is rounded to two decimals:
+
+```text
+min(0.95, 0.40 + 0.05 * min(n, 6) + 0.05 * min(d, 5) + 0.10 * min(s / 14, 1))
+```
+
+It must exceed current importance by at least 0.05, allowing floating-point
+rounding tolerance. Confidence is the rounded minimum of memory confidence and
+`0.60 + 0.04 * min(n, 5) + 0.02 * min(d, 5)`. Expiry is seven days after the
+latest supporting ingress. For example, three observations over six days
+produce 0.74 importance. Later conflicting ingress invalidates a frozen
+proposal, including an event carrying an older clock timestamp.
+
+Schema v10 stores score inputs, scorer version, frozen bounds, original memory
+revision, job attempt and evidence fingerprint in `memory_importance_scores`.
+`memory_importance_sources` stores each supporting/context source, ingress and
+event times, role and fingerprint. Deleted raw/chat rows become nullable FK
+tombstones while the original source IDs remain as provenance. Stable proposal
+IDs bind candidate and evidence fingerprints; retry/reopen does not duplicate
+proposal/revision/audit rows. Workers process 20 records per transaction, retain
+the frozen window across continuation jobs, and check the current durable
+attempt and unexpired lease before writing and before commit.
+
+Approval revalidates evidence without changing ranking. Separate application
+revalidates sources, score, privacy and the current memory revision, then updates
+only governed importance with linked memory/proposal revisions and audits.
+`updated_at` is preserved to avoid adding a recency boost. Rollback uses the
+linked apply revision's previous importance and appends a restore revision; it
+requires the applied revision still to be current. New learning and application
+have independent startup controls, both disabled by default. Disabling them
+preserves history, existing ranking and rollback. The authenticated governance
+UI exposes score inputs and consequences; its review queue includes pending,
+approved and applied proposals so application and rollback survive refresh or
+restart. See [Operations](operations.md#importance-learning-and-rollback).
 
 ## QQ And CLI Memory Governance
 

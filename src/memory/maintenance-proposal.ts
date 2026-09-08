@@ -6,16 +6,22 @@ import {
   readMemoryMaintenanceCandidateSnapshot,
 } from './maintenance-candidate-snapshot.js';
 
-export type MemoryMaintenanceProposalKind = 'conflict' | 'consolidation' | 'decay';
+export type MemoryMaintenanceProposalKind = 'conflict' | 'consolidation' | 'decay' | 'importance';
 
 export type MemoryMaintenanceReasonCode =
   | 'same_boundary_title_different_content'
   | 'same_boundary_title_and_content'
   | 'stale'
   | 'low_confidence'
-  | 'low_importance';
+  | 'low_importance'
+  | 'repeated_first_party_evidence';
 
 export type MemoryMaintenanceProposedEffect =
+  | {
+    type: 'adjust_importance';
+    memoryId: string;
+    importance: number;
+  }
   | {
     type: 'resolve_conflict';
     candidateMemoryIds: string[];

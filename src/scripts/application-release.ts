@@ -147,6 +147,8 @@ interface CrossVersionRehearsalResult {
     candidateSchemaObserved: boolean;
     candidatePiSchemaObserved: boolean;
     candidateMaintenanceSchemaObserved: boolean;
+    candidateEmbeddingSchemaObserved: boolean;
+    candidateImportanceSchemaObserved: boolean;
     databaseRestored: boolean;
     metadataRestored: boolean;
     pointersRestored: boolean;
@@ -171,14 +173,20 @@ interface CrossVersionRehearsalResult {
     candidateSchemaObserved: boolean;
     candidatePiSchemaObserved: boolean;
     candidateMaintenanceSchemaObserved: boolean;
+    candidateEmbeddingSchemaObserved: boolean;
+    candidateImportanceSchemaObserved: boolean;
   };
   sharedDatabase: {
     priorLedgerObserved: boolean;
     priorPiSchemaObserved: boolean;
-    priorMaintenanceSchemaAbsent: boolean;
+    priorMaintenanceSchemaObserved: boolean;
+    priorEmbeddingSchemaObserved: boolean;
+    priorImportanceSchemaAbsent: boolean;
     candidateLedgerObserved: boolean;
     candidatePiSchemaObserved: boolean;
     candidateMaintenanceSchemaObserved: boolean;
+    candidateEmbeddingSchemaObserved: boolean;
+    candidateImportanceSchemaObserved: boolean;
     sentinelPreserved: boolean;
     integrityOk: boolean;
     foreignKeysClean: boolean;
@@ -765,6 +773,8 @@ interface RehearsalDatabaseSnapshot {
   metadataFingerprint: string;
   piTurnInvocationSchema: boolean;
   memoryMaintenanceProposalSchema: boolean;
+  memoryEmbeddingSchema: boolean;
+  memoryImportanceSchema: boolean;
   integrityOk: boolean;
   foreignKeysClean: boolean;
 }
@@ -1165,8 +1175,14 @@ async function runCrossVersionRehearsal(
     const priorPiSchemaObserved = priorSnapshots.every(
       (snapshot) => snapshot.piTurnInvocationSchema,
     );
-    const priorMaintenanceSchemaAbsent = priorSnapshots.every(
-      (snapshot) => !snapshot.memoryMaintenanceProposalSchema,
+    const priorMaintenanceSchemaObserved = priorSnapshots.every(
+      (snapshot) => snapshot.memoryMaintenanceProposalSchema,
+    );
+    const priorEmbeddingSchemaObserved = priorSnapshots.every(
+      (snapshot) => snapshot.memoryEmbeddingSchema,
+    );
+    const priorImportanceSchemaAbsent = priorSnapshots.every(
+      (snapshot) => !snapshot.memoryImportanceSchema,
     );
     const candidateLedgerObserved = candidateSnapshots.every(
       (snapshot) => snapshot !== undefined && isCurrentLedger(snapshot),
@@ -1176,6 +1192,12 @@ async function runCrossVersionRehearsal(
     );
     const candidateMaintenanceSchemaObserved = candidateSnapshots.every(
       (snapshot) => snapshot?.memoryMaintenanceProposalSchema === true,
+    );
+    const candidateEmbeddingSchemaObserved = candidateSnapshots.every(
+      (snapshot) => snapshot?.memoryEmbeddingSchema === true,
+    );
+    const candidateImportanceSchemaObserved = candidateSnapshots.every(
+      (snapshot) => snapshot?.memoryImportanceSchema === true,
     );
     const sentinelPreserved = allSnapshots.every(
       (snapshot) => sameSentinel(rollbackPriorSnapshot, snapshot),
@@ -1207,10 +1229,14 @@ async function runCrossVersionRehearsal(
         && markerFreeRestartReady
         && priorLedgerObserved
         && priorPiSchemaObserved
-        && priorMaintenanceSchemaAbsent
+        && priorMaintenanceSchemaObserved
+        && priorEmbeddingSchemaObserved
+        && priorImportanceSchemaAbsent
         && candidateLedgerObserved
         && candidatePiSchemaObserved
         && candidateMaintenanceSchemaObserved
+        && candidateEmbeddingSchemaObserved
+        && candidateImportanceSchemaObserved
         && sentinelPreserved
         && integrityOk
         && foreignKeysClean,
@@ -1223,6 +1249,8 @@ async function runCrossVersionRehearsal(
         candidatePiSchemaObserved: rollbackCandidateSnapshot?.piTurnInvocationSchema === true,
         candidateMaintenanceSchemaObserved:
           rollbackCandidateSnapshot?.memoryMaintenanceProposalSchema === true,
+        candidateEmbeddingSchemaObserved: rollbackCandidateSnapshot?.memoryEmbeddingSchema === true,
+        candidateImportanceSchemaObserved: rollbackCandidateSnapshot?.memoryImportanceSchema === true,
         databaseRestored: rollbackDatabaseRestored,
         metadataRestored: rollbackPriorSnapshot.metadataFingerprint
           === rollbackRestoredSnapshot.metadataFingerprint,
@@ -1250,14 +1278,20 @@ async function runCrossVersionRehearsal(
         candidatePiSchemaObserved: confirmationRestartSnapshot.piTurnInvocationSchema,
         candidateMaintenanceSchemaObserved:
           confirmationRestartSnapshot.memoryMaintenanceProposalSchema,
+        candidateEmbeddingSchemaObserved: confirmationRestartSnapshot.memoryEmbeddingSchema,
+        candidateImportanceSchemaObserved: confirmationRestartSnapshot.memoryImportanceSchema,
       },
       sharedDatabase: {
         priorLedgerObserved,
         priorPiSchemaObserved,
-        priorMaintenanceSchemaAbsent,
+        priorMaintenanceSchemaObserved,
+        priorEmbeddingSchemaObserved,
+        priorImportanceSchemaAbsent,
         candidateLedgerObserved,
         candidatePiSchemaObserved,
         candidateMaintenanceSchemaObserved,
+        candidateEmbeddingSchemaObserved,
+        candidateImportanceSchemaObserved,
         sentinelPreserved,
         integrityOk,
         foreignKeysClean,
@@ -1724,6 +1758,17 @@ function inspectRehearsalDatabase(databasePath: string): RehearsalDatabaseSnapsh
       metadataFingerprint: `${stats.mode & 0o777}:${stats.uid}:${stats.gid}`,
       piTurnInvocationSchema: hasPiTurnInvocationSchema(db),
       memoryMaintenanceProposalSchema: hasMemoryMaintenanceProposalSchema(db),
+      memoryEmbeddingSchema: hasTableColumns(db, 'memory_embeddings', [
+        'memory_id', 'provider', 'model', 'model_revision', 'dimensions',
+        'index_version', 'content_fingerprint', 'memory_revision', 'vector', 'generated_at',
+      ]),
+      memoryImportanceSchema: hasTableColumns(db, 'memory_importance_scores', [
+        'proposal_id', 'scorer_version', 'memory_revision_id', 'window_start_at',
+        'window_end_at', 'observation_count', 'proposed_importance', 'evidence_fingerprint',
+      ]) && hasTableColumns(db, 'memory_importance_sources', [
+        'proposal_id', 'source_ordinal', 'source_raw_event_id', 'source_chat_message_id',
+        'raw_event_id', 'chat_message_id', 'source_fingerprint', 'evidence_role',
+      ]),
       integrityOk:
         integrityRows.length === 1 && Object.values(integrityRows[0] ?? {})[0] === 'ok',
       foreignKeysClean: db.prepare('PRAGMA foreign_key_check').all().length === 0,

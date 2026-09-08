@@ -45,6 +45,7 @@ export interface ConversationTurnServiceOptions {
   enqueueBackgroundTask(task: EnqueueTaskInput): string;
   piProvider: string;
   piModel: string;
+  procedureWritesEnabled?: boolean;
   botOwnerQqId?: string;
   getPiRuntime(): PiRuntime;
   getActionExecutor(): ActionExecutor;
@@ -254,6 +255,7 @@ export class ConversationTurnService {
         const shouldEnqueueExtraction = isAutomaticExtractionCandidate({
           text: event.message.content.text ?? '',
           conversationType: event.message.conversationType,
+          procedureWritesEnabled: this.options.procedureWritesEnabled,
         });
         currentStage = signals?.classification === 'defer'
           ? 'delayed_attention_persist'
@@ -331,6 +333,7 @@ export class ConversationTurnService {
             : {}),
           targetUserId: canonicalUserId,
           groupId,
+          ...(options.deadlineAtMs === undefined ? {} : { deadlineAtMs: options.deadlineAtMs }),
         });
 
         await this.options.contextTraceRepository.createFromContext(context);

@@ -98,9 +98,9 @@ function activationLockTempFixture(owner: {
 
 const schemaContract = {
   contractVersion: 1,
-  targetVersion: 8,
+  targetVersion: 10,
   minReadableVersion: 1,
-  maxReadableVersion: 8,
+  maxReadableVersion: 10,
   adoptsLegacyUnversioned: true,
 };
 
@@ -152,6 +152,16 @@ function writeRelease(releaseDir: string): void {
   writeFileSync(
     join(releaseDir, 'migrations/008_memory_maintenance_proposals.sql'),
     'SELECT 8;\n',
+    'utf8',
+  );
+  writeFileSync(
+    join(releaseDir, 'migrations/009_memory_embeddings.sql'),
+    'SELECT 9;\n',
+    'utf8',
+  );
+  writeFileSync(
+    join(releaseDir, 'migrations/010_memory_importance.sql'),
+    'SELECT 10;\n',
     'utf8',
   );
   writeFileSync(

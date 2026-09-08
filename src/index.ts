@@ -24,6 +24,12 @@ import {
 } from './application/conversation-turn-service.js';
 import { closeDatabase, initDatabase, runMigrations } from './storage/database.js';
 import { MemoryRepository } from './storage/memory-repository.js';
+import { MemoryEmbeddingRepository } from './storage/memory-embedding-repository.js';
+import { MemoryMaintenanceProposalRepository } from './storage/memory-maintenance-proposal-repository.js';
+import { LocalEmbeddingProvider } from './memory/local-embedding-provider.js';
+import { EmbeddingError } from './memory/embedding.js';
+import { MemoryEmbeddingWorker } from './workers/memory-embedding.js';
+import { SemanticMemoryRetrieval } from './context/semantic-retrieval.js';
 import { IdentityRepository } from './storage/identity-repository.js';
 import { AuditRepository } from './storage/audit-repository.js';
 import { ContextTraceRepository } from './storage/context-trace-repository.js';
@@ -221,6 +227,7 @@ class LetheBotApp {
   private config: Config;
   private db: Database.Database;
   private memoryRepo: MemoryRepository;
+  private embeddingProvider?: LocalEmbeddingProvider;
   private identityRepo: IdentityRepository;
   private auditRepo: AuditRepository;
   private turnRepo: TurnRepository;
@@ -267,7 +274,10 @@ class LetheBotApp {
     runMigrations(this.db, join(__dirname, '../migrations'));
 
     // 初始化存储层
-    this.memoryRepo = new MemoryRepository(this.db);
+    this.memoryRepo = new MemoryRepository(this.db, {
+      procedureWritesEnabled: this.config.procedureWritesEnabled,
+      procedureRetrievalEnabled: this.config.procedureRetrievalEnabled,
+    });
     this.identityRepo = new IdentityRepository(this.db);
     this.auditRepo = new AuditRepository(this.db);
     const contextTraceRepo = new ContextTraceRepository(this.db);
@@ -295,6 +305,9 @@ class LetheBotApp {
       this.db,
       this.memoryRepo,
       this.groupSummaryPolicyRepo,
+      new MemoryMaintenanceProposalRepository(this.db, new AuditRepository(this.db), {
+        importanceApplicationEnabled: this.config.importanceApplicationEnabled,
+      }),
     );
     this.actionRepo = new ActionRepository(this.db);
     this.cooldowns = new ActionCooldownManager();
@@ -332,7 +345,12 @@ class LetheBotApp {
     // 初始化核心模块
     this.attention = new AttentionEngine();
     this.delayedAttention = new DelayedAttentionService(this.db, this.jobRepo);
-    const contextBuilder = new ContextBuilder(this.memoryRepo, this.identityRepo, this.db);
+    const embeddingIndex = new MemoryEmbeddingRepository(this.db, this.memoryRepo);
+    if ((this.config.embeddingWritesEnabled || this.config.embeddingRetrievalEnabled) && this.config.embeddingModelDirectory) {
+      this.embeddingProvider = new LocalEmbeddingProvider(this.config.embeddingModelDirectory);
+    }
+    const contextBuilder = new ContextBuilder(this.memoryRepo, this.identityRepo, this.db,
+      this.embeddingProvider ? new SemanticMemoryRetrieval(this.embeddingProvider, embeddingIndex, this.config.embeddingRetrievalEnabled) : undefined);
 
     // 初始化 Pi Agent
     this.piProvider = process.env.PI_PROVIDER || 'openai';
@@ -404,6 +422,11 @@ class LetheBotApp {
       turnAdmissionController: this.turnAdmission,
       test: this.config.test,
       backgroundSummaryEnabled: this.config.backgroundSummaryEnabled,
+      embeddingWritesEnabled: this.config.embeddingWritesEnabled,
+      importanceLearningEnabled: this.config.importanceLearningEnabled,
+      embeddingWorker: this.embeddingProvider
+        ? new MemoryEmbeddingWorker(this.db, embeddingIndex, this.embeddingProvider, this.config.embeddingWritesEnabled)
+        : undefined,
       piProvider: this.piProvider,
       piModel: this.piModel,
       piTurnTimeoutMs: this.config.piTurnTimeoutMs,
@@ -455,6 +478,7 @@ class LetheBotApp {
       enqueueBackgroundTask: (task) => this.backgroundRuntime.enqueue(task),
       piProvider: this.piProvider,
       piModel: this.piModel,
+      procedureWritesEnabled: this.config.procedureWritesEnabled,
       ...(this.config.botOwnerQqId === undefined
         ? {}
         : { botOwnerQqId: this.config.botOwnerQqId }),
@@ -478,6 +502,13 @@ class LetheBotApp {
    * 启动应用
    */
   async start(): Promise<void> {
+    if (this.embeddingProvider) {
+      try {
+        await this.embeddingProvider.embed(['memory index version'], { timeoutMs: 15_000 });
+      } catch (error) {
+        logger.warn({ code: error instanceof EmbeddingError ? error.code : 'unavailable' }, 'Local embedding initialization failed; FTS remains available');
+      }
+    }
     const acceptedEvents = this.admissionRecovery.recover();
     await this.adapter.start();
 
@@ -566,11 +597,13 @@ class LetheBotApp {
     this.acceptingIngress = false;
 
     const schedulerDrain = this.backgroundRuntime.stopAndDrain();
+    const embeddingClose = this.embeddingProvider?.close();
     const serverClose = this.closeHttpServer();
     const governanceServerClose = this.closeGovernanceHttpServer();
 
     await Promise.all([
       schedulerDrain,
+      embeddingClose,
       serverClose,
       governanceServerClose,
       this.waitForIdle(),

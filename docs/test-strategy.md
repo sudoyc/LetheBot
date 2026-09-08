@@ -91,6 +91,12 @@ regressions are added; command exit status and the current output are evidence.
 Unit tests should use deterministic inputs and avoid network access, local
 credential files, real account identifiers, and persistent workspace data.
 
+`tests/unit/operations/semantic-recall.test.ts` verifies evaluation reporting
+with synthetic vectors: non-discriminating embeddings must not claim recall
+improvement, scoped source results and budgets remain inspectable, and failed
+or incomplete indexing cannot produce a completed report. Actual model quality
+still requires the unchanged frozen-corpus local-model evaluation.
+
 ### Gateway Fakes
 
 `tests/fakes/fake-onebot.ts` is the protocol-level fake for OneBot behavior.
@@ -114,6 +120,16 @@ surfaces include:
 Persistence tests use disposable databases. A behavior that changes durable
 state should assert the relevant rows and lifecycle transitions and finish with
 an empty `PRAGMA foreign_key_check` result.
+
+Importance learning is covered at two distinct boundaries:
+`tests/integration/memory-importance.test.ts` exercises frozen source windows,
+scope/privacy, score and revision revalidation, leases, transactional failure,
+batch continuation, concurrent review and reopen/retry. The production
+`memory-importance-runtime.test.ts` drives OneBot ingress, extraction, scheduled
+learning and authenticated governance HTTP, checks later ContextPack ordering,
+then restarts with both controls disabled and rolls back. The existing Chromium
+governance controller regression also renders importance detail and rollback.
+These use synthetic sources and no real Provider or QQ calls.
 
 ### Deterministic End-to-End Tests
 

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi, assert } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +20,46 @@ import type { MemoryEvaluationRequest, MemoryEvaluationResult } from '../../../s
 import { getLogger } from '../../../src/logger';
 
 describe('isAutomaticExtractionCandidate', () => {
+  it('stops procedure admission without suppressing ordinary private facts when writes are disabled', () => {
+    for (const text of ['Remember this procedure: summarize files.', '帮我总结文件：先列结论，再列风险。']) {
+      expect(isAutomaticExtractionCandidate({ text, conversationType: 'private', procedureWritesEnabled: false }))
+        .toBe(false);
+    }
+    expect(isAutomaticExtractionCandidate({
+      text: '我喜欢合成测试', conversationType: 'private', procedureWritesEnabled: false,
+    })).toBe(true);
+  });
+
+  it.each(['private', 'group'] as const)('admits a bounded workflow request for repeated %s evidence', (conversationType) => {
+    expect(isAutomaticExtractionCandidate({
+      text: '帮我总结文件：先列结论，再列风险。', conversationType,
+    })).toBe(true);
+  });
+
+  it.each([
+    '请记住这个流程：总结文件时，先列结论，再列风险。',
+    '以后帮我总结文件时，请先列结论，再列风险。',
+    'Remember this procedure: summarize files with conclusions, then risks.',
+    '记住流程：\n1. 列出结论。\n2. 列出风险。',
+  ])('admits explicit procedure teaching in private and group chat: %s', (text) => {
+    for (const conversationType of ['private', 'group'] as const) {
+      expect(isAutomaticExtractionCandidate({ text, conversationType })).toBe(true);
+    }
+  });
+
+  it.each([
+    '请总结文件，先列结论，再列风险。',
+    '他说：请记住这个流程：先列结论，再列风险。',
+    '如果以后总结文件时，先列结论，再列风险。',
+    '请记住这个流程：',
+    '请记住这个流程：先列结论，再列风险好吗？',
+    `请记住这个流程：${'步骤'.repeat(600)}`,
+  ])('does not learn a procedure without bounded first-party teaching: %s', (text) => {
+    for (const conversationType of ['private', 'group'] as const) {
+      expect(isAutomaticExtractionCandidate({ text, conversationType })).toBe(false);
+    }
+  });
+
   it.each([
     '你好，我叫 合成用户',
     '我是 合成工程师',
@@ -136,6 +176,38 @@ describe('MemoryExtractionWorker', () => {
   });
 
   describe('extractFromTurn', () => {
+    it.each(['private', 'group'] as const)('preserves an entire taught procedure and its %s boundary', async (conversationType) => {
+      const userMessage = '请记住这个流程：\n总结文件时，先列结论，再列风险。\n不要把示例“我喜欢简洁”存为偏好。';
+      const result = await extractCanonicalTurn(db, worker, {
+        conversationId: 'procedure-conversation',
+        conversationType,
+        groupId: conversationType === 'group' ? 'procedure-group' : undefined,
+        userId: 'procedure-owner',
+        userMessage,
+        botResponse: '',
+      });
+      expect(result).toMatchObject({ matched: true, count: 1 });
+      const memoryId = result.memoryIds[0];
+      assert(memoryId);
+      const memory = await new MemoryRepository(db).findById(memoryId);
+      assert(memory);
+      expect(memory).toMatchObject({
+        kind: 'procedure',
+        content: userMessage,
+        canonicalUserId: 'procedure-owner',
+        scope: 'user',
+        authority: 'user_stated',
+        state: conversationType === 'private' ? 'active' : 'proposed',
+        visibility: conversationType === 'private' ? 'private_only' : 'same_group_only',
+      });
+      expect(memory.title.length).toBeLessThanOrEqual(120);
+      expect(db.prepare('SELECT source_type, source_id FROM memory_sources WHERE memory_id = ?').all(memoryId))
+        .toEqual([{ source_type: 'chat_message', source_id: 'chat-source-procedure-conversation-procedure-owner' }]);
+      expect(db.prepare('SELECT change_type FROM memory_revisions WHERE memory_id = ?').all(memoryId))
+        .toEqual([{ change_type: 'create' }]);
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+    });
+
     it('should successfully extract name', async () => {
       const result = await extractCanonicalTurn(db, worker, {
         conversationId: 'conv-001',

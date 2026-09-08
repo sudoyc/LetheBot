@@ -161,6 +161,12 @@ Missing policy or missing exact group context excludes all such summaries.
 `group_summary_policy_disabled`, but that bounded sample is informational and
 never used to decide which memories enter the prompt or token budget.
 
+The independent procedure retrieval switch adds `kind <> 'procedure'` to both
+structured and FTS repository routes before ordering and limits. This prevents
+disabled procedures from consuming candidate slots for ordinary facts.
+ContextTrace records `procedure_retrieval=disabled` when that startup control
+is off. Governance inspection and lifecycle operations remain available.
+
 - store only redacted narrative trace metadata: rejected reasons, applied filter
   strings, injected identity-field labels, memory titles, and memory source
   context are final-guard redacted before `context_traces` insertion; exact
@@ -240,7 +246,11 @@ Under pressure, retention order is:
 
 Profile ties use importance, recency, and stable ID. Remaining memory uses
 importance, recency, confidence, and stable ID only after query source, scope
-affinity, and FTS ordinal. A memory omitted by the hard budget is recorded once
+affinity, and FTS ordinal. Governed importance proposals affect this existing
+ranking only after application. Approval alone has no effect; rollback restores
+the previous importance without a recency boost. Neither operation changes
+visibility, authority, query precedence or token limits.
+A memory omitted by the hard budget is recorded once
 as `token_budget_exceeded`; selected IDs remain order-identical across the
 ContextPack and trace. `memorySelections` covers selected IDs in that same order
 with only fixed query-source/retrieval/scope/reason enums and a 1-based retrieval

@@ -730,7 +730,8 @@ export class GovernanceQueryService {
   private readonly maintenanceProposals: MemoryMaintenanceProposalRepository;
   private readonly memories: MemoryRepository;
 
-  constructor(private readonly db: Database.Database) {
+  constructor(private readonly db: Database.Database,
+    private readonly options: { importanceApplicationEnabled?: boolean } = {}) {
     this.maintenanceProposals = new MemoryMaintenanceProposalRepository(
       db,
       new AuditRepository(db),
@@ -2335,6 +2336,7 @@ export class GovernanceQueryService {
     const revisions = proposal.revisions.slice(-MAX_MEMORY_MAINTENANCE_DETAIL_ITEMS);
     return {
       ...this.memoryMaintenanceReviewToInspection(proposal, scope.kind),
+      ...(proposal.importance ? { importance: proposal.importance } : {}),
       effectMemoryRef: proposal.effectMemoryId
         ? this.governanceReference('memory', proposal.effectMemoryId)
         : undefined,
@@ -2375,7 +2377,8 @@ export class GovernanceQueryService {
       proposalId: input.proposalId,
       access: { kind: 'exact_scope', scope },
     });
-    if (!proposal || proposal.lifecycleState !== 'pending_review') {
+    if (!proposal || proposal.lifecycleState !== 'pending_review'
+      || (proposal.kind === 'importance' && proposal.expiresAt !== null && proposal.expiresAt <= Date.now())) {
       return null;
     }
 
@@ -2632,7 +2635,7 @@ export class GovernanceQueryService {
           'memory_record_revision_append',
           'proposal_effect_evidence_append',
         ],
-        retrievalConsequences: ['restored_records_included'],
+        retrievalConsequences: proposal.kind === 'importance' ? ['importance_ranking_restored'] : ['restored_records_included'],
       },
       confirmation: {
         required: true,
@@ -2661,7 +2664,9 @@ export class GovernanceQueryService {
       proposalId: input.proposalId,
       access: { kind: 'exact_scope', scope },
     });
-    if (!proposal || proposal.lifecycleState !== 'approved') {
+    if (!proposal || proposal.lifecycleState !== 'approved'
+      || (proposal.kind === 'importance' && (!this.options.importanceApplicationEnabled
+        || (proposal.expiresAt !== null && proposal.expiresAt <= Date.now())))) {
       return null;
     }
 
@@ -2674,11 +2679,20 @@ export class GovernanceQueryService {
     }
     const effects: Array<{
       memoryRef: string;
-      role: 'retained' | 'superseded' | 'disabled';
+      role: 'retained' | 'superseded' | 'disabled' | 'importance_adjusted';
     }> = [];
     let retainedMemoryId: string | undefined;
     let selection: MemoryMaintenanceApplicationPreviewProjection['selection'];
     switch (proposal.kind) {
+      case 'importance': {
+        const target = candidates[0];
+        if (input.retainedMemoryRef !== undefined || proposal.effectType !== 'adjust_importance'
+          || candidates.length !== 1 || target?.candidate.effectRole !== 'importance_target'
+          || target.candidate.memoryId !== proposal.effectMemoryId || !proposal.importance) return null;
+        effects.push({ memoryRef: target.memoryRef, role: 'importance_adjusted' });
+        selection = { required: false };
+        break;
+      }
       case 'conflict': {
         const retained = typeof input.retainedMemoryRef === 'string'
           ? candidates
@@ -2751,7 +2765,7 @@ export class GovernanceQueryService {
       }
     }
 
-    const roleOrder = ['retained', 'superseded', 'disabled'] as const;
+    const roleOrder = ['retained', 'superseded', 'disabled', 'importance_adjusted'] as const;
     const roles: MemoryMaintenanceApplicationPreviewProjection['affectedRecords']['roles'] = [];
     for (const role of roleOrder) {
       const memoryRefs = effects
@@ -2804,7 +2818,7 @@ export class GovernanceQueryService {
           'memory_record_revision_append',
           'proposal_effect_evidence_append',
         ],
-        retrievalConsequences: proposal.kind === 'decay'
+        retrievalConsequences: proposal.kind === 'importance' ? ['importance_ranking_adjusted'] : proposal.kind === 'decay'
           ? ['disabled_records_excluded']
           : ['superseded_records_excluded'],
       },
@@ -2985,7 +2999,8 @@ export class GovernanceQueryService {
       || input.preview.expected.lifecycleState !== 'rolled_back'
       || input.preview.expected.revisionNumber !== rolledBackRevisionNumber
       || input.preview.expected.retrievalConsequences.length !== 1
-      || input.preview.expected.retrievalConsequences[0] !== 'restored_records_included'
+      || input.preview.expected.retrievalConsequences[0] !== (input.proposal.kind === 'importance'
+        ? 'importance_ranking_restored' : 'restored_records_included')
       || input.preview.confirmation.required !== true
       || input.preview.confirmation.boundary !== 'separate_confirmation_required'
     ) {
@@ -5009,7 +5024,7 @@ export class GovernanceQueryService {
   }
 
   private memoryMaintenanceApplicationRoleFingerprint(
-    role: 'retained' | 'superseded' | 'disabled',
+    role: 'retained' | 'superseded' | 'disabled' | 'importance_adjusted',
     memoryRefs: string[],
   ): string {
     return createHash('sha256')

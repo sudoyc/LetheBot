@@ -30,7 +30,7 @@ describe('schema v4 evaluator correction attempts migration', () => {
 
       runMigrations(db, migrationDirectory);
 
-      expect(getSchemaVersion(db)).toBe(8);
+      expect(getSchemaVersion(db)).toBe(10);
       expect(db.prepare(
         'SELECT version, description FROM schema_version ORDER BY version',
       ).all()).toEqual([
@@ -42,6 +42,8 @@ describe('schema v4 evaluator correction attempts migration', () => {
         { version: 6, description: 'Group summary policy' },
         { version: 7, description: 'Pi turn model invocations' },
         { version: 8, description: 'Memory maintenance proposals' },
+        { version: 9, description: 'Memory embeddings' },
+        { version: 10, description: 'Memory importance' },
       ]);
       expect(db.prepare(
         `SELECT rowid, id, call_number, status, error_code

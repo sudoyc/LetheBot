@@ -1,6 +1,8 @@
 import type Database from 'better-sqlite3';
 import { ulid } from 'ulidx';
 import { readMemoryMaintenanceCandidateSnapshot } from '../memory/maintenance-candidate-snapshot.js';
+import type { MemoryImportanceEvidence, MemoryImportanceSummary } from '../memory/importance.js';
+import { MemoryImportanceRepository } from './memory-importance-repository.js';
 import type {
   MemoryMaintenanceProposal,
   MemoryMaintenanceProposalKind,
@@ -55,13 +57,14 @@ export type MemoryMaintenanceProposalAccess =
 export interface MemoryMaintenanceProposalRecord {
   proposalId: string;
   kind: MemoryMaintenanceProposalKind;
-  effectType: 'resolve_conflict' | 'consolidate' | 'disable';
+  effectType: 'resolve_conflict' | 'consolidate' | 'disable' | 'adjust_importance';
   lifecycleState: MemoryMaintenanceProposalLifecycleState;
   scope: MemoryMaintenanceScopeSnapshot;
   candidateFingerprint: string;
   confidence: number;
   effectMemoryId: string | null;
-  effectMemoryRole: 'retained' | 'disable_target' | null;
+  effectMemoryRole: 'retained' | 'disable_target' | 'importance_target' | null;
+  importance?: MemoryImportanceSummary;
   currentRevisionNumber: number;
   createdAt: number;
   updatedAt: number;
@@ -70,7 +73,7 @@ export interface MemoryMaintenanceProposalRecord {
   candidates: Array<{
     candidateOrdinal: number;
     memoryId: string;
-    effectRole: 'conflict_candidate' | 'retained' | 'supersede' | 'disable_target';
+    effectRole: 'conflict_candidate' | 'retained' | 'supersede' | 'disable_target' | 'importance_target';
     expectedState: 'active';
     recordFingerprint: string;
     sourceCount: number;
@@ -172,6 +175,8 @@ export interface MemoryMaintenanceProposalPersistenceInput {
   scope: MemoryMaintenanceScopeSnapshot;
   candidates: MemoryMaintenanceCandidateSnapshot[];
   nowMs: number;
+  importance?: MemoryImportanceEvidence;
+  jobAttemptId?: string;
 }
 
 interface ExistingProposalRow {
@@ -261,14 +266,16 @@ interface MemoryApplyEffect {
   memoryId: string;
   nextState: 'active' | 'superseded' | 'disabled';
   changeType: 'update' | 'supersede' | 'disable';
-  effectRole: 'retained' | 'superseded' | 'disabled';
+  effectRole: 'retained' | 'superseded' | 'disabled' | 'importance_adjusted';
+  nextImportance?: number;
 }
 
 interface MemoryRevisionEffectEvidence {
   memoryId: string;
-  effectRole: 'retained' | 'superseded' | 'disabled' | 'restored';
+  effectRole: 'retained' | 'superseded' | 'disabled' | 'restored' | 'importance_adjusted';
   memoryRevisionId: string;
   memoryRevisionNewState: string;
+  memoryRevisionPreviousState: string | null;
 }
 
 /**
@@ -282,6 +289,7 @@ export class MemoryMaintenanceProposalRepository {
   constructor(
     private readonly db: Database.Database,
     private readonly auditRepository: AuditRepository,
+    private readonly options: { importanceApplicationEnabled?: boolean } = {},
   ) {}
 
   createOrGet(input: MemoryMaintenanceProposalPersistenceInput): MemoryMaintenanceProposal {
@@ -309,7 +317,7 @@ export class MemoryMaintenanceProposalRepository {
            effect_memory_id, effect_memory_role,
            current_revision_number, created_at, updated_at, expires_at,
            created_audit_id
-         ) VALUES (?, ?, ?, 'pending_review', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?)`,
+         ) VALUES (?, ?, ?, 'pending_review', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
       ).run(
         input.proposal.proposalId,
         input.proposal.kind,
@@ -325,6 +333,7 @@ export class MemoryMaintenanceProposalRepository {
         effect.memoryRole,
         input.nowMs,
         input.nowMs,
+        input.importance?.expiresAt ?? null,
         auditId,
       );
 
@@ -361,6 +370,10 @@ export class MemoryMaintenanceProposalRepository {
         insertReason.run(input.proposal.proposalId, input.proposal.kind, ordinal, reasonCode);
       });
 
+      if (input.importance) {
+        new MemoryImportanceRepository(this.db).save(input.proposal.proposalId, input.importance, input.nowMs, input.jobAttemptId);
+      }
+
       this.db.prepare(
         `INSERT INTO memory_maintenance_proposal_revisions (
            id, proposal_id, proposal_kind, revision_number, transition,
@@ -372,7 +385,7 @@ export class MemoryMaintenanceProposalRepository {
         `${input.proposal.proposalId}:revision:1`,
         input.proposal.proposalId,
         input.proposal.kind,
-        'scan_proposal_created',
+        input.importance ? 'importance_proposal_created' : 'scan_proposal_created',
         auditId,
         input.nowMs,
       );
@@ -472,6 +485,11 @@ export class MemoryMaintenanceProposalRepository {
         };
       }
 
+      if (input.transition === 'approve' && current.kind === 'importance'
+        && (!this.candidateSnapshotIsCurrent(current)
+          || !new MemoryImportanceRepository(this.db).isCurrent(current.proposalId, input.nowMs))) {
+        return { outcome: 'stale', proposal: current };
+      }
       const transitionAt = Math.max(input.nowMs, current.updatedAt);
       const update = this.db.prepare(
         `UPDATE memory_maintenance_proposals
@@ -588,6 +606,10 @@ export class MemoryMaintenanceProposalRepository {
       if (!this.candidateSnapshotIsCurrent(current)) {
         return { outcome: 'stale', proposal: current };
       }
+      if (current.kind === 'importance' && (!this.options.importanceApplicationEnabled
+        || !new MemoryImportanceRepository(this.db).isCurrent(current.proposalId, input.nowMs))) {
+        return { outcome: 'stale', proposal: current };
+      }
 
       const memoryRows = this.readMaintenanceMemoryRows(
         current.candidates.map((candidate) => candidate.memoryId),
@@ -625,12 +647,13 @@ export class MemoryMaintenanceProposalRepository {
         const evaluatorDecisionId = `policy:l0:${effect.nextState}:${effect.memoryId}`;
         const memoryUpdate = this.db.prepare(
           `UPDATE memory_records
-              SET state = ?, updated_at = ?, evaluator_decision_id = ?
+              SET state = ?, updated_at = ?, evaluator_decision_id = ?, importance = ?
             WHERE id = ? AND state = 'active'`,
         ).run(
           effect.nextState,
-          transitionAt,
+          current.kind === 'importance' ? previousRow.updated_at : transitionAt,
           evaluatorDecisionId,
+          effect.nextImportance ?? previousRow.importance,
           effect.memoryId,
         );
         if (memoryUpdate.changes !== 1) {
@@ -681,6 +704,10 @@ export class MemoryMaintenanceProposalRepository {
             newState: effect.nextState,
             revisionNumber: memoryRevisionNumber,
             effectRole: effect.effectRole,
+            ...(current.kind === 'importance' ? {
+              previousImportance: previousRow.importance, newImportance: updatedRow.importance,
+              scoringEvidenceFingerprint: current.importance?.evidenceFingerprint,
+            } : {}),
             reasonCode: input.reasonCode,
             authorityKind: input.authorityKind,
             redaction: 'normalized_lifecycle_metadata_only',
@@ -837,13 +864,25 @@ export class MemoryMaintenanceProposalRepository {
       for (const previousRow of memoryRows) {
         const previousSnapshot = this.memoryRowSnapshot(previousRow);
         const evaluatorDecisionId = `policy:l0:active:${previousRow.id}`;
+        let restoredImportance = previousRow.importance;
+        if (current.kind === 'importance') {
+          const evidence = applyEvidence.find((effect) => effect.memoryId === previousRow.id);
+          const original: unknown = JSON.parse(evidence?.memoryRevisionPreviousState ?? 'null');
+          if (!original || typeof original !== 'object' || !('importance' in original)
+            || typeof original.importance !== 'number' || !Number.isFinite(original.importance)
+            || original.importance < 0 || original.importance > 1) {
+            throw new Error('Importance rollback revision evidence is invalid');
+          }
+          restoredImportance = original.importance;
+        }
         const memoryUpdate = this.db.prepare(
           `UPDATE memory_records
-              SET state = 'active', updated_at = ?, evaluator_decision_id = ?
+              SET state = 'active', updated_at = ?, evaluator_decision_id = ?, importance = ?
             WHERE id = ? AND state = ?`,
         ).run(
-          transitionAt,
+          current.kind === 'importance' ? previousRow.updated_at : transitionAt,
           evaluatorDecisionId,
+          restoredImportance,
           previousRow.id,
           previousRow.state,
         );
@@ -894,6 +933,9 @@ export class MemoryMaintenanceProposalRepository {
             newState: 'active',
             revisionNumber: memoryRevisionNumber,
             effectRole: 'restored',
+            ...(current.kind === 'importance' ? {
+              previousImportance: previousRow.importance, newImportance: restoredImportance,
+            } : {}),
             reasonCode: input.reasonCode,
             authorityKind: input.authorityKind,
             redaction: 'normalized_lifecycle_metadata_only',
@@ -1040,6 +1082,9 @@ export class MemoryMaintenanceProposalRepository {
       confidence: row.confidence,
       effectMemoryId: row.effect_memory_id,
       effectMemoryRole: row.effect_memory_role,
+      ...(row.kind === 'importance' ? {
+        importance: new MemoryImportanceRepository(this.db).summary(row.id) ?? undefined,
+      } : {}),
       currentRevisionNumber: row.current_revision_number,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
@@ -1374,7 +1419,8 @@ export class MemoryMaintenanceProposalRepository {
   ): MemoryRevisionEffectEvidence[] {
     const rows = this.db.prepare(
       `SELECT e.memory_id, e.effect_role, e.memory_revision_id,
-              r.new_state AS memory_revision_new_state
+              r.new_state AS memory_revision_new_state,
+              r.previous_state AS memory_revision_previous_state
          FROM memory_maintenance_proposal_revision_effects AS e
          JOIN memory_maintenance_proposal_revisions AS pr
            ON pr.id = e.proposal_revision_id
@@ -1399,12 +1445,14 @@ export class MemoryMaintenanceProposalRepository {
       effect_role: MemoryRevisionEffectEvidence['effectRole'];
       memory_revision_id: string;
       memory_revision_new_state: string;
+      memory_revision_previous_state: string | null;
     }>;
     return rows.map((row) => ({
       memoryId: row.memory_id,
       effectRole: row.effect_role,
       memoryRevisionId: row.memory_revision_id,
       memoryRevisionNewState: row.memory_revision_new_state,
+      memoryRevisionPreviousState: row.memory_revision_previous_state,
     }));
   }
 
@@ -1499,6 +1547,9 @@ export class MemoryMaintenanceProposalRepository {
     if (proposal.kind === 'decay') {
       return evidence.length === 1 && evidence[0]?.effectRole === 'disabled';
     }
+    if (proposal.kind === 'importance') {
+      return evidence.length === 1 && evidence[0]?.effectRole === 'importance_adjusted';
+    }
     return evidence.filter((effect) => effect.effectRole === 'retained').length === 1
       && evidence.filter((effect) => effect.effectRole === 'superseded').length
         === evidence.length - 1;
@@ -1509,6 +1560,16 @@ export class MemoryMaintenanceProposalRepository {
     retainedMemoryId: string | undefined,
   ): MemoryApplyEffect[] {
     switch (proposal.kind) {
+      case 'importance': {
+        const target = proposal.candidates[0];
+        if (retainedMemoryId !== undefined || proposal.effectType !== 'adjust_importance'
+          || proposal.candidates.length !== 1 || target?.effectRole !== 'importance_target'
+          || target.memoryId !== proposal.effectMemoryId || !proposal.importance) {
+          throw new Error('Memory importance candidate is invalid');
+        }
+        return [{ memoryId: target.memoryId, nextState: 'active', changeType: 'update',
+          effectRole: 'importance_adjusted', nextImportance: proposal.importance.proposedImportance }];
+      }
       case 'conflict': {
         if (proposal.effectType !== 'resolve_conflict') {
           throw new Error('memory maintenance conflict effect is invalid');
@@ -1738,6 +1799,15 @@ export class MemoryMaintenanceProposalRepository {
   }
 
   private validateInput(input: MemoryMaintenanceProposalPersistenceInput): void {
+    if ((input.proposal.kind === 'importance') !== Boolean(input.importance)) {
+      throw new Error('Importance proposals require versioned source evidence');
+    }
+    if (input.importance && (input.proposal.proposedEffect.type !== 'adjust_importance'
+      || input.importance.memoryId !== input.proposal.proposedEffect.memoryId
+      || input.importance.proposedImportance !== input.proposal.proposedEffect.importance
+      || input.importance.confidence !== input.proposal.confidence)) {
+      throw new Error('Importance score does not match the proposed effect');
+    }
     const candidateIds = input.proposal.candidateMemoryIds;
     const uniqueCandidateIds = new Set(candidateIds);
     if (candidateIds.length === 0 || uniqueCandidateIds.size !== candidateIds.length) {
@@ -1771,6 +1841,7 @@ export class MemoryMaintenanceProposalRepository {
         }
         break;
       }
+      case 'adjust_importance':
       case 'disable':
         if (candidateIds.length !== 1 || candidateIds[0] !== input.proposal.proposedEffect.memoryId) {
           throw new Error('memory maintenance decay effect does not match candidates');
@@ -1818,6 +1889,8 @@ export class MemoryMaintenanceProposalRepository {
     memoryRole: string | null;
   } {
     switch (effect.type) {
+      case 'adjust_importance':
+        return { effectType: effect.type, memoryId: effect.memoryId, memoryRole: 'importance_target' };
       case 'resolve_conflict':
         return {
           effectType: 'resolve_conflict',
@@ -1844,6 +1917,8 @@ export class MemoryMaintenanceProposalRepository {
     memoryId: string,
   ): string {
     switch (effect.type) {
+      case 'adjust_importance':
+        return 'importance_target';
       case 'resolve_conflict':
         return 'conflict_candidate';
       case 'consolidate':

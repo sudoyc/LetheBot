@@ -11,6 +11,13 @@ import { MemoryRepository } from '../storage/memory-repository.js';
 import { PrivacyPreferenceRepository } from '../storage/privacy-preference-repository.js';
 import { getLogger } from '../logger/index.js';
 import {
+  isExplicitProcedureTeaching,
+  isRepeatableProcedureRequest,
+  readProcedureSource,
+  readRepeatedProcedureSources,
+  type ProcedureSource,
+} from '../memory/procedure.js';
+import {
   buildMemoryCandidateEffectId,
   MemoryProposalService,
   type MemoryProposalOutcome,
@@ -55,7 +62,7 @@ export interface BatchExtractionInput {
  */
 export interface ExtractionPattern {
   regex: RegExp;
-  type: 'name' | 'identity' | 'attribute' | 'preference';
+  type: 'name' | 'identity' | 'attribute' | 'preference' | 'procedure';
   sensitivity: 'normal' | 'personal' | 'sensitive';
   confidence: number; // 0.0-1.0
   importance: number; // 0.0-1.0
@@ -84,7 +91,9 @@ interface ExpectedExtractionEffect {
   groupId?: string;
   visibility: 'private_only' | 'same_group_only';
   sensitivity: ExtractionPattern['sensitivity'];
-  kind: 'preference' | 'fact';
+  kind: 'preference' | 'fact' | 'procedure';
+  authority: 'user_stated' | 'inferred';
+  procedureSources?: ProcedureSource[];
   title: string;
   content: string;
   sourceContext: string;
@@ -163,6 +172,14 @@ const DEFAULT_PATTERNS: ExtractionPattern[] = [
   },
 ];
 
+const PROCEDURE_PATTERN: ExtractionPattern = {
+  regex: /^[\s\S]+$/u,
+  type: 'procedure',
+  sensitivity: 'normal',
+  confidence: 0.9,
+  importance: 0.7,
+};
+
 const GROUP_AUTO_EXTRACTION_MAX_LENGTH = 160;
 const GROUP_UNSAFE_CONTEXT_PATTERN = /(?:如果|假如|假设|要是|的话|听说|据说|我想要|我需要|(?:他|她|他们|她们|有人).{0,8}(?:说|表示))/u;
 const GROUP_UNSAFE_ATTRIBUTE_PATTERN = /^我的\s*(?:备注|记录|假设|愿望)\s*是/u;
@@ -197,10 +214,15 @@ const GROUP_EXTRACTION_PATTERNS: readonly ExtractionPattern[] = [
 export function isAutomaticExtractionCandidate(input: {
   text: string;
   conversationType: 'private' | 'group';
+  procedureWritesEnabled?: boolean;
 }): boolean {
   const text = input.text.trim();
   if (text.length === 0) {
     return false;
+  }
+
+  if (isExplicitProcedureTeaching(text) || isRepeatableProcedureRequest(text)) {
+    return input.procedureWritesEnabled !== false;
   }
 
   if (input.conversationType === 'private') {
@@ -295,7 +317,28 @@ export class MemoryExtractionWorker {
     const memoryIds: string[] = [];
     const errors: Array<{ code: string; message: string; context?: Record<string, unknown> }> = [];
 
-    const patterns = input.conversationType === 'group'
+    const teaching = isExplicitProcedureTeaching(input.userMessage);
+    const workflow = isRepeatableProcedureRequest(input.userMessage);
+    if ((teaching || workflow) && this.memoryRepo.procedureWritesEnabled === false) {
+      return { matched: false, count: 0, memoryIds: [] };
+    }
+    const procedureSources = workflow && input.messageId
+      ? readRepeatedProcedureSources(this.db, input.messageId, input.userId)
+      : undefined;
+    if (workflow && !procedureSources) return { matched: false, count: 0, memoryIds: [] };
+    if (teaching || procedureSources) {
+      const source = input.messageId ? readProcedureSource(this.db, input.messageId, input.userId) : undefined;
+      if (!source || source.text.trim() !== input.userMessage.trim()
+        || source.conversationId !== input.conversationId
+        || source.conversationType !== (input.conversationType ?? 'private')
+        || source.groupId !== (input.groupId ?? null)) {
+        throw new MemoryExtractionError('Procedure teaching requires exact canonical source evidence', 'INVALID_PROCEDURE_SOURCE');
+      }
+    }
+
+    const patterns = teaching || procedureSources
+      ? [PROCEDURE_PATTERN]
+      : input.conversationType === 'group'
       ? isAutomaticExtractionCandidate({
         text: input.userMessage,
         conversationType: 'group',
@@ -304,12 +347,13 @@ export class MemoryExtractionWorker {
 
     // 模式匹配循环
     for (const pattern of patterns) {
+      if (pattern.type === 'procedure' && !teaching && !procedureSources) continue;
       try {
         const matches = input.userMessage.match(pattern.regex);
 
         if (matches) {
           // 提取fact内容（完整匹配）
-          const fact = matches[0];
+          const fact = pattern.type === 'procedure' ? matches[0].trim() : matches[0];
 
           // 创建记忆
           try {
@@ -319,7 +363,7 @@ export class MemoryExtractionWorker {
               type: pattern.type,
               fact,
               sensitivity: pattern.sensitivity,
-              confidence: pattern.confidence,
+              confidence: procedureSources ? 0.8 : pattern.confidence,
               importance: pattern.importance,
               messageId: input.messageId,
               timestamp: input.timestamp,
@@ -327,6 +371,7 @@ export class MemoryExtractionWorker {
               groupId: input.groupId,
               jobAttemptId: input.jobAttemptId,
               sourceRawEventId: input.sourceRawEventId,
+              procedureSources,
             });
 
             memoryIds.push(memoryId);
@@ -604,6 +649,7 @@ export class MemoryExtractionWorker {
     groupId?: string;
     jobAttemptId?: string;
     sourceRawEventId?: string;
+    procedureSources?: ProcedureSource[];
   }): Promise<string> {
     try {
       // 确保用户存在
@@ -615,9 +661,11 @@ export class MemoryExtractionWorker {
       const isGroupDerived = data.conversationType === 'group';
       const sourceContext = isGroupDerived ? 'group_chat' : privateSourceContext;
       const sourceId = data.messageId ?? `chat:${data.conversationId}`;
-      const kind = data.type === 'preference' ? 'preference' : 'fact';
+      const kind = data.type === 'procedure' || data.type === 'preference' ? data.type : 'fact';
       const memoryId = buildExtractionMemoryId({
-        sourceId,
+        sourceId: data.procedureSources
+          ? JSON.stringify(['procedure-repeat-v1', isGroupDerived ? 'group' : 'private', data.groupId ?? null])
+          : sourceId,
         userId: data.userId,
         kind,
         content: data.fact,
@@ -630,7 +678,11 @@ export class MemoryExtractionWorker {
         visibility: isGroupDerived ? 'same_group_only' : 'private_only',
         sensitivity: data.sensitivity,
         kind,
-        title: `${data.type}: ${data.fact}`,
+        authority: data.procedureSources ? 'inferred' : 'user_stated',
+        procedureSources: data.procedureSources,
+        title: data.type === 'procedure'
+          ? `procedure: ${data.fact.replace(/\s+/gu, ' ')}`.slice(0, 120)
+          : `${data.type}: ${data.fact}`,
         content: data.fact,
         sourceContext,
         sourceId,
@@ -671,16 +723,23 @@ export class MemoryExtractionWorker {
           conversationId: data.conversationId,
           visibility: expectedEffect.visibility,
           sensitivity: data.sensitivity,
-          authority: 'user_stated',
+          authority: expectedEffect.authority,
           kind,
           title: expectedEffect.title,
           content: data.fact,
           confidence: data.confidence,
           importance: data.importance,
+          initialRiskLevel: data.procedureSources ? 'high' : undefined,
           sourceContext,
           jobAttemptId: data.jobAttemptId,
-          sourceEventIds: data.sourceRawEventId ? [data.sourceRawEventId] : undefined,
-          sources: [
+          sourceEventIds: data.procedureSources?.map((source) => source.rawEventId)
+            ?? (data.sourceRawEventId ? [data.sourceRawEventId] : undefined),
+          sources: data.procedureSources?.map((source) => ({
+            sourceType: 'chat_message' as const,
+            sourceId: source.id,
+            sourceTimestamp: source.timestamp,
+            extractedBy: 'worker',
+          })) ?? [
             {
               sourceType: 'chat_message',
               sourceId,
@@ -762,17 +821,19 @@ export class MemoryExtractionWorker {
     const exact =
       existing.scope === 'user'
       && existing.canonicalUserId === expected.userId
-      && existing.conversationId === expected.conversationId
+      && (expected.procedureSources !== undefined || existing.conversationId === expected.conversationId)
       && existing.groupId === expected.groupId
       && existing.visibility === expected.visibility
-      && existing.sensitivity === expected.sensitivity
-      && existing.authority === 'user_stated'
+      && (expected.procedureSources !== undefined || existing.sensitivity === expected.sensitivity)
+      && existing.authority === expected.authority
       && existing.kind === expected.kind
       && existing.title === expected.title
       && existing.content === expected.content
-      && existing.sourceContext === expected.sourceContext
-      && source?.extracted_by === 'worker'
-      && (expected.sourceTimestamp === undefined || source.source_timestamp === expected.sourceTimestamp);
+      && (expected.procedureSources !== undefined || (
+        existing.sourceContext === expected.sourceContext
+        && source?.extracted_by === 'worker'
+        && (expected.sourceTimestamp === undefined || source.source_timestamp === expected.sourceTimestamp)
+      ));
 
     if (!exact) {
       throw new MemoryExtractionError(
@@ -782,9 +843,22 @@ export class MemoryExtractionWorker {
       );
     }
 
+    if (expected.procedureSources) {
+      const originalSources = this.readOriginalProcedureSources(expected.memoryId);
+      if (originalSources.length !== 3 || new Set(originalSources).size !== 3) this.throwEffectConflict(expected.memoryId);
+    }
+
     this.assertReusableDecisionAuthority(expected);
 
     return true;
+  }
+
+  private readOriginalProcedureSources(memoryId: string): string[] {
+    return this.db.prepare(`SELECT chat.raw_event_id FROM memory_sources source
+      JOIN chat_messages chat ON chat.id = source.chat_message_id AND chat.id = source.source_id
+      WHERE source.memory_id = ? AND source.source_type = 'chat_message'
+        AND source.extracted_by = 'worker' AND source.source_timestamp = chat.timestamp
+      ORDER BY source.rowid LIMIT 3`).pluck().all(memoryId) as string[];
   }
 
   private assertReusableDecisionAuthority(
@@ -843,12 +917,15 @@ export class MemoryExtractionWorker {
           ed.invocation_context,
           ed.source_event_ids,
           owner_attempt.job_id AS owner_job_id,
+          owner_job.type AS owner_job_type,
+          owner_job.payload AS owner_job_payload,
           current_attempt.job_id AS current_job_id,
           current_attempt.status AS current_attempt_status,
           current_job.type AS current_job_type,
           current_job.payload AS current_job_payload
          FROM evaluator_decisions ed
          LEFT JOIN job_attempts owner_attempt ON owner_attempt.id = ed.job_attempt_id
+         LEFT JOIN jobs owner_job ON owner_job.id = owner_attempt.job_id
          LEFT JOIN job_attempts current_attempt ON current_attempt.id = ?
          LEFT JOIN jobs current_job ON current_job.id = current_attempt.job_id
          WHERE ed.id = ?`
@@ -862,6 +939,8 @@ export class MemoryExtractionWorker {
         invocation_context: string;
         source_event_ids: string;
         owner_job_id: string | null;
+        owner_job_type: string | null;
+        owner_job_payload: string | null;
         current_job_id: string | null;
         current_attempt_status: string | null;
         current_job_type: string | null;
@@ -869,6 +948,15 @@ export class MemoryExtractionWorker {
       } | undefined;
     const payload = readExtractionJobPayload(authority?.current_job_payload);
     const sourceEventIds = readStringArray(authority?.source_event_ids);
+    const expectedSourceIds = expected.procedureSources
+      ? this.readOriginalProcedureSources(expected.memoryId) : [expected.sourceRawEventId];
+    if (expected.procedureSources) {
+      const ownerPayload = readExtractionJobPayload(authority?.owner_job_payload);
+      const ownerRawEventId = ownerPayload && this.db.prepare('SELECT raw_event_id FROM chat_messages WHERE id = ?')
+        .pluck().get(ownerPayload.sourceChatMessageId);
+      if (authority?.owner_job_type !== 'extraction' || ownerPayload?.targetUserId !== expected.userId
+        || ownerRawEventId !== expectedSourceIds.at(-1)) this.throwEffectConflict(expected.memoryId);
+    }
 
     if (
       !authority
@@ -878,13 +966,13 @@ export class MemoryExtractionWorker {
       || authority.actor_user_id !== expected.userId
       || authority.actor_class !== 'system_worker'
       || authority.invocation_context !== 'background_worker'
-      || authority.owner_job_id !== authority.current_job_id
+      || (expected.procedureSources === undefined && authority.owner_job_id !== authority.current_job_id)
       || authority.current_attempt_status !== 'running'
       || authority.current_job_type !== 'extraction'
       || payload?.sourceChatMessageId !== expected.sourceId
       || payload.targetUserId !== expected.userId
-      || sourceEventIds.length !== 1
-      || sourceEventIds[0] !== expected.sourceRawEventId
+      || sourceEventIds.length !== expectedSourceIds.length
+      || sourceEventIds.some((sourceId, index) => sourceId !== expectedSourceIds[index])
     ) {
       this.throwEffectConflict(expected.memoryId);
     }
@@ -934,7 +1022,7 @@ export class MemoryExtractionWorker {
 function buildExtractionMemoryId(input: {
   sourceId: string;
   userId: string;
-  kind: 'preference' | 'fact';
+  kind: 'preference' | 'fact' | 'procedure';
   content: string;
 }): string {
   const digest = createHash('sha256')

@@ -24,6 +24,7 @@ import type { MemoryRecord } from '../types/memory.js';
 import type Database from 'better-sqlite3';
 import { redactSecretsInText, scanMemoryForSecrets } from '../memory/secret-scan.js';
 import { toSafeMemoryFtsQuery } from '../memory/fts-query.js';
+import type { SemanticMemoryRetrieval } from './semantic-retrieval.js';
 
 export interface BuildContextInput {
   turnId?: string;
@@ -39,6 +40,7 @@ export interface BuildContextInput {
   includeMemory?: boolean;
   currentMessageId?: string;
   replyToMessageId?: string;
+  deadlineAtMs?: number;
 }
 
 interface MemoryRetrievalResult {
@@ -54,7 +56,8 @@ interface MemoryRetrievalResult {
 
 interface MemoryQuery {
   source: MemoryQuerySource;
-  ftsQuery: string;
+  text: string;
+  ftsQuery?: string;
 }
 
 interface MemoryRanking {
@@ -62,6 +65,7 @@ interface MemoryRanking {
   retrievalMethods: Set<MemoryRetrievalMethod>;
   scopeAffinity: MemoryScopeAffinity;
   ftsOrdinal?: number;
+  semantic?: NonNullable<MemorySelectionEvidence['semantic']>;
 }
 
 interface IdentityBudgetField {
@@ -113,22 +117,27 @@ export class ContextBuilder {
   private memoryRepo: MemoryRepository;
   private identityRepo: IdentityRepository;
   private db?: Database.Database;
+  private readonly semanticRetrieval?: SemanticMemoryRetrieval;
 
   constructor(
     memoryRepo: MemoryRepository,
     identityRepo: IdentityRepository,
-    db?: Database.Database
+    db?: Database.Database,
+    semanticRetrieval?: SemanticMemoryRetrieval,
   );
   constructor(
     db: Database.Database,
     memoryRepo: MemoryRepository,
-    identityRepo: IdentityRepository
+    identityRepo: IdentityRepository,
+    semanticRetrieval?: SemanticMemoryRetrieval,
   );
   constructor(
     first: MemoryRepository | Database.Database,
     second: IdentityRepository | MemoryRepository,
-    third?: Database.Database | IdentityRepository
+    third?: Database.Database | IdentityRepository,
+    semanticRetrieval?: SemanticMemoryRetrieval,
   ) {
+    this.semanticRetrieval = semanticRetrieval;
     if (this.isDatabase(first)) {
       this.db = first;
       this.memoryRepo = second as MemoryRepository;
@@ -368,6 +377,7 @@ export class ContextBuilder {
           groupId,
           conversationId,
           memoryQueries,
+          input.deadlineAtMs,
         );
     const identityBudgetFields = this.buildIdentityBudgetFields({
       conversationId,
@@ -562,8 +572,8 @@ export class ContextBuilder {
     const queries: MemoryQuery[] = [];
     const addQuery = (source: MemoryQuerySource, text: string | undefined): void => {
       const ftsQuery = text === undefined ? undefined : toSafeMemoryFtsQuery(text);
-      if (ftsQuery !== undefined) {
-        queries.push({ source, ftsQuery });
+      if (text?.trim() && (ftsQuery !== undefined || this.semanticRetrieval !== undefined)) {
+        queries.push({ source, text, ftsQuery });
       }
     };
 
@@ -601,7 +611,13 @@ export class ContextBuilder {
     groupId: string | undefined,
     conversationId: string,
     memoryQueries: MemoryQuery[] = [],
+    deadlineAtMs?: number,
   ): Promise<MemoryRetrievalResult> {
+    const semantic = await this.semanticRetrieval?.retrieve(
+      memoryQueries.map((query) => query.text),
+      { canonicalUserId: userId, contextType: conversationType, groupId, conversationId },
+      deadlineAtMs,
+    );
     const allMemories = new Map<string, MemoryRecord>();
     const rankings = new Map<string, MemoryRanking>();
     const groupSummaryPolicyDisabled = conversationType === 'group'
@@ -635,6 +651,8 @@ export class ContextBuilder {
         ranking.retrievalMethods.add(method);
         if (querySource !== undefined) {
           ranking.querySources.add(querySource);
+        }
+        if (method === 'fts') {
           const ordinal = index + 1;
           ranking.ftsOrdinal = ranking.ftsOrdinal === undefined
             ? ordinal
@@ -648,12 +666,27 @@ export class ContextBuilder {
       recordMemories(await this.memoryRepo.retrieve(route), 'scoped_rank');
       if (route.contextType !== undefined) {
         for (const query of memoryQueries) {
+          if (query.ftsQuery === undefined) continue;
           recordMemories(
             await this.memoryRepo.search(query.ftsQuery, route),
             'fts',
             query.source,
           );
         }
+      }
+    }
+
+    for (const match of semantic?.matches ?? []) {
+      const memory = await this.memoryRepo.findById(match.memoryId);
+      const query = memoryQueries[match.queryIndex];
+      if (!memory || !query || !semantic?.identity) continue;
+      recordMemories([memory], 'semantic', query.source);
+      const ranking = rankings.get(memory.id);
+      if (ranking && (ranking.semantic === undefined || match.score > ranking.semantic.score)) {
+        ranking.semantic = {
+          score: match.score, model: semantic.identity.model, modelRevision: semantic.identity.modelRevision,
+          dimensions: semantic.identity.dimensions, indexVersion: semantic.identity.indexVersion,
+        };
       }
     }
 
@@ -694,7 +727,13 @@ export class ContextBuilder {
       rejectedMemories,
       filtersApplied: [
         ...(groupSummaryPolicyDisabled ? ['group_summary_policy=disabled'] : []),
+        ...(this.memoryRepo.procedureRetrievalEnabled === false ? ['procedure_retrieval=disabled'] : []),
         ...(memoryQueries.length > 0 ? ['memory_ranking=query_fts_scope_recency_v1'] : []),
+        ...(semantic ? [
+          `semantic_status=${semantic.status}`,
+          `semantic_stale=${semantic.stale}`,
+          ...(semantic.truncated ? ['semantic_scan=bounded'] : []),
+        ] : []),
       ],
     };
   }
@@ -1273,6 +1312,10 @@ export class ContextBuilder {
       return queryOrder;
     }
 
+    const lexicalOrder = Number(bRanking?.retrievalMethods.has('fts') ?? false)
+      - Number(aRanking?.retrievalMethods.has('fts') ?? false);
+    if (lexicalOrder !== 0) return lexicalOrder;
+
     const scopeOrder = this.scopeAffinityPriority(bRanking?.scopeAffinity)
       - this.scopeAffinityPriority(aRanking?.scopeAffinity);
     if (scopeOrder !== 0) {
@@ -1284,6 +1327,9 @@ export class ContextBuilder {
     if (ftsOrder !== 0) {
       return ftsOrder;
     }
+
+    const semanticOrder = (bRanking?.semantic?.score ?? -1) - (aRanking?.semantic?.score ?? -1);
+    if (semanticOrder !== 0) return semanticOrder;
 
     const globalScopeOrder = Number(a.scope === 'global') - Number(b.scope === 'global');
     return globalScopeOrder
@@ -1363,7 +1409,7 @@ export class ContextBuilder {
       'quoted_message',
       'recent_thread',
     ];
-    const retrievalMethodOrder: MemoryRetrievalMethod[] = ['scoped_rank', 'fts'];
+    const retrievalMethodOrder: MemoryRetrievalMethod[] = ['scoped_rank', 'fts', 'semantic'];
     const querySources = querySourceOrder.filter((source) => ranking.querySources.has(source));
     const retrievalMethods = retrievalMethodOrder.filter(
       (method) => ranking.retrievalMethods.has(method),
@@ -1375,6 +1421,7 @@ export class ContextBuilder {
       retrievalMethods,
       scopeAffinity: ranking.scopeAffinity,
       retrievalRank,
+      ...(ranking.semantic ? { semantic: ranking.semantic } : {}),
       selectionReason: priorityProfileIds.has(memory.id)
         ? 'profile_priority'
         : querySources.length > 0

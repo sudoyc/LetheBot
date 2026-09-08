@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
+import { MemoryRepository, type MemoryRecordInput } from '../../src/storage/memory-repository.js';
 
 const piAdapterConstructor = vi.hoisted(() => vi.fn());
 
@@ -22,6 +23,47 @@ const { ToolRegistry } = await import('../../src/tools/registry.js');
 const { KNOWN_TOOL_NAMES } = await import('../../src/tools/known-tools.js');
 
 describe('Pi runtime configuration wiring', () => {
+  it.each([
+    { writes: false, retrieval: true },
+    { writes: true, retrieval: false },
+  ])('wires independent procedure controls into the production repository: %j', async ({ writes, retrieval }) => {
+    const originalEnv = process.env;
+    const testDir = mkdtempSync(join(tmpdir(), 'lethebot-procedure-controls-'));
+    let app: InstanceType<typeof LetheBotApp> | undefined;
+    try {
+      process.env = {
+        ...originalEnv, LETHEBOT_TEST: 'true', LETHEBOT_DB_PATH: join(testDir, 'lethebot.db'),
+        LOG_LEVEL: 'fatal', ONEBOT_TRANSPORT: 'http', PI_PROVIDER: 'mock', PI_MODEL: 'mock',
+        EVALUATOR_PROVIDER: 'mock', EVALUATOR_MODEL: 'mock',
+        LETHEBOT_PROCEDURE_WRITES_ENABLED: String(writes),
+        LETHEBOT_PROCEDURE_RETRIEVAL_ENABLED: String(retrieval),
+      };
+      resetConfig();
+      app = new LetheBotApp();
+      const repository: unknown = Reflect.get(app, 'memoryRepo');
+      if (!(repository instanceof MemoryRepository)) throw new Error('Expected the production memory repository');
+      const input: MemoryRecordInput = {
+        scope: 'global', kind: 'procedure', authority: 'system', visibility: 'public', sensitivity: 'normal',
+        title: 'Synthetic procedure', content: 'Summarize files with conclusions, then risks.',
+        state: 'active', confidence: 0.9, importance: 0.7, sourceContext: 'admin_cli',
+        actor: { actorClass: 'admin', context: 'admin_cli' },
+        sources: [{ sourceType: 'user_command', sourceId: 'synthetic-procedure-control', external: true }],
+      };
+      const previousId = await new MemoryRepository(app.getDatabase()).create(input);
+      expect((await repository.retrieve({ scope: 'global' })).map((memory) => memory.id))
+        .toEqual(retrieval ? [previousId] : []);
+      if (writes) await expect(repository.create(input)).resolves.toEqual(expect.any(String));
+      else await expect(repository.create(input)).rejects.toThrow('Procedure writes are disabled');
+      expect(await repository.findById(previousId)).toMatchObject({ kind: 'procedure', state: 'active' });
+      expect(app.getDatabase().prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+    } finally {
+      await app?.stop();
+      process.env = originalEnv;
+      resetConfig();
+      rmSync(testDir, { recursive: true, force: true });
+    }
+  });
+
   it('registers only the reviewed production tool catalog', async () => {
     const originalEnv = process.env;
     const testDir = mkdtempSync(join(tmpdir(), 'lethebot-production-tool-catalog-'));

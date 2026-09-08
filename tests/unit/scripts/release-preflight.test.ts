@@ -8,9 +8,9 @@ import { runReleasePreflight } from '../../../src/scripts/release-preflight.js';
 const temporaryRoots: string[] = [];
 const schemaContract = {
   contractVersion: 1,
-  targetVersion: 8,
+  targetVersion: 10,
   minReadableVersion: 1,
-  maxReadableVersion: 8,
+  maxReadableVersion: 10,
   adoptsLegacyUnversioned: true,
 };
 
@@ -33,6 +33,8 @@ function createProjectFixture(options: {
   writeFileSync(join(projectRoot, 'migrations/006_group_summary_policy.sql'), 'SELECT 6;\n', 'utf8');
   writeFileSync(join(projectRoot, 'migrations/007_pi_turn_model_invocations.sql'), 'SELECT 7;\n', 'utf8');
   writeFileSync(join(projectRoot, 'migrations/008_memory_maintenance_proposals.sql'), 'SELECT 8;\n', 'utf8');
+  writeFileSync(join(projectRoot, 'migrations/009_memory_embeddings.sql'), 'SELECT 9;\n', 'utf8');
+  writeFileSync(join(projectRoot, 'migrations/010_memory_importance.sql'), 'SELECT 10;\n', 'utf8');
   writeFileSync(
     join(projectRoot, 'package.json'),
     options.packageJson ?? JSON.stringify({
@@ -108,6 +110,8 @@ describe('release preflight', () => {
     ['migrations/006_group_summary_policy.sql', 'invalid-migration-set'],
     ['migrations/007_pi_turn_model_invocations.sql', 'invalid-migration-set'],
     ['migrations/008_memory_maintenance_proposals.sql', 'invalid-migration-set'],
+    ['migrations/009_memory_embeddings.sql', 'invalid-migration-set'],
+    ['migrations/010_memory_importance.sql', 'invalid-migration-set'],
     ['package.json', 'missing-package-manifest'],
     ['pnpm-lock.yaml', 'missing-lockfile'],
     ['LICENSE', 'missing-license'],
@@ -181,7 +185,7 @@ describe('release preflight', () => {
     [{ ...schemaContract, minReadableVersion: 2 }, 'a narrowed minimum'],
     [{ ...schemaContract, minReadableVersion: 7 }, 'a minimum above the target'],
     [{ ...schemaContract, maxReadableVersion: 1 }, 'a maximum below the target'],
-    [{ ...schemaContract, maxReadableVersion: 9 }, 'a maximum above the target'],
+    [{ ...schemaContract, maxReadableVersion: 11 }, 'a maximum above the target'],
     [{ ...schemaContract, targetVersion: 2.5 }, 'a non-integer target'],
     [{ ...schemaContract, minReadableVersion: 1.5 }, 'a non-integer minimum'],
     [{ ...schemaContract, maxReadableVersion: 2.5 }, 'a non-integer maximum'],

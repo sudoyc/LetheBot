@@ -9,7 +9,8 @@ Recommended MVP processes:
 - `gateway`: SnowLuma / OneBot WS or HTTP event receiving and message routing.
 - `api`: internal HTTP server and governance CLI entrypoints.
 - `worker`: summarization, extraction, retention, memory conflict scans,
-  memory decay review scans, memory consolidation candidate scans, admin
+  memory decay review scans, memory consolidation candidate scans, importance
+  learning, admin
   digests, delayed Attention rechecks, and their scheduler/discovery jobs.
   Backup is an operator-run maintenance command, not a registered background
   handler.
@@ -66,6 +67,63 @@ has no resolved handler, and fails the policy gate.
 For Docker, systemd, or another process manager that does not use an editable
 env file, set `LETHEBOT_DISABLED_TOOLS` in that manager's configuration and
 perform its normal controlled restart instead.
+
+## Procedure Rollback Controls
+
+Set either strict boolean in the application's explicit launcher environment
+and apply it through the normal controlled restart:
+
+```text
+LETHEBOT_PROCEDURE_WRITES_ENABLED=false
+LETHEBOT_PROCEDURE_RETRIEVAL_ENABLED=false
+```
+
+The controls are independent and both default to `true`. Writer disable stops
+new procedure admission, extraction evaluation and tool-created candidates;
+already queued procedure jobs complete without learning. Retrieval disable
+excludes procedures from ContextBuilder and `memory.search` before ranking and
+candidate limits. Neither control deletes records, source links, revisions or
+audit history. Owner inspection and governed disable/delete/restore still work.
+Use lifecycle commands to roll back a particular record; use the switches to
+disable the capability. Set a switch back to `true` and restart to reenable it.
+Raw/chat retention, privacy preferences and ordinary fact extraction still
+apply. Previously deleted/rejected workflows are not reactivated by later
+repeated requests.
+
+## Importance Learning And Rollback
+
+Set the independent strict booleans in the application's explicit launcher
+environment and apply them through a controlled restart:
+
+```text
+LETHEBOT_IMPORTANCE_LEARNING_ENABLED=true
+LETHEBOT_IMPORTANCE_APPLICATION_ENABLED=true
+```
+
+Both default to `false`. Learning discovers a frozen source window at startup
+and hourly, then processes at most 20 memory candidates per durable batch.
+It uses retained local first-party preferences and writes review proposals only.
+Job/attempt results expose scanned, proposed, unchanged and skipped counts.
+No model installation or Provider request is required. The bounded supported
+grammar, evidence requirements and versioned formula are in
+[Memory System](memory-system.md#source-backed-importance-learning).
+
+In the authenticated governance UI, select Memory, Reviews and the exact owner
+scope. Inspect the score version, observations/days/span, old/new importance,
+confidence and expiry. Approval and application each use separate preview and
+confirmation. Only application changes subsequent eligible ContextPack ranking;
+normal scope, visibility, lexical ranking and token limits still apply.
+Pending, approved and applied proposals remain discoverable after refresh.
+
+To stop new learning, set the learning control to `false`; queued importance
+jobs complete without creating proposals. To stop application, independently
+set its control to `false`. Neither switch restores previously applied scores.
+Select the applied proposal and confirm its rollback to restore the prior
+importance through a new revision. This remains available with both switches
+disabled and preserves all score/source/apply/audit history. A changed latest
+revision or source boundary rejects rollback as stale; inspect that newer
+governed change before acting. Expired or stale evidence cannot be approved or
+applied; reject or expire the proposal through review.
 
 ## Configured Retention
 
@@ -147,7 +205,7 @@ profile. In non-test runtime it starts a timer-based scheduler that:
   `processNext()` path. Structured diagnostic object keys and values are both
   sanitized; raw worker IDs remain internal local keys for exact lookup and
   heartbeat/attempt linkage;
-- executes concrete `summary`, `extraction`, `attention_recheck`, `retention`,
+- executes concrete `summary`, `extraction`, `embedding`, `importance`, `attention_recheck`, `retention`,
   `admin_digest`, `conflict`, `decay`, and `consolidation` handlers.
 
 The following ActionExecutor routes are separate from timer scheduling:
@@ -1253,16 +1311,16 @@ database; never recursively change ownership of a parent shared with SnowLuma.
 
 Startup treats `schema_version` and the migration-derived structure as
 fail-closed compatibility boundaries. The release requires the contiguous
-`001` through `008` migration set, targets schema v8, and reads only v1 through
-v8. Malformed/noncontiguous metadata or a version above 8 is rejected before
+`001` through `010` migration set, targets schema v10, and reads only v1 through
+v10. Malformed/noncontiguous metadata or a version above 10 is rejected before
 any migration schema/data write. For a missing or valid-empty ledger, v1
-compatibility patches and migrations v2-v8 run in one `IMMEDIATE` transaction;
+compatibility patches and migrations v2-v10 run in one `IMMEDIATE` transaction;
 each version is recorded only after the result matches its migration-derived
 table, column/type/nullability/default/primary-key, foreign-key,
 required-index, supported CHECK, virtual-table, and migration-owned trigger
 contract and `PRAGMA foreign_key_check` is clean. A same-named but incompatible
 legacy object therefore aborts and rolls back every patch and DDL change
-instead of being stamped current. Existing v1-v8 metadata is idempotent, keeps
+instead of being stamped current. Existing v1-v10 metadata is idempotent, keeps
 its original timestamps, and receives the same structural validation. Three exact
 early-v1 memory CHECK shapes are upgraded transactionally: the runner rebuilds
 `memory_records`, `memory_revisions`, and/or `memory_sources` from the current
@@ -1273,6 +1331,22 @@ transaction and is restored afterward; `foreign_key_check` remains the commit
 gate. Any other constraint drift fails closed. Do not delete or rewrite version
 rows to force an older release to start; keep the service stopped and use a
 compatible release or the verified stopped-service restore procedure.
+
+Migration v9 adds only the rebuildable `memory_embeddings` table and its model
+index. It records local model identity/revision, dimensions, index version,
+memory/content versions, vector and generation time; it creates no embeddings
+and changes no governed memory. Normal SQLite backups include this index.
+Retain a verified v8 snapshot and the prior release before upgrading: v8 code
+rejects a v9 ledger, so application rollback must restore that snapshot before
+starting the prior binary. Clearing derived vectors on a compatible release
+does not roll back the schema or memory truth.
+
+Migration v10 extends the five normalized maintenance tables while preserving
+their records and links, and adds versioned importance scores and source
+evidence with deletion tombstones. It performs no learning or active-memory
+mutation. Retain a verified v9 backup and runnable prior release before the
+upgrade: v9 rejects v10, so schema rollback requires restoring that backup.
+This is separate from proposal rollback, which runs on v10 and preserves history.
 
 ## Backup and Restore
 
@@ -2217,7 +2291,7 @@ Recommended local install/update sequence:
    successful A-to-B slot activation. A second B uses a deliberately mismatched
    readiness route, so fixed `/readyz` fails and the activator must stop B,
    restore pointers, and restart/probe A. Aggregate output also requires
-   empty-ledger v8 adoption, stable v1/v2/v3/v4/v5/v6/v7/v8 timestamps, preserved
+   empty-ledger v10 adoption, stable v1-v10 timestamps, preserved
    synthetic sentinel, and a stable logical fingerprint of every non-internal schema
    object and table row after A readiness, clean integrity/FKs, stopped child
    processes, and removed temporary state. It does not call a provider or QQ. Because both
@@ -2232,16 +2306,17 @@ Recommended local install/update sequence:
 
    ```bash
    pnpm --silent ops:rehearse-cross-version -- \
-     --prior-release=/srv/lethebot/releases/<v7-release> \
-     --candidate-release=/srv/lethebot/releases/<v8-release>
+     --prior-release=/srv/lethebot/releases/<v9-release> \
+     --candidate-release=/srv/lethebot/releases/<v10-release>
    ```
 
-   This proves readiness-failure rollback to runnable v7, startup-gate denial
-   plus explicit recovery for a crashed unconfirmed v8, and wrong-confirmation
-   preservation followed by exact confirmation and marker-free v8 restart. It
-   checks the prior/current ledgers, preserves the v7 Pi invocation boundary,
-   and reaches readiness only after the v8 migration-derived maintenance
-   proposal schema passes structural and foreign-key validation.
+   This proves readiness-failure rollback to runnable v9, startup-gate denial
+   plus explicit recovery for a crashed unconfirmed v10, and wrong-confirmation
+   preservation followed by exact confirmation and marker-free v10 restart. It
+   checks the prior/current ledgers, preserves the Pi and maintenance boundaries,
+   and reaches readiness only after the v10 migration-derived importance
+   schema passes structural and foreign-key validation. The importance schema
+   must be absent on the prior/restored databases and present on each candidate.
    Output contains only aggregate booleans; input paths and synthetic DB content
    are not emitted.
 
