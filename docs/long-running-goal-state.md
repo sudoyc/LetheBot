@@ -1,249 +1,400 @@
 # Long-Running Goal State
 
 **State type:** active checkpoint, not a completion certificate
-**Updated:** 2026-09-05 17:06 CST (+0800)
+**Updated:** 2026-09-08 22:32 CST (+0800)
 **Program:** repair-and-long-term-development goal
 **Program verdict:** `ACTIVE`
-**Operational baseline:** `LOCAL_COMPLETE_EXTERNAL_BLOCKED` for P0-P9; required V1-V3 vision phases remain unverified
-**Product verdict:** `DETERMINISTIC_READY`; production/live acceptance is not complete
+**User goal verdict:** `DEL-V3 PHASE_COMPLETE` (local deterministic scope)
+**Product verdict:** release, smoke and coverage gates pass; final product/live acceptance remains open
 
-This file is intentionally concise. It replaces the former append-only execution
-journal. Canonical requirements live in `docs/long-term-development-constraints.md`,
-and the required delivery units and handoff format live in
-`docs/long-term-development-delivery.md`; historical detail remains available in
-Git history and `docs/archive/`. Resume work from this checkpoint, current code,
-and current verification output—not from old completion claims.
+Canonical requirements are in `long-term-development-constraints.md`; delivery
+and evidence requirements are in `long-term-development-delivery.md`. This is
+the only mutable checkpoint. Resume from current code and observed evidence.
 
-## 1. Authority And Proof Boundary
+**Immediate next task:** close the remaining V2 operations/documentation audit,
+then freeze the complete product candidate for the final DEL-OPS/DEL-LIVE matrix.
+V3 source-backed learning, governed application and rollback are complete in
+the local deterministic scope. Preserve test pruning and V1/V2 implementation.
+The broader program remains `ACTIVE`; this is not a live-readiness claim.
 
-Authorized in the current program:
+### Current V3 Slice
 
-- local source, test, migration, documentation, and deterministic acceptance work;
-- disposable synthetic databases, processes, environment files, and release
-  rehearsal artifacts;
-- commits and pushes required by the active repository-completion objective.
+Requirement: `DEL-V3`. The two reproduced static errors have been fixed by
+explicitly typing semantic-recall query results and formatting the parameterized
+semantic-retrieval test call. `LOG_LEVEL=fatal pnpm release:check` passed with
+2871 passing tests and 10 skipped, 133 passing files and one skipped, starting
+21:10:26 CST (163.39 seconds for Vitest). Log:
+`/tmp/lethebot-v3-V1HcAG/baseline-release.log`.
 
-Not authorized in the current program:
+Selected storage design: extend normalized maintenance proposal kinds/effects
+for governed importance adjustment; add versioned score inputs and exact source
+links with deletion tombstones. No new active facts or wider visibility.
+Learning uses deterministic local first-party evidence; no Provider dependency.
 
-- reading existing credentials, private QQ data, operator databases, or historic
-  private runtime artifacts;
-- connecting to a real Provider or QQ/NapCat deployment;
-- restarting or disrupting a real deployment;
-- treating synthetic evidence as live evidence.
+Schema allowed paths: `migrations/010_memory_importance.sql`, schema-version and
+package schema contract, migration/preflight/rehearsal tests and schema rehearsal
+assertions. Behavior paths follow only after schema verification: maintenance
+proposal/repository, importance scorer/worker, governance projections, config,
+application/background wiring and their focused tests/owning docs.
+Protected: inherited unrelated WIP, frozen recall corpus, credentials, live
+databases, deployment and Provider/QQ activity.
 
-Fresh `LIVE_PROVIDER`, `LIVE_QQ`, and `LIVE_DEPLOYMENT_OR_RESTART` authority is
-absent. Those boundaries remain fail-closed.
+Schema assertions: fresh/sequential upgrade, preserve existing maintenance
+records and revision/source/audit chains, repeat without writes, reject invalid
+inputs atomically, integrity/FK, backup/restore and v9/v10 release rollback.
+Planned tests: `tests/unit/storage/schema-v10-migration.test.ts`, existing
+migration/preflight/release suites; then
+`tests/integration/memory-importance.test.ts` and
+`tests/integration/memory-importance-runtime.test.ts` for source/scoring,
+scope/privacy, review/apply/expire/reject, failure atomicity, retry/concurrency,
+restart, ContextPack ranking and rollback. Reuse shared lifecycle coverage;
+do not add literal-only or duplicate CRUD tests.
 
-## 2. Verified Candidate Snapshot
+Commands: focused Vitest, both typechecks, lint, release gate, disposable
+`ops:rehearse-cross-version`; coverage at integrated phase exit. Prior v9 build
+is preserved at `/tmp/lethebot-v3-V1HcAG/prior-v9`. Schema rollback restores the
+pre-upgrade backup and uses that prior runner; runtime rollback independently
+disables learning/application and restores applied ranking through revisions.
 
-- Verified candidate source commit before this checkpoint update: `4e9dcff` (`chore/sync-pi-and-prune-tests`, tracking `origin/chore/sync-pi-and-prune-tests`); the worktree was clean.
-- `origin` is the canonical GitHub repository; no separate `upstream` remote is configured.
-- After `git fetch origin --prune`, `main...origin/main` is `0 0`: the source tree has no commit drift from the remote default branch.
-- The repository now resolves `@earendil-works/pi-agent-core` and `@earendil-works/pi-ai` at `0.85.0`, matching the upstream Pi repository release `v0.85.0` from 2026-09-04; the dependency lockfile and runtime compatibility checks pass.
-- Candidate scope: the accumulated local program changes listed in section 6,
-  plus the Pi 0.85.0 dependency sync, redundant-test cleanup, and archived
-  development-document cleanup on this branch.
-- No live Provider, QQ, deployment restart, production restore, or private-data
-  operation was performed. The Framework Compose path was not started, stopped,
-  rebuilt, or recreated during this audit; its persistent SnowLuma/QQ bind
-  directories and shared ports remain protected.
-- The source-stack images were built successfully with `--env-file /dev/null` and
-  `--pull=false`; no Compose service was started by this audit.
-- Both Compose files passed `config --quiet` with `/dev/null`; this is config
-  inspection only, not runtime or QQ evidence.
+Schema slice verified at 21:31 CST: 97 focused migration/preflight tests and 69
+application release tests pass. The release fixture initially still declared
+v9; after correcting that fixture, `schema-release-final.log` records a complete
+passing release gate (2875 tests, 10 skipped; 134 files, one skipped). Both
+typechecks, lint, build, preflight, packaging and diff checks passed.
+`schema-cross-version.log` reports every v9/v10 activation/crash/confirmation/
+restore assertion true with clean integrity/FKs and stopped child processes.
+`schema-compatibility.log` records the actual prior v9 runner rejecting v10 with
+`future-schema-version` and zero writes. The schema-only v10 build is preserved
+at `/tmp/lethebot-v3-V1HcAG/candidate-v10-schema`.
 
-Current deterministic gate components, run against the candidate at
-2026-09-05 16:41 CST:
+Selected behavior: bounded 30-day first-party preference window, at least three
+observations on three days spanning two days. Rules support explicit Chinese
+and English self-statements, reject conflicting/ambiguous same-topic evidence,
+and score repetition, distinct days and span with a versioned deterministic
+formula. Proposals expire seven days after the latest supporting ingress.
+Defaults independently disable learning and application; rollback stays usable.
 
-```text
-pnpm typecheck: passed
-pnpm typecheck:test: passed
-pnpm lint: passed
-pnpm build: passed
-pnpm release:preflight: passed (5 required files)
-pnpm release:pack-check: passed (606 files)
-pnpm exec vitest run --silent
-  128 passed, 1 skipped files
-  2830 passed, 10 skipped tests
-git diff --check: passed
+Behavior now exists in `src/memory/importance.ts`,
+`src/storage/memory-importance-repository.ts`, `src/workers/memory-importance.ts`,
+the existing maintenance repository, governance projections/browser modules,
+config and application/background wiring. Learning runs at startup and hourly,
+with frozen 20-record continuation batches and no Provider calls.
+
+Focused verification: 221 tests across 13 importance, maintenance, governance,
+HTTP authority and background suites passed; both typechecks and lint passed.
+`tests/integration/memory-importance.test.ts` covers canonical source-window
+scoring, exact-group authority, opt-out/account/source/expiry/revision/score
+revalidation, atomic source/effect failures, concurrent review and all governed
+transitions. Before-start and before-commit lease expiry cases recover the same
+durable job across database reopen; the commit-expiry regression first failed
+and now passes with the shared job authority check. A 21-candidate case verifies
+20/1 batching, committed-batch retry without duplicate proposals or continuation
+jobs, and no active-memory mutation.
+
+`tests/integration/memory-importance-runtime.test.ts` uses actual OneBot ingress,
+extraction, scheduled learning, authenticated HTTP governance and subsequent
+ContextPacks. Approval leaves ranking unchanged; application raises an eligible
+record from 0.40 to 0.74 and changes ordering. Another user's context excludes
+it. Application restart with both controls disabled preserves the applied
+ranking and permits rollback to the original order, with intact source history
+and zero model invocations. This exposed a real UI discovery defect: the HTTP
+review list used pending-only defaults. It now explicitly includes pending,
+approved and applied proposals, preserving apply/rollback access after refresh.
+
+`tests/integration/governance-http.test.ts` passes all 55 remaining tests,
+including native Chromium score-detail and rollback controllers. The first
+integrated gate exposed an obsolete source-byte/hash characterization test;
+that one test was removed instead of replacing its expected digest. The
+existing static asset security/module checks and actual browser interaction
+checks remain. This is one additional pruning case beyond the 56-case audit
+below; only that earlier 56-case pruning has an isolated coverage comparison.
+
+Owning docs now describe the v10 contract, bounded supported grammar, formula,
+expiry, controls, source tombstones, audit history and rollback. The additional
+score progression regression proves 0.74, 0.85 and capped 0.95 with increasing
+source evidence, with no active-memory mutation. The applied proposal's complete
+score/source/revision/effect/audit chain survives the production backup/restore
+APIs, retry and governed rollback. All DEL-V3 scenarios in delivery section 3
+are covered at the actual storage/governance and production application boundaries.
+
+Final verification (logs under `/tmp/lethebot-v3-V1HcAG/`):
+
+- `LOG_LEVEL=fatal pnpm release:check`: exit 0; 2904 tests pass, 10 opt-in
+  Provider tests skipped; 137 files pass, one skipped. Source/test typechecks,
+  lint, build, preflight, packaging and diff checks pass (`final-release.log`).
+- `LOG_LEVEL=fatal pnpm test:coverage`: exit 0, same passing suite. Statements
+  85.68% (15706/18329), branches 82.53% (13382/16214), functions 93.01%
+  (3035/3263), lines 85.75% (15363/17914). All four subprocess entrypoints pass
+  their separate thresholds (`final-coverage.log`). No threshold or exclusion
+  changed. The earlier function shortfall was closed by meaningful evaluation
+  contract coverage in `tests/unit/operations/semantic-recall.test.ts`:
+  uninformative embeddings cannot claim improvement, source/budget reporting
+  is governed, and failed/incomplete indexing rejects. Synthetic vectors here
+  are not model-quality evidence; the frozen corpus and prior real-model result
+  remain unchanged.
+- Smoke, disposable maintenance backup/restore/retention and database rollback
+  all report success (`behavior-smoke.log`, `behavior-maintenance.log`,
+  `behavior-rollback.log`).
+- Built-process application activation/rollback and v9/v10 crash/confirmation/
+  recovery rehearsals report every assertion true, with clean integrity/FKs and
+  stopped child processes (`final-application-rollback.log`,
+  `final-cross-version.log`). Commands use the frozen candidate's compiled
+  `dist/scripts/application-release.js` with `rehearse` and
+  `rehearse-cross-version --prior-release=.../final-prior
+  --candidate-release=.../final-candidate`.
+
+Frozen V3 builds use their own copied dependency tree, not the mutable worktree
+dependency link. The initial rehearsal packaging omitted README/LICENSE, and
+the same-version attempt also observed dependency fingerprint drift during
+coverage. Complete independently stored artifacts resolve both issues; final
+rehearsals preserve their before/after digests:
+
+- `final-prior` (v9):
+  `48c648ee26bf1aa35bc4e250c4e4bb37d5ea5b7e1aaa81a76f0e2a0f615a0fe5`.
+- `final-candidate` (v10):
+  `7dfe377f04a3812b3fb360f2c7057b573828e4e3d222f16b697633aa966b73c3`.
+- Candidate runtime content matches the current worktree build; content digest
+  `ea4c5c991c831055ee6e0998c9dab3e0495ba41858879e50d7a963d86d88c947`.
+- Lockfile SHA-256:
+  `0d20a2ea6885200216c327596aca3205ebdaae14a31c32974b9d4bf6bd4a6cd9`.
+
+The final source snapshot and aggregate manifest are `final-source/` and
+`final-evidence.json` under that same temporary artifact root. At snapshot
+creation, they included the intended uncommitted source/tests/docs, excluding
+deleted and ignored local files. This candidate is evidence for DEL-V3, not
+the later full-product live acceptance candidate. No commit or push had been
+performed at that point; the subsequent authorized Git handoff is recorded
+below. No deployment, real Provider/QQ call or private database access was
+performed.
+
+## 1. Authority
+
+`LOCAL_CODE_TEST_DOCS=AUTHORIZED`, `SYNTHETIC_TMP_EVIDENCE=AUTHORIZED`.
+`COMMITS=AUTHORIZED`, `PUSH=AUTHORIZED` by the September 8 user request to
+organize and maintain Git and push the current work. This authorizes the
+existing branch's normal commit/push handoff.
+`LIVE_PROVIDER`, `LIVE_QQ`,
+`LIVE_DEPLOYMENT_OR_RESTART`, `PRIVATE_DB_OR_RAW_CHAT_READ`,
+`DESTRUCTIVE_CLEANUP_OR_REVERT`, and `SCOPE_EXPANSION` remain `NOT_AUTHORIZED`.
+No live Provider/QQ, private database, credential, or deployment operation has
+been performed by this implementation goal.
+
+## 2. Candidate And Current Evidence
+
+- Branch: `chore/sync-pi-and-prune-tests`, tracking the same branch on `origin`.
+- Source baseline: `88c587a`. Commit `c259bf7` contains the isolated 56-case
+  test pruning and its guidance. Commit `bd53699` contains the integrated
+  V1-V3 implementation, migrations, dependencies, tests and owning docs,
+  including the additional obsolete governance source-hash test removal.
+- All 430 files in the final source manifest matched the worktree before this
+  Git handoff. Only this checkpoint was subsequently edited; runtime, tests,
+  dependencies and the frozen corpus are unchanged from the verified snapshot.
+  Reuse the final release/coverage evidence above for those committed contents.
+- `git fetch --prune origin` succeeded before the handoff commits. The branch
+  and fetched tracking ref both pointed to `88c587a`, with no divergence.
+  This checkpoint accompanies the two implementation/test commits in the
+  user-authorized normal push to the same branch. Check current Git status and
+  the remote branch SHA for the completed handoff result.
+- Historical September 8 audit: HEAD was five commits ahead of the locally
+  cached `origin/main`, without a fetch at that time. The pre-V3 pruning
+  snapshot had 47 modified tracked files, 3 deleted test files and 20 untracked
+  files. That inherited V1/V2 work and the subsequent V3 work are now committed.
+- Pi packages remain at `0.85.0`. V2 adds `@huggingface/transformers` `4.2.0` and
+  schema v9; V3 advances the schema contract to v10. The reviewed lockfile and
+  disabled ONNX/Sharp install scripts are included in `bd53699`.
+
+### Status Audit: September 8, Before Test Pruning
+
+Environment: Node `v26.4.0`, pnpm `11.18.0`. Checks used synthetic test data and
+the previously downloaded public local embedding model. No live service,
+private database or real environment file was inspected.
+
+| Check | Observed result |
+|---|---|
+| `LOG_LEVEL=fatal pnpm release:check` | Exit 2 at source typecheck; later release stages did not run. |
+| Source typecheck and `pnpm typecheck:test` | Both fail with TS7034/TS7005 in `src/operations/semantic-recall.ts:70` and `:97`: `queries` needs an explicit result-array type. |
+| `pnpm lint` | Exit 1: `tests/unit/context/semantic-retrieval.test.ts:88`, `no-unexpected-multiline` on the split `it.each(...)(...)` call. |
+| `LOG_LEVEL=fatal pnpm test:run --reporter=dot` | Exit 0; 136 files passed, 1 skipped; 2927 tests passed, 10 skipped. Started 20:25:56 CST, duration 165.40 seconds. |
+| Real local-model FTS/semantic comparison | Exit 0, `success=true`; details in section 4. |
+| `git diff --check` | Exit 0. |
+
+Audit artifacts are under `/tmp/lethebot-status-audit-eZxaVA/`:
+`tests.log`, `typecheck-test.log`, `lint.log`, `semantic-recall.log` and
+`semantic-recall.json`. These are local audit artifacts, not an immutable final
+release candidate. Build, preflight, packaging, smoke, coverage and operational
+rehearsals were not separately rerun in this status audit.
+
+### Test Pruning Audit: September 8
+
+Removed 56 cases and three files, reducing test code by 837 lines:
+
+- `tests/unit/e2e-helpers/deepseek-helpers.test.ts`: 33 cases asserting locally
+  assigned literals, environment values and arithmetic without exercising
+  project code.
+- `tests/e2e/deepseek-real-api.test.ts`: five cases for an unused test-local
+  configuration loader. The actual opt-in gate remains in `pi-real-api.test.ts`.
+- `tests/integration/identity-resolution.test.ts`: five CRUD cases duplicated
+  by the SQLite-backed identity repository suite. Both accounts resolving to
+  the same canonical user are now asserted in its existing multi-account case.
+- Thirteen redundant cases across MockPi, persona, logger, registry and
+  FakeOneBot: combined same-input result assertions; removed static prompt-copy,
+  no-op connection, instance-only and ineffective counter-reset checks. Retained
+  the memory-proposal prompt rule, log redaction, registry authority/lifecycle
+  and gateway message/reaction assertions.
+
+Verification used `LOG_LEVEL=fatal pnpm test:coverage` before and after pruning.
+Vitest passed both times: 2927 to 2871 passing tests, 136 to 133 passing files;
+one file and ten real-provider tests remain skipped. The after run started
+20:41:46 CST and took 210.66 seconds; the before run took 218.26 seconds. These
+single-run timings do not establish a reliable performance improvement.
+
+Coverage is identical before/after, including each covered statement, function
+and branch: statements 85.26% (15462/18135), lines 85.35% (15151/17751), branches
+82.19% (13118/15959), functions 92.54% (2993/3234). Both coverage commands exit 1
+because the existing 93% function threshold is unmet. Thresholds, exclusions,
+production code and dependencies were unchanged by pruning.
+
+The separate `pnpm test:coverage:subprocess` check passes for all four required
+entrypoints: lines/statements 87.21%, functions 86.26%, branches 79.86%.
+Focused affected suites, environment isolation and E2E checks pass (111 tests,
+10 skipped). Both typechecks and lint still report only the issues listed in
+the earlier status audit; `git diff --check` passes.
+
+Before/after coverage maps and logs, focused-test output, static-check logs and
+subprocess coverage output are in `/tmp/lethebot-test-pruning-pqLA65/`.
+Stable pruning rules and current E2E commands are in `test-strategy.md` and
+`../tests/e2e/README.md`.
+
+### Historical Slice Evidence: September 5
+
+These historical checks predate the integrated V1-V3 implementation. The final
+verification in Current V3 Slice is the current release-gate evidence.
+
+- `LOG_LEVEL=fatal pnpm release:check`, started 20:13:50 CST, exit 0:
+  source/test typechecks, lint, build, preflight (5 files), packaging (610 files),
+  and Vitest all passed. Tests: 130 files passed, 1 skipped; 2880 tests passed,
+  10 skipped. `git diff --check` passed.
+- Focused V1 evidence: `tests/integration/procedural-memory.test.ts` (19 tests),
+  `tests/integration/procedural-memory-runtime.test.ts` (3 tests). Source, lease,
+  evaluator, revision and audit tests in the full gate cover the writer controls,
+  repeated evidence and proposal-tool boundary.
+
+V2 schema gate: `LOG_LEVEL=fatal pnpm release:check` completed at 20:30 CST,
+exit 0: both typechecks, lint, build, preflight, packaging (611 files), 131 test
+files / 2886 tests passed, 1 file / 10 tests skipped. Five new migration cases
+first failed, then passed. Focused schema/release checks passed (162 tests).
+The cross-version rehearsal initially exposed the old v7-to-v8 table assertion;
+after updating it for v8-to-v9, the actual rehearsal returned `success=true`
+with all assertions true. The updated release CLI integration suite passed
+25 tests, and source typecheck passed. The actual prior v8 migration runner
+rejects a v9 DB with `future-schema-version`, zero writes and clean FKs.
+
+Preserved immutable schema-slice builds (not the final product candidate):
+
+- `/tmp/lethebot-v2-releases-YaJqFd/prior-v8`, digest
+  `25fbf4b8d44b7d49c95feb19176782c76853e04d484da359e3ff92b28a641db2`.
+- `/tmp/lethebot-v2-releases-YaJqFd/candidate-v9-schema`, digest
+  `6fd89b834646ba538e4d5482430866a831a32ff99db497f7e1fa008171a9e894`.
+
+The schema gate predates the selected embedding dependency/runtime work.
+The installed dependency adds 34 packages without changing existing package
+versions; ONNX/Sharp install scripts are explicitly disabled. The public model
+assets are at `/tmp/lethebot-embedding-model-dS3Xoz`, downloaded from the pinned
+Hugging Face revision `2c4055b12046f11709e9df2c122e59ffbdc2f900`. Quantized ONNX
+SHA-256 matches upstream: `66fc00f5f29afcaff34092e1bdd20008ca3918265a82fb9695a551e510cc4ebc`.
+
+Frozen corpus: `src/memory/semantic-recall-corpus.json`, SHA-256
+`65209aaa2c2458c98031659052971201b72b64b887efad8fd8d9c081175463da`.
+It fixes 24 records, 11 queries, expected source IDs, k=3 and token budget=8000
+before model quality evaluation. Do not tune by changing the labels or corpus.
+
+## 3. Requirement Status
+
+| Area | Status | Evidence and remaining work |
+|---|---|---|
+| Current worktree gates | `DETERMINISTIC_READY` | Final release, smoke and coverage pass. Static errors repaired, obsolete source hash assertion removed, useful evaluation-contract coverage closes the previous function shortfall. |
+| P0-P3 | `DETERMINISTIC_READY` at prior slice | Baseline, security, durable admission/concurrency, invocation ledger and Pi isolation have prior acceptance and no failures in the fresh suite. The integrated release gate now passes. |
+| P5-P8 | `DETERMINISTIC_READY` at prior slice | Memory governance, tools, application orchestration and local governance UI/CLI have prior acceptance and no failures in the fresh suite. Product additions need their own integration proof. |
+| V1 / DEL-V1 | `DETERMINISTIC_READY` at prior slice | Explicit teaching, exact three-source repeated evidence, scoped recall, governance, lifecycle/rollback and independent controls have prior acceptance. Both procedure integration files pass in the fresh suite, including application restart with mocked Pi/sender. Final candidate acceptance remains open. |
+| V2 / DEL-V2 | `REPRODUCED` | Schema, local provider, governed index, durable worker, retrieval/trace and application wiring exist. Unit/runtime tests, prior real-model comparison and current static/release/coverage gates pass; remaining V2 operations and documentation audit is tracked in section 4. |
+| V3 / DEL-V3 | `PHASE_COMPLETE` | All local delivery scenarios pass: dynamic source-window scoring, exact source/revision/privacy checks, governed transitions, controls, leases, retry/concurrency/restart, backup/restore, ContextPack ranking and rollback. Integrated gates and frozen v9/v10 rehearsals pass; no live acceptance claim. |
+| P4 / P6 live / P9 / DEL-LIVE | `BLOCKED_EXTERNAL` | No fresh authority or current-candidate Provider/QQ matrix, controlled deployment restart/restore/rollback, or 72-hour real soak. |
+| DEL-OPS / DEL-DOC | `UNVERIFIED` for final candidate | Prior operations evidence remains, and the fresh test suite passes. Repeat smoke, coverage, all disposable rehearsals, one-hour synthetic soak and final documentation audit after V1-V3. |
+
+Historic runtime samples, previous synthetic soaks and empty validator templates
+are not evidence for the final candidate. A template passing share-safety while
+failing completeness is expected and does not prove live behavior.
+
+## 4. Selected Slice: V2 Acceptance And Gate Repair
+
+Requirement: `DEL-V2`. Existing implementation includes
+`migrations/009_memory_embeddings.sql`, `src/memory/local-embedding-provider.ts`,
+`src/storage/memory-embedding-repository.ts`, `src/workers/memory-embedding.ts`,
+`src/context/semantic-retrieval.ts`, ContextBuilder/trace integration and
+production application/background wiring. The fresh full suite includes:
+
+- `tests/unit/storage/schema-v9-migration.test.ts`;
+- `tests/unit/memory/local-embedding-provider.test.ts`;
+- `tests/unit/storage/memory-embedding-repository.test.ts`;
+- `tests/unit/workers/memory-embedding.test.ts`;
+- `tests/unit/context/semantic-retrieval.test.ts`;
+- `tests/integration/semantic-retrieval-runtime.test.ts`.
+
+The actual governed comparison was run with the unchanged frozen corpus:
+
+```bash
+LOG_LEVEL=fatal pnpm ops:semantic-recall -- \
+  --model-directory /tmp/lethebot-embedding-model-dS3Xoz \
+  --out /tmp/lethebot-status-audit-eZxaVA/semantic-recall.json
 ```
 
-Additional current deterministic evidence:
+The output path is create-only; choose a new output filename when rerunning.
+Report SHA-256:
+`d7adef884f288e24a0fad7bd671b0955ec77ca9b2a2881363533c81e981580ed`.
+Model: `Xenova/paraphrase-multilingual-MiniLM-L12-v2`, 384 dimensions, index v1;
+runtime model fingerprint:
+`8b8f385441556effd4a326e9d59efbac8eb88c83925a564cb05a8964a5ef18c4`.
 
-```text
-pnpm smoke: all smoke checks passed.
-pnpm --silent ops:worker-soak -- --duration-ms=15000 --interval-ms=1000:
-  success=true; 22 attempts (21 completed, 1 planned retry); 21 jobs completed;
-  lease extension observed; scheduler errors=0; isolation clean; FK violations=0.
-pnpm --silent ops:rehearse-maintenance: success=true; disposable backup/restore/
-  retention rehearsal; integrity and foreign-key checks clean.
-pnpm --silent ops:rehearse-rollback: success=true; disposable rollback rehearsal;
-  integrity and foreign-key checks clean.
-pnpm --silent acceptance:db-summary on a disposable restored DB:
-  integrity=true, foreign-key violations=0; --require-acceptance-hints exited 1
-  because populated live acceptance rows are absent.
-pnpm --silent ops:doctor on the same disposable DB:
-  overall=ok; 25/25 required tables; foreign-key violations=0.
-Fresh acceptance template plus default validator: valid=true, findingCount=0.
-The same template with --require-complete exited 1 with findingCount=119;
-this is the expected incomplete-live-evidence result, not a product-gate failure.
-```
-
-No live Provider/QQ/runtime claim is inferred from these deterministic results.
-
-## 3. P0–P9 Contract Audit
-
-Status vocabulary:
-
-- `PROVED`: the phase's current deterministic exit contract is covered by code,
-  tests, and current gate evidence.
-- `DETERMINISTIC_READY`: local behavior is proved, but a named live exit item is
-  still authorization-bound.
-- `BLOCKED_EXTERNAL`: the next valid evidence requires fresh live authority or
-  operator infrastructure.
-
-| Phase | Status | Current evidence | Remaining boundary |
+| Query class | Queries | FTS recall@3 | Semantic recall@3 |
 |---|---|---|---|
-| `P0` Baseline and risk map | `PROVED` | Clean base commit identified; canonical constraints, migrations, scripts, test inventory, and deterministic release gate are current. | None local. |
-| `P1` Security and privacy gates | `PROVED` | Loopback/auth/body limits, redaction, bounded audit/log output, and fail-closed startup/transport contracts remain covered by the full suite. | Production exposure is rechecked in `P4`/`P9`, not inferred here. |
-| `P2` Scheduling and recovery | `PROVED` | Durable admission, claims, heartbeats, recovery, queue saturation, cancellation, shutdown, and group-summary scheduling are covered by repository/worker/application/integration tests. | Live restart and long soak belong to `P9`. |
-| `P3` Invocation ledger and Pi concurrency | `PROVED` | Durable model invocation state, prepared-call boundaries, cancellation/timeout behavior, evaluator isolation, and Pi concurrency contracts pass the current suite. | Provider-observed behavior belongs to `P4`. |
-| `P4` Live Provider and QQ baseline | `BLOCKED_EXTERNAL` | Deterministic harnesses and evidence validators exist. Historic live samples are not evidence for this candidate. | Fresh Provider/QQ/restart authority and the complete live matrix are absent. |
-| `P5` Memory lifecycle | `PROVED` | Memory proposals, review/apply/rollback, provenance, visibility, deletion, conflict/consolidation/decay, and governed retrieval paths are covered by storage/worker/governance/context tests. | Real-runtime recall/privacy samples are part of `P4`/`P9`. |
-| `P6` Tool registry and execution | `DETERMINISTIC_READY` | Exact reviewed catalog, policy/evaluator/audit/sandbox/output bounds, optional tools, owner inspection, and restart-scoped enable/disable configuration pass focused and full gates. | One allowed and one denied tool call in real authorized QQ remain live evidence. |
-| `P7` Application orchestration | `PROVED` | Composition root, turn lifecycle, QQ command path, governed memory/context/tool flow, failure mapping, and shutdown ownership pass unit/integration/e2e coverage. | Live behavior is not claimed. |
-| `P8` Governance and operations UI | `PROVED` | CLI, QQ governance commands, authenticated loopback governance listener, browser workflows, privacy controls, maintenance, backup/restore handoff, retention controls, and deterministic accessibility/security QA are covered by current local contracts. | Production browser screenshots/accessibility sign-off and actual stopped-service restore remain live/operator work. |
-| `P9` Release and sustained operation | `BLOCKED_EXTERNAL` | Deterministic install/update/rollback rehearsal, immutable release artifact work, validators, and a one-hour synthetic concurrent worker soak were completed in the current program; the current package gate passes. | Planned real restart/fault injection, actual stopped-service restore, complete live matrix, and 72-hour real soak are absent. |
+| English paraphrases | 4 | 0.75 | 0.75 |
+| Chinese paraphrases | 3 | 0 | 1 |
+| Lexical matches | 4 | 1 | 1 |
 
-No phase is labeled production-complete. `P4`, the live parts of `P6`, and `P9`
-must not be promoted from local tests or synthetic evidence.
+Three paraphrases were recovered, with zero lexical regressions, forbidden
+selections or token-budget violations; integrity and foreign-key checks passed.
+Both paths used the same 8000-token budget. Indexing took 4625 ms, recorded
+embedding-process peak RSS was 694599680 bytes, and semantic query/context
+durations were 11-17 ms. The `paraphrase-quiet` source remains outside the top
+three in both paths; `success=true` does not mean perfect recall. This replaces
+the previous model-only quality evidence, but does not close all V2 criteria.
 
-## 4. Cross-Phase Requirement Matrix
+Allowed paths: embedding runtime/repository/worker and tests; ContextBuilder,
+context types/trace repository; config and application/background wiring; model
+setup/recall-evaluation operations scripts; package commands and owning docs.
+Keep the frozen corpus unchanged. No additional schema or live change.
 
-| Area | Status | Evidence summary | Next valid proof |
-|---|---|---|---|
-| `SEC` | `PROVED` | Deterministic auth, ingress, body, redaction, privacy, audit, and bounded-output contracts pass. | Recheck the deployed surface during authorized acceptance. |
-| `GW` / `ING` | `DETERMINISTIC_READY` | OneBot normalization, dedupe, commands, transport failure, and admission tests pass. | Real QQ private/group ingress and reconnect matrix. |
-| `TURN` / `CTX` / `PI` | `DETERMINISTIC_READY` | Durable turn ownership, context budgets, invocation ledger, cancellation, evaluator, and concurrency tests pass. | Authorized Provider quality, timing, and concurrency observations. |
-| `ACT` | `DETERMINISTIC_READY` | Durable effects, idempotency, retry/failure boundaries, and redacted action evidence pass. | Real outbound delivery/failure samples. |
-| `MEM` | `DETERMINISTIC_READY` | Source-linked governed lifecycle, retrieval, visibility, deletion, and maintenance pass. | Real-runtime recall and privacy samples. |
-| `TOOL` | `DETERMINISTIC_READY` | Reviewed exact catalog, policy/evaluator/audit/sandbox limits, owner inspection, and restart-scoped configuration pass. | One allowed and one denied real QQ tool call. |
-| `WORK` | `DETERMINISTIC_READY` | Claims, leases, recovery, heartbeats, saturation, shutdown, and one-hour synthetic concurrency are covered. | 72-hour real soak and restart/fault evidence. |
-| `GOV` | `PROVED` | CLI, QQ commands, governance HTTP/browser workflows, scope/preview handles, privacy, maintenance, and local accessibility/security contracts pass. | Production operator sign-off. |
-| `OPS` | `DETERMINISTIC_READY` | Doctor, metrics, backup/restore handoff, retention, release activation/rollback, packaging, and validators are implemented and locally exercised. | Actual stopped-service restore and controlled deployment rollback. |
-| `LIVE` | `BLOCKED_EXTERNAL` | Templates and validators exist; current-candidate live records do not. | Fresh authority, then complete every required evidence cell. |
-| `VISION` | `UNVERIFIED` | Required V1-V3 delivery units are specified but procedural memory, semantic retrieval, and reflection/importance are not yet evidenced for this candidate. | Complete `DEL-V1`, `DEL-V2`, and `DEL-V3` with source, governance, retrieval, rollback, and handoff evidence. |
-| `DOC` | `PROVED` | Canonical architecture/contracts/security/deployment/operations/test/tool docs match the current implementation; this checkpoint is current and concise. | Update only after new verified behavior or live evidence. |
+Remaining acceptance: finish the V2-specific audit against all DEL-V2 scenarios
+and explicitly verify index backup/restore/rebuild/rollback on disposable
+databases. Typechecks, lint and the current release gate now pass. Complete the model setup, controls,
+fallback/trace and evaluation runbook in owning docs. In particular,
+`architecture.md` still calls embedding a future worker and
+`context-orchestration.md` still describes the pre-semantic ranking path.
 
-## 5. Completed Final Local Slice: Reviewed Tool Configuration
+Rollback: feature remains disabled until explicitly configured. Terminate the
+embedding child and fall back to FTS; memory truth and schema remain intact.
 
-The current slice closes the local owner/operator configuration gap without
-adding a hot-mutation path:
+## 5. Exact Resume Action
 
-- `KNOWN_TOOL_NAMES` defines the nine reviewed canonical names:
-  `memory.search`, `memory.propose`, `memory.disable`,
-  `group.recent_summary`, `runtime.status`, `runtime.tools`,
-  `workspace.list`, `workspace.read_text`, and `web.fetch_text`.
-- `LETHEBOT_DISABLED_TOOLS` is parsed and validated before database
-  initialization. Empty/unset means no disabled tools; duplicates and unknown
-  names fail startup.
-- Registry entries now expose explicit `enabled` state. Disabled entries remain
-  registered and owner-inspectable, but are excluded from Pi availability and
-  handler lookup for new calls. In-flight calls are not interrupted.
-- Private owner/admin `runtime.tools` returns only bounded redacted catalog
-  metadata, explicit enablement/current-context availability, evaluator flags,
-  and counts. It cannot mutate runtime state.
-- Owner CLI commands `list-tools`, `tool-status`, `disable-tool`, and
-  `enable-tool` inspect or atomically update an explicitly supplied launcher env
-  file. Mutation rejects symlinks, preserves unrelated settings and mode, and
-  reports that restart is required.
-- Optional workspace and web tools remain conditionally registered; configuration
-  does not invent handlers or permissions.
-- CLI action validation is fail-closed at runtime as well as in TypeScript types.
+1. Close the remaining V2 acceptance gaps in section 4, retaining the frozen corpus and
+   current working implementation. Runtime must not download a model or send
+   memory text remotely merely because a chat provider is configured.
+2. Freeze the complete V1-V3 product candidate and finish the delivery-contract gates:
+   release checks, smoke, coverage, disposable maintenance/restore/application
+   and cross-version rollback rehearsals, one-hour synthetic soak and doc audit.
+3. Complete final Provider/QQ acceptance, controlled deployment recovery and the
+   72-hour real soak against that candidate once their specific authority and
+   runtime details are supplied. This remains separate from local tests.
 
-## 6. Candidate Paths
-
-All current candidate paths are intentional and within the active program:
-
-```text
-.env.example
-README.md
-docs/architecture.md
-docs/contracts.md
-docs/deployment.md
-docs/long-running-goal-state.md
-docs/operations.md
-docs/security-privacy.md
-docs/test-strategy.md
-docs/tool-registry.md
-src/cli/main.ts
-src/cli/tool-config.ts
-src/config/index.ts
-src/index.ts
-src/scripts/local-acceptance-evidence.ts
-src/tools/builtins/runtime-tools.ts
-src/tools/known-tools.ts
-src/tools/registry.ts
-tests/integration/cli-main.test.ts
-tests/unit/cli/tool-config.test.ts
-tests/unit/config/index.test.ts
-tests/unit/index-pi-runtime.test.ts
-tests/unit/pi/pi-adapter.test.ts
-tests/unit/scripts/local-acceptance-evidence.test.ts
-tests/unit/tools/registry.test.ts
-tests/unit/tools/runtime-tools.test.ts
-```
-
-No dependency or migration file is changed by this final slice.
-
-## 7. Remaining Blockers
-
-The repository is locally complete under the P0-P9 deterministic contract. The
-expanded product target is not complete because these required items are absent:
-
-0. V1-V3 procedural memory, semantic retrieval, and reflection/importance
-   delivery units have not been implemented and evidenced for the current
-   candidate release.
-1. Complete real Provider/QQ matrix: private and group turns, reply-to-bot and
-   ordinary mentions, silence/response decisions, allowed/denied tools, memory
-   extraction/recall/privacy, cancellation, timeouts, provider and delivery
-   failures, duplicate ingress, saturation, recovery, and concurrent turns.
-2. Controlled real restart/fault-injection run with durable turn/job/action
-   recovery evidence.
-3. Actual stopped-service backup/restore and deployment rollback evidence.
-4. Continuous 72-hour real runtime soak with no unexplained loss, duplicate
-   effect, privacy leak, or unbounded growth.
-5. Production browser accessibility/visual operator sign-off.
-6. Share-safe validation and complete validation of the populated current-candidate
-   evidence set. A fresh empty template is share-safe (`valid=true`, zero findings),
-   but `--require-complete` exits 1 with 119 findings because populated live
-   evidence is absent.
-
-Historic samples, deterministic harness results, the one-hour synthetic soak,
-and empty/template evidence cannot satisfy these items.
-
-## 8. Exact Resume Action
-
-The next local product slice is V1 procedural memory, followed by V2 semantic
-retrieval and V3 reflection/importance. Before any runtime acceptance,
-keep `docker-compose.snowluma-framework.yml` off-limits without fresh live
-authority: it references the real SnowLuma image, `restart: unless-stopped`,
-persistent framework bind directories, `SNOWLUMA_HOOK_AUTOLOAD=1`, and ports shared
-with the source stack. This audit used only `/dev/null` config checks and a
-source-stack image build; it did not start any stack or stop/recreate any service.
-
-After the local V1-V3 slices, the next external action is:
-
-1. obtain fresh, explicit `LIVE_PROVIDER`, `LIVE_QQ`, and
-   `LIVE_DEPLOYMENT_OR_RESTART` authority plus a controlled runtime and test
-   identities;
-2. run the `P4` matrix and populate only redacted current-candidate evidence;
-3. run the planned restart/fault and actual restore/rollback scenarios;
-4. run the 72-hour real soak;
-5. run share-safety and completeness validators;
-6. update this checkpoint and the affected canonical docs from observed results.
-
-Without that authority and infrastructure, the operational baseline remains
-`LOCAL_COMPLETE_EXTERNAL_BLOCKED`; until V1-V3 are also proved, the program
-remains `ACTIVE`. Do not fabricate completion, read private artifacts, or
-substitute synthetic evidence.
+The Framework Compose deployment, its persistent SnowLuma/QQ directories, real
+configuration and shared ports remain protected throughout local implementation.
