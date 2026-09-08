@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { createServer, request, type ClientRequest, type Server } from 'node:http';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import {
   GovernanceHttpServer,
   type GovernanceHttpRoute,
@@ -36,7 +38,12 @@ const MISMATCHED_HANDLE = 'm'.repeat(43);
 const RESOURCE_HANDLE = 'd'.repeat(43);
 const UNKNOWN_RESOURCE_HANDLE = 'n'.repeat(43);
 const RESOURCE_KIND = 'synthetic_record';
-const CHROMIUM_PATH = '/usr/bin/chromium';
+const CHROMIUM_PATH = process.env.LETHEBOT_BROWSER_EXECUTABLE_PATH
+  ?? ['/usr/bin/google-chrome', '/usr/bin/chromium'].find(existsSync);
+if ((process.env.LETHEBOT_BROWSER_TESTS === '1' || process.env.LETHEBOT_BROWSER_EXECUTABLE_PATH)
+  && (!CHROMIUM_PATH || !existsSync(CHROMIUM_PATH))) {
+  throw new Error('Browser tests require an existing LETHEBOT_BROWSER_EXECUTABLE_PATH');
+}
 
 type CdpValue = Record<string, unknown>;
 
@@ -45,21 +52,64 @@ interface CdpClient {
   readonly close: () => void;
 }
 
+async function startChromium(): Promise<CdpClient> {
+  if (!CHROMIUM_PATH) throw new Error('No Chrome or Chromium executable found');
+  const profile = mkdtempSync(join(tmpdir(), 'lethebot-governance-browser-'));
+  const browser = spawn(CHROMIUM_PATH, [
+    '--headless=new',
+    '--disable-gpu',
+    '--disable-dev-shm-usage',
+    '--no-first-run',
+    `--user-data-dir=${profile}`,
+    '--remote-debugging-port=0',
+    'about:blank',
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  // Register cleanup before CDP startup so failed and timed-out launches are reaped.
+  onTestFinished(async () => {
+    if (browser.pid !== undefined && browser.exitCode === null && browser.signalCode === null) {
+      await new Promise<void>((resolve) => {
+        const forceStop = setTimeout(() => browser.kill('SIGKILL'), 2000);
+        browser.once('close', () => {
+          clearTimeout(forceStop);
+          resolve();
+        });
+        browser.kill('SIGTERM');
+      });
+    }
+    rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+  return connectCdp(browser);
+}
+
 async function connectCdp(browser: ChildProcessWithoutNullStreams): Promise<CdpClient> {
   const endpoint = await new Promise<string>((resolve, reject) => {
     let output = '';
-    const onData = (chunk: Buffer): void => {
-      output += chunk.toString('utf8');
-      const match = output.match(/DevTools listening on (ws:\/\/[^\s]+)/u);
-      if (match?.[1]) {
-        browser.stderr.off('data', onData);
-        resolve(match[1]);
-      }
+    const finish = (result: string | Error): void => {
+      clearTimeout(timer);
+      browser.stderr.off('data', onData);
+      browser.off('error', onError);
+      browser.off('exit', onExit);
+      if (result instanceof Error) reject(result);
+      else resolve(result);
     };
+    const onData = (chunk: Buffer): void => {
+      output = (output + chunk.toString('utf8')).slice(-8192);
+      const match = output.match(/DevTools listening on (ws:\/\/[^\s]+)/u);
+      if (match?.[1]) finish(match[1]);
+    };
+    const onError = (error: Error): void => finish(error);
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      finish(new Error(`Chromium exited before CDP endpoint (${code ?? signal}): ${output}`));
+    };
+    const timer = setTimeout(() => {
+      finish(new Error(`Chromium did not expose a CDP endpoint within 5 seconds: ${output}`));
+    }, 5000);
     browser.stderr.on('data', onData);
-    browser.once('exit', () => reject(new Error('Chromium exited before CDP endpoint')));
+    browser.once('error', onError);
+    browser.once('exit', onExit);
   });
   const socket = new WebSocket(endpoint);
+  onTestFinished(() => socket.close());
   await new Promise<void>((resolve, reject) => {
     socket.addEventListener('open', () => resolve());
     socket.addEventListener('error', () => reject(new Error('CDP WebSocket connection failed')));
@@ -1997,18 +2047,11 @@ describe('governance HTTP security boundary', () => {
     expect(harness.handleAuthorizedRequest).not.toHaveBeenCalled();
   });
 
-  it.skipIf(!existsSync(CHROMIUM_PATH))(
+  it.skipIf(!CHROMIUM_PATH)(
     'executes Privacy, Group-summary, and Display-profile controllers in Chromium',
     async () => {
       const harness = await startHarness();
-      const browser = spawn(CHROMIUM_PATH, [
-        '--headless=new',
-        '--disable-gpu',
-        '--disable-dev-shm-usage',
-        '--remote-debugging-port=0',
-        'about:blank',
-      ], { stdio: ['ignore', 'pipe', 'pipe'] });
-      const client = await connectCdp(browser);
+      const client = await startChromium();
       try {
         const target = await client.send('Target.createTarget', { url: 'about:blank' });
         const attached = await client.send('Target.attachToTarget', {
@@ -2302,23 +2345,15 @@ describe('governance HTTP security boundary', () => {
         });
       } finally {
         client.close();
-        browser.kill('SIGKILL');
       }
     },
   );
 
-  it.skipIf(!existsSync(CHROMIUM_PATH))(
+  it.skipIf(!CHROMIUM_PATH)(
     'executes read-only Explain catalog and detail in Chromium',
     async () => {
       const harness = await startHarness();
-      const browser = spawn(CHROMIUM_PATH, [
-        '--headless=new',
-        '--disable-gpu',
-        '--disable-dev-shm-usage',
-        '--remote-debugging-port=0',
-        'about:blank',
-      ], { stdio: ['ignore', 'pipe', 'pipe'] });
-      const client = await connectCdp(browser);
+      const client = await startChromium();
       try {
         const target = await client.send('Target.createTarget', { url: 'about:blank' });
         const attached = await client.send('Target.attachToTarget', {
@@ -2453,7 +2488,6 @@ describe('governance HTTP security boundary', () => {
         });
       } finally {
         client.close();
-        browser.kill('SIGKILL');
       }
     },
   );
@@ -2501,18 +2535,11 @@ describe('governance HTTP security boundary', () => {
     expect(harness.handleAuthorizedRequest).not.toHaveBeenCalled();
   });
 
-  it.skipIf(!existsSync(CHROMIUM_PATH))(
+  it.skipIf(!CHROMIUM_PATH)(
     'executes memory record mutation controllers in Chromium',
     async () => {
       const harness = await startHarness();
-      const browser = spawn(CHROMIUM_PATH, [
-        '--headless=new',
-        '--disable-gpu',
-        '--disable-dev-shm-usage',
-        '--remote-debugging-port=0',
-        'about:blank',
-      ], { stdio: ['ignore', 'pipe', 'pipe'] });
-      const client = await connectCdp(browser);
+      const client = await startChromium();
       try {
         const target = await client.send('Target.createTarget', { url: 'about:blank' });
         const attached = await client.send('Target.attachToTarget', {
@@ -2683,7 +2710,6 @@ describe('governance HTTP security boundary', () => {
         }
       } finally {
         client.close();
-        browser.kill('SIGKILL');
       }
     },
   );
@@ -2731,18 +2757,11 @@ describe('governance HTTP security boundary', () => {
     expect(harness.handleAuthorizedRequest).not.toHaveBeenCalled();
   });
 
-  it.skipIf(!existsSync(CHROMIUM_PATH))(
+  it.skipIf(!CHROMIUM_PATH)(
     'executes strict application preview projection in Chromium',
     async () => {
       const harness = await startHarness();
-      const browser = spawn(CHROMIUM_PATH, [
-        '--headless=new',
-        '--disable-gpu',
-        '--disable-dev-shm-usage',
-        '--remote-debugging-port=0',
-        'about:blank',
-      ], { stdio: ['ignore', 'pipe', 'pipe'] });
-      const client = await connectCdp(browser);
+      const client = await startChromium();
       try {
         const target = await client.send('Target.createTarget', { url: 'about:blank' });
         const attached = await client.send('Target.attachToTarget', {
@@ -2834,23 +2853,15 @@ describe('governance HTTP security boundary', () => {
         });
       } finally {
         client.close();
-        browser.kill('SIGKILL');
       }
     },
   );
 
-  it.skipIf(!existsSync(CHROMIUM_PATH))(
+  it.skipIf(!CHROMIUM_PATH)(
     'executes application preview and confirmation controller in Chromium',
     async () => {
       const harness = await startHarness();
-      const browser = spawn(CHROMIUM_PATH, [
-        '--headless=new',
-        '--disable-gpu',
-        '--disable-dev-shm-usage',
-        '--remote-debugging-port=0',
-        'about:blank',
-      ], { stdio: ['ignore', 'pipe', 'pipe'] });
-      const client = await connectCdp(browser);
+      const client = await startChromium();
       try {
         const target = await client.send('Target.createTarget', { url: 'about:blank' });
         const attached = await client.send('Target.attachToTarget', {
@@ -3087,23 +3098,15 @@ describe('governance HTTP security boundary', () => {
         }
       } finally {
         client.close();
-        browser.kill('SIGKILL');
       }
     },
   );
 
-  it.skipIf(!existsSync(CHROMIUM_PATH))(
+  it.skipIf(!CHROMIUM_PATH)(
     'executes rollback and expiration preview-confirmation controllers in Chromium',
     async () => {
       const harness = await startHarness();
-      const browser = spawn(CHROMIUM_PATH, [
-        '--headless=new',
-        '--disable-gpu',
-        '--disable-dev-shm-usage',
-        '--remote-debugging-port=0',
-        'about:blank',
-      ], { stdio: ['ignore', 'pipe', 'pipe'] });
-      const client = await connectCdp(browser);
+      const client = await startChromium();
       try {
         const target = await client.send('Target.createTarget', { url: 'about:blank' });
         const attached = await client.send('Target.attachToTarget', {
@@ -3411,23 +3414,15 @@ describe('governance HTTP security boundary', () => {
         }
       } finally {
         client.close();
-        browser.kill('SIGKILL');
       }
     },
   );
 
-  it.skipIf(!existsSync(CHROMIUM_PATH))(
+  it.skipIf(!CHROMIUM_PATH)(
     'executes the rejection preview and confirmation controller in Chromium',
     async () => {
     const harness = await startHarness();
-    const browser = spawn(CHROMIUM_PATH, [
-      '--headless=new',
-      '--disable-gpu',
-      '--disable-dev-shm-usage',
-      '--remote-debugging-port=0',
-      'about:blank',
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
-    const client = await connectCdp(browser);
+    const client = await startChromium();
     try {
       const target = await client.send('Target.createTarget', { url: 'about:blank' });
       const targetId = String(target.targetId);
@@ -3668,22 +3663,14 @@ describe('governance HTTP security boundary', () => {
       }
     } finally {
       client.close();
-      browser.kill('SIGKILL');
     }
     },
   );
-  it.skipIf(!existsSync(CHROMIUM_PATH))(
+  it.skipIf(!CHROMIUM_PATH)(
     'executes unscoped Identity and Operations controllers in Chromium',
     async () => {
       const harness = await startHarness();
-      const browser = spawn(CHROMIUM_PATH, [
-        '--headless=new',
-        '--disable-gpu',
-        '--disable-dev-shm-usage',
-        '--remote-debugging-port=0',
-        'about:blank',
-      ], { stdio: ['ignore', 'pipe', 'pipe'] });
-      const client = await connectCdp(browser);
+      const client = await startChromium();
       try {
         const target = await client.send('Target.createTarget', { url: 'about:blank' });
         const attached = await client.send('Target.attachToTarget', {
@@ -3910,23 +3897,15 @@ describe('governance HTTP security boundary', () => {
         });
       } finally {
         client.close();
-        browser.kill('SIGKILL');
       }
     },
   );
 
-  it.skipIf(!existsSync(CHROMIUM_PATH))(
+  it.skipIf(!CHROMIUM_PATH)(
     'keeps every governance view accessible and bounded at desktop and mobile widths',
     async () => {
       const harness = await startHarness();
-      const browser = spawn(CHROMIUM_PATH, [
-        '--headless=new',
-        '--disable-gpu',
-        '--disable-dev-shm-usage',
-        '--remote-debugging-port=0',
-        'about:blank',
-      ], { stdio: ['ignore', 'pipe', 'pipe'] });
-      const client = await connectCdp(browser);
+      const client = await startChromium();
       try {
         const target = await client.send('Target.createTarget', { url: 'about:blank' });
         const attached = await client.send('Target.attachToTarget', {
@@ -4067,7 +4046,6 @@ describe('governance HTTP security boundary', () => {
         expect(focused).toBe('login-button');
       } finally {
         client.close();
-        browser.kill('SIGKILL');
       }
     },
   );

@@ -312,7 +312,8 @@ describe('SQLite operations maintenance', () => {
     const db = initDatabase({ path: backupPath });
 
     try {
-      runMigration(db, migrationPath);
+      db.exec('CREATE TABLE marker (value TEXT NOT NULL)');
+      db.prepare('INSERT INTO marker (value) VALUES (?)').run('must-survive');
     } finally {
       closeDatabase(db);
     }

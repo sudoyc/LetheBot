@@ -36,6 +36,14 @@ pnpm ci:check
 completion evidence use `pnpm test:run`, `pnpm release:check`, or
 `pnpm ci:check`. The CI workflow also builds both maintained Dockerfiles.
 
+Governance browser tests honor `LETHEBOT_BROWSER_EXECUTABLE_PATH`; without it,
+they look for `/usr/bin/google-chrome` and then `/usr/bin/chromium`. CI sets
+`LETHEBOT_BROWSER_TESTS=1`, so a missing browser fails the suite instead of
+skipping it. An explicitly configured missing executable also fails. Local
+runs without either setting may skip browser cases when neither is installed.
+Each browser uses a disposable profile and is reaped even when startup or the
+test fails. CDP startup has a bounded wait and reports the browser's stderr.
+
 `pnpm test:coverage` is one gate with two explicit measurements. Vitest applies
 the repository-wide thresholds to every `src/**/*.ts` module except the two
 process-only command modules, `src/cli/main.ts` and

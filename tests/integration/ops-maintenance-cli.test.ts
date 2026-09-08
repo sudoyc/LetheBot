@@ -2445,6 +2445,13 @@ describe('ops maintenance CLI', () => {
       `Rollback rehearsal database already exists: ${dbPath}`,
     );
 
+    reopenDb(true);
+    expect(countRows(db, 'raw_events')).toBe(1);
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('redacts malformed command and option errors without mutating persisted data', () => {
+    insertRawEvent('evt-ops-negative', Date.UTC(2026, 6, 3));
     const secret = 'sk-ops-maintenance-secret-should-not-leak';
     const platformId = 'qq-123456789';
     const secretLikeInvalidSince = `${secret}+${platformId}`;
@@ -2516,6 +2523,15 @@ describe('ops maintenance CLI', () => {
     expect(redactedUnknownOption.stderr).not.toContain('src/scripts');
     expect(redactedUnknownOption.stderr).not.toContain('\n    at ');
 
+    reopenDb(true);
+    expect(countRows(db, 'raw_events')).toBe(1);
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
+
+  it('redacts malformed flag and worker-soak values without mutating persisted data', () => {
+    insertRawEvent('evt-ops-negative', Date.UTC(2026, 6, 3));
+    const secret = 'sk-ops-maintenance-secret-should-not-leak';
+    const platformId = 'qq-123456789';
     const redactedFlagValue = runOps([
       'restore',
       `--backup=${dbPath}`,
@@ -2577,7 +2593,10 @@ describe('ops maintenance CLI', () => {
     reopenDb(true);
     expect(countRows(db, 'raw_events')).toBe(1);
     expect(db.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0);
+  });
 
+  it('rejects restore into an existing database without mutating persisted data', () => {
+    insertRawEvent('evt-ops-negative', Date.UTC(2026, 6, 3));
     const backupPath = join(testDir, 'negative.backup.db');
     expectSuccessfulOps(['backup', '--db', dbPath, '--out', backupPath]);
 
