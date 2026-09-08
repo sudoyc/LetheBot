@@ -8,17 +8,6 @@ describe('FakeOneBot', () => {
     gateway = new FakeOneBot();
   });
 
-  describe('Connection', () => {
-    it('should connect immediately', async () => {
-      await expect(gateway.connect()).resolves.toBeUndefined();
-    });
-
-    it('should disconnect immediately', async () => {
-      await gateway.connect();
-      await expect(gateway.disconnect()).resolves.toBeUndefined();
-    });
-  });
-
   describe('Capabilities', () => {
     it('should return default capabilities', () => {
       const caps = gateway.getCapabilities();
@@ -338,17 +327,6 @@ describe('FakeOneBot', () => {
       gateway.reset();
       expect(gateway.getSentReactions()).toHaveLength(0);
       expect(gateway.getLastSentReaction()).toBeUndefined();
-    });
-
-    it('should reset counters', async () => {
-      gateway.simulatePrivateMessage({ text: 'test1' });
-      gateway.simulatePrivateMessage({ text: 'test2' });
-
-      gateway.reset();
-
-      gateway.simulatePrivateMessage({ text: 'test3' });
-      // After reset, counters start from 1 again
-      expect(gateway.getSentMessages()).toHaveLength(0); // No messages sent, only simulated
     });
   });
 });

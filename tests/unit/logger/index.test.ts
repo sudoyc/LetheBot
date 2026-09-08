@@ -1,28 +1,9 @@
 import { describe, test, expect } from 'vitest';
 import { Writable } from 'node:stream';
 import pino from 'pino';
-import { getLogger, redactingLogHooks, sanitizeLogValueForOutput } from '../../../src/logger/index.js';
+import { redactingLogHooks, sanitizeLogValueForOutput } from '../../../src/logger/index.js';
 
 describe('Logger', () => {
-  test('getLogger returns a logger instance', () => {
-    const logger = getLogger();
-
-    expect(logger).toBeDefined();
-    expect(typeof logger.info).toBe('function');
-    expect(typeof logger.error).toBe('function');
-    expect(typeof logger.debug).toBe('function');
-  });
-
-  test('logger can log messages', () => {
-    const logger = getLogger();
-
-    // Should not throw
-    expect(() => {
-      logger.info('test message');
-      logger.debug({ foo: 'bar' }, 'test object');
-    }).not.toThrow();
-  });
-
   test('sanitizeLogValueForOutput redacts secret-like and platform identifiers recursively', () => {
     const rawSecret = 'sk-logger-redaction-secret-should-not-persist';
     const rawPlatformId = 'qq-1234567890';

@@ -19,32 +19,6 @@ describe('ToolRegistry', () => {
   const registry = new ToolRegistry();
 
   describe('register', () => {
-    it('should register a tool', () => {
-      registry.register({
-        name: 'echo',
-        version: '1.0.0',
-        description: 'Echo input back',
-        capabilities: ['read_context'],
-        permissions: {
-          allowedActors: ['owner', 'admin', 'user'],
-          allowedContexts: ['private_chat', 'group_chat'],
-        },
-        evaluatorPolicy: 'bypass',
-        auditLevel: 'summary',
-        sandboxPolicy: createSandboxPolicy(),
-        outputSensitivity: 'normal',
-        piSchema: {
-          input: { type: 'object', properties: { text: { type: 'string' } } },
-          output: { type: 'object', properties: { echo: { type: 'string' } } },
-        },
-        handler: async () => ({ ok: true }),
-      });
-
-      const tool = registry.get('echo');
-      expect(tool).toBeDefined();
-      expect(tool?.name).toBe('echo');
-    });
-
     it('should retain a deeply frozen metadata snapshot while preserving its handler', async () => {
       const snapshotRegistry = new ToolRegistry();
       const handler: ToolRegistryEntry['handler'] = async () => ({ handled: true });
@@ -329,26 +303,6 @@ describe('ToolRegistry', () => {
   describe('get', () => {
     it('should return undefined for unknown tool', () => {
       expect(registry.get('nonexistent')).toBeUndefined();
-    });
-
-    it('should return registered tool', () => {
-      registry.register({
-        name: 'search',
-        version: '1.0.0',
-        description: 'Search',
-        capabilities: ['network'],
-        permissions: { allowedActors: ['user'], allowedContexts: ['private_chat'] },
-        evaluatorPolicy: 'required',
-        auditLevel: 'summary',
-        sandboxPolicy: createSandboxPolicy('allowed', 5000),
-        outputSensitivity: 'normal',
-        piSchema: { input: {}, output: {} },
-        handler: async () => ({ ok: true }),
-      });
-
-      const tool = registry.get('search');
-      expect(tool?.name).toBe('search');
-      expect(tool?.capabilities).toContain('network');
     });
   });
 

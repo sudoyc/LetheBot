@@ -41,34 +41,18 @@ describe('MockPi', () => {
   });
 
   describe('run', () => {
-    it('should return mock response for greeting', async () => {
+    it('should return a greeting with an action decision and consistent token usage', async () => {
       const result = await mockPi.run({
         contextPack: buildTestContext(),
       });
 
-      expect(result.responseText).toBeDefined();
       expect(result.responseText).toContain('你好');
-      expect(result.actionDecision).toBeDefined();
       expect(result.toolCalls).toEqual([]);
-      expect(result.tokensUsed.total).toBeGreaterThan(0);
-    });
-
-    it('should generate action decision with reply_short', async () => {
-      const result = await mockPi.run({
-        contextPack: buildTestContext(),
-      });
-
-      expect(result.actionDecision?.actions).toBeDefined();
       expect(result.actionDecision?.actions[0].type).toBe('reply_short');
       expect(result.actionDecision?.riskLevel).toBe('low');
       expect(result.actionDecision?.confidence).toBeGreaterThan(0.5);
-    });
-
-    it('should track token usage', async () => {
-      const result = await mockPi.run({
-        contextPack: buildTestContext(),
-      });
-
+      expect(result.actionDecision?.reasons.length).toBeGreaterThan(0);
+      expect(result.actionDecision?.suppressors).toEqual([]);
       expect(result.tokensUsed.input).toBeGreaterThan(0);
       expect(result.tokensUsed.output).toBeGreaterThan(0);
       expect(result.tokensUsed.total).toBe(result.tokensUsed.input + result.tokensUsed.output);
@@ -92,16 +76,6 @@ describe('MockPi', () => {
 
       expect(result.responseText).toBeDefined();
       expect(result.actionDecision?.actions[0].type).toBe('reply_short');
-    });
-
-    it('should include action decision reasons', async () => {
-      const result = await mockPi.run({
-        contextPack: buildTestContext(),
-      });
-
-      expect(result.actionDecision?.reasons).toBeDefined();
-      expect(result.actionDecision?.reasons.length).toBeGreaterThan(0);
-      expect(result.actionDecision?.suppressors).toBeDefined();
     });
   });
 

@@ -8,17 +8,12 @@ or provider secrets.
 
 ```text
 tests/e2e/
-├── deepseek-real-api.test.ts  # deterministic harness guard; no network calls
 ├── full-memory-cycle.test.ts  # deterministic governed-memory conversation
 └── pi-real-api.test.ts        # opt-in real PiAdapter/provider calls
 ```
 
 `full-memory-cycle.test.ts` exercises the credential-free ingestion, memory,
 context, action, and response path against a disposable SQLite database.
-
-`deepseek-real-api.test.ts` intentionally verifies only configuration gating. It
-prevents legacy placeholder checks from being mistaken for real-provider
-evidence and does not read local secret files.
 
 `pi-real-api.test.ts` is the authoritative real-provider E2E suite. It exercises
 `PiAdapter` with a live provider only when explicitly enabled. Its governed-tool
@@ -31,12 +26,12 @@ Provider-call evidence.
 Run the default e2e subset without credentials:
 
 ```bash
-pnpm exec vitest run tests/e2e/deepseek-real-api.test.ts tests/e2e/pi-real-api.test.ts --silent
+pnpm exec vitest run tests/e2e --silent
 ```
 
 Expected behavior without opt-in credentials:
 
-- `deepseek-real-api.test.ts` passes its deterministic guard tests.
+- `full-memory-cycle.test.ts` passes its deterministic conversation tests.
 - `pi-real-api.test.ts` is skipped.
 - No local secret files are read.
 - No provider network calls are made.

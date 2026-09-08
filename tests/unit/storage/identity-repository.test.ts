@@ -268,6 +268,8 @@ describe('IdentityRepository', () => {
       expect(accounts).toHaveLength(2);
       expect(accounts.map((a) => a.platformAccountId)).toContain('111111');
       expect(accounts.map((a) => a.platformAccountId)).toContain('222222');
+      expect(await repo.findCanonicalUserId('qq', '111111')).toBe('user-001');
+      expect(await repo.findCanonicalUserId('qq', '222222')).toBe('user-001');
     });
   });
 

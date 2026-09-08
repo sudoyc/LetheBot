@@ -58,6 +58,24 @@ merged with incompatible in-process mappings.
 Do not hardcode pass counts in stable documentation. Counts change as focused
 regressions are added; command exit status and the current output are evidence.
 
+## Test Value And Pruning
+
+- Exercise production code or a test helper used by other suites. Assertions on
+  freshly assigned literals, language builtins, or a test-local copy of unused
+  behavior do not provide regression coverage.
+- Keep assertions for one input and result together. A separate test should
+  cover a different behavior or boundary, not repeat the same setup for each
+  output field or static prompt phrase.
+- Repository unit tests already use real SQLite. An integration test should
+  add a distinct interaction, source chain, restart or application boundary.
+  When removing duplicate CRUD cases, retain any unique assertion in the owning
+  repository suite.
+- Retain privacy, authorization, lifecycle, atomicity, retry and application
+  wiring regressions. Similar assertions at different enforcement boundaries
+  can be necessary; coverage percentages alone do not prove duplication.
+- Compare coverage before and after pruning. Keep thresholds and exclusions
+  unchanged, and report pre-existing gate failures separately.
+
 ## Test Layers
 
 ### Unit Tests
@@ -100,8 +118,7 @@ an empty `PRAGMA foreign_key_check` result.
 ### Deterministic End-to-End Tests
 
 The default suite includes credential-free end-to-end coverage such as
-`tests/e2e/full-memory-cycle.test.ts`. It also includes the deterministic guard
-in `tests/e2e/deepseek-real-api.test.ts`.
+`tests/e2e/full-memory-cycle.test.ts`.
 
 `tests/e2e/pi-real-api.test.ts` is opt-in and skipped by default. Its presence
 in a default Vitest run is not real-provider evidence.
